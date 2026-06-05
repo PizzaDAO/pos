@@ -10,12 +10,14 @@ import {
   DEMO_LOCATION_DOWNTOWN_ID,
   DEMO_TENANT_ID,
   type Menu,
+  type PaymentSettings,
   type StoreSettings,
 } from "@/lib/db";
 
 export interface MenuResponse {
   menu: Menu;
   settings: StoreSettings;
+  paymentSettings: PaymentSettings;
   driver: string;
 }
 

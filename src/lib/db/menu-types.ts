@@ -101,6 +101,7 @@ export interface StoreSettings {
 export type OrderStatus =
   | "draft"
   | "placed"
+  | "paid"
   | "in_kitchen"
   | "ready"
   | "out_for_delivery"

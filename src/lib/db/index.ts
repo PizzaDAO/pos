@@ -6,6 +6,7 @@
 export * from "./client";
 export * from "./types";
 export * from "./menu-types";
+export * from "./payment-types";
 export * from "./driver";
 export {
   DEMO_CONTEXT,

@@ -14,6 +14,7 @@ import type {
   ModifierGroup,
   StoreSettings,
 } from "./menu-types";
+import type { PaymentSettings } from "./payment-types";
 import type { Location, Tenant } from "./types";
 
 export const DEMO_TENANT_ID = "10000000-0000-0000-0000-000000000001";
@@ -305,6 +306,30 @@ export const storeSettings: StoreSettings[] = [
     location_id: DEMO_LOCATION_UPTOWN_ID,
     currency: "USD",
     tax_rate_bps: 825,
+    tip_presets_bps: [1500, 1800, 2000],
+  },
+];
+
+/**
+ * Per-tenant/location payment settings (mock). Platform fee 2.5% + $0.10 per
+ * card order (taken via Connect application_fee), tip presets 15/18/20%.
+ * Phase 2 reads these to compute the application fee + tip suggestions.
+ */
+export const paymentSettings: PaymentSettings[] = [
+  {
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_DOWNTOWN_ID,
+    currency: "USD",
+    platform_fee_bps: 250,
+    platform_fee_flat_cents: 10,
+    tip_presets_bps: [1500, 1800, 2000],
+  },
+  {
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_UPTOWN_ID,
+    currency: "USD",
+    platform_fee_bps: 250,
+    platform_fee_flat_cents: 10,
     tip_presets_bps: [1500, 1800, 2000],
   },
 ];

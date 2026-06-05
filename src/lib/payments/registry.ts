@@ -11,6 +11,7 @@ import type { PaymentRail, PaymentRailKey } from "./PaymentRail";
 
 /** All rail keys the platform knows about, in display order. */
 export const PAYMENT_RAIL_KEYS: readonly PaymentRailKey[] = [
+  "cash",
   "stripe_terminal",
   "stripe_online",
   "crypto_onchain_usdc",
@@ -19,6 +20,7 @@ export const PAYMENT_RAIL_KEYS: readonly PaymentRailKey[] = [
 
 /** Human-readable labels for UI/config surfaces. */
 export const PAYMENT_RAIL_LABELS: Record<PaymentRailKey, string> = {
+  cash: "Cash",
   stripe_terminal: "Card — Stripe Terminal (in-store)",
   stripe_online: "Card — Stripe (online)",
   crypto_onchain_usdc: "Crypto — Onchain USDC (Base)",

@@ -22,10 +22,16 @@ export async function GET(request: Request) {
     searchParams.get("locationId") ?? DEMO_LOCATION_DOWNTOWN_ID;
 
   const driver = getPosDriver();
-  const [menu, settings] = await Promise.all([
+  const [menu, settings, paymentSettings] = await Promise.all([
     driver.getMenu(tenantId, locationId),
     driver.getStoreSettings(tenantId, locationId),
+    driver.getPaymentSettings(tenantId, locationId),
   ]);
 
-  return NextResponse.json({ menu, settings, driver: driver.name });
+  return NextResponse.json({
+    menu,
+    settings,
+    paymentSettings,
+    driver: driver.name,
+  });
 }
