@@ -66,6 +66,7 @@ export function buildLine(input: BuildLineInput): OrderItem {
     id: lineId ?? newId(),
     item_id: item.id,
     item_name: item.name,
+    station: item.station,
     size_id: size?.id ?? null,
     size_name: size?.name ?? null,
     base_price_cents: size?.price_cents ?? 0,

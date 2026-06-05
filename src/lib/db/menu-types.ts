@@ -16,6 +16,13 @@ export interface MenuCategory {
   sort_order: number;
 }
 
+/**
+ * Kitchen station an item is prepared at. Used by the KDS (Phase 3) to route
+ * line items so each station only sees its own work. `none` means the item
+ * needs no kitchen prep (e.g. a canned drink) and is hidden from station views.
+ */
+export type Station = "oven" | "cold" | "fryer" | "expo" | "none";
+
 export interface MenuItem {
   id: string;
   tenant_id: string;
@@ -24,6 +31,8 @@ export interface MenuItem {
   description: string | null;
   /** Whether this item can be built as a half-and-half pizza. */
   is_half_and_half_capable: boolean;
+  /** Kitchen station this item is prepared at (Phase 3 KDS routing). */
+  station: Station;
 }
 
 export interface ItemSize {
@@ -83,6 +92,17 @@ export interface Menu {
   categories: MenuCategoryWithItems[];
 }
 
+/**
+ * KDS age-coloring thresholds (Phase 3), in seconds since an order was placed.
+ * A ticket renders green below `warn_seconds`, yellow at/after it, and red at/
+ * after `urgent_seconds`. Pulled from store settings so each location can tune
+ * its own "this order is getting old" cadence.
+ */
+export interface KdsThresholds {
+  warn_seconds: number;
+  urgent_seconds: number;
+}
+
 /** Per-location store settings (tax, rounding, currency) — mocked in Phase 1. */
 export interface StoreSettings {
   tenant_id: string;
@@ -92,6 +112,8 @@ export interface StoreSettings {
   tax_rate_bps: number;
   /** Default tip percentage suggestions (Phase 2 wires real tipping). */
   tip_presets_bps: number[];
+  /** KDS age-coloring thresholds (Phase 3). Optional; a default is applied. */
+  kds_thresholds?: KdsThresholds;
 }
 
 // ----------------------------------------------------------------------------
@@ -104,10 +126,30 @@ export type OrderStatus =
   | "paid"
   | "in_kitchen"
   | "ready"
+  | "recall"
   | "out_for_delivery"
   | "completed"
   | "voided"
   | "refunded";
+
+/**
+ * KDS status flow (Phase 3). A bumpable order moves forward through this set;
+ * `recall` pulls a bumped (`ready`/`completed`) order back onto the board.
+ *
+ *   placed → in_kitchen → ready → completed
+ *                  ▲          │
+ *                  └── recall ─┘  (recall re-opens a bumped ticket)
+ *
+ * `paid` is treated as an active kitchen state (paid-at-counter, awaiting prep)
+ * so paying for an order surfaces it on the board.
+ */
+export const KDS_ACTIVE_STATUSES: readonly OrderStatus[] = [
+  "placed",
+  "paid",
+  "in_kitchen",
+  "ready",
+  "recall",
+] as const;
 
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
 
@@ -129,6 +171,12 @@ export interface OrderItem {
   id: string;
   item_id: string;
   item_name: string;
+  /**
+   * Kitchen station this line routes to (Phase 3 KDS). Optional on the wire so
+   * older/queued orders without it still parse; the KDS resolves a fallback
+   * from the menu when absent.
+   */
+  station?: Station;
   size_id: string | null;
   size_name: string | null;
   /** Per-unit base price (size price), in cents. */

@@ -74,6 +74,12 @@ export const menuCategories: MenuCategory[] = [
     name: "Drinks",
     sort_order: 2,
   },
+  {
+    id: "20000000-0000-0000-0000-000000000003",
+    tenant_id: DEMO_TENANT_ID,
+    name: "Sides",
+    sort_order: 3,
+  },
 ];
 
 export const menuItems: MenuItem[] = [
@@ -84,6 +90,7 @@ export const menuItems: MenuItem[] = [
     name: "Margherita",
     description: "San Marzano tomato, fresh mozzarella, basil.",
     is_half_and_half_capable: true,
+    station: "oven",
   },
   {
     id: "30000000-0000-0000-0000-000000000002",
@@ -92,6 +99,7 @@ export const menuItems: MenuItem[] = [
     name: "Pepperoni",
     description: "Tomato, mozzarella, pepperoni.",
     is_half_and_half_capable: true,
+    station: "oven",
   },
   {
     id: "30000000-0000-0000-0000-000000000010",
@@ -100,6 +108,25 @@ export const menuItems: MenuItem[] = [
     name: "Fountain Soda",
     description: "Choice of fountain drink.",
     is_half_and_half_capable: false,
+    station: "none",
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000020",
+    tenant_id: DEMO_TENANT_ID,
+    category_id: "20000000-0000-0000-0000-000000000003",
+    name: "Caesar Salad",
+    description: "Romaine, parmesan, croutons, Caesar dressing.",
+    is_half_and_half_capable: false,
+    station: "cold",
+  },
+  {
+    id: "30000000-0000-0000-0000-000000000030",
+    tenant_id: DEMO_TENANT_ID,
+    category_id: "20000000-0000-0000-0000-000000000003",
+    name: "Garlic Knots",
+    description: "Fried dough knots, garlic butter, parmesan.",
+    is_half_and_half_capable: false,
+    station: "fryer",
   },
 ];
 
@@ -154,6 +181,22 @@ export const itemSizes: ItemSize[] = [
     item_id: "30000000-0000-0000-0000-000000000010",
     name: "Regular",
     price_cents: 299,
+    sort_order: 1,
+  },
+  // Caesar Salad (single size)
+  {
+    id: "40000000-0000-0000-0000-000000000031",
+    item_id: "30000000-0000-0000-0000-000000000020",
+    name: "Regular",
+    price_cents: 899,
+    sort_order: 1,
+  },
+  // Garlic Knots (single size)
+  {
+    id: "40000000-0000-0000-0000-000000000041",
+    item_id: "30000000-0000-0000-0000-000000000030",
+    name: "6-piece",
+    price_cents: 699,
     sort_order: 1,
   },
 ];
@@ -300,6 +343,7 @@ export const storeSettings: StoreSettings[] = [
     currency: "USD",
     tax_rate_bps: 825,
     tip_presets_bps: [1500, 1800, 2000],
+    kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
   },
   {
     tenant_id: DEMO_TENANT_ID,
@@ -307,6 +351,7 @@ export const storeSettings: StoreSettings[] = [
     currency: "USD",
     tax_rate_bps: 825,
     tip_presets_bps: [1500, 1800, 2000],
+    kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
   },
 ];
 
