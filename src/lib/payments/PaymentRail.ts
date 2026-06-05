@@ -6,16 +6,23 @@
  * contract and the registry — never on Stripe/Coinbase/chain specifics. New
  * rails = new implementation, no core changes.
  *
- * Phase 0: interface + types + an EMPTY registry only. Implementations land in
- * Phase 2 (card/crypto). Do not add provider SDKs here yet.
+ * Phase 2: real provider code paths (Stripe Terminal/online, onchain USDC,
+ * Coinbase Commerce) + a fully-real `cash` rail are implemented and registered.
+ * Each external rail is guarded by its env keys and falls back to a simulated
+ * settlement when no keys are present (the default, incl. the Vercel preview).
  */
 
-/** Stable identifiers for the payment rails the platform supports. */
+/**
+ * Stable identifiers for the payment rails the platform supports. `cash` is a
+ * first-class rail (no external dependency) so the terminal can treat every
+ * tender uniformly through this interface.
+ */
 export type PaymentRailKey =
   | "stripe_terminal"
   | "stripe_online"
   | "crypto_onchain_usdc"
-  | "crypto_coinbase";
+  | "crypto_coinbase"
+  | "cash";
 
 /**
  * Money as an integer minor-unit amount plus an ISO-4217 currency code.

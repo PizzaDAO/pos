@@ -30,6 +30,7 @@ import {
   OrderConfirmation,
   type PlacedOrderSummary,
 } from "./order-confirmation";
+import { PaymentScreen } from "./payment-screen";
 
 function newUuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -63,6 +64,8 @@ export function TerminalClient() {
   const [editingLine, setEditingLine] = useState<OrderItem | null>(null);
   const [placing, setPlacing] = useState(false);
   const [placed, setPlaced] = useState<PlacedOrderSummary | null>(null);
+  /** Order awaiting payment (opens the checkout screen). */
+  const [payOrderId, setPayOrderId] = useState<string | null>(null);
 
   if (isLoading) {
     return (
@@ -86,7 +89,7 @@ export function TerminalClient() {
     );
   }
 
-  const { menu, settings } = data;
+  const { menu, settings, paymentSettings } = data;
   const location = menu.locationId;
 
   function openBuilderForItem(item: MenuItemDetail) {
@@ -124,8 +127,9 @@ export function TerminalClient() {
       });
 
       const orderNumber = clientOrderNumber();
+      const orderId = newUuid();
       const payload: CreateOrderInput = {
-        id: newUuid(),
+        id: orderId,
         tenant_id: menu.tenantId,
         location_id: location,
         channel: "in_store",
@@ -143,12 +147,19 @@ export function TerminalClient() {
       await sync.placeOrderOffline(payload);
 
       clear();
-      setPlaced({
-        orderNumber,
-        totalCents: totals.total_cents,
-        currency: settings.currency,
-        synced: wasOnline,
-      });
+      if (wasOnline) {
+        // Order reached the server → go straight to taking payment.
+        setPayOrderId(orderId);
+      } else {
+        // Offline: payment needs connectivity (beyond reader store-and-forward),
+        // so confirm the queued order; the cashier pays once back online.
+        setPlaced({
+          orderNumber,
+          totalCents: totals.total_cents,
+          currency: settings.currency,
+          synced: false,
+        });
+      }
     } finally {
       setPlacing(false);
     }
@@ -202,6 +213,17 @@ export function TerminalClient() {
         <OrderConfirmation
           order={placed}
           onNewOrder={() => setPlaced(null)}
+        />
+      )}
+
+      {payOrderId && (
+        <PaymentScreen
+          orderId={payOrderId}
+          tenantId={menu.tenantId}
+          locationId={location}
+          paymentSettings={paymentSettings}
+          onClose={() => setPayOrderId(null)}
+          onPaid={() => setPayOrderId(null)}
         />
       )}
     </div>

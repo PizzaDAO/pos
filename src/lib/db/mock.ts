@@ -18,8 +18,14 @@ import type {
   MenuItemDetail,
   MenuModifierGroup,
   Order,
+  OrderStatus,
   StoreSettings,
 } from "./menu-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentSettings,
+} from "./payment-types";
 import {
   itemModifierGroups,
   itemSizes,
@@ -27,11 +33,16 @@ import {
   menuItems,
   modifierGroups,
   modifiers,
+  paymentSettings,
   storeSettings,
 } from "./seed-data";
 
 /** Process-lifetime order store, keyed by client UUID for idempotent upsert. */
 const orders = new Map<string, Order>();
+/** Payment tenders keyed by client UUID (idempotency key). */
+const payments = new Map<string, Payment>();
+/** Connect onboarding status keyed by tenant id. */
+const connectAccounts = new Map<string, ConnectAccount>();
 let orderSeq = 0;
 
 function buildMenuItemDetail(itemId: string): MenuItemDetail | null {
@@ -141,10 +152,110 @@ export const mockDriver: PosDriver = {
       )
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
   },
+
+  async updateOrderStatus(
+    id: string,
+    status: OrderStatus,
+  ): Promise<Order | null> {
+    const order = orders.get(id);
+    if (!order) return null;
+    const updated: Order = {
+      ...order,
+      status,
+      updated_at: new Date().toISOString(),
+    };
+    orders.set(id, updated);
+    return updated;
+  },
+
+  // -- Payments --------------------------------------------------------------
+
+  async getPaymentSettings(
+    tenantId,
+    locationId,
+  ): Promise<PaymentSettings> {
+    const found = paymentSettings.find(
+      (s) => s.tenant_id === tenantId && s.location_id === locationId,
+    );
+    if (found) return found;
+    return {
+      tenant_id: tenantId,
+      location_id: locationId,
+      currency: "USD",
+      platform_fee_bps: 250,
+      platform_fee_flat_cents: 10,
+      tip_presets_bps: [1500, 1800, 2000],
+    };
+  },
+
+  async upsertPayment(payment: Payment): Promise<Payment> {
+    const existing = payments.get(payment.id);
+    if (existing) {
+      // Merge mutable fields (status/refund/crypto confirmation), keep created_at.
+      const merged: Payment = {
+        ...existing,
+        ...payment,
+        created_at: existing.created_at,
+        updated_at: new Date().toISOString(),
+      };
+      payments.set(payment.id, merged);
+      return merged;
+    }
+    const now = new Date().toISOString();
+    const created: Payment = {
+      ...payment,
+      created_at: payment.created_at || now,
+      updated_at: now,
+    };
+    payments.set(created.id, created);
+    return created;
+  },
+
+  async getPayment(id: string): Promise<Payment | null> {
+    return payments.get(id) ?? null;
+  },
+
+  async getPaymentByChargeId(chargeId: string): Promise<Payment | null> {
+    for (const p of payments.values()) {
+      if (p.charge_id === chargeId) return p;
+    }
+    return null;
+  },
+
+  async listPaymentsForOrder(orderId: string): Promise<Payment[]> {
+    return [...payments.values()]
+      .filter((p) => p.order_id === orderId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  },
+
+  // -- Stripe Connect --------------------------------------------------------
+
+  async getConnectAccount(tenantId: string): Promise<ConnectAccount | null> {
+    return connectAccounts.get(tenantId) ?? null;
+  },
+
+  async upsertConnectAccount(
+    account: ConnectAccount,
+  ): Promise<ConnectAccount> {
+    const existing = connectAccounts.get(account.tenant_id);
+    const merged: ConnectAccount = {
+      ...account,
+      created_at: existing?.created_at ?? account.created_at,
+      updated_at: new Date().toISOString(),
+    };
+    connectAccounts.set(account.tenant_id, merged);
+    return merged;
+  },
 };
 
 /** Test helper: clear placed orders + reset the sequence. */
 export function resetMockOrders(): void {
   orders.clear();
   orderSeq = 0;
+}
+
+/** Test helper: clear payments + connect state. */
+export function resetMockPayments(): void {
+  payments.clear();
+  connectAccounts.clear();
 }
