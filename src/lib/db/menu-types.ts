@@ -103,6 +103,69 @@ export interface KdsThresholds {
   urgent_seconds: number;
 }
 
+/**
+ * Opening hours for a single weekday (Phase 4 online-ordering gate). Times are
+ * local "HH:MM" 24h strings in the location's timezone. `closed` shops accept
+ * no orders that day. A window may wrap past midnight (open > close) — handled
+ * by the scheduling helpers.
+ */
+export interface DayHours {
+  /** 0 = Sunday … 6 = Saturday (JS getDay()). */
+  weekday: number;
+  open: string;
+  close: string;
+  closed: boolean;
+}
+
+/**
+ * A delivery zone (Phase 4) defined by a list of in-range postal codes. Real
+ * geo-fencing (polygons/radius) is a later concern; postal-code matching is
+ * enough for the pilot + keeps the mock deterministic with no env. Fee + ETA are
+ * integer cents / minutes.
+ */
+export interface DeliveryZone {
+  id: string;
+  name: string;
+  /** Postal codes served by this zone (exact match, case-insensitive). */
+  postal_codes: string[];
+  /** Flat delivery fee for this zone, in integer cents. */
+  fee_cents: number;
+  /** Estimated extra delivery minutes added to the kitchen prep time. */
+  eta_minutes: number;
+  /** Minimum order subtotal (cents) required to deliver to this zone. */
+  min_subtotal_cents: number;
+}
+
+/**
+ * Per-location online-ordering / fulfillment configuration (Phase 4). Kept on
+ * store settings so the storefront, scheduler, and delivery providers share one
+ * source of truth. All optional so Phase 1–3 settings still satisfy the type.
+ */
+export interface FulfillmentSettings {
+  /** Whether the location accepts online pickup orders. */
+  pickup_enabled: boolean;
+  /** Whether the location accepts online delivery orders. */
+  delivery_enabled: boolean;
+  /** Minutes the kitchen needs before an order is ready (ASAP gate). */
+  prep_minutes: number;
+  /** Minimum lead time (minutes) for a SCHEDULED order beyond prep. */
+  scheduling_lead_minutes: number;
+  /** How many days ahead a customer may schedule. */
+  scheduling_horizon_days: number;
+  /** Weekly opening hours used to gate ASAP + scheduled times. */
+  hours: DayHours[];
+  /** Delivery zones (postal-code → fee/ETA). Empty = nowhere in range. */
+  delivery_zones: DeliveryZone[];
+  /**
+   * Delivery providers this location offers, in preference order. The first
+   * available (registered) provider is used to quote/dispatch. Keys match
+   * `DeliveryProviderKey` but are typed as string here to avoid a cross-import.
+   */
+  delivery_providers: string[];
+  /** Pickup address shown to the customer / used as the delivery pickup point. */
+  pickup_address?: string;
+}
+
 /** Per-location store settings (tax, rounding, currency) — mocked in Phase 1. */
 export interface StoreSettings {
   tenant_id: string;
@@ -114,6 +177,8 @@ export interface StoreSettings {
   tip_presets_bps: number[];
   /** KDS age-coloring thresholds (Phase 3). Optional; a default is applied. */
   kds_thresholds?: KdsThresholds;
+  /** Online-ordering / fulfillment config (Phase 4). Optional; a default applies. */
+  fulfillment?: FulfillmentSettings;
 }
 
 // ----------------------------------------------------------------------------
@@ -149,9 +214,46 @@ export const KDS_ACTIVE_STATUSES: readonly OrderStatus[] = [
   "in_kitchen",
   "ready",
   "recall",
+  // Online delivery: stays on the board while out for delivery (Phase 4).
+  "out_for_delivery",
 ] as const;
 
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
+
+/** How an online order is fulfilled (Phase 4). */
+export type FulfillmentType = "pickup" | "delivery";
+
+/**
+ * Customer-supplied fulfillment details attached to an online order (Phase 4).
+ * Absent on in-store orders. Kept on the order so the KDS, confirmation, and
+ * tracking surfaces can render pickup-vs-delivery + the scheduled time without
+ * a second lookup.
+ */
+export interface OrderFulfillment {
+  type: FulfillmentType;
+  /** "asap" or an ISO timestamp the customer scheduled the order for. */
+  scheduled_for: "asap" | string;
+  /** Promised-ready ISO timestamp (now + prep, or the scheduled time). */
+  promised_at: string;
+  /** Delivery address (delivery only). */
+  address?: DeliveryAddress;
+  /** Resolved delivery zone id (delivery only). */
+  zone_id?: string;
+  /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
+  delivery_fee_cents?: number;
+  /** Customer-facing delivery instructions (delivery only). */
+  delivery_notes?: string;
+}
+
+/** A structured delivery address (Phase 4). */
+export interface DeliveryAddress {
+  line1: string;
+  line2?: string;
+  city: string;
+  region: string;
+  postal_code: string;
+  country: string;
+}
 
 /** Which half of a pizza a topping is placed on. */
 export type HalfPlacement = "left" | "right" | "whole";
@@ -216,6 +318,10 @@ export interface Order {
   notes: string | null;
   /** Human-friendly sequential order number, assigned at placement. */
   order_number: string;
+  /** Online-order customer id (Phase 4); null for in-store / guest-less orders. */
+  customer_id?: string | null;
+  /** Online-order fulfillment details (Phase 4); absent on in-store orders. */
+  fulfillment?: OrderFulfillment;
   created_at: string;
   updated_at: string;
 }
@@ -235,4 +341,8 @@ export interface CreateOrderInput {
   order_number?: string;
   /** Optional status override; defaults to "placed". */
   status?: OrderStatus;
+  /** Online-order customer id (Phase 4). */
+  customer_id?: string | null;
+  /** Online-order fulfillment details (Phase 4). */
+  fulfillment?: OrderFulfillment;
 }

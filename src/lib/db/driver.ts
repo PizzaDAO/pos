@@ -18,10 +18,26 @@ import type {
   Payment,
   PaymentSettings,
 } from "./payment-types";
+import type {
+  Customer,
+  DeliveryRecord,
+  MagicLinkToken,
+} from "./customer-types";
+import type { Location } from "./types";
 
 export interface PosDriver {
   /** Stable id of the active driver implementation (for diagnostics/UX). */
   readonly name: "mock" | "supabase";
+
+  // --------------------------------------------------------------------------
+  // Locations (Phase 4 storefront resolves a location by its public slug)
+  // --------------------------------------------------------------------------
+
+  /** All locations for a tenant. */
+  listLocations(tenantId: string): Promise<Location[]>;
+
+  /** Resolve a location by its public slug (storefront URL), or null. */
+  getLocationBySlug(slug: string): Promise<Location | null>;
 
   /** Fully-assembled menu graph for a location (categories → items → sizes/modifiers). */
   getMenu(tenantId: string, locationId: string): Promise<Menu>;
@@ -83,4 +99,46 @@ export interface PosDriver {
 
   /** Upsert (persist) a tenant's Connect account status. */
   upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount>;
+
+  // --------------------------------------------------------------------------
+  // Customers (Phase 4 — guest checkout + magic-link account stub)
+  // --------------------------------------------------------------------------
+
+  /** Find a tenant's customer by email (per-tenant uniqueness), or null. */
+  getCustomerByEmail(tenantId: string, email: string): Promise<Customer | null>;
+
+  /** Fetch a single customer by id, or null. */
+  getCustomer(id: string): Promise<Customer | null>;
+
+  /**
+   * Upsert a customer. Re-using an id merges mutable fields; a new id with an
+   * email that already exists for the tenant returns the existing row (so guest
+   * checkout is idempotent on email).
+   */
+  upsertCustomer(customer: Customer): Promise<Customer>;
+
+  /** Persist a (stubbed, never-emailed) magic-link token. */
+  createMagicLinkToken(token: MagicLinkToken): Promise<MagicLinkToken>;
+
+  /** Consume a magic-link token: marks it used + verifies the customer. */
+  consumeMagicLinkToken(token: string): Promise<Customer | null>;
+
+  // --------------------------------------------------------------------------
+  // Deliveries (Phase 4 — DeliveryProvider quote/dispatch/track persistence)
+  // --------------------------------------------------------------------------
+
+  /** Upsert-by-id of a delivery record (idempotent dispatch). */
+  upsertDelivery(delivery: DeliveryRecord): Promise<DeliveryRecord>;
+
+  /** Fetch the delivery for an order, or null. */
+  getDeliveryForOrder(orderId: string): Promise<DeliveryRecord | null>;
+
+  /** Fetch a single delivery by id, or null. */
+  getDelivery(id: string): Promise<DeliveryRecord | null>;
+
+  /** List a location's deliveries (newest first) — the /admin dispatch view. */
+  listDeliveries(
+    tenantId: string,
+    locationId: string,
+  ): Promise<DeliveryRecord[]>;
 }

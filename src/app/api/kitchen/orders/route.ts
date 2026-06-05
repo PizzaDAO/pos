@@ -90,7 +90,7 @@ export async function POST(request: Request) {
 
   const next =
     action === "bump"
-      ? nextBumpStatus(current.status)
+      ? nextBumpStatus(current.status, current.channel)
       : recallStatus(current.status);
 
   // No-op (already terminal for this action) → return unchanged, idempotently.
