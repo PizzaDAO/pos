@@ -12,6 +12,12 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
+import {
+  captureError,
+  childLogger,
+  resolveRequestId,
+  traceResponseHeaders,
+} from "@/lib/observability";
 
 // In-memory mock state lives in the Node runtime; force it (not edge).
 export const runtime = "nodejs";
@@ -31,23 +37,50 @@ function isValidPayload(body: unknown): body is CreateOrderInput {
 }
 
 export async function POST(request: Request) {
+  const requestId = resolveRequestId(request.headers);
+  const log = childLogger({ requestId, route: "POST /api/orders" });
+  const headers = traceResponseHeaders(requestId);
+
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return NextResponse.json(
+      { error: "Invalid JSON body." },
+      { status: 400, headers },
+    );
   }
 
   if (!isValidPayload(body)) {
     return NextResponse.json(
       { error: "Malformed order payload." },
-      { status: 422 },
+      { status: 422, headers },
     );
   }
 
-  const driver = getPosDriver();
-  const order = await driver.createOrder(body);
-  return NextResponse.json({ order }, { status: 201 });
+  try {
+    const driver = getPosDriver();
+    // createOrder is an idempotent upsert-by-UUID — retries return the existing
+    // order, so this log line may report the same order id more than once.
+    const order = await driver.createOrder(body);
+    log.info("order_upserted", {
+      orderId: order.id,
+      tenantId: order.tenant_id,
+      locationId: order.location_id,
+      total_cents: order.totals.total_cents,
+    });
+    return NextResponse.json({ order }, { status: 201, headers });
+  } catch (err) {
+    captureError(err, {
+      requestId,
+      scope: "orders",
+      tenantId: (body as CreateOrderInput).tenant_id,
+    });
+    return NextResponse.json(
+      { error: "Failed to place order." },
+      { status: 500, headers },
+    );
+  }
 }
 
 export async function GET(request: Request) {

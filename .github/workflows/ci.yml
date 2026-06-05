@@ -32,3 +32,69 @@ jobs:
       - name: Build
         # Must build with NO env vars set (Supabase deferred).
         run: npm run build
+
+  test:
+    name: vitest (unit + mock-driver, zero env)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite
+        # The whole suite runs against pure logic + the in-memory mock driver,
+        # so it must pass with NO env vars set (mirrors the build invariant).
+        run: npm run test:run
+
+  rls-isolation:
+    name: RLS isolation (Postgres) — optional, non-blocking
+    runs-on: ubuntu-latest
+    # This job spins up a throwaway Postgres, applies the tenancy migrations, and
+    # runs supabase/tests/rls_isolation.sql. It is OPTIONAL: a live DB is not a CI
+    # dependency for the platform, so a failure here must NOT block a PR. The
+    # required gates are `build` + `test` above.
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGPASSWORD: postgres
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/pos_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply auth.uid() shim
+        # Vanilla Postgres lacks Supabase's `auth` schema / `auth.uid()`, which the
+        # tenancy RLS policies depend on. This shim recreates that exact contract so
+        # the migrations apply and the isolation test exercises real RLS off-platform.
+        # NOT applied on a real Supabase project (the platform supplies auth.uid()).
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/auth_shim.sql
+
+      - name: Apply tenancy migrations
+        run: |
+          for f in supabase/migrations/*.sql; do
+            echo "Applying $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Run RLS isolation test
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/rls_isolation.sql

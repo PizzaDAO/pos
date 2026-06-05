@@ -87,9 +87,40 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/rls_isolation.sql
 # expect: result = "RLS isolation test PASSED"
 ```
 
+The script asserts:
+
+- tenant A's member sees exactly tenant A's tenant/location and **never** tenant B's;
+- tenant B's member sees only tenant B's;
+- a cross-tenant **write** is blocked **and leaves no row behind**;
+- **memberships** are tenant-scoped (no cross-tenant staff visibility);
+- a member **cannot read another tenant's user row** but can read their own;
+- a platform admin sees **both** tenants.
+
 > Run this as a role that owns the tables (e.g. the migration/`postgres` role).
-> It switches to `authenticated` internally to exercise RLS. In CI this becomes
-> part of an automated tenant-isolation suite (Phase 7 hardening).
+> It switches to `authenticated` internally to exercise RLS.
+
+### One-command harness
+
+`supabase/tests/run-rls-isolation.sh` applies the migrations and runs the test
+in one step against any Postgres. Point it at a **fresh** database (a throwaway
+container or a provisioned Supabase project):
+
+```bash
+# Local throwaway Postgres:
+docker run -d --name pos-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres" \
+  bash supabase/tests/run-rls-isolation.sh
+```
+
+### CI
+
+A **non-blocking** `rls-isolation` job in `.github/workflows/ci.yml` spins up a
+Postgres service, applies the migrations, and runs this test on every PR. It is
+marked `continue-on-error: true` because **a live DB must NOT be a required CI
+dependency** for the platform (the app builds and the full Vitest suite passes
+with zero env vars). The required gates are `build` + `test` (Vitest). The
+app-layer complement to this DB-level test lives in
+`src/lib/db/tenant-isolation.test.ts` and **does** run in the required suite.
 
 ## Note on `seed.sql` and the menu schema
 
