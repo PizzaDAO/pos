@@ -1,24 +1,15 @@
-import { SurfacePlaceholder } from "@/components/surface-placeholder";
-import { ConnectOnboarding } from "./connect-onboarding";
-import { DeliveryDispatch } from "./delivery-dispatch";
+import { AdminShell } from "./components/admin-shell";
 
 /**
- * Admin surface. Most of the tenant back office (menu mgmt, inventory, reports,
- * staff/shifts, end-of-day) is Phase 5. Phase 2 adds the Stripe Connect
- * onboarding scaffold; Phase 4 adds the in-house delivery dispatch board (assign
- * drivers to online delivery orders).
+ * Tenant back office (Phase 5). A tabbed surface over the demo tenant's two
+ * locations: menu management (CRUD + per-location overrides + 86), inventory
+ * (with sale-driven depletion + low-stock alerts), reports (per-location +
+ * tenant rollup, payment mix, tips, voids/refunds), staff & shifts (clock in/out
+ * + drawer reconciliation), and the end-of-day Z-report. The Phase 2 Stripe
+ * Connect onboarding and the Phase 4 delivery dispatch board are reachable from
+ * the Payments and Delivery tabs. All data flows through getPosDriver() (mock
+ * driver today); the surface builds + runs with zero env vars.
  */
 export default function AdminPage() {
-  return (
-    <div className="min-h-screen">
-      <ConnectOnboarding />
-      <DeliveryDispatch />
-      <div className="border-t">
-        <SurfacePlaceholder
-          surface="Admin"
-          description="The rest of the tenant back office — menu management, inventory, reports, staff/shifts, end-of-day — is built in Phase 5."
-        />
-      </div>
-    </div>
-  );
+  return <AdminShell />;
 }

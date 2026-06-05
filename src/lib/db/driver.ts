@@ -23,6 +23,33 @@ import type {
   DeliveryRecord,
   MagicLinkToken,
 } from "./customer-types";
+import type {
+  BusinessDayClose,
+  CategoryInput,
+  DateRange,
+  DrawerReconciliation,
+  InventoryItem,
+  InventoryItemView,
+  InventoryMovement,
+  ItemInput,
+  LocationMenuOverride,
+  ModifierGroupInput,
+  ModifierInput,
+  MovementReason,
+  OverrideInput,
+  SalesReport,
+  Shift,
+  ShiftCashEvent,
+  Staff,
+  SizeInput,
+} from "./backoffice-types";
+import type {
+  MenuCategory,
+  MenuItem,
+  ItemSize,
+  Modifier,
+  ModifierGroup,
+} from "./menu-types";
 import type { Location } from "./types";
 
 export interface PosDriver {
@@ -141,4 +168,156 @@ export interface PosDriver {
     tenantId: string,
     locationId: string,
   ): Promise<DeliveryRecord[]>;
+
+  // --------------------------------------------------------------------------
+  // Menu management (Phase 5) — CRUD on the tenant menu definition.
+  //
+  // `getMenu(...)` already folds per-location overrides into its reads, so the
+  // terminal/shop reflect edits with NO call-site changes. Mutations here change
+  // the tenant-level menu (categories/items/sizes/modifier groups/modifiers);
+  // per-location price/availability + 86 live in the override methods below.
+  // --------------------------------------------------------------------------
+
+  listCategories(tenantId: string): Promise<MenuCategory[]>;
+  upsertCategory(input: CategoryInput): Promise<MenuCategory>;
+  deleteCategory(id: string): Promise<void>;
+
+  upsertItem(input: ItemInput): Promise<MenuItem>;
+  deleteItem(id: string): Promise<void>;
+
+  upsertSize(input: SizeInput): Promise<ItemSize>;
+  deleteSize(id: string): Promise<void>;
+
+  listModifierGroups(tenantId: string): Promise<ModifierGroup[]>;
+  upsertModifierGroup(input: ModifierGroupInput): Promise<ModifierGroup>;
+  deleteModifierGroup(id: string): Promise<void>;
+
+  upsertModifier(input: ModifierInput): Promise<Modifier>;
+  deleteModifier(id: string): Promise<void>;
+
+  // --------------------------------------------------------------------------
+  // Per-location menu overrides (price / availability — incl. "86 an item").
+  // --------------------------------------------------------------------------
+
+  /** All overrides for a location (admin editor). */
+  listOverrides(
+    tenantId: string,
+    locationId: string,
+  ): Promise<LocationMenuOverride[]>;
+
+  /** Upsert (by tenant+location+target) a price/availability override. */
+  upsertOverride(input: OverrideInput): Promise<LocationMenuOverride>;
+
+  /** Clear an override entirely (revert to the tenant definition). */
+  clearOverride(
+    tenantId: string,
+    locationId: string,
+    targetType: LocationMenuOverride["target_type"],
+    targetId: string,
+  ): Promise<void>;
+
+  // --------------------------------------------------------------------------
+  // Inventory (per location) — items, movements, depletion, low-stock.
+  // --------------------------------------------------------------------------
+
+  /** Location inventory with a derived `low` flag. */
+  listInventory(
+    tenantId: string,
+    locationId: string,
+  ): Promise<InventoryItemView[]>;
+
+  upsertInventoryItem(item: InventoryItem): Promise<InventoryItem>;
+
+  /**
+   * Apply a signed movement to an inventory item (restock/adjustment/waste/
+   * depletion), persist the ledger entry, and return the new level.
+   */
+  applyInventoryMovement(input: {
+    inventoryItemId: string;
+    reason: MovementReason;
+    delta: number;
+    orderId?: string | null;
+    note?: string | null;
+  }): Promise<{ item: InventoryItem; movement: InventoryMovement }>;
+
+  /** Movement ledger for a location (newest first). */
+  listInventoryMovements(
+    tenantId: string,
+    locationId: string,
+  ): Promise<InventoryMovement[]>;
+
+  // --------------------------------------------------------------------------
+  // Reports + end-of-day (derive from orders/payments via the abstraction).
+  // --------------------------------------------------------------------------
+
+  /**
+   * Compute a sales report. `locationId === null` produces a TENANT ROLLUP
+   * across all the tenant's locations; a concrete id scopes to one location.
+   */
+  getSalesReport(
+    tenantId: string,
+    locationId: string | null,
+    range: DateRange,
+  ): Promise<SalesReport>;
+
+  /** Existing close for a (location, business day), or null. */
+  getBusinessDayClose(
+    tenantId: string,
+    locationId: string,
+    businessDate: string,
+  ): Promise<BusinessDayClose | null>;
+
+  /**
+   * Idempotently close a business day for a location (the Z-report). Re-closing
+   * the same day returns the already-frozen snapshot.
+   */
+  closeBusinessDay(
+    tenantId: string,
+    locationId: string,
+    businessDate: string,
+  ): Promise<BusinessDayClose>;
+
+  // --------------------------------------------------------------------------
+  // Staff & shifts (clock in/out + drawer reconciliation).
+  // --------------------------------------------------------------------------
+
+  listStaff(tenantId: string): Promise<Staff[]>;
+  upsertStaff(staff: Staff): Promise<Staff>;
+
+  /** List shifts for a location (newest first). */
+  listShifts(tenantId: string, locationId: string): Promise<Shift[]>;
+
+  /** The open shift for a staff member at a location, or null. */
+  getOpenShift(
+    tenantId: string,
+    locationId: string,
+    staffId: string,
+  ): Promise<Shift | null>;
+
+  /** Clock in: open a shift with an opening float. */
+  openShift(input: {
+    tenantId: string;
+    locationId: string;
+    staffId: string;
+    openingFloatCents: number;
+  }): Promise<Shift>;
+
+  /** Record a cash event (sale/payout/paid_in/drop) against an open shift. */
+  addShiftCashEvent(event: ShiftCashEvent): Promise<ShiftCashEvent>;
+
+  /** Cash events for a shift (oldest first). */
+  listShiftCashEvents(shiftId: string): Promise<ShiftCashEvent[]>;
+
+  /** Reconciliation summary (expected vs counted) for a shift. */
+  getDrawerReconciliation(shiftId: string): Promise<DrawerReconciliation>;
+
+  /**
+   * Clock out + reconcile: closes the shift, records the counted drawer, and
+   * computes over/short. Returns the closed shift.
+   */
+  closeShift(input: {
+    shiftId: string;
+    countedCents: number;
+    note?: string | null;
+  }): Promise<Shift | null>;
 }

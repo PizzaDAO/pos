@@ -17,6 +17,11 @@ import type {
   StoreSettings,
 } from "./menu-types";
 import type { PaymentSettings } from "./payment-types";
+import type {
+  InventoryItem,
+  ItemInventoryLink,
+  Staff,
+} from "./backoffice-types";
 import type { Location, Tenant } from "./types";
 
 export const DEMO_TENANT_ID = "10000000-0000-0000-0000-000000000001";
@@ -446,5 +451,191 @@ export const paymentSettings: PaymentSettings[] = [
     platform_fee_bps: 250,
     platform_fee_flat_cents: 10,
     tip_presets_bps: [1500, 1800, 2000],
+  },
+];
+
+// ----------------------------------------------------------------------------
+// Phase 5 back-office seed: inventory (per location), inventory→menu links, and
+// staff. Inventory is per-location so each location has its own stock row; the
+// links are tenant-level (a menu element consumes the same recipe everywhere)
+// and the depletion logic resolves the row for the order's location.
+// ----------------------------------------------------------------------------
+
+const INV_DOUGH_DT = "70000000-0000-0000-0000-000000000001";
+const INV_CHEESE_DT = "70000000-0000-0000-0000-000000000002";
+const INV_PEPPERONI_DT = "70000000-0000-0000-0000-000000000003";
+const INV_DOUGH_UP = "70000000-0000-0000-0000-000000000101";
+const INV_CHEESE_UP = "70000000-0000-0000-0000-000000000102";
+const INV_PEPPERONI_UP = "70000000-0000-0000-0000-000000000103";
+
+/**
+ * Per-location stock. Downtown pepperoni is intentionally seeded near its low
+ * threshold so a couple of pepperoni-pizza sales trip the low-stock alert in
+ * the demo. Quantities are integers in the item's unit (grams / each).
+ */
+export const inventoryItems: InventoryItem[] = [
+  {
+    id: INV_DOUGH_DT,
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_DOWNTOWN_ID,
+    name: "Pizza dough ball",
+    unit: "each",
+    on_hand: 80,
+    low_threshold: 20,
+    created_at: NOW,
+    updated_at: NOW,
+  },
+  {
+    id: INV_CHEESE_DT,
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_DOWNTOWN_ID,
+    name: "Mozzarella",
+    unit: "g",
+    on_hand: 20000,
+    low_threshold: 5000,
+    created_at: NOW,
+    updated_at: NOW,
+  },
+  {
+    id: INV_PEPPERONI_DT,
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_DOWNTOWN_ID,
+    name: "Pepperoni",
+    unit: "g",
+    on_hand: 600,
+    low_threshold: 500,
+    created_at: NOW,
+    updated_at: NOW,
+  },
+  {
+    id: INV_DOUGH_UP,
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_UPTOWN_ID,
+    name: "Pizza dough ball",
+    unit: "each",
+    on_hand: 60,
+    low_threshold: 15,
+    created_at: NOW,
+    updated_at: NOW,
+  },
+  {
+    id: INV_CHEESE_UP,
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_UPTOWN_ID,
+    name: "Mozzarella",
+    unit: "g",
+    on_hand: 15000,
+    low_threshold: 5000,
+    created_at: NOW,
+    updated_at: NOW,
+  },
+  {
+    id: INV_PEPPERONI_UP,
+    tenant_id: DEMO_TENANT_ID,
+    location_id: DEMO_LOCATION_UPTOWN_ID,
+    name: "Pepperoni",
+    unit: "g",
+    on_hand: 4000,
+    low_threshold: 500,
+    created_at: NOW,
+    updated_at: NOW,
+  },
+];
+
+const ITEM_MARGHERITA = "30000000-0000-0000-0000-000000000001";
+const ITEM_PEPPERONI = "30000000-0000-0000-0000-000000000002";
+const MOD_EXTRA_CHEESE = "60000000-0000-0000-0000-000000000024";
+
+/**
+ * Recipe links (tenant-level): selling a pizza consumes a dough ball + cheese;
+ * the Pepperoni pizza also consumes pepperoni; the "Extra cheese" topping
+ * modifier consumes more mozzarella. Depletion resolves the per-location stock
+ * row (same name) for the order's location. Keeping these tenant-level keeps the
+ * seed small; a real schema would scope a recipe per location.
+ */
+export const itemInventoryLinks: ItemInventoryLink[] = [
+  {
+    id: "71000000-0000-0000-0000-000000000001",
+    tenant_id: DEMO_TENANT_ID,
+    source_type: "item",
+    source_id: ITEM_MARGHERITA,
+    inventory_item_id: INV_DOUGH_DT, // resolved by name per location at depletion
+    qty_per_unit: 1,
+  },
+  {
+    id: "71000000-0000-0000-0000-000000000002",
+    tenant_id: DEMO_TENANT_ID,
+    source_type: "item",
+    source_id: ITEM_MARGHERITA,
+    inventory_item_id: INV_CHEESE_DT,
+    qty_per_unit: 150,
+  },
+  {
+    id: "71000000-0000-0000-0000-000000000003",
+    tenant_id: DEMO_TENANT_ID,
+    source_type: "item",
+    source_id: ITEM_PEPPERONI,
+    inventory_item_id: INV_DOUGH_DT,
+    qty_per_unit: 1,
+  },
+  {
+    id: "71000000-0000-0000-0000-000000000004",
+    tenant_id: DEMO_TENANT_ID,
+    source_type: "item",
+    source_id: ITEM_PEPPERONI,
+    inventory_item_id: INV_CHEESE_DT,
+    qty_per_unit: 150,
+  },
+  {
+    id: "71000000-0000-0000-0000-000000000005",
+    tenant_id: DEMO_TENANT_ID,
+    source_type: "item",
+    source_id: ITEM_PEPPERONI,
+    inventory_item_id: INV_PEPPERONI_DT,
+    qty_per_unit: 80,
+  },
+  {
+    id: "71000000-0000-0000-0000-000000000006",
+    tenant_id: DEMO_TENANT_ID,
+    source_type: "modifier",
+    source_id: MOD_EXTRA_CHEESE,
+    inventory_item_id: INV_CHEESE_DT,
+    qty_per_unit: 75,
+  },
+];
+
+/** Demo staff covering each role for the staff-view / shift demos. */
+export const staff: Staff[] = [
+  {
+    id: "80000000-0000-0000-0000-000000000001",
+    tenant_id: DEMO_TENANT_ID,
+    name: "Tony Soprano",
+    role: "owner",
+    active: true,
+    created_at: NOW,
+  },
+  {
+    id: "80000000-0000-0000-0000-000000000002",
+    tenant_id: DEMO_TENANT_ID,
+    name: "Carmela M.",
+    role: "manager",
+    active: true,
+    created_at: NOW,
+  },
+  {
+    id: "80000000-0000-0000-0000-000000000003",
+    tenant_id: DEMO_TENANT_ID,
+    name: "Christopher M.",
+    role: "cashier",
+    active: true,
+    created_at: NOW,
+  },
+  {
+    id: "80000000-0000-0000-0000-000000000004",
+    tenant_id: DEMO_TENANT_ID,
+    name: "Furio G.",
+    role: "kitchen",
+    active: true,
+    created_at: NOW,
   },
 ];
