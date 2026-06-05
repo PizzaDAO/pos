@@ -83,6 +83,26 @@ values
    'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1',
    'cash', 'captured', 1299, 'USD');
 
+-- A customer + a staff row per tenant, so the anon-cannot-read assertions below
+-- exercise tables that actually hold rows (a 0-row read must be a DENIAL, not an
+-- empty table).
+insert into public.customers (id, tenant_id, email, name, verified) values
+  ('c0a00001-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   'cust-a@example.com', 'Cust A', true),
+  ('c0b00001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+   'cust-b@example.com', 'Cust B', true);
+
+insert into public.staff (id, tenant_id, name, role, active) values
+  ('57a00001-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   'Staff A', 'cashier', true),
+  ('57b00001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+   'Staff B', 'cashier', true);
+
+-- A store_settings row per location so anon's public-surface read returns rows.
+insert into public.store_settings (tenant_id, location_id, currency, tax_rate_bps) values
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'USD', 825),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1', 'USD', 825);
+
 set session_replication_role = origin;
 
 -- ---- Helper to impersonate a user --------------------------------------------
@@ -246,36 +266,51 @@ select set_config('request.jwt.claims', '', true);
 
 -- 12) MENU is intentionally PUBLIC-READABLE (storefront). The `anon` role sees
 --     BOTH tenants' menu items (public reads), but writes stay tenant-scoped.
+--     This is the storefront-public surface anon retains SELECT on after the
+--     least-privilege migration (20260605000200).
 set local role anon;
 do $$
 declare n int;
 begin
   select count(*) into n from public.menu_items;
   assert n = 2, format('anon (storefront) should read both menus (2 items), saw %s', n);
+  select count(*) into n from public.menu_categories;
+  assert n = 2, format('anon should read both menu categories, saw %s', n);
+  -- store_settings is part of the public surface (currency/tax/hours).
+  select count(*) into n from public.store_settings;
+  assert n = 2, format('anon should read both stores'' settings, saw %s', n);
+  -- A storefront resolves a LOCATION by slug; anon can read the location row
+  -- (active tenant) so the slug lookup works.
+  select count(*) into n from public.locations where slug = 'a-downtown';
+  assert n = 1, format('anon should resolve a public location by slug, saw %s', n);
 end $$;
 reset role;
 
--- 13) anon CANNOT read tenant-scoped operational data (orders/payments). anon
---     has NO table grant there, so a read must be DENIED (0 rows if a grant ever
---     existed, else a hard permission error — either way, never any data).
+-- 13) anon CANNOT read the tenant REGISTRY or any operational/PII table. After
+--     the least-privilege migration, anon has NO table grant on these (the
+--     blanket grant was revoked) AND no anon SELECT policy, so each read must be
+--     DENIED — a hard permission error (insufficient_privilege) or, if a grant
+--     somehow lingered, 0 rows. Either way: NEVER any data. This is the core
+--     regression guard for finding #1 (over-broad anon grants) and finding #2
+--     (tenant/location registry enumeration via tenants_public_select).
 set local role anon;
 do $$
-declare n int; blocked boolean := false;
+declare n int; tbl text;
 begin
-  begin
-    select count(*) into n from public.orders;
-    assert n = 0, format('anon must NOT read any orders, saw %s', n);
-  exception when insufficient_privilege then
-    blocked := true; -- permission denied is the strongest "no access"
-  end;
-  begin
-    select count(*) into n from public.payments;
-    assert n = 0, format('anon must NOT read any payments, saw %s', n);
-  exception when insufficient_privilege then
-    blocked := true;
-  end;
-  -- Either way (RLS 0-rows or table-grant denial), anon got NO operational data.
-  perform blocked; -- referenced to satisfy the analyzer; assertions above gate it
+  foreach tbl in array array[
+    'tenants', 'orders', 'payments', 'customers', 'staff', 'memberships'
+  ]
+  loop
+    begin
+      execute format('select count(*) from public.%I', tbl) into n;
+      -- If the grant/policy ever leaks, at least prove no ROW is visible.
+      assert n = 0,
+        format('anon must NOT read any %s rows, saw %s', tbl, n);
+    exception when insufficient_privilege then
+      -- permission denied at the grant layer is the strongest "no access".
+      null;
+    end;
+  end loop;
 end $$;
 reset role;
 

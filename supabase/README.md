@@ -19,6 +19,9 @@ supabase/
                                        #   subscriptions, onboarding, audit_log (+ enums + indexes)
     20260605000100_domain_rls.sql     # strict RLS + grants for every domain table (public menu read,
                                        #   customer-owns-their-orders, tenant-staff everything else)
+    20260605000200_least_privilege_grants.sql  # CORRECTIVE: revoke the over-broad anon/authenticated
+                                       #   table grants down to least privilege; drop anon's tenant-
+                                       #   registry read; scope anon's location read to active tenants
   tests/
     auth_shim.sql                     # auth.uid() shim so the migrations/test run on vanilla Postgres
     rls_isolation.sql                 # proves isolation on tenancy + orders/menu/payments
@@ -64,6 +67,47 @@ supabase/
    matching policy, access is denied — including for the table owner.
 4. Helper functions are `SECURITY DEFINER` with a pinned `search_path` so they
    can read membership tables without recursive policy evaluation.
+
+## Public-surface least-privilege model (`anon` / `authenticated`)
+
+GRANTs decide whether a role may touch a table **at all**; RLS decides **which
+rows**. The two are independent defenses, and the public (`anon`) role is held to
+the absolute minimum. This is enforced by
+`20260605000200_least_privilege_grants.sql`, which corrects an earlier
+over-grant that handed `anon` (and `authenticated`) effectively ALL privileges on
+every table:
+
+- **`anon` (the public/unauthenticated key)** holds **`SELECT` only**, and only
+  on the **storefront-public read surface**:
+  `menu_categories, menu_items, item_sizes, modifier_groups, modifiers,
+  item_modifier_groups, location_menu_overrides, store_settings, locations`.
+  It has **no** grant on `tenants, orders, payments, customers, memberships,
+  staff, subscriptions, audit_log` or any other operational/PII table — a read
+  there is denied at the **grant layer** (permission denied), independent of RLS.
+  anon never has INSERT/UPDATE/DELETE/TRUNCATE anywhere.
+- **`anon` policies**: the menu/overrides/`store_settings` tables expose a
+  `using (true)` SELECT policy (no PII; a tenant's menu is already public on its
+  storefront). `locations` exposes `locations_public_select` scoped to
+  **active tenants** (`is_active_tenant()`, a SECURITY DEFINER helper so anon
+  never reads `tenants` directly) so a visitor can resolve ONE store's location
+  by slug — **not** enumerate the registry. There is **no anon policy** on
+  `tenants` (the old blanket `tenants_public_select` was dropped); tenant
+  resolution happens server-side via the `locations` row (which carries
+  `tenant_id`).
+- **`authenticated`** holds least-privilege DML — `SELECT, INSERT, UPDATE,
+  DELETE` only (no `TRUNCATE/TRIGGER/REFERENCES`) — on the tenant-operational
+  tables. Every row is still gated by the `memberships`-keyed RLS policies.
+
+### Why the app is unaffected
+
+The live data path is **server-side via the `service_role` key** (RLS-bypassing,
+with explicit `tenant_id`/`location_id` filters in `src/lib/db/supabase.ts`).
+`readSupabaseConfig()` prefers the service-role key; the storefront (`/shop` RSC +
+`/api/shop/*` routes) resolves the location, menu, and settings server-side
+through `getPosDriver()` and **never uses the `anon` role** for reads or writes.
+The narrow `anon` SELECT grants above exist only so the storefront menu surface
+*could* be read client-side with the anon key in a future iteration without
+re-granting — tightening anon therefore cannot break the current app.
 
 ## Go-live: exact steps (once you have live credentials)
 
