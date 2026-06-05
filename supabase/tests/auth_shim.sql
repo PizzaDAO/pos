@@ -11,8 +11,26 @@
 -- so the migrations apply and the isolation test exercises real RLS off-platform.
 --
 -- Apply this BEFORE the migrations. On a real Supabase project it is unnecessary
--- (the platform supplies `auth.uid()`); do NOT apply it there.
+-- (the platform supplies `auth.uid()` and these roles); do NOT apply it there.
 -- ============================================================================
+
+-- Supabase ships these Postgres roles; the isolation test does `set local role
+-- authenticated` (and policies may target anon/authenticated). Vanilla Postgres
+-- has none of them, so recreate the no-login role contract.
+do $$
+begin
+  if not exists (select from pg_roles where rolname = 'anon') then
+    create role anon nologin noinherit;
+  end if;
+  if not exists (select from pg_roles where rolname = 'authenticated') then
+    create role authenticated nologin noinherit;
+  end if;
+  if not exists (select from pg_roles where rolname = 'service_role') then
+    create role service_role nologin noinherit bypassrls;
+  end if;
+end
+$$;
+
 create schema if not exists auth;
 
 create or replace function auth.uid()
