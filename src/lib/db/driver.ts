@@ -50,11 +50,115 @@ import type {
   Modifier,
   ModifierGroup,
 } from "./menu-types";
-import type { Location } from "./types";
+import type { Location, PlatformAdmin, Tenant, User } from "./types";
+import type {
+  AuditLogEntry,
+  CreateLocationInput,
+  CreateTenantInput,
+  OnboardingStep,
+  PlanTier,
+  Subscription,
+  TenantHealth,
+  TenantOnboarding,
+} from "./saas-types";
 
 export interface PosDriver {
   /** Stable id of the active driver implementation (for diagnostics/UX). */
   readonly name: "mock" | "supabase";
+
+  // --------------------------------------------------------------------------
+  // Tenancy + self-serve SaaS (Phase 6)
+  //
+  // Signup creates a brand-new, isolated tenant (its own owner user, locations,
+  // store/payment settings, and menu) through these methods. A future Supabase
+  // driver implements them as RLS-scoped table writes; call sites are unchanged.
+  // --------------------------------------------------------------------------
+
+  /** All tenants (platform/super-admin scope — outside tenant RLS). */
+  listTenants(): Promise<Tenant[]>;
+
+  /** Fetch a single tenant by id, or null. */
+  getTenant(tenantId: string): Promise<Tenant | null>;
+
+  /**
+   * Create a brand-new tenant + its owner user (modelled as a User + an owner
+   * Membership). The tenant starts in `suspended` (pre-go-live) status with a
+   * unique slug derived from the business name. Onboarding state is initialised.
+   */
+  createTenant(
+    input: CreateTenantInput,
+  ): Promise<{ tenant: Tenant; owner: User }>;
+
+  /** Update a tenant's lifecycle status (active/suspended/cancelled). */
+  setTenantStatus(
+    tenantId: string,
+    status: Tenant["status"],
+  ): Promise<Tenant | null>;
+
+  /** Add a location to a tenant during/after onboarding (own slug + settings). */
+  createLocation(input: CreateLocationInput): Promise<Location>;
+
+  /** Replace a new tenant's menu with the starter template (onboarding import). */
+  importStarterMenu(tenantId: string): Promise<void>;
+
+  // -- Onboarding state ------------------------------------------------------
+
+  /** Current onboarding state for a tenant, or null. */
+  getOnboarding(tenantId: string): Promise<TenantOnboarding | null>;
+
+  /** Mark a wizard step complete + advance current_step. */
+  completeOnboardingStep(
+    tenantId: string,
+    step: OnboardingStep,
+  ): Promise<TenantOnboarding>;
+
+  /** Finalize onboarding: flip the tenant to active + mark live. */
+  goLive(tenantId: string): Promise<TenantOnboarding>;
+
+  // -- Subscriptions (Stripe Billing — our revenue) --------------------------
+
+  /** A tenant's subscription, or null if never subscribed. */
+  getSubscription(tenantId: string): Promise<Subscription | null>;
+
+  /** Upsert (persist) a tenant's subscription row. */
+  upsertSubscription(sub: Subscription): Promise<Subscription>;
+
+  /**
+   * Advance a SIMULATED subscription's lifecycle for the demo: trialing→active,
+   * active→past_due, past_due→active|canceled. No-op on real subscriptions.
+   */
+  advanceSubscriptionStatus(
+    tenantId: string,
+    status: Subscription["status"],
+  ): Promise<Subscription | null>;
+
+  /** Switch a tenant's plan tier (keeps the same subscription row). */
+  changeSubscriptionTier(
+    tenantId: string,
+    tier: PlanTier,
+  ): Promise<Subscription | null>;
+
+  // -- Platform admin + health ------------------------------------------------
+
+  /** Whether a user id is a platform (super) admin. */
+  isPlatformAdmin(userId: string): Promise<boolean>;
+
+  /** The platform-admin roster. */
+  listPlatformAdmins(): Promise<PlatformAdmin[]>;
+
+  /** Resolve a user id → email label (for audit display); null if unknown. */
+  getUser(userId: string): Promise<User | null>;
+
+  /** Aggregated per-tenant health for the super-admin tenant list. */
+  listTenantHealth(): Promise<TenantHealth[]>;
+
+  // -- Audit log (impersonation + sensitive actions) -------------------------
+
+  /** Append an audit entry (impersonation start/end, suspend, etc.). */
+  appendAuditLog(entry: Omit<AuditLogEntry, "id" | "created_at">): Promise<AuditLogEntry>;
+
+  /** Read the audit log (newest first), optionally scoped to a tenant. */
+  listAuditLog(tenantId?: string): Promise<AuditLogEntry[]>;
 
   // --------------------------------------------------------------------------
   // Locations (Phase 4 storefront resolves a location by its public slug)

@@ -19,15 +19,17 @@ import type {
 } from "@/lib/db";
 import { formatMoney } from "@/lib/pricing";
 import { railFamily } from "@/lib/reports";
-import { LOCATIONS } from "./admin-shell";
+import type { Location } from "@/lib/db";
 
 interface Props {
   tenantId: string;
+  /** The tenant's locations (Phase 6 — dynamic, no longer a static constant). */
+  locations: Location[];
 }
 
 const ROLLUP = "all";
 
-export function ReportsView({ tenantId }: Props) {
+export function ReportsView({ tenantId, locations }: Props) {
   const [scope, setScope] = useState<string>(ROLLUP);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
@@ -80,7 +82,7 @@ export function ReportsView({ tenantId }: Props) {
               onChange={(e) => setScope(e.target.value)}
             >
               <option value={ROLLUP}>Tenant rollup (all)</option>
-              {LOCATIONS.map((l) => (
+              {locations.map((l) => (
                 <option key={l.id} value={l.id}>
                   {l.name}
                 </option>

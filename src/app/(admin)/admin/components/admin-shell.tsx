@@ -1,45 +1,43 @@
 /**
- * Back-office shell (Phase 5, /admin).
+ * Back-office shell (Phase 5 + Phase 6, /admin).
  *
- * Top-level client surface for the tenant back office. Holds the active LOCATION
- * (the seed tenant has 2 locations + a tenant-rollup option for reports) and a
- * demo STAFF identity (no real auth — a switcher so staff/shift views are
- * demoable), and renders the section tabs. Each section is its own client
- * component talking to the /api/admin/* routes (mock driver, no env vars).
+ * Top-level client surface for the tenant back office. Phase 6 makes it
+ * TENANT-AWARE: the active tenant is resolved from `?tenant=` (defaulting to the
+ * demo tenant) so a newly self-served tenant's back office works in isolation,
+ * and an `?impersonate=1` flag shows a clear "viewing as tenant" banner (the
+ * audited platform impersonation lands here). Locations + entitlements are
+ * fetched live, so plan gating (location cap, online-ordering/advanced-reports
+ * features) reflects the tenant's subscription. All data flows through the
+ * /api/admin/* + /api/entitlements + /api/billing routes (mock driver, no env).
  */
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BarChart3,
   Boxes,
   ClipboardList,
   CreditCard,
+  Eye,
   LayoutGrid,
+  MapPin,
   Receipt,
   Truck,
   Users,
+  Wallet,
 } from "lucide-react";
-import {
-  DEMO_LOCATION_DOWNTOWN_ID,
-  DEMO_LOCATION_UPTOWN_ID,
-  DEMO_TENANT_ID,
-} from "@/lib/db";
+import { DEMO_TENANT_ID, type Location } from "@/lib/db";
+import { useEntitlements } from "@/lib/saas/use-entitlements";
 import { cn } from "@/lib/utils";
 import { MenuManager } from "./menu-manager";
 import { InventoryManager } from "./inventory-manager";
 import { ReportsView } from "./reports-view";
 import { StaffShifts } from "./staff-shifts";
 import { EndOfDay } from "./end-of-day";
+import { LocationsManager } from "./locations-manager";
+import { PlanBilling } from "./plan-billing";
 import { ConnectOnboarding } from "../connect-onboarding";
 import { DeliveryDispatch } from "../delivery-dispatch";
-
-export const LOCATIONS = [
-  { id: DEMO_LOCATION_DOWNTOWN_ID, name: "Tony's Downtown" },
-  { id: DEMO_LOCATION_UPTOWN_ID, name: "Tony's Uptown" },
-] as const;
-
-export const TENANT_ID = DEMO_TENANT_ID;
 
 type Tab =
   | "menu"
@@ -47,52 +45,118 @@ type Tab =
   | "reports"
   | "staff"
   | "eod"
+  | "locations"
+  | "plan"
   | "payments"
   | "delivery";
 
-const TABS: { id: Tab; label: string; icon: typeof LayoutGrid }[] = [
-  { id: "menu", label: "Menu", icon: LayoutGrid },
-  { id: "inventory", label: "Inventory", icon: Boxes },
-  { id: "reports", label: "Reports", icon: BarChart3 },
-  { id: "staff", label: "Staff & shifts", icon: Users },
-  { id: "eod", label: "End of day", icon: Receipt },
-  { id: "payments", label: "Payments", icon: CreditCard },
-  { id: "delivery", label: "Delivery", icon: Truck },
-];
+function readTenantParam(): { tenantId: string; impersonate: boolean } {
+  if (typeof window === "undefined") {
+    return { tenantId: DEMO_TENANT_ID, impersonate: false };
+  }
+  const params = new URLSearchParams(window.location.search);
+  return {
+    tenantId: params.get("tenant") ?? DEMO_TENANT_ID,
+    impersonate: params.get("impersonate") === "1",
+  };
+}
 
 export function AdminShell() {
+  const [{ tenantId, impersonate }] = useState(readTenantParam);
+  const [tenantName, setTenantName] = useState("Back office");
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [locationId, setLocationId] = useState<string>("");
   const [tab, setTab] = useState<Tab>("menu");
-  const [locationId, setLocationId] = useState<string>(
-    DEMO_LOCATION_DOWNTOWN_ID,
-  );
+
+  const { entitlements, refresh: refreshEntitlements } =
+    useEntitlements(tenantId);
+
+  const loadLocations = useCallback(async () => {
+    const res = await fetch(`/api/admin/locations?tenantId=${tenantId}`, {
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { locations: Location[] };
+      setLocations(data.locations);
+      setLocationId((cur) => cur || data.locations[0]?.id || "");
+    }
+    const t = await fetch(`/api/signup?tenantId=${tenantId}`);
+    if (t.ok) {
+      const td = (await t.json()) as { tenant?: { name: string } };
+      if (td.tenant?.name) setTenantName(td.tenant.name);
+    }
+  }, [tenantId]);
+
+  useEffect(() => {
+    void loadLocations();
+  }, [loadLocations]);
+
+  const advancedReportsAllowed =
+    entitlements?.entitlements.advanced_reports ?? false;
+  const deliveryAllowed = entitlements?.entitlements.delivery ?? false;
+
+  const tabs = useMemo(() => {
+    const base: { id: Tab; label: string; icon: typeof LayoutGrid }[] = [
+      { id: "menu", label: "Menu", icon: LayoutGrid },
+      { id: "inventory", label: "Inventory", icon: Boxes },
+      { id: "reports", label: "Reports", icon: BarChart3 },
+      { id: "staff", label: "Staff & shifts", icon: Users },
+      { id: "eod", label: "End of day", icon: Receipt },
+      { id: "locations", label: "Locations", icon: MapPin },
+      { id: "plan", label: "Plan", icon: Wallet },
+      { id: "payments", label: "Payments", icon: CreditCard },
+      { id: "delivery", label: "Delivery", icon: Truck },
+    ];
+    return base;
+  }, []);
 
   return (
     <div className="min-h-screen">
+      {impersonate && (
+        <div className="flex items-center justify-center gap-2 bg-amber-500 px-4 py-1.5 text-center text-xs font-semibold text-amber-950">
+          <Eye className="h-3.5 w-3.5" /> Platform support session — viewing as{" "}
+          {tenantName}. This view is audited.
+        </div>
+      )}
       <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur">
         <div className="mx-auto max-w-6xl px-4 py-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <ClipboardList className="h-5 w-5" />
-              <h1 className="text-lg font-bold">Tony&apos;s Pizza — Back office</h1>
+              <h1 className="text-lg font-bold">{tenantName} — Back office</h1>
+              {entitlements && (
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                  {entitlements.plan_name}
+                </span>
+              )}
             </div>
-            <label className="flex items-center gap-2 text-sm">
-              <span className="text-muted-foreground">Location</span>
-              <select
-                className="rounded-md border bg-background px-2 py-1.5 text-sm"
-                value={locationId}
-                onChange={(e) => setLocationId(e.target.value)}
-              >
-                {LOCATIONS.map((l) => (
-                  <option key={l.id} value={l.id}>
-                    {l.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {locations.length > 0 && (
+              <label className="flex items-center gap-2 text-sm">
+                <span className="text-muted-foreground">Location</span>
+                <select
+                  className="rounded-md border bg-background px-2 py-1.5 text-sm"
+                  value={locationId}
+                  onChange={(e) => setLocationId(e.target.value)}
+                >
+                  {locations.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
           </div>
 
+          {entitlements?.past_due && (
+            <div className="mt-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-800">
+              Your subscription is past due. Update billing on the Plan tab to
+              keep premium features.
+            </div>
+          )}
+
           <nav className="mt-3 flex flex-wrap gap-1">
-            {TABS.map((t) => {
+            {tabs.map((t) => {
               const Icon = t.icon;
               return (
                 <button
@@ -115,22 +179,79 @@ export function AdminShell() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-6">
-        {tab === "menu" && (
-          <MenuManager tenantId={TENANT_ID} locationId={locationId} />
+        {tab === "menu" && locationId && (
+          <MenuManager tenantId={tenantId} locationId={locationId} />
         )}
-        {tab === "inventory" && (
-          <InventoryManager tenantId={TENANT_ID} locationId={locationId} />
+        {tab === "inventory" && locationId && (
+          <InventoryManager tenantId={tenantId} locationId={locationId} />
         )}
-        {tab === "reports" && <ReportsView tenantId={TENANT_ID} />}
-        {tab === "staff" && (
-          <StaffShifts tenantId={TENANT_ID} locationId={locationId} />
+        {tab === "reports" &&
+          (advancedReportsAllowed ? (
+            <ReportsView tenantId={tenantId} locations={locations} />
+          ) : (
+            <FeatureLocked
+              feature="Advanced reports"
+              detail="Sales rollups, payment-mix, and exports require the Pro plan or higher."
+            />
+          ))}
+        {tab === "staff" && locationId && (
+          <StaffShifts tenantId={tenantId} locationId={locationId} />
         )}
-        {tab === "eod" && (
-          <EndOfDay tenantId={TENANT_ID} locationId={locationId} />
+        {tab === "eod" && locationId && (
+          <EndOfDay
+            tenantId={tenantId}
+            locationId={locationId}
+            locationName={
+              locations.find((l) => l.id === locationId)?.name ?? locationId
+            }
+          />
         )}
-        {tab === "payments" && <ConnectOnboarding />}
-        {tab === "delivery" && <DeliveryDispatch />}
+        {tab === "locations" && (
+          <LocationsManager
+            tenantId={tenantId}
+            onLocationsChanged={() => {
+              void loadLocations();
+              void refreshEntitlements();
+            }}
+          />
+        )}
+        {tab === "plan" && (
+          <PlanBilling
+            tenantId={tenantId}
+            onChanged={() => void refreshEntitlements()}
+          />
+        )}
+        {tab === "payments" && <ConnectOnboarding tenantId={tenantId} />}
+        {tab === "delivery" &&
+          (deliveryAllowed ? (
+            <DeliveryDispatch />
+          ) : (
+            <FeatureLocked
+              feature="Delivery"
+              detail="Delivery dispatch requires the Pro plan or higher."
+            />
+          ))}
       </main>
+    </div>
+  );
+}
+
+function FeatureLocked({
+  feature,
+  detail,
+}: {
+  feature: string;
+  detail: string;
+}) {
+  return (
+    <div className="mx-auto max-w-md rounded-lg border border-amber-500/50 bg-amber-500/10 p-6 text-center">
+      <div className="text-lg font-semibold text-amber-800">
+        {feature} is locked
+      </div>
+      <p className="mt-1 text-sm text-amber-800">{detail}</p>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Upgrade on the Plan tab to unlock it.
+      </p>
     </div>
   );
 }

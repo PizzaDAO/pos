@@ -14,7 +14,11 @@ import { DEMO_TENANT_ID, type ConnectAccount } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
-export function ConnectOnboarding() {
+export function ConnectOnboarding({
+  tenantId = DEMO_TENANT_ID,
+}: {
+  tenantId?: string;
+}) {
   const [account, setAccount] = useState<ConnectAccount | null>(null);
   const [simulated, setSimulated] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -22,7 +26,7 @@ export function ConnectOnboarding() {
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(`/api/connect?tenantId=${DEMO_TENANT_ID}`);
+      const res = await fetch(`/api/connect?tenantId=${tenantId}`);
       const data = (await res.json()) as {
         account: ConnectAccount | null;
         simulated: boolean;
@@ -32,7 +36,7 @@ export function ConnectOnboarding() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load status.");
     }
-  }, []);
+  }, [tenantId]);
 
   useEffect(() => {
     void load();
@@ -45,7 +49,7 @@ export function ConnectOnboarding() {
       const res = await fetch("/api/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tenantId: DEMO_TENANT_ID }),
+        body: JSON.stringify({ tenantId }),
       });
       const data = (await res.json()) as {
         account: ConnectAccount;

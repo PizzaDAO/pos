@@ -22,12 +22,25 @@ import type {
   ItemInventoryLink,
   Staff,
 } from "./backoffice-types";
-import type { Location, Tenant } from "./types";
+import type { Location, PlatformAdmin, Tenant, User } from "./types";
 
 export const DEMO_TENANT_ID = "10000000-0000-0000-0000-000000000001";
 export const DEMO_LOCATION_DOWNTOWN_ID =
   "10000000-0000-0000-0000-000000000101";
 export const DEMO_LOCATION_UPTOWN_ID = "10000000-0000-0000-0000-000000000102";
+
+/**
+ * Platform (super) admin — us. Modelled via the existing `platform_admins`
+ * concept, outside tenant RLS. Real auth is deferred (Phase 7/Supabase); this
+ * identity drives the /platform surface + audit-log actor attribution.
+ */
+export const PLATFORM_ADMIN_USER_ID =
+  "00000000-0000-0000-0000-0000000000aa";
+export const PLATFORM_ADMIN_EMAIL = "ops@pizzapos.example";
+
+/** The demo tenant's owner user (Phase 6 models owner users properly). */
+export const DEMO_OWNER_USER_ID = "10000000-0000-0000-0000-0000000000a1";
+export const DEMO_OWNER_EMAIL = "tony@tonys-pizza.example";
 
 /** The hardcoded demo tenant + location the Phase 1 terminal operates as. */
 export const DEMO_CONTEXT = {
@@ -45,6 +58,17 @@ export const tenants: Tenant[] = [
     status: "active",
     created_at: NOW,
   },
+];
+
+/** Seed users: the platform operator + the demo tenant's owner. */
+export const users: User[] = [
+  { id: PLATFORM_ADMIN_USER_ID, email: PLATFORM_ADMIN_EMAIL, created_at: NOW },
+  { id: DEMO_OWNER_USER_ID, email: DEMO_OWNER_EMAIL, created_at: NOW },
+];
+
+/** Platform-admin roster (super-admins, outside tenant RLS). */
+export const platformAdmins: PlatformAdmin[] = [
+  { user_id: PLATFORM_ADMIN_USER_ID, created_at: NOW },
 ];
 
 export const locations: Location[] = [
