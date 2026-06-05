@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { NextConfig } from "next";
+import withSerwistInit from "@serwist/next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
@@ -8,4 +9,15 @@ const nextConfig: NextConfig = {
   outputFileTracingRoot: path.join(__dirname),
 };
 
-export default nextConfig;
+/**
+ * PWA via Serwist. Generates a service worker from `src/app/sw.ts` and emits it
+ * to `public/sw.js`. Disabled in development to avoid caching churn while
+ * iterating. Requires no env vars — builds offline.
+ */
+const withSerwist = withSerwistInit({
+  swSrc: "src/app/sw.ts",
+  swDest: "public/sw.js",
+  disable: process.env.NODE_ENV === "development",
+});
+
+export default withSerwist(nextConfig);

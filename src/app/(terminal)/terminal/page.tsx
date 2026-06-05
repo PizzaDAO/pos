@@ -1,10 +1,11 @@
-import { SurfacePlaceholder } from "@/components/surface-placeholder";
+import type { Metadata } from "next";
+import { TerminalClient } from "./components/terminal-client";
+
+export const metadata: Metadata = {
+  title: "Terminal — Pizzeria POS",
+  description: "Offline-first counter POS terminal.",
+};
 
 export default function TerminalPage() {
-  return (
-    <SurfacePlaceholder
-      surface="Terminal"
-      description="Counter POS — installable, offline-first PWA terminal. Order taking, payments, and the offline queue land in Phases 1–2."
-    />
-  );
+  return <TerminalClient />;
 }
