@@ -106,7 +106,42 @@ begin
 end $$;
 reset role;
 
--- 4) Platform admin sees BOTH tenants.
+-- 4) The blocked cross-tenant write (assertion 3) left NO row behind. Check as
+--    the table owner (RLS reset) so we see the true persisted state.
+do $$
+declare n int;
+begin
+  select count(*) into n from public.locations where slug = 'hacked';
+  assert n = 0, format('Blocked cross-tenant insert must leave no row, found %s', n);
+end $$;
+
+-- 5) memberships are tenant-scoped: Alice sees only tenant A's membership rows,
+--    never Bob's (no cross-tenant staff visibility).
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int;
+begin
+  select count(*) into n from public.memberships;
+  assert n = 1, format('Alice should see 1 membership (her own tenant), saw %s', n);
+  perform 1 from public.memberships
+    where tenant_id = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  assert not found, 'Alice must NOT see tenant B memberships';
+end $$;
+reset role;
+
+-- 6) Alice cannot read Bob's user row (no shared tenant); she can read her own.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int;
+begin
+  perform 1 from public.users where email = 'bob@tenant-b.example';
+  assert not found, 'Alice must NOT see Bob''s user row';
+  select count(*) into n from public.users where id = '11111111-1111-1111-1111-111111111111';
+  assert n = 1, 'Alice must be able to read her own user row';
+end $$;
+reset role;
+
+-- 7) Platform admin sees BOTH tenants.
 select pg_temp.act_as('33333333-3333-3333-3333-333333333333');
 do $$
 declare n int;
