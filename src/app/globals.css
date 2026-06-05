@@ -53,3 +53,17 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ---- Kitchen ticket print (Phase 3) -------------------------------------- */
+/* When printing, drop margins so the ticket fits a narrow receipt roll. The
+   print view itself hides chrome via `print:hidden`; this just tightens the
+   page box and forces crisp black-on-white. */
+@media print {
+  @page {
+    margin: 6mm;
+  }
+  body {
+    background: #fff;
+    color: #000;
+  }
+}

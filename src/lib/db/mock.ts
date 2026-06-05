@@ -36,6 +36,7 @@ import {
   paymentSettings,
   storeSettings,
 } from "./seed-data";
+import { seedKitchenOrders } from "./kds-seed";
 
 /** Process-lifetime order store, keyed by client UUID for idempotent upsert. */
 const orders = new Map<string, Order>();
@@ -44,6 +45,25 @@ const payments = new Map<string, Payment>();
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 let orderSeq = 0;
+
+/**
+ * KDS demo seed (mock-only). Serverless lambdas are stateless: the in-memory
+ * `orders` Map does NOT persist across cold starts, so a freshly-spun Vercel
+ * instance would show an EMPTY kitchen board. To keep `/kitchen` demoable in the
+ * preview we lazily seed a handful of open kitchen orders (varied ages,
+ * stations, and statuses) the first time orders are read/listed in a given warm
+ * instance. Orders actually placed in the same warm instance still appear
+ * alongside the seed. This entire behavior disappears once Supabase is wired —
+ * persistence then comes from Postgres, not this Map.
+ */
+let kitchenSeeded = false;
+function ensureKitchenSeed(): void {
+  if (kitchenSeeded) return;
+  kitchenSeeded = true;
+  for (const order of seedKitchenOrders()) {
+    if (!orders.has(order.id)) orders.set(order.id, order);
+  }
+}
 
 function buildMenuItemDetail(itemId: string): MenuItemDetail | null {
   const item = menuItems.find((i) => i.id === itemId);
@@ -113,6 +133,7 @@ export const mockDriver: PosDriver = {
       currency: "USD",
       tax_rate_bps: 0,
       tip_presets_bps: [1500, 1800, 2000],
+      kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
     };
   },
 
@@ -142,10 +163,12 @@ export const mockDriver: PosDriver = {
   },
 
   async getOrder(id: string): Promise<Order | null> {
+    ensureKitchenSeed();
     return orders.get(id) ?? null;
   },
 
   async listOrders(tenantId, locationId): Promise<Order[]> {
+    ensureKitchenSeed();
     return [...orders.values()]
       .filter(
         (o) => o.tenant_id === tenantId && o.location_id === locationId,
@@ -157,6 +180,7 @@ export const mockDriver: PosDriver = {
     id: string,
     status: OrderStatus,
   ): Promise<Order | null> {
+    ensureKitchenSeed();
     const order = orders.get(id);
     if (!order) return null;
     const updated: Order = {
@@ -248,10 +272,11 @@ export const mockDriver: PosDriver = {
   },
 };
 
-/** Test helper: clear placed orders + reset the sequence. */
+/** Test helper: clear placed orders + reset the sequence + KDS seed flag. */
 export function resetMockOrders(): void {
   orders.clear();
   orderSeq = 0;
+  kitchenSeeded = false;
 }
 
 /** Test helper: clear payments + connect state. */
