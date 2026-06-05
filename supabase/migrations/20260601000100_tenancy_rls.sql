@@ -230,3 +230,17 @@ create policy platform_admins_all on public.platform_admins
   for all
   using (public.is_platform_admin())
   with check (public.is_platform_admin());
+
+-- ----------------------------------------------------------------------------
+-- Grants. RLS decides WHICH ROWS a role may see; table GRANTs decide whether the
+-- role may touch the table at all. Supabase normally applies default privileges
+-- to anon/authenticated implicitly — we make them explicit so the schema is
+-- self-contained and portable (vanilla Postgres) and access is least-privilege
+-- by intent: `authenticated` gets table access (rows still gated by the policies
+-- above), `anon` gets none of the tenancy tables.
+-- ----------------------------------------------------------------------------
+grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete
+  on public.tenants, public.locations, public.users,
+     public.memberships, public.platform_admins
+  to authenticated;
