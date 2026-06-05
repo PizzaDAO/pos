@@ -16,6 +16,10 @@
 # It applies migrations idempotently-ish (create-or-replace functions; tables
 # will error if already present — point it at a FRESH database). The isolation
 # test itself runs in a transaction and rolls back, mutating nothing persistent.
+#
+# On a VANILLA Postgres (local/CI) the auth.uid() shim is applied first so the
+# policies resolve. Against a REAL Supabase project, set SKIP_AUTH_SHIM=1 — the
+# platform already supplies auth.uid() and the shim must NOT overwrite it.
 # ============================================================================
 set -euo pipefail
 
@@ -24,6 +28,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MIGRATIONS_DIR="$ROOT/supabase/migrations"
 TEST_FILE="$ROOT/supabase/tests/rls_isolation.sql"
+SHIM_FILE="$ROOT/supabase/tests/auth_shim.sql"
+
+if [ -z "${SKIP_AUTH_SHIM:-}" ]; then
+  echo "==> Applying auth.uid() shim (vanilla Postgres; set SKIP_AUTH_SHIM=1 for real Supabase)"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$SHIM_FILE"
+fi
 
 echo "==> Applying tenancy migrations from $MIGRATIONS_DIR"
 for f in "$MIGRATIONS_DIR"/*.sql; do

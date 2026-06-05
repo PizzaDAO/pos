@@ -82,6 +82,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Apply auth.uid() shim
+        # Vanilla Postgres lacks Supabase's `auth` schema / `auth.uid()`, which the
+        # tenancy RLS policies depend on. This shim recreates that exact contract so
+        # the migrations apply and the isolation test exercises real RLS off-platform.
+        # NOT applied on a real Supabase project (the platform supplies auth.uid()).
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/auth_shim.sql
+
       - name: Apply tenancy migrations
         run: |
           for f in supabase/migrations/*.sql; do
