@@ -39,8 +39,9 @@ write leaves no row, and that a platform admin sees everything.
 The SQL isolation test now also covers the **operational tables** (orders,
 payments) and the **public menu** surface: it asserts a member of tenant A sees
 only tenant A's orders/payments, a cross-tenant order write is blocked and leaves
-no row, the storefront `anon` role can read **both** tenants' menus (public) but
-**cannot** read any orders/payments or write the menu.
+no row, the storefront `anon` role can read **both** tenants' menus + store
+settings + a location-by-slug (public) but **cannot** read `tenants`, `orders`,
+`payments`, `customers`, `staff`, or `memberships`, and cannot write the menu.
 
 **RLS/grants model for the new tables** (`..._domain_rls.sql`):
 - Every domain table has RLS **enabled + FORCED**, keyed to `memberships` via the
@@ -48,8 +49,20 @@ no row, the storefront `anon` role can read **both** tenants' menus (public) but
 - **Public menu read**: menu definition tables (categories/items/sizes/groups/
   modifiers/links), `location_menu_overrides`, and `store_settings` grant
   `SELECT` to `anon` (storefront renders for unauthenticated visitors). Writes
-  stay owner/manager-only. `tenants`/`locations` get an additive anon `SELECT`
-  policy for slug resolution.
+  stay owner/manager-only. `locations` gets an additive anon `SELECT` policy
+  scoped to **active tenants** for slug resolution.
+- **Least-privilege anon/authenticated grants** (corrective migration
+  `..._least_privilege_grants.sql`, fixing a live finding that `anon`/
+  `authenticated` held effectively ALL privileges on every table): `anon` holds
+  `SELECT` ONLY on the storefront-public surface (the menu tables +
+  `store_settings` + `locations`) and **nothing else** — no grant on `tenants`,
+  `orders`, `payments`, `customers`, `memberships`, `staff`, `subscriptions`,
+  `audit_log`, etc., so a read there is denied at the grant layer regardless of
+  RLS. The blanket anon `tenants_public_select` (registry enumeration) was
+  **dropped**. `authenticated` is trimmed to `SELECT/INSERT/UPDATE/DELETE` (no
+  TRUNCATE/TRIGGER/REFERENCES). The app is unaffected: its data path is
+  server-side via the `service_role` key (explicit tenant filters); the
+  storefront never uses the anon role.
 - **Customer-owns-their-data**: a signed-in customer (`auth.uid() == customers.id`)
   may read their own customer row + their own orders + those orders' line items,
   modifiers, payments, and delivery (via `can_read_order()`). They may also
@@ -63,6 +76,10 @@ no row, the storefront `anon` role can read **both** tenants' menus (public) but
 **Go-live dependencies:**
 - [x] Schema + RLS for orders/payments/menu/inventory/staff/settings/SaaS exist
       with the same `memberships`-keyed policies (RLS ON + FORCED on all).
+- [x] **anon/authenticated grants are least-privilege** (corrective migration):
+      anon = `SELECT` on the storefront-public surface only; authenticated =
+      DML only; no anon tenant-registry read. Verified by the extended SQL
+      isolation test (optional Postgres CI job).
 - [ ] Provision Supabase; `npm run db:apply` (or `supabase db push` + seed).
 - [ ] Wire Supabase Auth so `auth.uid() == public.users.id` (the RLS assumption).
 - [ ] Confirm the **service-role key is never** used for tenant-scoped
