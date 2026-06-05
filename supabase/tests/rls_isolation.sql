@@ -49,6 +49,40 @@ insert into public.memberships (user_id, tenant_id, role) values
 insert into public.platform_admins (user_id) values
   ('33333333-3333-3333-3333-333333333333');
 
+-- ---- Domain fixtures (menu, orders, payments) for both tenants -------------
+-- A menu category + item per tenant (public-readable), an order per tenant
+-- (tenant-scoped), and a payment per order (tenant-scoped). These let us assert
+-- isolation on the operational tables, not just the tenancy core.
+insert into public.menu_categories (id, tenant_id, name, sort_order) values
+  ('caca0001-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'A Pizzas', 1),
+  ('cbcb0001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'B Pizzas', 1);
+
+insert into public.menu_items (id, tenant_id, category_id, name) values
+  ('11aa0001-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   'caca0001-0000-0000-0000-000000000001', 'A Margherita'),
+  ('11bb0001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+   'cbcb0001-0000-0000-0000-000000000001', 'B Margherita');
+
+insert into public.orders
+  (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+values
+  ('0ada0001-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+   'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'paid', 'in_store', 'USD', 0,
+   '{"total_cents":1099}'::jsonb, 'A-0001'),
+  ('0bdb0001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+   'b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1', 'paid', 'in_store', 'USD', 0,
+   '{"total_cents":1299}'::jsonb, 'A-0001');
+
+insert into public.payments
+  (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+values
+  ('0aea0001-0000-0000-0000-000000000001', '0ada0001-0000-0000-0000-000000000001',
+   'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+   'cash', 'captured', 1099, 'USD'),
+  ('0beb0001-0000-0000-0000-000000000001', '0bdb0001-0000-0000-0000-000000000001',
+   'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1',
+   'cash', 'captured', 1299, 'USD');
+
 set session_replication_role = origin;
 
 -- ---- Helper to impersonate a user --------------------------------------------
@@ -148,6 +182,117 @@ declare n int;
 begin
   select count(*) into n from public.tenants;
   assert n = 2, format('Platform admin should see 2 tenants, saw %s', n);
+end $$;
+reset role;
+
+-- ============================================================================
+-- DOMAIN-TABLE ISOLATION — orders, payments, and (public) menu.
+-- ============================================================================
+
+-- 8) ORDERS are tenant-scoped: Alice sees only tenant A's order, never B's.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int;
+begin
+  select count(*) into n from public.orders;
+  assert n = 1, format('Alice should see 1 order (tenant A), saw %s', n);
+  perform 1 from public.orders where tenant_id = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  assert not found, 'Alice must NOT see tenant B orders';
+end $$;
+reset role;
+
+-- 9) PAYMENTS are tenant-scoped: Bob sees only tenant B's payment, never A's.
+select pg_temp.act_as('22222222-2222-2222-2222-222222222222');
+do $$
+declare n int;
+begin
+  select count(*) into n from public.payments;
+  assert n = 1, format('Bob should see 1 payment (tenant B), saw %s', n);
+  perform 1 from public.payments where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  assert not found, 'Bob must NOT see tenant A payments';
+end $$;
+reset role;
+
+-- 10) Cross-tenant ORDER WRITE is blocked: Alice cannot insert an order into B.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare blocked boolean := false;
+begin
+  begin
+    insert into public.orders
+      (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+    values
+      ('0ada9999-0000-0000-0000-000000000099', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+       'b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1', 'paid', 'in_store', 'USD', 0,
+       '{"total_cents":1}'::jsonb, 'HACK');
+  exception when others then
+    blocked := true;
+  end;
+  assert blocked, 'Alice must NOT be able to write an order into tenant B';
+end $$;
+reset role;
+
+-- 11) The blocked cross-tenant order write left NO row (checked as table owner).
+do $$
+declare n int;
+begin
+  select count(*) into n from public.orders where order_number = 'HACK';
+  assert n = 0, format('Blocked cross-tenant order insert must leave no row, found %s', n);
+end $$;
+
+-- Clear any impersonation so the anon blocks below run as a TRUE anonymous
+-- visitor (auth.uid() = null), not a leftover authenticated subject.
+select set_config('request.jwt.claims', '', true);
+
+-- 12) MENU is intentionally PUBLIC-READABLE (storefront). The `anon` role sees
+--     BOTH tenants' menu items (public reads), but writes stay tenant-scoped.
+set local role anon;
+do $$
+declare n int;
+begin
+  select count(*) into n from public.menu_items;
+  assert n = 2, format('anon (storefront) should read both menus (2 items), saw %s', n);
+end $$;
+reset role;
+
+-- 13) anon CANNOT read tenant-scoped operational data (orders/payments). anon
+--     has NO table grant there, so a read must be DENIED (0 rows if a grant ever
+--     existed, else a hard permission error — either way, never any data).
+set local role anon;
+do $$
+declare n int; blocked boolean := false;
+begin
+  begin
+    select count(*) into n from public.orders;
+    assert n = 0, format('anon must NOT read any orders, saw %s', n);
+  exception when insufficient_privilege then
+    blocked := true; -- permission denied is the strongest "no access"
+  end;
+  begin
+    select count(*) into n from public.payments;
+    assert n = 0, format('anon must NOT read any payments, saw %s', n);
+  exception when insufficient_privilege then
+    blocked := true;
+  end;
+  -- Either way (RLS 0-rows or table-grant denial), anon got NO operational data.
+  perform blocked; -- referenced to satisfy the analyzer; assertions above gate it
+end $$;
+reset role;
+
+-- 14) anon CANNOT write the public menu (read-only storefront surface).
+set local role anon;
+do $$
+declare blocked boolean := false;
+begin
+  begin
+    insert into public.menu_items (id, tenant_id, category_id, name)
+    values ('11cc9999-0000-0000-0000-000000000099',
+            'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            'caca0001-0000-0000-0000-000000000001', 'anon hack');
+  exception when others then
+    blocked := true;
+  end;
+  assert blocked, 'anon must NOT be able to write menu items';
 end $$;
 reset role;
 

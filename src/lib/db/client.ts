@@ -13,6 +13,7 @@
  */
 import type { PosDriver } from "./driver";
 import { mockDriver } from "./mock";
+import { createSupabaseDriver, readSupabaseConfig } from "./supabase";
 
 export interface DbClientConfig {
   url: string;
@@ -55,21 +56,23 @@ export function resetDb(): void {
 }
 
 // ----------------------------------------------------------------------------
-// PosDriver selection (Phase 1)
+// PosDriver selection (live-wiring)
 //
-// The terminal talks to menu/order data ONLY through `getPosDriver()`. Today
-// this always returns the in-memory mock driver (Supabase is deferred to the
-// last phase). When a live Supabase project exists, swap the selection here
-// based on `readDbConfig()` — NO call site changes required.
+// The terminal talks to menu/order data ONLY through `getPosDriver()`. The
+// selection is env-driven and LAZY (read at call time, never at module load):
+//   * Supabase env present (NEXT_PUBLIC_SUPABASE_URL + a SUPABASE_* key) → the
+//     real Supabase-backed driver.
+//   * Otherwise → the in-memory mock driver (the zero-env default, so the app
+//     builds/runs/tests with no configuration).
+// NO call site changes are required either way — both implement `PosDriver`.
 // ----------------------------------------------------------------------------
 
 let cachedDriver: PosDriver | null = null;
 
 export function getPosDriver(): PosDriver {
   if (cachedDriver) return cachedDriver;
-  // Future: const config = readDbConfig();
-  //         cachedDriver = config ? createSupabaseDriver(config) : mockDriver;
-  cachedDriver = mockDriver;
+  const config = readSupabaseConfig();
+  cachedDriver = config ? createSupabaseDriver(config) : mockDriver;
   return cachedDriver;
 }
 
