@@ -1,15 +1,19 @@
 -- ============================================================================
--- Seed: sample pizzeria — "Tony's Pizza"
+-- Seed: sample pizzeria — "Tony's Pizza" (FULL demo dataset)
 --
--- One demo tenant, two locations, and a small but realistic menu with
--- half-and-half-capable modifier groups. Used to develop against once a live
--- Supabase DB exists (DEFERRED in Phase 0).
+-- One demo tenant, two locations, the full menu (pizzas with half-and-half
+-- modifier groups, drinks, sides), the owner user + membership + platform admin,
+-- per-location store/payment settings (incl. fulfillment/delivery zones),
+-- inventory + recipe links + staff, and the SaaS layer (onboarded + Pro
+-- subscription). This mirrors src/lib/db/seed-data.ts so a freshly-provisioned
+-- DB matches EXACTLY what the in-memory mock driver shows.
 --
--- NOTE: The menu tables (menu_categories, menu_items, item_sizes,
--- modifier_groups, modifiers, item_modifier_groups) are introduced by a Phase 1
--- migration. This seed is written against that intended shape so it is ready to
--- run when those migrations land; it is idempotent via fixed UUIDs + ON CONFLICT.
--- Apply AFTER migrations. See supabase/README.md.
+-- Idempotent via fixed UUIDs + ON CONFLICT. Apply AFTER migrations
+-- (supabase/apply.sh / supabase db push). See supabase/README.md.
+--
+-- The menu block is guarded by `to_regclass('public.menu_items')` so it is a
+-- safe no-op if only the tenancy core has been applied; the remaining sections
+-- assume the domain migrations (20260605000000_domain_core.sql) have run.
 -- ============================================================================
 
 -- ---- Tenant + locations -----------------------------------------------------
@@ -42,23 +46,30 @@ begin
   -- ---- Categories -----------------------------------------------------------
   insert into public.menu_categories (id, tenant_id, name, sort_order) values
     ('20000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', 'Pizzas', 1),
-    ('20000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001', 'Drinks', 2)
+    ('20000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001', 'Drinks', 2),
+    ('20000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001', 'Sides',  3)
   on conflict (id) do nothing;
 
   -- ---- Items ----------------------------------------------------------------
-  insert into public.menu_items (id, tenant_id, category_id, name, description, is_half_and_half_capable) values
+  insert into public.menu_items (id, tenant_id, category_id, name, description, is_half_and_half_capable, station) values
     ('30000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001',
      '20000000-0000-0000-0000-000000000001', 'Margherita',
-     'San Marzano tomato, fresh mozzarella, basil.', true),
+     'San Marzano tomato, fresh mozzarella, basil.', true, 'oven'),
     ('30000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001',
      '20000000-0000-0000-0000-000000000001', 'Pepperoni',
-     'Tomato, mozzarella, pepperoni.', true),
+     'Tomato, mozzarella, pepperoni.', true, 'oven'),
     ('30000000-0000-0000-0000-000000000010', '10000000-0000-0000-0000-000000000001',
      '20000000-0000-0000-0000-000000000002', 'Fountain Soda',
-     'Choice of fountain drink.', false)
+     'Choice of fountain drink.', false, 'none'),
+    ('30000000-0000-0000-0000-000000000020', '10000000-0000-0000-0000-000000000001',
+     '20000000-0000-0000-0000-000000000003', 'Caesar Salad',
+     'Romaine, parmesan, croutons, Caesar dressing.', false, 'cold'),
+    ('30000000-0000-0000-0000-000000000030', '10000000-0000-0000-0000-000000000001',
+     '20000000-0000-0000-0000-000000000003', 'Garlic Knots',
+     'Fried dough knots, garlic butter, parmesan.', false, 'fryer')
   on conflict (id) do nothing;
 
-  -- ---- Sizes (per pizza item; price in integer cents) -----------------------
+  -- ---- Sizes (per item; price in integer cents) -----------------------------
   insert into public.item_sizes (id, item_id, name, price_cents, sort_order) values
     -- Margherita S/M/L
     ('40000000-0000-0000-0000-000000000001', '30000000-0000-0000-0000-000000000001', 'Small (10")',  1099, 1),
@@ -67,7 +78,11 @@ begin
     -- Pepperoni S/M/L
     ('40000000-0000-0000-0000-000000000011', '30000000-0000-0000-0000-000000000002', 'Small (10")',  1299, 1),
     ('40000000-0000-0000-0000-000000000012', '30000000-0000-0000-0000-000000000002', 'Medium (14")', 1699, 2),
-    ('40000000-0000-0000-0000-000000000013', '30000000-0000-0000-0000-000000000002', 'Large (18")',  2099, 3)
+    ('40000000-0000-0000-0000-000000000013', '30000000-0000-0000-0000-000000000002', 'Large (18")',  2099, 3),
+    -- Single-size items
+    ('40000000-0000-0000-0000-000000000021', '30000000-0000-0000-0000-000000000010', 'Regular',  299, 1),
+    ('40000000-0000-0000-0000-000000000031', '30000000-0000-0000-0000-000000000020', 'Regular',  899, 1),
+    ('40000000-0000-0000-0000-000000000041', '30000000-0000-0000-0000-000000000030', '6-piece',  699, 1)
   on conflict (id) do nothing;
 
   -- ---- Modifier groups ------------------------------------------------------
@@ -105,3 +120,149 @@ begin
     ('30000000-0000-0000-0000-000000000002', '50000000-0000-0000-0000-000000000003', 3)
   on conflict do nothing;
 end $$;
+
+-- ============================================================================
+-- OWNER + MEMBERSHIP + PLATFORM ADMIN
+-- (mirrors src/lib/db/seed-data.ts so RLS lets the demo owner operate the tenant
+-- and the platform operator drives /platform).
+-- ============================================================================
+insert into public.users (id, email) values
+  ('00000000-0000-0000-0000-0000000000aa', 'ops@pizzapos.example'),
+  ('10000000-0000-0000-0000-0000000000a1', 'tony@tonys-pizza.example')
+on conflict (id) do nothing;
+
+insert into public.platform_admins (user_id) values
+  ('00000000-0000-0000-0000-0000000000aa')
+on conflict (user_id) do nothing;
+
+insert into public.memberships (id, user_id, tenant_id, role) values
+  ('10000000-0000-0000-0000-0000000000b1',
+   '10000000-0000-0000-0000-0000000000a1',
+   '10000000-0000-0000-0000-000000000001', 'owner')
+on conflict (user_id, tenant_id) do nothing;
+
+-- ============================================================================
+-- STORE + PAYMENT SETTINGS (per location). Tax 8.25%, USD, tip presets.
+-- Downtown offers pickup + delivery (two zones); Uptown is pickup-only.
+-- ============================================================================
+insert into public.store_settings
+  (tenant_id, location_id, currency, tax_rate_bps, tip_presets_bps, kds_thresholds, fulfillment)
+values
+  ('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000101',
+   'USD', 825, '{1500,1800,2000}',
+   '{"warn_seconds":300,"urgent_seconds":600}'::jsonb,
+   '{
+      "pickup_enabled": true, "delivery_enabled": true,
+      "prep_minutes": 20, "scheduling_lead_minutes": 15, "scheduling_horizon_days": 5,
+      "hours": [
+        {"weekday":0,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":1,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":2,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":3,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":4,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":5,"open":"11:00","close":"23:00","closed":false},
+        {"weekday":6,"open":"11:00","close":"23:00","closed":false}
+      ],
+      "delivery_providers": ["in_house_manual","doordash_drive"],
+      "pickup_address": "123 Main St, Springfield",
+      "delivery_zones": [
+        {"id":"zone-near","name":"Downtown core","postal_codes":["10001","10002","10003"],
+         "fee_cents":399,"eta_minutes":30,"min_subtotal_cents":0},
+        {"id":"zone-far","name":"Greater Springfield","postal_codes":["10010","10011","10012"],
+         "fee_cents":699,"eta_minutes":45,"min_subtotal_cents":2000}
+      ]
+    }'::jsonb),
+  ('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000102',
+   'USD', 825, '{1500,1800,2000}',
+   '{"warn_seconds":300,"urgent_seconds":600}'::jsonb,
+   '{
+      "pickup_enabled": true, "delivery_enabled": false,
+      "prep_minutes": 25, "scheduling_lead_minutes": 15, "scheduling_horizon_days": 5,
+      "hours": [
+        {"weekday":0,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":1,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":2,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":3,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":4,"open":"11:00","close":"22:00","closed":false},
+        {"weekday":5,"open":"11:00","close":"23:00","closed":false},
+        {"weekday":6,"open":"11:00","close":"23:00","closed":false}
+      ],
+      "delivery_providers": [],
+      "pickup_address": "900 North Ave, Springfield",
+      "delivery_zones": []
+    }'::jsonb)
+on conflict (tenant_id, location_id) do nothing;
+
+insert into public.payment_settings
+  (tenant_id, location_id, currency, platform_fee_bps, platform_fee_flat_cents, tip_presets_bps)
+values
+  ('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000101',
+   'USD', 250, 10, '{1500,1800,2000}'),
+  ('10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000102',
+   'USD', 250, 10, '{1500,1800,2000}')
+on conflict (tenant_id, location_id) do nothing;
+
+-- ============================================================================
+-- INVENTORY (per location) + recipe links (tenant-level) + STAFF.
+-- Downtown pepperoni is seeded near its low threshold (demo low-stock alert).
+-- ============================================================================
+insert into public.inventory_items
+  (id, tenant_id, location_id, name, unit, on_hand, low_threshold)
+values
+  ('70000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000101', 'Pizza dough ball', 'each', 80, 20),
+  ('70000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000101', 'Mozzarella', 'g', 20000, 5000),
+  ('70000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000101', 'Pepperoni', 'g', 600, 500),
+  ('70000000-0000-0000-0000-000000000101', '10000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000102', 'Pizza dough ball', 'each', 60, 15),
+  ('70000000-0000-0000-0000-000000000102', '10000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000102', 'Mozzarella', 'g', 15000, 5000),
+  ('70000000-0000-0000-0000-000000000103', '10000000-0000-0000-0000-000000000001',
+   '10000000-0000-0000-0000-000000000102', 'Pepperoni', 'g', 4000, 500)
+on conflict (id) do nothing;
+
+insert into public.item_inventory_links
+  (id, tenant_id, source_type, source_id, inventory_item_id, qty_per_unit)
+values
+  ('71000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001',
+   'item', '30000000-0000-0000-0000-000000000001', '70000000-0000-0000-0000-000000000001', 1),
+  ('71000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001',
+   'item', '30000000-0000-0000-0000-000000000001', '70000000-0000-0000-0000-000000000002', 150),
+  ('71000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001',
+   'item', '30000000-0000-0000-0000-000000000002', '70000000-0000-0000-0000-000000000001', 1),
+  ('71000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001',
+   'item', '30000000-0000-0000-0000-000000000002', '70000000-0000-0000-0000-000000000002', 150),
+  ('71000000-0000-0000-0000-000000000005', '10000000-0000-0000-0000-000000000001',
+   'item', '30000000-0000-0000-0000-000000000002', '70000000-0000-0000-0000-000000000003', 80),
+  ('71000000-0000-0000-0000-000000000006', '10000000-0000-0000-0000-000000000001',
+   'modifier', '60000000-0000-0000-0000-000000000024', '70000000-0000-0000-0000-000000000002', 75)
+on conflict (id) do nothing;
+
+insert into public.staff (id, tenant_id, name, role, active) values
+  ('80000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', 'Tony Soprano',    'owner',   true),
+  ('80000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001', 'Carmela M.',      'manager', true),
+  ('80000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001', 'Christopher M.',  'cashier', true),
+  ('80000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001', 'Furio G.',        'kitchen', true)
+on conflict (id) do nothing;
+
+-- ============================================================================
+-- SaaS LAYER — the demo tenant is already onboarded + on the Pro plan, so
+-- /platform shows a healthy live tenant (matches the mock's bootstrap).
+-- ============================================================================
+insert into public.tenant_onboarding
+  (tenant_id, current_step, completed_steps, live)
+values
+  ('10000000-0000-0000-0000-000000000001', 'go_live',
+   '{business,location,connect,menu,plan,go_live}', true)
+on conflict (tenant_id) do nothing;
+
+insert into public.subscriptions
+  (id, tenant_id, tier, status, current_period_end, trial_end,
+   cancel_at_period_end, simulated, stripe_customer_id, stripe_subscription_id)
+values
+  ('sub_sim_demo_tonys', '10000000-0000-0000-0000-000000000001', 'pro', 'active',
+   now() + interval '30 days', null, false, true,
+   'cus_sim_demo_tonys', 'sub_stripe_sim_demo_tonys')
+on conflict (tenant_id) do nothing;

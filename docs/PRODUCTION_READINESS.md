@@ -6,9 +6,17 @@ of the platform's correctness/security posture. It covers what is proven **now**
 the **final live-wiring phase** (real Supabase + Stripe + crypto + DoorDash).
 
 > Status of the build today: everything runs on the in-memory **mock driver**
-> (`getPosDriver()`), every payment rail **simulates** settlement when its keys
-> are absent, and the full automated test suite + production build pass with
-> **no environment variables**. No live services are wired in this phase.
+> (`getPosDriver()`) when no Supabase env is set, every payment rail **simulates**
+> settlement when its keys are absent, and the full automated test suite +
+> production build pass with **no environment variables**.
+>
+> **Persistence is now wired.** The real **Supabase driver** (`src/lib/db/supabase.ts`)
+> implements the entire `PosDriver` contract over a complete Postgres schema
+> (`supabase/migrations/20260605000000_domain_core.sql` + `..._domain_rls.sql`),
+> with strict RLS on every table. Setting the Supabase env vars flips
+> `getPosDriver()` to it with **no call-site changes**; absent them, the mock
+> stays the default. The remaining go-live work is provisioning + credentials
+> (below), not code.
 
 ---
 
@@ -28,14 +36,38 @@ tenant's driver calls. The SQL test proves a member of tenant A cannot read or
 write tenant B's tenants/locations/memberships/users, that a blocked cross-tenant
 write leaves no row, and that a platform admin sees everything.
 
+The SQL isolation test now also covers the **operational tables** (orders,
+payments) and the **public menu** surface: it asserts a member of tenant A sees
+only tenant A's orders/payments, a cross-tenant order write is blocked and leaves
+no row, the storefront `anon` role can read **both** tenants' menus (public) but
+**cannot** read any orders/payments or write the menu.
+
+**RLS/grants model for the new tables** (`..._domain_rls.sql`):
+- Every domain table has RLS **enabled + FORCED**, keyed to `memberships` via the
+  same `is_tenant_member()` / `has_tenant_role()` / `is_platform_admin()` helpers.
+- **Public menu read**: menu definition tables (categories/items/sizes/groups/
+  modifiers/links), `location_menu_overrides`, and `store_settings` grant
+  `SELECT` to `anon` (storefront renders for unauthenticated visitors). Writes
+  stay owner/manager-only. `tenants`/`locations` get an additive anon `SELECT`
+  policy for slug resolution.
+- **Customer-owns-their-data**: a signed-in customer (`auth.uid() == customers.id`)
+  may read their own customer row + their own orders + those orders' line items,
+  modifiers, payments, and delivery (via `can_read_order()`). They may also
+  insert their own online order. All other order/payment writes are tenant-staff.
+- Everything else (payments writes, inventory, staff/shifts, reports/close,
+  payment_settings, connect, subscriptions, onboarding) is tenant-member /
+  owner-manager scoped; `audit_log` is platform-admin only.
+- Explicit `GRANT`s: `authenticated` gets full DML on every domain table (rows
+  gated by policies); `anon` gets `SELECT` only on the storefront-public surface.
+
 **Go-live dependencies:**
-- [ ] Provision Supabase; apply `supabase/migrations/*` and confirm RLS is ON +
-      FORCED on every table (existing + future orders/payments/etc. tables get
-      the same `memberships`-keyed policies before they hold tenant data).
+- [x] Schema + RLS for orders/payments/menu/inventory/staff/settings/SaaS exist
+      with the same `memberships`-keyed policies (RLS ON + FORCED on all).
+- [ ] Provision Supabase; `npm run db:apply` (or `supabase db push` + seed).
 - [ ] Wire Supabase Auth so `auth.uid() == public.users.id` (the RLS assumption).
 - [ ] Confirm the **service-role key is never** used for tenant-scoped
-      reads/writes without an explicit `tenant_id` filter (server code runs as
-      the `authenticated` role through PostgREST).
+      reads/writes without an explicit `tenant_id` filter — the Supabase driver
+      already filters every tenant-scoped query by `tenant_id`/`location_id`.
 - [ ] Run `run-rls-isolation.sh` against the live DB; expect "RLS isolation test PASSED".
 
 ---
@@ -194,10 +226,12 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 
 ## 10. Go-live checklist (depends on the final live-wiring phase)
 
-- [ ] Provision Supabase; apply migrations; enable + verify **RLS/FORCE** on all
-      tenant tables; run the RLS isolation harness green.
-- [ ] Wire Supabase Auth (`auth.uid() == users.id`); swap `getPosDriver()` to the
-      Supabase driver (single switch in `src/lib/db/client.ts`, no call-site changes).
+- [ ] Provision Supabase; `npm run db:apply` (migrations + seed); enable + verify
+      **RLS/FORCE** on all tenant tables; run the RLS isolation harness green
+      (now covers orders/menu/payments).
+- [ ] Wire Supabase Auth (`auth.uid() == users.id`). Set the Supabase env vars —
+      `getPosDriver()` auto-selects the Supabase driver when they are present
+      (no call-site changes; the mock is the no-env default).
 - [ ] Enable **PITR/backups**; test a restore.
 - [ ] Stripe: live keys + **Connect onboarding per tenant** (KYC); Billing Prices
       per tier; verify webhooks (payments, Connect, Billing) signature-checked.

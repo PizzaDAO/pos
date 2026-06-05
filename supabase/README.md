@@ -1,22 +1,42 @@
-# Supabase — schema, RLS, and how to run (DEFERRED in Phase 0)
+# Supabase — schema, RLS, and how to run
 
-This directory holds the database schema as **migration files** and a sample
-seed. In **Phase 0 there is no live Supabase project** — nothing here is applied
-yet, and the Next.js app builds and runs with **no Supabase env vars set**. These
-files are reviewed now and applied once a Supabase project is provisioned.
+This directory holds the database schema as **migration files** and a full demo
+seed. The Next.js app builds and runs with **no Supabase env vars set** (it falls
+back to the in-memory **mock driver**); these files are applied once a Supabase
+project is provisioned, at which point setting the env vars flips
+`getPosDriver()` to the live **Supabase driver** (`src/lib/db/supabase.ts`) with
+no call-site changes.
 
 ## Layout
 
 ```
 supabase/
   migrations/
-    20260601000000_tenancy_core.sql   # enums + tables (tenants, locations, users, memberships, platform_admins)
-    20260601000100_tenancy_rls.sql    # strict RLS policies + helper functions
+    20260601000000_tenancy_core.sql   # enums + tenancy tables (tenants, locations, users, memberships, platform_admins)
+    20260601000100_tenancy_rls.sql    # strict RLS policies + helper functions for the tenancy core
+    20260605000000_domain_core.sql    # ALL operational tables: menu, orders, payments, customers,
+                                       #   deliveries, inventory, staff/shifts, reports/close, settings,
+                                       #   subscriptions, onboarding, audit_log (+ enums + indexes)
+    20260605000100_domain_rls.sql     # strict RLS + grants for every domain table (public menu read,
+                                       #   customer-owns-their-orders, tenant-staff everything else)
   tests/
-    rls_isolation.sql                 # proves tenant A cannot read/write tenant B
-  seed.sql                            # sample tenant "Tony's Pizza", 2 locations, menu
+    auth_shim.sql                     # auth.uid() shim so the migrations/test run on vanilla Postgres
+    rls_isolation.sql                 # proves isolation on tenancy + orders/menu/payments
+    run-rls-isolation.sh              # one-command harness (shim + migrations + test)
+  apply.sh                            # turnkey: apply ALL migrations + seed to a DATABASE_URL
+  seed.sql                            # full demo tenant "Tony's Pizza" (2 locations, menu, inventory, staff, …)
   README.md                           # this file
 ```
+
+## Driver selection (mock ↔ Supabase)
+
+`getPosDriver()` (`src/lib/db/client.ts`) chooses lazily at call time:
+
+- **Supabase env present** — `NEXT_PUBLIC_SUPABASE_URL` + a key
+  (`SUPABASE_SERVICE_ROLE_KEY` server-side, else `NEXT_PUBLIC_SUPABASE_ANON_KEY`)
+  → the real Supabase driver.
+- **Otherwise** — the in-memory mock driver (the zero-env default; the build +
+  the full Vitest suite pass with no env). Nothing reads env at module load.
 
 ## Tenancy & isolation model
 
@@ -45,28 +65,39 @@ supabase/
 4. Helper functions are `SECURITY DEFINER` with a pinned `search_path` so they
    can read membership tables without recursive policy evaluation.
 
-## How to run (once a live DB exists)
+## Go-live: exact steps (once you have live credentials)
 
-Using the Supabase CLI (recommended):
+1. **Provision** a Supabase project; copy its URL + anon key + service-role key
+   + the Postgres connection string.
+2. **Apply** the schema + RLS + demo seed. Two equivalent paths:
 
-```bash
-# point at your project
-supabase link --project-ref <ref>
+   Turnkey script (plain `psql` against any Postgres/Supabase pooler URL):
 
-# apply all migrations
-supabase db push
+   ```bash
+   DATABASE_URL="postgres://postgres:<pw>@<host>:5432/postgres" npm run db:apply
+   #   = bash supabase/apply.sh  (auto-detects auth.uid(); SKIP_SEED=1 to omit demo data)
+   ```
 
-# load the sample pizzeria (after migrations)
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/seed.sql
-```
+   Or the Supabase CLI (migrations only) + seed:
 
-Or with plain `psql` against any Postgres:
+   ```bash
+   supabase link --project-ref <ref>
+   supabase db push                                   # applies all migrations in order
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/seed.sql
+   ```
 
-```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20260601000000_tenancy_core.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20260601000100_tenancy_rls.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/seed.sql
-```
+3. **Set env** on Vercel (and `.env.local` for local): `NEXT_PUBLIC_SUPABASE_URL`,
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`.
+   Presence of these flips `getPosDriver()` to the Supabase driver automatically.
+4. **Wire Supabase Auth** so `auth.uid() == public.users.id` (the RLS assumption).
+5. **Verify** isolation against the live DB:
+   `SKIP_AUTH_SHIM=1 DATABASE_URL=... bash supabase/tests/run-rls-isolation.sh`
+   → expect `RLS isolation test PASSED`.
+
+> **service-role key is server-only.** The Supabase driver reads it only on the
+> server and EVERY tenant-scoped query carries an explicit `tenant_id`/
+> `location_id` filter, so it never crosses tenants even though it bypasses RLS.
+> Never expose it to the client; keep it in a secret manager.
 
 ## Running the RLS isolation test
 
