@@ -262,7 +262,13 @@ end $$;
 
 -- Clear any impersonation so the anon blocks below run as a TRUE anonymous
 -- visitor (auth.uid() = null), not a leftover authenticated subject.
-select set_config('request.jwt.claims', '', true);
+--
+-- Reset to an EMPTY JSON OBJECT, not an empty string: a SELECT as anon still
+-- triggers the *_write policies' USING (FOR ALL policies apply to SELECT too),
+-- which call is_platform_admin() -> auth.uid() -> (claims)::json. The auth shim
+-- casts the GUC to json before extracting 'sub', and ''::json is INVALID json
+-- (would error), whereas '{}'::json ->> 'sub' is NULL → auth.uid() = NULL.
+select set_config('request.jwt.claims', '{}', true);
 
 -- 12) MENU is intentionally PUBLIC-READABLE (storefront). The `anon` role sees
 --     BOTH tenants' menu items (public reads), but writes stay tenant-scoped.
