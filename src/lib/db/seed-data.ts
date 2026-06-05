@@ -6,6 +6,8 @@
  * UUIDs match the SQL seed so the mock and a future Supabase DB are consistent.
  */
 import type {
+  DayHours,
+  FulfillmentSettings,
   ItemModifierGroup,
   ItemSize,
   MenuCategory,
@@ -333,8 +335,74 @@ export const itemModifierGroups: ItemModifierGroup[] = [
 ];
 
 /**
+ * Mock weekly hours (Phase 4 online-ordering gate). Open Mon–Thu + Sun
+ * 11:00–22:00, Fri–Sat 11:00–23:00. Deterministic so the storefront's
+ * ASAP/scheduled gating behaves the same in every preview instance.
+ */
+function weeklyHours(): DayHours[] {
+  const out: DayHours[] = [];
+  for (let weekday = 0; weekday < 7; weekday += 1) {
+    const lateNight = weekday === 5 || weekday === 6; // Fri/Sat
+    out.push({
+      weekday,
+      open: "11:00",
+      close: lateNight ? "23:00" : "22:00",
+      closed: false,
+    });
+  }
+  return out;
+}
+
+/**
+ * Per-location fulfillment config (Phase 4). Downtown offers pickup + delivery
+ * with two zones; Uptown is pickup-only. The in-house provider is preferred and
+ * DoorDash Drive is offered as a fallback (simulated when unkeyed).
+ */
+const downtownFulfillment: FulfillmentSettings = {
+  pickup_enabled: true,
+  delivery_enabled: true,
+  prep_minutes: 20,
+  scheduling_lead_minutes: 15,
+  scheduling_horizon_days: 5,
+  hours: weeklyHours(),
+  delivery_providers: ["in_house_manual", "doordash_drive"],
+  pickup_address: "123 Main St, Springfield",
+  delivery_zones: [
+    {
+      id: "zone-near",
+      name: "Downtown core",
+      postal_codes: ["10001", "10002", "10003"],
+      fee_cents: 399,
+      eta_minutes: 30,
+      min_subtotal_cents: 0,
+    },
+    {
+      id: "zone-far",
+      name: "Greater Springfield",
+      postal_codes: ["10010", "10011", "10012"],
+      fee_cents: 699,
+      eta_minutes: 45,
+      min_subtotal_cents: 2000,
+    },
+  ],
+};
+
+const uptownFulfillment: FulfillmentSettings = {
+  pickup_enabled: true,
+  delivery_enabled: false,
+  prep_minutes: 25,
+  scheduling_lead_minutes: 15,
+  scheduling_horizon_days: 5,
+  hours: weeklyHours(),
+  delivery_providers: [],
+  pickup_address: "900 North Ave, Springfield",
+  delivery_zones: [],
+};
+
+/**
  * Per-location store settings (mock). Tax 8.25%, USD, a couple tip presets.
- * Phase 1 reads only currency + tax_rate_bps; tipping is Phase 2.
+ * Phase 1 reads only currency + tax_rate_bps; tipping is Phase 2; Phase 4 adds
+ * fulfillment (hours, prep, delivery zones/providers).
  */
 export const storeSettings: StoreSettings[] = [
   {
@@ -344,6 +412,7 @@ export const storeSettings: StoreSettings[] = [
     tax_rate_bps: 825,
     tip_presets_bps: [1500, 1800, 2000],
     kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
+    fulfillment: downtownFulfillment,
   },
   {
     tenant_id: DEMO_TENANT_ID,
@@ -352,6 +421,7 @@ export const storeSettings: StoreSettings[] = [
     tax_rate_bps: 825,
     tip_presets_bps: [1500, 1800, 2000],
     kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
+    fulfillment: uptownFulfillment,
   },
 ];
 

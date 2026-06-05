@@ -13,7 +13,7 @@
  * `paid` is an entry point equivalent to `placed` (paid-at-counter, not yet
  * started), so bumping it begins prep.
  */
-import type { OrderStatus } from "@/lib/db";
+import type { OrderChannel, OrderStatus } from "@/lib/db";
 
 /** Bump order: where each status advances to. */
 const BUMP_NEXT: Partial<Record<OrderStatus, OrderStatus>> = {
@@ -22,14 +22,27 @@ const BUMP_NEXT: Partial<Record<OrderStatus, OrderStatus>> = {
   recall: "in_kitchen",
   in_kitchen: "ready",
   ready: "completed",
+  // Online delivery: a dispatched ticket is bumped to done on hand-off.
+  out_for_delivery: "completed",
 };
 
 /**
  * The status a `bump` moves `current` to, or null if `current` can't be bumped
  * (already completed/void/etc.). Idempotency lives at the DB call site: bumping
  * an already-`completed` order is a no-op.
+ *
+ * For online DELIVERY orders, a `ready` ticket bumps to `out_for_delivery`
+ * (handed to the driver) rather than straight to `completed`, so the kitchen +
+ * customer tracker reflect the delivery leg. The optional `channel` selects this
+ * path; without it, `ready` → `completed` (pickup/in-store).
  */
-export function nextBumpStatus(current: OrderStatus): OrderStatus | null {
+export function nextBumpStatus(
+  current: OrderStatus,
+  channel?: OrderChannel,
+): OrderStatus | null {
+  if (current === "ready" && channel === "online_delivery") {
+    return "out_for_delivery";
+  }
   return BUMP_NEXT[current] ?? null;
 }
 
@@ -40,7 +53,13 @@ export function nextBumpStatus(current: OrderStatus): OrderStatus | null {
  * can't be recalled (nothing to pull back).
  */
 export function recallStatus(current: OrderStatus): OrderStatus | null {
-  if (current === "ready" || current === "completed") return "recall";
+  if (
+    current === "ready" ||
+    current === "completed" ||
+    current === "out_for_delivery"
+  ) {
+    return "recall";
+  }
   return null;
 }
 
@@ -57,6 +76,8 @@ export function statusLabel(status: OrderStatus): string {
       return "Ready";
     case "recall":
       return "Recalled";
+    case "out_for_delivery":
+      return "Out for delivery";
     case "completed":
       return "Done";
     default:

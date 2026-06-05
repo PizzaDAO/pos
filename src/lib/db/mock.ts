@@ -26,9 +26,16 @@ import type {
   Payment,
   PaymentSettings,
 } from "./payment-types";
+import type {
+  Customer,
+  DeliveryRecord,
+  MagicLinkToken,
+} from "./customer-types";
+import type { Location } from "./types";
 import {
   itemModifierGroups,
   itemSizes,
+  locations,
   menuCategories,
   menuItems,
   modifierGroups,
@@ -44,6 +51,12 @@ const orders = new Map<string, Order>();
 const payments = new Map<string, Payment>();
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
+/** Online-ordering customers keyed by id. */
+const customers = new Map<string, Customer>();
+/** Magic-link tokens (stubbed, never emailed) keyed by token. */
+const magicLinks = new Map<string, MagicLinkToken>();
+/** Deliveries keyed by id. */
+const deliveries = new Map<string, DeliveryRecord>();
 let orderSeq = 0;
 
 /**
@@ -117,6 +130,14 @@ function nextOrderNumber(): string {
 export const mockDriver: PosDriver = {
   name: "mock",
 
+  async listLocations(tenantId: string): Promise<Location[]> {
+    return locations.filter((l) => l.tenant_id === tenantId);
+  },
+
+  async getLocationBySlug(slug: string): Promise<Location | null> {
+    return locations.find((l) => l.slug === slug) ?? null;
+  },
+
   async getMenu(tenantId, locationId): Promise<Menu> {
     return assembleMenu(tenantId, locationId);
   },
@@ -155,6 +176,8 @@ export const mockDriver: PosDriver = {
       totals: input.totals,
       notes: input.notes,
       order_number: input.order_number ?? nextOrderNumber(),
+      customer_id: input.customer_id ?? null,
+      fulfillment: input.fulfillment,
       created_at: now,
       updated_at: now,
     };
@@ -270,6 +293,109 @@ export const mockDriver: PosDriver = {
     connectAccounts.set(account.tenant_id, merged);
     return merged;
   },
+
+  // -- Customers (Phase 4) ---------------------------------------------------
+
+  async getCustomerByEmail(
+    tenantId: string,
+    email: string,
+  ): Promise<Customer | null> {
+    const norm = email.trim().toLowerCase();
+    for (const c of customers.values()) {
+      if (c.tenant_id === tenantId && c.email === norm) return c;
+    }
+    return null;
+  },
+
+  async getCustomer(id: string): Promise<Customer | null> {
+    return customers.get(id) ?? null;
+  },
+
+  async upsertCustomer(customer: Customer): Promise<Customer> {
+    const email = customer.email.trim().toLowerCase();
+    // Idempotent on (tenant, email): a new id reuses an existing customer.
+    const existingById = customers.get(customer.id);
+    const existingByEmail = existingById
+      ? null
+      : [...customers.values()].find(
+          (c) => c.tenant_id === customer.tenant_id && c.email === email,
+        );
+    const base = existingById ?? existingByEmail;
+    const now = new Date().toISOString();
+    const merged: Customer = {
+      ...customer,
+      id: base?.id ?? customer.id,
+      email,
+      // Don't downgrade a verified customer back to guest.
+      verified: customer.verified || base?.verified || false,
+      name: customer.name ?? base?.name ?? null,
+      phone: customer.phone ?? base?.phone ?? null,
+      created_at: base?.created_at ?? now,
+      updated_at: now,
+    };
+    customers.set(merged.id, merged);
+    return merged;
+  },
+
+  async createMagicLinkToken(
+    token: MagicLinkToken,
+  ): Promise<MagicLinkToken> {
+    magicLinks.set(token.token, token);
+    return token;
+  },
+
+  async consumeMagicLinkToken(token: string): Promise<Customer | null> {
+    const rec = magicLinks.get(token);
+    if (!rec || rec.consumed) return null;
+    if (new Date(rec.expires_at).getTime() < Date.now()) return null;
+    magicLinks.set(token, { ...rec, consumed: true });
+    const customer = customers.get(rec.customer_id);
+    if (!customer) return null;
+    const verified: Customer = {
+      ...customer,
+      verified: true,
+      updated_at: new Date().toISOString(),
+    };
+    customers.set(verified.id, verified);
+    return verified;
+  },
+
+  // -- Deliveries (Phase 4) --------------------------------------------------
+
+  async upsertDelivery(delivery: DeliveryRecord): Promise<DeliveryRecord> {
+    const existing = deliveries.get(delivery.id);
+    const now = new Date().toISOString();
+    const merged: DeliveryRecord = {
+      ...existing,
+      ...delivery,
+      created_at: existing?.created_at ?? delivery.created_at ?? now,
+      updated_at: now,
+    };
+    deliveries.set(merged.id, merged);
+    return merged;
+  },
+
+  async getDeliveryForOrder(orderId: string): Promise<DeliveryRecord | null> {
+    for (const d of deliveries.values()) {
+      if (d.order_id === orderId) return d;
+    }
+    return null;
+  },
+
+  async getDelivery(id: string): Promise<DeliveryRecord | null> {
+    return deliveries.get(id) ?? null;
+  },
+
+  async listDeliveries(
+    tenantId: string,
+    locationId: string,
+  ): Promise<DeliveryRecord[]> {
+    return [...deliveries.values()]
+      .filter(
+        (d) => d.tenant_id === tenantId && d.location_id === locationId,
+      )
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  },
 };
 
 /** Test helper: clear placed orders + reset the sequence + KDS seed flag. */
@@ -283,4 +409,11 @@ export function resetMockOrders(): void {
 export function resetMockPayments(): void {
   payments.clear();
   connectAccounts.clear();
+}
+
+/** Test helper: clear customers, magic-link tokens, and deliveries. */
+export function resetMockOnline(): void {
+  customers.clear();
+  magicLinks.clear();
+  deliveries.clear();
 }
