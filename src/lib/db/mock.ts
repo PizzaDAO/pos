@@ -63,21 +63,36 @@ import type {
   SizeInput,
   Staff,
 } from "./backoffice-types";
-import type { Location } from "./types";
+import type { Location, PlatformAdmin, Tenant, User } from "./types";
+import type {
+  AuditLogEntry,
+  CreateLocationInput,
+  CreateTenantInput,
+  OnboardingStep,
+  PlanTier,
+  Subscription,
+  TenantHealth,
+  TenantOnboarding,
+} from "./saas-types";
+import { ONBOARDING_STEPS } from "./saas-types";
 import {
   inventoryItems as seedInventoryItems,
   itemInventoryLinks as seedItemInventoryLinks,
-  itemModifierGroups,
+  itemModifierGroups as seedItemModifierGroups,
   itemSizes as seedItemSizes,
-  locations,
+  locations as seedLocations,
   menuCategories as seedMenuCategories,
   menuItems as seedMenuItems,
   modifierGroups as seedModifierGroups,
   modifiers as seedModifiers,
-  paymentSettings,
+  paymentSettings as seedPaymentSettings,
+  platformAdmins as seedPlatformAdmins,
   staff as seedStaff,
-  storeSettings,
+  storeSettings as seedStoreSettings,
+  tenants as seedTenants,
+  users as seedUsers,
 } from "./seed-data";
+import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
 
@@ -91,6 +106,64 @@ const menuItems: MenuItem[] = seedMenuItems.map((i) => ({ ...i }));
 const itemSizes: ItemSize[] = seedItemSizes.map((s) => ({ ...s }));
 const modifierGroups: ModifierGroup[] = seedModifierGroups.map((g) => ({ ...g }));
 const modifiers: Modifier[] = seedModifiers.map((m) => ({ ...m }));
+const itemModifierGroups = seedItemModifierGroups.map((l) => ({ ...l }));
+
+// ---------------------------------------------------------------------------
+// MUTABLE tenancy + SaaS state (Phase 6). Cloned from the seed so self-serve
+// signup can append brand-new, isolated tenants (own locations, settings, menu)
+// without touching the immutable seed module. Store/payment settings move to
+// arrays so a new tenant/location gets its own row.
+// ---------------------------------------------------------------------------
+const tenants: Tenant[] = seedTenants.map((t) => ({ ...t }));
+const locations: Location[] = seedLocations.map((l) => ({ ...l }));
+const storeSettings = seedStoreSettings.map((s) => ({ ...s }));
+const paymentSettings = seedPaymentSettings.map((s) => ({ ...s }));
+const usersById = new Map<string, User>(seedUsers.map((u) => [u.id, { ...u }]));
+const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({ ...a }));
+/** Subscriptions keyed by tenant id (one per tenant). */
+const subscriptions = new Map<string, Subscription>();
+/** Onboarding state keyed by tenant id. */
+const onboardingState = new Map<string, TenantOnboarding>();
+/** Append-only audit log (impersonation + sensitive platform actions). */
+const auditLog: AuditLogEntry[] = [];
+
+// Seed the demo tenant as already onboarded + on the Pro plan, so /platform
+// shows a healthy live tenant alongside any newly self-served tenant. The demo
+// tenant runs 2 locations + online ordering, which requires Pro.
+(() => {
+  const demoTenant = seedTenants[0];
+  if (!demoTenant) return;
+  const now = "2025-01-01T00:00:00.000Z";
+  onboardingState.set(demoTenant.id, {
+    tenant_id: demoTenant.id,
+    current_step: "go_live",
+    completed_steps: [
+      "business",
+      "location",
+      "connect",
+      "menu",
+      "plan",
+      "go_live",
+    ],
+    live: true,
+    created_at: now,
+    updated_at: now,
+  });
+  subscriptions.set(demoTenant.id, {
+    id: `sub_sim_${demoTenant.id.replace(/-/g, "").slice(0, 16)}`,
+    tenant_id: demoTenant.id,
+    tier: "pro",
+    status: "active",
+    current_period_end: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    trial_end: null,
+    cancel_at_period_end: false,
+    simulated: true,
+    stripe_customer_id: `cus_sim_${demoTenant.id.replace(/-/g, "").slice(0, 16)}`,
+    stripe_subscription_id: `sub_stripe_sim_${demoTenant.id.replace(/-/g, "").slice(0, 16)}`,
+    created_at: now,
+    updated_at: now,
+  });
+})();
 
 /** Per-location overrides keyed `${location}:${type}:${target}`. */
 const overrides = new Map<string, LocationMenuOverride>();
@@ -134,6 +207,21 @@ function nowIso(): string {
 function genId(prefix: string): string {
   idSeq += 1;
   return `${prefix}-${Date.now().toString(36)}-${idSeq}`;
+}
+
+/** Slugify a name into a URL-safe slug, made unique against `existing`. */
+function uniqueSlug(name: string, existing: Set<string>): string {
+  const base =
+    name
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "tenant";
+  if (!existing.has(base)) return base;
+  let n = 2;
+  while (existing.has(`${base}-${n}`)) n += 1;
+  return `${base}-${n}`;
 }
 
 /** In-place remove of every element matching `pred` (mutates `arr`). */
@@ -390,6 +478,300 @@ function computeReconciliation(shift: Shift): DrawerReconciliation {
 
 export const mockDriver: PosDriver = {
   name: "mock",
+
+  // -- Tenancy + self-serve SaaS (Phase 6) -----------------------------------
+
+  async listTenants(): Promise<Tenant[]> {
+    return tenants
+      .slice()
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .map((t) => ({ ...t }));
+  },
+
+  async getTenant(tenantId: string): Promise<Tenant | null> {
+    return tenants.find((t) => t.id === tenantId) ?? null;
+  },
+
+  async createTenant(
+    input: CreateTenantInput,
+  ): Promise<{ tenant: Tenant; owner: User }> {
+    const now = nowIso();
+    const slug = uniqueSlug(
+      input.businessName,
+      new Set(tenants.map((t) => t.slug)),
+    );
+    const tenant: Tenant = {
+      id: genId("tenant"),
+      name: input.businessName.trim(),
+      slug,
+      // New tenants start suspended (pre-go-live); goLive() flips to active.
+      status: "suspended",
+      created_at: now,
+    };
+    tenants.push(tenant);
+
+    // Model the owner as a User + an owner Membership (so Phase 7/Supabase can
+    // make auth real). Reuse an existing user row if the email already exists.
+    const email = input.ownerEmail.trim().toLowerCase();
+    let owner = [...usersById.values()].find((u) => u.email === email);
+    if (!owner) {
+      owner = { id: genId("user"), email, created_at: now };
+      usersById.set(owner.id, owner);
+    }
+
+    // Initialise onboarding at the first step.
+    onboardingState.set(tenant.id, {
+      tenant_id: tenant.id,
+      current_step: "location",
+      completed_steps: ["business"],
+      live: false,
+      created_at: now,
+      updated_at: now,
+    });
+
+    return { tenant: { ...tenant }, owner: { ...owner } };
+  },
+
+  async setTenantStatus(
+    tenantId: string,
+    status: Tenant["status"],
+  ): Promise<Tenant | null> {
+    const t = tenants.find((x) => x.id === tenantId);
+    if (!t) return null;
+    t.status = status;
+    return { ...t };
+  },
+
+  async createLocation(input: CreateLocationInput): Promise<Location> {
+    const now = nowIso();
+    const slug = uniqueSlug(
+      input.name,
+      new Set(locations.map((l) => l.slug)),
+    );
+    const location: Location = {
+      id: genId("loc"),
+      tenant_id: input.tenant_id,
+      name: input.name.trim(),
+      slug,
+      timezone: input.timezone ?? "America/New_York",
+      address: input.address ?? null,
+      created_at: now,
+    };
+    locations.push(location);
+
+    // Give the new location its own store + payment settings (sensible defaults
+    // mirroring the demo) so terminal/shop/checkout work immediately.
+    storeSettings.push({
+      tenant_id: input.tenant_id,
+      location_id: location.id,
+      currency: "USD",
+      tax_rate_bps: 825,
+      tip_presets_bps: [1500, 1800, 2000],
+      kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
+      fulfillment: {
+        pickup_enabled: true,
+        delivery_enabled: false,
+        prep_minutes: 20,
+        scheduling_lead_minutes: 15,
+        scheduling_horizon_days: 5,
+        hours: Array.from({ length: 7 }, (_, weekday) => ({
+          weekday,
+          open: "11:00",
+          close: "22:00",
+          closed: false,
+        })),
+        delivery_providers: ["in_house_manual"],
+        pickup_address: input.address ?? undefined,
+        delivery_zones: [],
+      },
+    });
+    paymentSettings.push({
+      tenant_id: input.tenant_id,
+      location_id: location.id,
+      currency: "USD",
+      platform_fee_bps: 250,
+      platform_fee_flat_cents: 10,
+      tip_presets_bps: [1500, 1800, 2000],
+    });
+
+    return { ...location };
+  },
+
+  async importStarterMenu(tenantId: string): Promise<void> {
+    // Idempotent-ish: skip if this tenant already has categories.
+    if (menuCategories.some((c) => c.tenant_id === tenantId)) return;
+    const tpl = buildStarterMenu(tenantId);
+    menuCategories.push(...tpl.categories);
+    menuItems.push(...tpl.items);
+    itemSizes.push(...tpl.sizes);
+    modifierGroups.push(...tpl.modifierGroups);
+    modifiers.push(...tpl.modifiers);
+    itemModifierGroups.push(...tpl.itemModifierGroups);
+  },
+
+  // -- Onboarding state ------------------------------------------------------
+
+  async getOnboarding(tenantId: string): Promise<TenantOnboarding | null> {
+    return onboardingState.get(tenantId) ?? null;
+  },
+
+  async completeOnboardingStep(
+    tenantId: string,
+    step: OnboardingStep,
+  ): Promise<TenantOnboarding> {
+    const now = nowIso();
+    const existing =
+      onboardingState.get(tenantId) ??
+      ({
+        tenant_id: tenantId,
+        current_step: "business",
+        completed_steps: [],
+        live: false,
+        created_at: now,
+        updated_at: now,
+      } satisfies TenantOnboarding);
+    const completed = existing.completed_steps.includes(step)
+      ? existing.completed_steps
+      : [...existing.completed_steps, step];
+    // current_step = the next not-yet-complete step in canonical order.
+    const next =
+      ONBOARDING_STEPS.find((s) => !completed.includes(s)) ?? "go_live";
+    const updated: TenantOnboarding = {
+      ...existing,
+      completed_steps: completed,
+      current_step: next,
+      updated_at: now,
+    };
+    onboardingState.set(tenantId, updated);
+    return { ...updated };
+  },
+
+  async goLive(tenantId: string): Promise<TenantOnboarding> {
+    const now = nowIso();
+    const ob = await this.completeOnboardingStep(tenantId, "go_live");
+    const updated: TenantOnboarding = { ...ob, live: true, updated_at: now };
+    onboardingState.set(tenantId, updated);
+    // Activate the tenant on go-live.
+    const t = tenants.find((x) => x.id === tenantId);
+    if (t) t.status = "active";
+    return { ...updated };
+  },
+
+  // -- Subscriptions ---------------------------------------------------------
+
+  async getSubscription(tenantId: string): Promise<Subscription | null> {
+    return subscriptions.get(tenantId) ?? null;
+  },
+
+  async upsertSubscription(sub: Subscription): Promise<Subscription> {
+    const existing = subscriptions.get(sub.tenant_id);
+    const merged: Subscription = {
+      ...sub,
+      created_at: existing?.created_at ?? sub.created_at ?? nowIso(),
+      updated_at: nowIso(),
+    };
+    subscriptions.set(sub.tenant_id, merged);
+    return { ...merged };
+  },
+
+  async advanceSubscriptionStatus(
+    tenantId: string,
+    status: Subscription["status"],
+  ): Promise<Subscription | null> {
+    const sub = subscriptions.get(tenantId);
+    if (!sub) return null;
+    const updated: Subscription = {
+      ...sub,
+      status,
+      // Leaving dunning / converting from trial extends the period.
+      current_period_end:
+        status === "active"
+          ? new Date(Date.now() + 30 * 86_400_000).toISOString()
+          : sub.current_period_end,
+      trial_end: status === "active" ? null : sub.trial_end,
+      updated_at: nowIso(),
+    };
+    subscriptions.set(tenantId, updated);
+    return { ...updated };
+  },
+
+  async changeSubscriptionTier(
+    tenantId: string,
+    tier: PlanTier,
+  ): Promise<Subscription | null> {
+    const sub = subscriptions.get(tenantId);
+    if (!sub) return null;
+    const updated: Subscription = { ...sub, tier, updated_at: nowIso() };
+    subscriptions.set(tenantId, updated);
+    return { ...updated };
+  },
+
+  // -- Platform admin + health -----------------------------------------------
+
+  async isPlatformAdmin(userId: string): Promise<boolean> {
+    return platformAdmins.some((a) => a.user_id === userId);
+  },
+
+  async listPlatformAdmins(): Promise<PlatformAdmin[]> {
+    return platformAdmins.map((a) => ({ ...a }));
+  },
+
+  async getUser(userId: string): Promise<User | null> {
+    return usersById.get(userId) ?? null;
+  },
+
+  async listTenantHealth(): Promise<TenantHealth[]> {
+    ensureKitchenSeed();
+    const since = Date.now() - 30 * 86_400_000; // trailing 30 days
+    const out: TenantHealth[] = [];
+    for (const t of tenants) {
+      const locs = locations.filter((l) => l.tenant_id === t.id);
+      const recent = [...orders.values()].filter(
+        (o) =>
+          o.tenant_id === t.id &&
+          o.status !== "voided" &&
+          new Date(o.created_at).getTime() >= since,
+      );
+      const connect = connectAccounts.get(t.id);
+      out.push({
+        tenant_id: t.id,
+        name: t.name,
+        slug: t.slug,
+        status: t.status,
+        location_count: locs.length,
+        recent_order_count: recent.length,
+        recent_gross_cents: recent.reduce(
+          (sum, o) => sum + o.totals.total_cents,
+          0,
+        ),
+        subscription: subscriptions.get(t.id) ?? null,
+        onboarding: onboardingState.get(t.id) ?? null,
+        connected: connect?.status === "connected",
+      });
+    }
+    return out;
+  },
+
+  // -- Audit log -------------------------------------------------------------
+
+  async appendAuditLog(
+    entry: Omit<AuditLogEntry, "id" | "created_at">,
+  ): Promise<AuditLogEntry> {
+    const created: AuditLogEntry = {
+      ...entry,
+      id: genId("audit"),
+      created_at: nowIso(),
+    };
+    auditLog.push(created);
+    return { ...created };
+  },
+
+  async listAuditLog(tenantId?: string): Promise<AuditLogEntry[]> {
+    return auditLog
+      .filter((e) => !tenantId || e.tenant_id === tenantId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .map((e) => ({ ...e }));
+  },
 
   async listLocations(tenantId: string): Promise<Location[]> {
     return locations.filter((l) => l.tenant_id === tenantId);

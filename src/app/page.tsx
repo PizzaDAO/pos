@@ -23,6 +23,11 @@ const surfaces = [
     title: "Platform",
     desc: "Super-admin: tenants, billing, support.",
   },
+  {
+    href: "/signup",
+    title: "Sign up",
+    desc: "Self-serve onboarding: create a new pizzeria.",
+  },
 ];
 
 export default function HomePage() {
@@ -55,8 +60,11 @@ export default function HomePage() {
         ))}
       </section>
 
-      <div>
+      <div className="flex flex-wrap gap-3">
         <Button asChild>
+          <Link href="/signup">Start your pizzeria</Link>
+        </Button>
+        <Button asChild variant="outline">
           <Link href="/platform">Open platform admin</Link>
         </Button>
       </div>

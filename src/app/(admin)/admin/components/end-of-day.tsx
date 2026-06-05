@@ -15,11 +15,12 @@ import type { BusinessDayClose, SalesReport } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 import { railFamily } from "@/lib/reports";
-import { LOCATIONS } from "./admin-shell";
 
 interface Props {
   tenantId: string;
   locationId: string;
+  /** Display name for the active location (Phase 6 — locations are dynamic). */
+  locationName?: string;
 }
 
 function todayIso(): string {
@@ -32,7 +33,7 @@ interface EodData {
   report?: SalesReport;
 }
 
-export function EndOfDay({ tenantId, locationId }: Props) {
+export function EndOfDay({ tenantId, locationId, locationName: locName }: Props) {
   const [date, setDate] = useState(todayIso());
   const [data, setData] = useState<EodData | null>(null);
   const [busy, setBusy] = useState(false);
@@ -66,8 +67,7 @@ export function EndOfDay({ tenantId, locationId }: Props) {
   const report = data?.close?.report ?? data?.report ?? null;
   const drawer = data?.close?.drawer ?? null;
   const closed = data?.closed ?? false;
-  const locationName =
-    LOCATIONS.find((l) => l.id === locationId)?.name ?? locationId;
+  const locationName = locName ?? locationId;
 
   const family = { cash: 0, card: 0, crypto: 0 };
   for (const s of report?.paymentMix ?? []) {

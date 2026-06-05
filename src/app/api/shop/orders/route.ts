@@ -31,6 +31,10 @@ import {
 } from "@/lib/shop/scheduling";
 import { quoteDelivery, dispatchDelivery } from "@/lib/delivery/service";
 import { DeliveryUnavailableError } from "@/lib/delivery";
+import {
+  canUseOnlineOrdering,
+  resolveEntitlements,
+} from "@/lib/saas/entitlements";
 
 export const runtime = "nodejs";
 
@@ -91,6 +95,19 @@ export async function POST(request: Request) {
   }
   const tenantId = location.tenant_id;
   const locationId = location.id;
+
+  // ---- Plan gate: online ordering requires the Pro plan or higher. ----------
+  // The tenant's subscription tier gates customer online ordering (Phase 6). A
+  // Starter-plan tenant's storefront cannot accept online orders; the server is
+  // authoritative here even though the storefront also reflects it.
+  const subscription = await driver.getSubscription(tenantId);
+  const onlineGate = canUseOnlineOrdering(resolveEntitlements(subscription));
+  if (!onlineGate.allowed) {
+    return NextResponse.json(
+      { error: onlineGate.reason, code: "plan_limit" },
+      { status: 402 },
+    );
+  }
 
   const settings = await driver.getStoreSettings(tenantId, locationId);
   const fulfillment = settings.fulfillment;
