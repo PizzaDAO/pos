@@ -40,11 +40,7 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type {
-  ConnectAccount,
-  Payment,
-  PaymentSettings,
-} from "./payment-types";
+import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
   BusinessDayClose,
@@ -273,7 +269,9 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
     active: r.active as boolean,
     // pin_hash is only carried for server-side PIN verification (getStaffById);
     // list/upsert results omit it so it never reaches the client.
-    pin_hash: opts?.includePin ? ((r.pin_hash as string | null) ?? null) : undefined,
+    pin_hash: opts?.includePin
+      ? ((r.pin_hash as string | null) ?? null)
+      : undefined,
     created_at: r.created_at as string,
   };
 }
@@ -401,15 +399,16 @@ function mapConnect(r: Row): ConnectAccount {
 // Driver factory.
 // ---------------------------------------------------------------------------
 
-export function createSupabaseDriver(
-  config: SupabaseDriverConfig,
-): PosDriver {
+export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
   const sb: SupabaseClient = createClient(config.url, config.key, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
   /** Throw on a Supabase error; return data otherwise. */
-  function unwrap<T>(res: { data: T | null; error: { message: string } | null }): T {
+  function unwrap<T>(res: {
+    data: T | null;
+    error: { message: string } | null;
+  }): T {
     if (res.error) throw new Error(`Supabase: ${res.error.message}`);
     return res.data as T;
   }
@@ -418,6 +417,7 @@ export function createSupabaseDriver(
   async function assembleMenu(
     tenantId: string,
     locationId: string,
+    includeUnavailable = false,
   ): Promise<Menu> {
     const [cats, items, sizes, groups, mods, links, overrides] =
       await Promise.all([
@@ -496,10 +496,12 @@ export function createSupabaseDriver(
           };
           const groupMods: Modifier[] = modRows
             .filter((m) => m.group_id === group.id)
-            .filter((m) => ov("modifier", m.id as string)?.available !== false)
-            .sort(
-              (a, b) => (a.sort_order as number) - (b.sort_order as number),
+            .filter(
+              (m) =>
+                includeUnavailable ||
+                ov("modifier", m.id as string)?.available !== false,
             )
+            .sort((a, b) => (a.sort_order as number) - (b.sort_order as number))
             .map((m) => {
               const o = ov("modifier", m.id as string);
               return {
@@ -523,7 +525,11 @@ export function createSupabaseDriver(
     const categories: MenuCategoryWithItems[] = categoryRows.map((c) => {
       const catItems = itemRows
         .filter((i) => i.category_id === c.id)
-        .filter((i) => ov("item", i.id as string)?.available !== false)
+        .filter(
+          (i) =>
+            includeUnavailable ||
+            ov("item", i.id as string)?.available !== false,
+        )
         .map(buildItemDetail);
       return {
         id: c.id as string,
@@ -712,12 +718,14 @@ export function createSupabaseDriver(
   }
 
   async function depleteForOrder(order: Order): Promise<void> {
-    const links = (unwrap(
-      await sb
-        .from("item_inventory_links")
-        .select("*")
-        .eq("tenant_id", order.tenant_id),
-    ) as Row[]).map(
+    const links = (
+      unwrap(
+        await sb
+          .from("item_inventory_links")
+          .select("*")
+          .eq("tenant_id", order.tenant_id),
+      ) as Row[]
+    ).map(
       (r): ItemInventoryLink => ({
         id: r.id as string,
         tenant_id: r.tenant_id as string,
@@ -784,8 +792,7 @@ export function createSupabaseDriver(
       else if (e.type === "paid_in") paidIn += e.amount_cents;
       else payouts += Math.abs(e.amount_cents);
     }
-    const expected =
-      shift.opening_float_cents + cashSales + paidIn - payouts;
+    const expected = shift.opening_float_cents + cashSales + paidIn - payouts;
     const counted = shift.counted_cents;
     return {
       opening_float_cents: shift.opening_float_cents,
@@ -819,9 +826,11 @@ export function createSupabaseDriver(
 
     // -- Tenancy + self-serve SaaS -----------------------------------------
     async listTenants() {
-      return (unwrap(
-        await sb.from("tenants").select("*").order("created_at"),
-      ) as Row[]).map(mapTenant);
+      return (
+        unwrap(
+          await sb.from("tenants").select("*").order("created_at"),
+        ) as Row[]
+      ).map(mapTenant);
     },
 
     async getTenant(tenantId) {
@@ -921,9 +930,9 @@ export function createSupabaseDriver(
     async createLocation(input) {
       const now = nowIso();
       const existingSlugs = new Set(
-        ((unwrap(await sb.from("locations").select("slug")) as Row[]) ?? []).map(
-          (r) => r.slug as string,
-        ),
+        (
+          (unwrap(await sb.from("locations").select("slug")) as Row[]) ?? []
+        ).map((r) => r.slug as string),
       );
       let slug = slugify(input.name);
       if (existingSlugs.has(slug)) {
@@ -1030,15 +1039,14 @@ export function createSupabaseDriver(
     async completeOnboardingStep(tenantId, step) {
       const now = nowIso();
       const existing = await this.getOnboarding(tenantId);
-      const base: TenantOnboarding =
-        existing ?? {
-          tenant_id: tenantId,
-          current_step: "business",
-          completed_steps: [],
-          live: false,
-          created_at: now,
-          updated_at: now,
-        };
+      const base: TenantOnboarding = existing ?? {
+        tenant_id: tenantId,
+        current_step: "business",
+        completed_steps: [],
+        live: false,
+        created_at: now,
+        updated_at: now,
+      };
       const completed = base.completed_steps.includes(step)
         ? base.completed_steps
         : [...base.completed_steps, step];
@@ -1162,9 +1170,9 @@ export function createSupabaseDriver(
     },
 
     async listPlatformAdmins() {
-      return (unwrap(
-        await sb.from("platform_admins").select("*"),
-      ) as Row[]).map((r) => ({
+      return (
+        unwrap(await sb.from("platform_admins").select("*")) as Row[]
+      ).map((r) => ({
         user_id: r.user_id as string,
         created_at: r.created_at as string,
       }));
@@ -1264,9 +1272,11 @@ export function createSupabaseDriver(
 
     // -- Locations + menu read ---------------------------------------------
     async listLocations(tenantId) {
-      return (unwrap(
-        await sb.from("locations").select("*").eq("tenant_id", tenantId),
-      ) as Row[]).map(mapLocation);
+      return (
+        unwrap(
+          await sb.from("locations").select("*").eq("tenant_id", tenantId),
+        ) as Row[]
+      ).map(mapLocation);
     },
 
     async getLocationBySlug(slug) {
@@ -1276,8 +1286,8 @@ export function createSupabaseDriver(
       return r ? mapLocation(r) : null;
     },
 
-    async getMenu(tenantId, locationId) {
-      return assembleMenu(tenantId, locationId);
+    async getMenu(tenantId, locationId, opts) {
+      return assembleMenu(tenantId, locationId, opts?.includeUnavailable);
     },
 
     async getStoreSettings(tenantId, locationId) {
@@ -1438,13 +1448,15 @@ export function createSupabaseDriver(
     },
 
     async listPaymentsForOrder(orderId) {
-      return (unwrap(
-        await sb
-          .from("payments")
-          .select("*")
-          .eq("order_id", orderId)
-          .order("created_at"),
-      ) as Row[]).map(mapPayment);
+      return (
+        unwrap(
+          await sb
+            .from("payments")
+            .select("*")
+            .eq("order_id", orderId)
+            .order("created_at"),
+        ) as Row[]
+      ).map(mapPayment);
     },
 
     // -- Stripe Connect ----------------------------------------------------
@@ -1507,15 +1519,19 @@ export function createSupabaseDriver(
       ) as Row | null;
       const byEmail = byId
         ? null
-        : ((unwrap(
+        : (unwrap(
             await sb
               .from("customers")
               .select("*")
               .eq("tenant_id", customer.tenant_id)
               .eq("email", email)
               .maybeSingle(),
-          ) as Row | null));
-      const base = byId ? mapCustomer(byId) : byEmail ? mapCustomer(byEmail) : null;
+          ) as Row | null);
+      const base = byId
+        ? mapCustomer(byId)
+        : byEmail
+          ? mapCustomer(byEmail)
+          : null;
       const now = nowIso();
       const merged: Customer = {
         ...customer,
@@ -1621,25 +1637,29 @@ export function createSupabaseDriver(
     },
 
     async listDeliveries(tenantId, locationId) {
-      return (unwrap(
-        await sb
-          .from("deliveries")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId)
-          .order("created_at", { ascending: false }),
-      ) as Row[]).map(mapDelivery);
+      return (
+        unwrap(
+          await sb
+            .from("deliveries")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at", { ascending: false }),
+        ) as Row[]
+      ).map(mapDelivery);
     },
 
     // -- Menu management ---------------------------------------------------
     async listCategories(tenantId) {
-      return (unwrap(
-        await sb
-          .from("menu_categories")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .order("sort_order"),
-      ) as Row[]).map((r) => ({
+      return (
+        unwrap(
+          await sb
+            .from("menu_categories")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .order("sort_order"),
+        ) as Row[]
+      ).map((r) => ({
         id: r.id as string,
         tenant_id: r.tenant_id as string,
         name: r.name as string,
@@ -1676,12 +1696,14 @@ export function createSupabaseDriver(
           };
         }
       }
-      const count = (unwrap(
-        await sb
-          .from("menu_categories")
-          .select("id")
-          .eq("tenant_id", input.tenant_id),
-      ) as Row[]).length;
+      const count = (
+        unwrap(
+          await sb
+            .from("menu_categories")
+            .select("id")
+            .eq("tenant_id", input.tenant_id),
+        ) as Row[]
+      ).length;
       const r = unwrap(
         await sb
           .from("menu_categories")
@@ -1723,7 +1745,8 @@ export function createSupabaseDriver(
               .update({
                 category_id: input.category_id,
                 name: input.name,
-                description: input.description ?? (cur.description as string | null),
+                description:
+                  input.description ?? (cur.description as string | null),
                 is_half_and_half_capable:
                   input.is_half_and_half_capable ??
                   (cur.is_half_and_half_capable as boolean),
@@ -1805,9 +1828,11 @@ export function createSupabaseDriver(
           };
         }
       }
-      const count = (unwrap(
-        await sb.from("item_sizes").select("id").eq("item_id", input.item_id),
-      ) as Row[]).length;
+      const count = (
+        unwrap(
+          await sb.from("item_sizes").select("id").eq("item_id", input.item_id),
+        ) as Row[]
+      ).length;
       const r = unwrap(
         await sb
           .from("item_sizes")
@@ -1835,12 +1860,14 @@ export function createSupabaseDriver(
     },
 
     async listModifierGroups(tenantId) {
-      return (unwrap(
-        await sb
-          .from("modifier_groups")
-          .select("*")
-          .eq("tenant_id", tenantId),
-      ) as Row[]).map((r) => ({
+      return (
+        unwrap(
+          await sb
+            .from("modifier_groups")
+            .select("*")
+            .eq("tenant_id", tenantId),
+        ) as Row[]
+      ).map((r) => ({
         id: r.id as string,
         tenant_id: r.tenant_id as string,
         name: r.name as string,
@@ -1943,9 +1970,14 @@ export function createSupabaseDriver(
           };
         }
       }
-      const count = (unwrap(
-        await sb.from("modifiers").select("id").eq("group_id", input.group_id),
-      ) as Row[]).length;
+      const count = (
+        unwrap(
+          await sb
+            .from("modifiers")
+            .select("id")
+            .eq("group_id", input.group_id),
+        ) as Row[]
+      ).length;
       const r = unwrap(
         await sb
           .from("modifiers")
@@ -1974,13 +2006,15 @@ export function createSupabaseDriver(
 
     // -- Per-location overrides --------------------------------------------
     async listOverrides(tenantId, locationId) {
-      return (unwrap(
-        await sb
-          .from("location_menu_overrides")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId),
-      ) as Row[]).map(mapOverride);
+      return (
+        unwrap(
+          await sb
+            .from("location_menu_overrides")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId),
+        ) as Row[]
+      ).map(mapOverride);
     },
 
     async upsertOverride(input: OverrideInput) {
@@ -2049,14 +2083,16 @@ export function createSupabaseDriver(
 
     // -- Inventory ---------------------------------------------------------
     async listInventory(tenantId, locationId) {
-      return (unwrap(
-        await sb
-          .from("inventory_items")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId)
-          .order("name"),
-      ) as Row[])
+      return (
+        unwrap(
+          await sb
+            .from("inventory_items")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("name"),
+        ) as Row[]
+      )
         .map(mapInventoryItem)
         .map(
           (i): InventoryItemView => ({
@@ -2068,13 +2104,13 @@ export function createSupabaseDriver(
 
     async upsertInventoryItem(item) {
       const existing = item.id
-        ? ((unwrap(
+        ? (unwrap(
             await sb
               .from("inventory_items")
               .select("created_at")
               .eq("id", item.id)
               .maybeSingle(),
-          ) as Row | null))
+          ) as Row | null)
         : null;
       const now = nowIso();
       return mapInventoryItem(
@@ -2103,14 +2139,16 @@ export function createSupabaseDriver(
     },
 
     async listInventoryMovements(tenantId, locationId) {
-      return (unwrap(
-        await sb
-          .from("inventory_movements")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId)
-          .order("created_at", { ascending: false }),
-      ) as Row[]).map(mapInventoryMovement);
+      return (
+        unwrap(
+          await sb
+            .from("inventory_movements")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at", { ascending: false }),
+        ) as Row[]
+      ).map(mapInventoryMovement);
     },
 
     // -- Reports + end-of-day ----------------------------------------------
@@ -2123,9 +2161,11 @@ export function createSupabaseDriver(
       const scopedPayments =
         orderIds.length === 0
           ? []
-          : (unwrap(
-              await sb.from("payments").select("*").in("order_id", orderIds),
-            ) as Row[]).map(mapPayment);
+          : (
+              unwrap(
+                await sb.from("payments").select("*").in("order_id", orderIds),
+              ) as Row[]
+            ).map(mapPayment);
 
       // Resolve category + location labels (tenant-scoped reads).
       const itemRows = unwrap(
@@ -2141,10 +2181,7 @@ export function createSupabaseDriver(
           .eq("tenant_id", tenantId),
       ) as Row[];
       const locRows = unwrap(
-        await sb
-          .from("locations")
-          .select("id,name")
-          .eq("tenant_id", tenantId),
+        await sb.from("locations").select("id,name").eq("tenant_id", tenantId),
       ) as Row[];
       const catNameById = new Map(
         catRows.map((c) => [c.id as string, c.name as string]),
@@ -2215,16 +2252,20 @@ export function createSupabaseDriver(
       ) as Row[];
       const dayShifts = shiftRows
         .map(mapShift)
-        .filter((s) => s.closed_at != null && isoDate(s.closed_at) === businessDate);
+        .filter(
+          (s) => s.closed_at != null && isoDate(s.closed_at) === businessDate,
+        );
 
       let openingFloat = 0;
       let cashSales = 0;
       let expected = 0;
       let counted = 0;
       for (const s of dayShifts) {
-        const events = (unwrap(
-          await sb.from("shift_cash_events").select("*").eq("shift_id", s.id),
-        ) as Row[]).map(
+        const events = (
+          unwrap(
+            await sb.from("shift_cash_events").select("*").eq("shift_id", s.id),
+          ) as Row[]
+        ).map(
           (e): ShiftCashEvent => ({
             id: e.id as string,
             shift_id: e.shift_id as string,
@@ -2281,13 +2322,15 @@ export function createSupabaseDriver(
     // -- Staff & shifts ----------------------------------------------------
     async listStaff(tenantId) {
       // pin_hash omitted (default) so it never reaches the client.
-      return (unwrap(
-        await sb
-          .from("staff")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .order("name"),
-      ) as Row[]).map((r) => mapStaff(r));
+      return (
+        unwrap(
+          await sb
+            .from("staff")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .order("name"),
+        ) as Row[]
+      ).map((r) => mapStaff(r));
     },
 
     async getStaffById(tenantId, staffId) {
@@ -2305,13 +2348,13 @@ export function createSupabaseDriver(
 
     async upsertStaff(staff) {
       const existing = staff.id
-        ? ((unwrap(
+        ? (unwrap(
             await sb
               .from("staff")
               .select("created_at")
               .eq("id", staff.id)
               .maybeSingle(),
-          ) as Row | null))
+          ) as Row | null)
         : null;
       // Only write pin_hash when the caller explicitly set it (not undefined),
       // so an unrelated update can't accidentally wipe a staff member's PIN.
@@ -2329,14 +2372,16 @@ export function createSupabaseDriver(
     },
 
     async listShifts(tenantId, locationId) {
-      return (unwrap(
-        await sb
-          .from("shifts")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId)
-          .order("opened_at", { ascending: false }),
-      ) as Row[]).map(mapShift);
+      return (
+        unwrap(
+          await sb
+            .from("shifts")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("opened_at", { ascending: false }),
+        ) as Row[]
+      ).map(mapShift);
     },
 
     async getOpenShift(tenantId, locationId, staffId) {
@@ -2410,13 +2455,15 @@ export function createSupabaseDriver(
     },
 
     async listShiftCashEvents(shiftId) {
-      return (unwrap(
-        await sb
-          .from("shift_cash_events")
-          .select("*")
-          .eq("shift_id", shiftId)
-          .order("created_at"),
-      ) as Row[]).map((e) => ({
+      return (
+        unwrap(
+          await sb
+            .from("shift_cash_events")
+            .select("*")
+            .eq("shift_id", shiftId)
+            .order("created_at"),
+        ) as Row[]
+      ).map((e) => ({
         id: e.id as string,
         shift_id: e.shift_id as string,
         tenant_id: e.tenant_id as string,
