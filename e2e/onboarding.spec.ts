@@ -48,9 +48,15 @@ test("signup wizard creates a tenant and goes live", async ({ page }) => {
     timeout: 30_000,
   });
   await page.getByRole("button", { name: /Connect Stripe/ }).click();
-  await page
-    .getByRole("button", { name: /Continue/ })
-    .click({ timeout: 30_000 });
+  // Simulated Connect completes instantly and the CTA flips to "Continue". Wait
+  // for that flip (the POST /api/connect round-trip) before advancing — clicking
+  // too early (while it's still "Connect Stripe") leaves the wizard on this step.
+  const connectContinue = page.getByRole("button", {
+    name: "Continue",
+    exact: true,
+  });
+  await expect(connectContinue).toBeVisible({ timeout: 30_000 });
+  await connectContinue.click();
 
   // STEP 4 — Menu
   await expect(
