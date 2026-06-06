@@ -16,6 +16,8 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { getCurrentUser } from "@/lib/auth/session";
+import { recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -23,7 +25,10 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const tenantId = searchParams.get("tenantId");
   if (!tenantId) {
-    return NextResponse.json({ error: "tenantId is required." }, { status: 400 });
+    return NextResponse.json(
+      { error: "tenantId is required." },
+      { status: 400 },
+    );
   }
   const driver = getPosDriver();
   const [tenant, onboarding, locations, subscription, connect] =
@@ -81,7 +86,10 @@ export async function POST(request: Request) {
           ownerEmail,
         });
         const onboarding = await driver.getOnboarding(tenant.id);
-        return NextResponse.json({ tenant, owner, onboarding }, { status: 201 });
+        return NextResponse.json(
+          { tenant, owner, onboarding },
+          { status: 201 },
+        );
       }
 
       case "add_location": {
@@ -128,6 +136,17 @@ export async function POST(request: Request) {
         }
         const onboarding = await driver.goLive(body.tenantId);
         const tenant = await driver.getTenant(body.tenantId);
+        // Audit tenant go-live (lifecycle) — best-effort actor from session.
+        const actor = await getCurrentUser();
+        await recordAudit({
+          actor: {
+            id: actor?.id ?? "system",
+            label: actor?.email ?? "self-serve onboarding",
+          },
+          action: "tenant_go_live",
+          tenantId: body.tenantId,
+          detail: `Tenant "${tenant?.name ?? body.tenantId}" went live.`,
+        });
         return NextResponse.json({ ok: true, onboarding, tenant });
       }
 

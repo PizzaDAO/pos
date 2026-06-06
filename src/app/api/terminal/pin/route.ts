@@ -21,6 +21,7 @@ import { getPosDriver } from "@/lib/db";
 import { getCurrentUser } from "@/lib/auth/session";
 import { tenantsForSurface } from "@/lib/auth/roles";
 import { isValidPinFormat, verifyPin } from "@/lib/auth/pin";
+import { enforceRateLimit, readJsonBody, recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -67,18 +68,24 @@ function isValid(b: unknown): b is Body {
 }
 
 export async function POST(request: Request) {
+  // Brute-force defence on PIN verification — strict per-IP rate limit.
+  const limited = enforceRateLimit(request, "pin");
+  if (limited) return limited;
+
   // The device session authorizes WHICH tenant the PIN switch applies to.
   const user = await getCurrentUser();
   if (!user) {
     return NextResponse.json({ error: "Not signed in." }, { status: 401 });
   }
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) {
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   }
+  const body = parsed.body;
   if (!isValid(body) || !isValidPinFormat(body.pin)) {
     return NextResponse.json({ error: "Invalid PIN." }, { status: 401 });
   }
@@ -105,6 +112,14 @@ export async function POST(request: Request) {
     // Generic 401 — don't reveal whether the staff id existed or the PIN was wrong.
     return NextResponse.json({ error: "Incorrect PIN." }, { status: 401 });
   }
+
+  // Audit the active-staff switch (tenant-scoped) — who took over the till.
+  await recordAudit({
+    actor: { id: user.id, label: user.email },
+    action: "staff_pin_switch",
+    tenantId: matched.tenant_id,
+    detail: `Active staff switched to ${matched.name} (${matched.role}).`,
+  });
 
   // Success: return only non-sensitive identity for attribution (no hash).
   return NextResponse.json({

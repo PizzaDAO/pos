@@ -344,3 +344,148 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 - [ ] Hardware field test (reader, printer, drawer, tablet) — separate from this
       code phase.
 - [ ] Re-run the full Vitest suite + production build with the live env; both green.
+
+---
+
+## 11. Security hardening (headers/CSP, rate limiting, audit, service-role)
+
+Defense-in-depth added in the hardening pass, layered on top of (never replacing)
+RLS + the session-gated auth model. All of it is **zero-env safe** (build + Vitest
+green with no env) and adds **no new npm dependency**. Code lives under
+`src/lib/security/*`; the threat model is in
+`plans/arrabbiata-71129-phase-7-security-hardening.md`.
+
+### 11a. Security headers + Content-Security-Policy
+
+Applied to **every** route via `next.config.ts` `headers()` (source
+`src/lib/security/headers.ts`), so `/shop`, `/`, and static routes are covered too
+(middleware only matches the protected surfaces). Static values — no env reads.
+
+| Header | Value (summary) | Defends |
+|---|---|---|
+| `Content-Security-Policy` | `default-src 'self'`; enumerated `script/style/img/font/connect/frame/worker/manifest-src`; `object-src 'none'`; `base-uri 'self'`; `form-action 'self'`; `frame-ancestors 'none'`; `upgrade-insecure-requests` | XSS, injection, clickjacking, downgrade |
+| `Strict-Transport-Security` | `max-age=63072000; includeSubDomains; preload` | HTTPS downgrade/MITM (inert on localhost) |
+| `X-Content-Type-Options` | `nosniff` | MIME-sniffing |
+| `X-Frame-Options` | `DENY` | clickjacking (legacy companion to `frame-ancestors`) |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | referrer leakage |
+| `Permissions-Policy` | `camera=()`, `microphone=()`, `geolocation=()`, `payment=(self)`, `usb=()`, … | feature abuse |
+| `Cross-Origin-Opener-Policy` | `same-origin` | cross-origin tab interference |
+
+**CSP nonce/hashing approach — documented trade-off.** The policy is **static**
+(no per-request nonce). Next.js App Router injects framework **inline** runtime
+scripts on every page; a nonce-based `script-src` would require minting a nonce in
+middleware and threading it through the document, but this app's middleware
+intentionally matches the protected surfaces only (`/admin|/terminal|/kitchen|
+/platform`) — `/shop`, `/`, and statically-rendered routes are not matched, so a
+nonce cannot be applied uniformly without broadening the matcher (out of scope and
+it would break static optimisation). We therefore allow `script-src 'self'
+'unsafe-inline'` (+ Stripe origins). This is weaker than a nonce, but the app
+ships **no author-controlled inline scripts** (no inline `<script>`, no
+`dangerouslySetInnerHTML`), so the practical XSS surface is small, and every other
+directive is locked down. **Upgrade path:** mint a nonce in middleware, broaden the
+matcher to all routes, set `script-src 'self' 'nonce-…' 'strict-dynamic'`, and pass
+the nonce into the root layout. `connect-src`/`frame-src` are a superset of mock-
+and live-mode origins (Supabase REST+WSS, Stripe API/JS, Base RPC) so a later env
+flip needs no header change. The PWA service worker is covered by `worker-src
+'self' blob:`.
+
+> **Go-live check:** load the deployed preview, open devtools → Network → the
+> document response, confirm the headers above are present, and watch the Console
+> for any CSP violation while exercising terminal/shop/admin (esp. Stripe.js +
+> Supabase Realtime). If a needed origin is blocked, add it to the relevant
+> directive in `headers.ts` (do not loosen `script-src`).
+
+### 11b. Rate limiting
+
+Zero-dependency in-memory **fixed-window** limiter (`src/lib/security/rate-limit.ts`)
++ a route-handler guard (`enforceRateLimit` in `http.ts`) that derives the client
+IP from `x-forwarded-for`/`x-real-ip`, limits per-IP (and per-account/email where
+sensible), and returns **429 + `Retry-After` + `RateLimit-*`** headers. **No-op
+when disabled** (`RATE_LIMIT_DISABLED`) or under tests (`VITEST`/`NODE_ENV=test`),
+so CI/dev never throttle.
+
+| Endpoint | Bucket (limit / 60s) | Keys |
+|---|---|---|
+| `POST /api/terminal/pin` | `pin` (8) | IP |
+| `POST /api/shop/auth/magic-link` | `auth` (10) | IP + email |
+| `POST /api/orders` | `orders` (60) | IP |
+| `POST /api/payments` | `payments` (30) | IP |
+| `POST /api/payments/refund` | `payments` (30) | IP |
+
+**Coverage note for tenant/platform login:** the `/login` + `/platform/login`
+forms call Supabase Auth **directly from the browser** (`signInWithOtp`/
+`signInWithPassword`) — there is no first-party server endpoint to limit, and
+Supabase enforces its own auth rate limits. The customer **magic-link** flow does
+go through a server route and is limited above; the staff **PIN** path (the only
+first-party credential check) is limited strictly.
+
+**Caveat:** the store is **process-local**, so on serverless each instance keeps
+its own window and the effective global limit scales with instance count. This is
+a deliberate no-new-dep trade-off; for a hard global limit, swap `defaultLimiter`
+for a shared store (Redis/Upstash) — call sites are unchanged.
+
+### 11c. Audit logging (broadened)
+
+Coverage of the existing append-only, tenant-scoped `audit_log` is broadened beyond
+platform impersonation/lifecycle via a fail-open helper (`recordAudit` in
+`src/lib/security/audit.ts` — it never throws, so a logging failure can't break the
+primary action). New `AuditAction` values + where they are written:
+
+| Action | Written at | Tenant-scoped |
+|---|---|---|
+| `auth_sign_in` | `/auth/callback` after a successful code exchange (one entry per membership; platform admins get a null-tenant entry; customers not audited) | yes (per membership) |
+| `staff_pin_switch` | `/api/terminal/pin` on a verified PIN switch | yes |
+| `payment_refund` / `payment_void` | `/api/payments/refund` (void = fully refunded) | yes |
+| `menu_86` | `/api/admin/overrides` when availability is set false | yes |
+| `connect_change` | `/api/connect` on Connect onboarding start/refresh | yes |
+| `subscription_change` | `/api/billing` on subscribe / tier change / status advance | yes |
+| `tenant_go_live` | `/api/signup` `go_live` | yes |
+| `membership_change` | *reserved* — no dedicated member-management route yet; action defined for when one lands | yes |
+
+Pre-existing (unchanged): `impersonate_start/end`, `tenant_suspend/reactivate`,
+`subscription_override`. All surface read-only in `/platform`.
+
+### 11d. Service-role key inventory + review (T8)
+
+The service-role key (`SUPABASE_SERVICE_ROLE_KEY`) **bypasses RLS**, so every use
+must be a trusted server op with an explicit tenant filter. Inventory after review:
+
+- **Single construction site:** `src/lib/db/supabase.ts` →
+  `readSupabaseConfig()` builds **one** `@supabase/supabase-js` client, preferring
+  the service-role key (falling back to anon) on the server. This is the live
+  `PosDriver`. It is the **only** code that reads the service-role key (verified by
+  grep: the only other hit is a doc comment in `src/lib/auth/api.ts`).
+- **Justification:** the driver implements the full server-side data contract
+  (route handlers / RSC) for background + cross-cutting writes (order intake,
+  payment persistence, reports) where there is no end-user RLS session; RLS remains
+  the DB backstop and the **session is the gate** (route guards in
+  `src/lib/auth/api.ts` re-check membership against the request's tenant).
+- **Tenant-scoping audit (the key risk):** every tenant-scoped read/write in the
+  driver carries an explicit `.eq("tenant_id", …)` (and `.eq("location_id", …)`
+  where applicable): tenants/locations/menu/orders/payments/inventory/staff/shifts/
+  reports/settings/subscriptions/onboarding/audit all filter by tenant. By-id
+  lookups used internally (`getOrder`, `getPayment`, `getStaffById`,
+  `getDrawerReconciliation`) are reached only after the route layer has authorized
+  the caller for that object's tenant. **No un-scoped tenant query was found.**
+- **User-scoped (RLS) path is used where it belongs:** the auth flows use
+  `getServerSupabase()` (anon key + the user's session cookie → RLS-enforced), **not**
+  the service-role client — the correct split. `pin_hash` is only carried on the
+  server PIN-verification path (`getStaffById`) and stripped from list/upsert
+  results.
+- **Finding / fix:** `POST /api/payments/refund` previously performed a refund from
+  a client-supplied `paymentId` with **no authorization** — any caller could refund
+  any payment. Fixed: it now loads the payment, derives its tenant, and requires
+  `requireTenantMember(tenant)` before refunding (and audits the result).
+  `POST /api/connect` similarly gained an `owner|manager` check (money-routing).
+- **Go-live:** keep the service-role key server-only (never `NEXT_PUBLIC_*`); store
+  it in a secret manager; rotate on exposure. The driver's tenant-filter invariant
+  is the load-bearing control — keep it covered by `tenant-isolation.test.ts`.
+
+### 11e. Input validation (T9)
+
+Dependency-free guards (`src/lib/security/validate.ts`): `readJsonBody` enforces a
+**256 KB** body cap (413) before/after decode and rejects empty/invalid JSON (400);
+`isMoneyCents` rejects negative/NaN/fractional/absurd amounts; `isClientId` bounds
+length + allowlists charset; `isEmail` bounds + shape-checks. Wired into the
+order/payment/refund/PIN/magic-link routes (the money + auth paths). Existing
+domain-level validation (scheduling, zone gates, idempotency) is unchanged.

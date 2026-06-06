@@ -10,6 +10,13 @@ import { NextResponse } from "next/server";
 import { refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
+import { requireTenantMember } from "@/lib/auth/api";
+import {
+  enforceRateLimit,
+  isMoneyCents,
+  readJsonBody,
+  recordAudit,
+} from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -20,19 +27,41 @@ interface RefundBody {
 }
 
 export async function POST(request: Request) {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  // Refunds move money out — rate-limit + audit every one.
+  const limited = enforceRateLimit(request, "payments");
+  if (limited) return limited;
+
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) {
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   }
-  const b = body as RefundBody;
+  const b = parsed.body as RefundBody;
   if (!b || typeof b.paymentId !== "string") {
     return NextResponse.json(
       { error: "paymentId is required." },
       { status: 422 },
     );
   }
+  if (b.amountCents !== undefined && !isMoneyCents(b.amountCents)) {
+    return NextResponse.json(
+      { error: "amountCents must be a non-negative integer." },
+      { status: 422 },
+    );
+  }
+
+  const driver = getPosDriver();
+
+  // The refund targets a specific payment; resolve it first so we can authorize
+  // the caller against THAT payment's tenant (not a client-supplied tenant).
+  const existingPayment = await driver.getPayment(b.paymentId);
+  if (!existingPayment) {
+    return NextResponse.json({ error: "Payment not found." }, { status: 404 });
+  }
+  const auth = await requireTenantMember(existingPayment.tenant_id);
+  if (!auth.ok) return auth.res;
 
   try {
     const payment = await refundPayment({
@@ -46,9 +75,18 @@ export async function POST(request: Request) {
         { status: 404 },
       );
     }
-    const driver = getPosDriver();
     const order = await driver.getOrder(payment.order_id);
     const balance = order ? await getOrderBalance(order) : 0;
+
+    // Audit the refund (tenant-scoped). Fully-refunded ⇒ a void of the tender.
+    const fullyRefunded = payment.refunded_cents >= payment.amount_cents;
+    await recordAudit({
+      actor: { id: auth.user.id, label: auth.user.email },
+      action: fullyRefunded ? "payment_void" : "payment_refund",
+      tenantId: payment.tenant_id,
+      detail: `Refunded ${b.amountCents ?? payment.amount_cents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
+    });
+
     return NextResponse.json({
       payment,
       balanceCents: balance,

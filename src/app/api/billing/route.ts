@@ -17,17 +17,31 @@ import { getPosDriver, type PlanTier, type SubscriptionStatus } from "@/lib/db";
 import { getPlans } from "@/lib/saas/plans";
 import { resolveEntitlements } from "@/lib/saas/entitlements";
 import { subscribeTenant, isBillingSimulated } from "@/lib/billing/service";
+import { getCurrentUser } from "@/lib/auth/session";
+import { recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
+
+/** Best-effort tenant-scoped audit of a subscription/billing change. */
+async function auditBilling(tenantId: string, detail: string): Promise<void> {
+  const actor = await getCurrentUser();
+  await recordAudit({
+    actor: {
+      id: actor?.id ?? "system",
+      label: actor?.email ?? "billing",
+    },
+    action: "subscription_change",
+    tenantId,
+    detail,
+  });
+}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const tenantId = searchParams.get("tenantId");
   const driver = getPosDriver();
   const plans = getPlans();
-  const subscription = tenantId
-    ? await driver.getSubscription(tenantId)
-    : null;
+  const subscription = tenantId ? await driver.getSubscription(tenantId) : null;
   const entitlements = resolveEntitlements(subscription);
   return NextResponse.json({
     plans,
@@ -52,7 +66,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
   if (!body.tenantId) {
-    return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
+    return NextResponse.json(
+      { error: "tenantId is required." },
+      { status: 422 },
+    );
   }
   const driver = getPosDriver();
 
@@ -74,6 +91,10 @@ export async function POST(request: Request) {
           { status: 404 },
         );
       }
+      await auditBilling(
+        body.tenantId,
+        `Subscription status advanced to ${body.status}.`,
+      );
       return NextResponse.json({ subscription: updated });
     }
 
@@ -95,6 +116,10 @@ export async function POST(request: Request) {
       );
       // Mark the plan step complete on the wizard if mid-onboarding.
       await driver.completeOnboardingStep(body.tenantId, "plan");
+      await auditBilling(
+        body.tenantId,
+        `Subscription tier changed ${existing.tier} → ${body.tier}.`,
+      );
       return NextResponse.json({
         subscription: switched,
         checkoutUrl: null,
@@ -123,6 +148,10 @@ export async function POST(request: Request) {
     });
     const subscription = await driver.upsertSubscription(result.subscription);
     await driver.completeOnboardingStep(body.tenantId, "plan");
+    await auditBilling(
+      body.tenantId,
+      `Subscribed to ${body.tier} plan${result.simulated ? " (simulated)" : ""}.`,
+    );
 
     return NextResponse.json({
       subscription,
