@@ -1,13 +1,16 @@
 import { PlatformConsole } from "./platform-console";
+import { requirePlatformAdmin } from "@/lib/auth/guard";
 
 /**
- * Super-admin platform console (Phase 6). Operates outside tenant RLS (tied to
- * the platform_admins concept): lists every tenant with health (subscription
- * state, # locations, recent order volume), drills into a tenant's billing
- * overview, and offers AUDITED support impersonation ("view as tenant") plus
- * suspend/reactivate — every sensitive action writes an audit-log entry shown
- * here. All data flows through getPosDriver(); no env vars required.
+ * Super-admin platform console (real-auth). SERVER component: gated to
+ * platform_admins ONLY (requirePlatformAdmin → redirects to /platform/login when
+ * signed out or not an admin). Operates OUTSIDE tenant RLS. In simulated/zero-env
+ * mode the seeded platform-operator identity drives the surface so it stays
+ * reachable with no config. All data flows through getPosDriver().
  */
-export default function PlatformPage() {
+export const dynamic = "force-dynamic";
+
+export default async function PlatformPage() {
+  await requirePlatformAdmin();
   return <PlatformConsole />;
 }

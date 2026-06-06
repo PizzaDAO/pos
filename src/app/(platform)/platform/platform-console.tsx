@@ -32,6 +32,7 @@ import type {
   TenantOnboarding,
 } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { SignOutButton } from "@/components/auth/sign-out-button";
 import { formatMoney } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
 
@@ -149,11 +150,14 @@ export function PlatformConsole() {
           <ShieldCheck className="h-5 w-5" />
           <h1 className="text-lg font-bold">Platform admin</h1>
         </div>
-        {list && (
-          <span className="text-xs text-muted-foreground">
-            Signed in as {list.admin.email}
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          {list && (
+            <span className="text-xs text-muted-foreground">
+              Signed in as {list.admin.email}
+            </span>
+          )}
+          <SignOutButton redirect="/platform/login" />
+        </div>
       </header>
 
       {impersonating && (

@@ -320,6 +320,12 @@ export interface Order {
   order_number: string;
   /** Online-order customer id (Phase 4); null for in-store / guest-less orders. */
   customer_id?: string | null;
+  /**
+   * Attributed staff member (the active terminal staff via PIN quick-switch);
+   * null for online / unattributed orders. Real-auth (Phase 7) sets this from
+   * the PIN-verified active staff so orders/shifts tie to the person at the till.
+   */
+  staff_id?: string | null;
   /** Online-order fulfillment details (Phase 4); absent on in-store orders. */
   fulfillment?: OrderFulfillment;
   created_at: string;
@@ -343,6 +349,8 @@ export interface CreateOrderInput {
   status?: OrderStatus;
   /** Online-order customer id (Phase 4). */
   customer_id?: string | null;
+  /** Attributed staff member (PIN quick-switch active staff); null if none. */
+  staff_id?: string | null;
   /** Online-order fulfillment details (Phase 4). */
   fulfillment?: OrderFulfillment;
 }

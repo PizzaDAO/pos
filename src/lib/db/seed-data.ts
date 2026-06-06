@@ -22,7 +22,13 @@ import type {
   ItemInventoryLink,
   Staff,
 } from "./backoffice-types";
-import type { Location, PlatformAdmin, Tenant, User } from "./types";
+import type {
+  Location,
+  Membership,
+  PlatformAdmin,
+  Tenant,
+  User,
+} from "./types";
 
 export const DEMO_TENANT_ID = "10000000-0000-0000-0000-000000000001";
 export const DEMO_LOCATION_DOWNTOWN_ID =
@@ -69,6 +75,25 @@ export const users: User[] = [
 /** Platform-admin roster (super-admins, outside tenant RLS). */
 export const platformAdmins: PlatformAdmin[] = [
   { user_id: PLATFORM_ADMIN_USER_ID, created_at: NOW },
+];
+
+/**
+ * Tenant memberships (user ↔ tenant ↔ role) — the join that drives ALL tenant
+ * authorization. The demo owner has an `owner` membership on the demo tenant.
+ * Matches `public.memberships` in the SQL seed; the real-auth session resolver
+ * reads these to gate routes per logged-in user (no hardcoded role anywhere).
+ */
+export const DEMO_OWNER_MEMBERSHIP_ID =
+  "10000000-0000-0000-0000-0000000000b1";
+
+export const memberships: Membership[] = [
+  {
+    id: DEMO_OWNER_MEMBERSHIP_ID,
+    user_id: DEMO_OWNER_USER_ID,
+    tenant_id: DEMO_TENANT_ID,
+    role: "owner",
+    created_at: NOW,
+  },
 ];
 
 export const locations: Location[] = [
@@ -628,7 +653,16 @@ export const itemInventoryLinks: ItemInventoryLink[] = [
   },
 ];
 
-/** Demo staff covering each role for the staff-view / shift demos. */
+/**
+ * Demo staff covering each role for the staff-view / shift demos.
+ *
+ * Each carries a scrypt-hashed quick-switch PIN so the terminal PIN switch is
+ * demoable out of the box (the plaintext is NEVER stored; only the salted hash):
+ *   Tony 1111 · Carmela 2222 · Christopher 3333 · Furio 4444
+ * These are deterministic seed hashes (documented in docs/PRODUCTION_READINESS.md);
+ * a tenant sets real PINs via the back office. Hashes verified by
+ * `src/lib/auth/pin.ts#verifyPin`.
+ */
 export const staff: Staff[] = [
   {
     id: "80000000-0000-0000-0000-000000000001",
@@ -636,6 +670,8 @@ export const staff: Staff[] = [
     name: "Tony Soprano",
     role: "owner",
     active: true,
+    pin_hash:
+      "scrypt$4f488f0d1691c55d1556e31c507b239f$95f4f7ba3f253dbaacaa4a9f398c9b0d2c842ce4f9a96d4e66decda6adeb4720",
     created_at: NOW,
   },
   {
@@ -644,6 +680,8 @@ export const staff: Staff[] = [
     name: "Carmela M.",
     role: "manager",
     active: true,
+    pin_hash:
+      "scrypt$4ab34d7609f8e6617dcfea668f618370$ee86b11282bc48d711aa3394602fb6e1b51743050cb360529d27e151cdd34059",
     created_at: NOW,
   },
   {
@@ -652,6 +690,8 @@ export const staff: Staff[] = [
     name: "Christopher M.",
     role: "cashier",
     active: true,
+    pin_hash:
+      "scrypt$f9711be6a1ca88216fb953d6de599969$c5bf37206b720347db1f626994a4388d55f5816c7bf92530d884db139f11cceb",
     created_at: NOW,
   },
   {
@@ -660,6 +700,8 @@ export const staff: Staff[] = [
     name: "Furio G.",
     role: "kitchen",
     active: true,
+    pin_hash:
+      "scrypt$10470d3a8e1408764b3fca12c9c78eec$3f0f3c62bba15799f6f4a9dd5cdeaaceb1d91599f017d56be0ac0f23b1c36b3e",
     created_at: NOW,
   },
 ];

@@ -68,7 +68,7 @@ import type {
   SizeInput,
   Staff,
 } from "./backoffice-types";
-import type { Location, Tenant, User } from "./types";
+import type { Location, Membership, Tenant, User } from "./types";
 import type {
   AuditLogEntry,
   OnboardingStep,
@@ -202,6 +202,7 @@ function mapOrder(r: Row, items: OrderItem[]): Order {
     notes: (r.notes as string | null) ?? null,
     order_number: r.order_number as string,
     customer_id: (r.customer_id as string | null) ?? null,
+    staff_id: (r.staff_id as string | null) ?? null,
     fulfillment: (r.fulfillment as Order["fulfillment"]) ?? undefined,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
@@ -263,13 +264,16 @@ function mapInventoryMovement(r: Row): InventoryMovement {
   };
 }
 
-function mapStaff(r: Row): Staff {
+function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
   return {
     id: r.id as string,
     tenant_id: r.tenant_id as string,
     name: r.name as string,
     role: r.role as Staff["role"],
     active: r.active as boolean,
+    // pin_hash is only carried for server-side PIN verification (getStaffById);
+    // list/upsert results omit it so it never reaches the client.
+    pin_hash: opts?.includePin ? ((r.pin_hash as string | null) ?? null) : undefined,
     created_at: r.created_at as string,
   };
 }
@@ -1173,6 +1177,31 @@ export function createSupabaseDriver(
       return r ? mapUser(r) : null;
     },
 
+    async getUserByEmail(email) {
+      const r = unwrap(
+        await sb
+          .from("users")
+          .select("*")
+          .ilike("email", email.trim())
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapUser(r) : null;
+    },
+
+    async listMembershipsForUser(userId) {
+      return (
+        unwrap(
+          await sb.from("memberships").select("*").eq("user_id", userId),
+        ) as Row[]
+      ).map((r) => ({
+        id: r.id as string,
+        user_id: r.user_id as string,
+        tenant_id: r.tenant_id as string,
+        role: r.role as Membership["role"],
+        created_at: r.created_at as string,
+      }));
+    },
+
     async listTenantHealth() {
       const tenantsList = await this.listTenants();
       const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
@@ -1298,6 +1327,7 @@ export function createSupabaseDriver(
             notes: input.notes,
             order_number: orderNumber,
             customer_id: input.customer_id ?? null,
+            staff_id: input.staff_id ?? null,
             fulfillment: input.fulfillment ?? null,
             created_at: now,
             updated_at: now,
@@ -2250,13 +2280,27 @@ export function createSupabaseDriver(
 
     // -- Staff & shifts ----------------------------------------------------
     async listStaff(tenantId) {
+      // pin_hash omitted (default) so it never reaches the client.
       return (unwrap(
         await sb
           .from("staff")
           .select("*")
           .eq("tenant_id", tenantId)
           .order("name"),
-      ) as Row[]).map(mapStaff);
+      ) as Row[]).map((r) => mapStaff(r));
+    },
+
+    async getStaffById(tenantId, staffId) {
+      const r = unwrap(
+        await sb
+          .from("staff")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .maybeSingle(),
+      ) as Row | null;
+      // includePin: this is the trusted server PIN-verification path only.
+      return r ? mapStaff(r, { includePin: true }) : null;
     },
 
     async upsertStaff(staff) {
@@ -2269,19 +2313,18 @@ export function createSupabaseDriver(
               .maybeSingle(),
           ) as Row | null))
         : null;
+      // Only write pin_hash when the caller explicitly set it (not undefined),
+      // so an unrelated update can't accidentally wipe a staff member's PIN.
+      const { pin_hash, ...rest } = staff;
+      const row: Record<string, unknown> = {
+        ...rest,
+        id: staff.id || genUuid(),
+        created_at:
+          (existing?.created_at as string) ?? staff.created_at ?? nowIso(),
+      };
+      if (pin_hash !== undefined) row.pin_hash = pin_hash;
       return mapStaff(
-        unwrap(
-          await sb
-            .from("staff")
-            .upsert({
-              ...staff,
-              id: staff.id || genUuid(),
-              created_at:
-                (existing?.created_at as string) ?? staff.created_at ?? nowIso(),
-            })
-            .select()
-            .single(),
-        ) as Row,
+        unwrap(await sb.from("staff").upsert(row).select().single()) as Row,
       );
     },
 

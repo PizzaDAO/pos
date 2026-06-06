@@ -18,6 +18,7 @@ import {
   type Shift,
   type ShiftCashEvent,
 } from "@/lib/db";
+import { requireTenantMember } from "@/lib/auth/api";
 
 export const runtime = "nodejs";
 
@@ -80,6 +81,12 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
+  // Any operational member of the tenant may clock in/out + record drawer events.
+  if (!body.tenantId) {
+    return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
+  }
+  const auth = await requireTenantMember(body.tenantId);
+  if (!auth.ok) return auth.res;
   const driver = getPosDriver();
 
   try {

@@ -13,6 +13,7 @@
  * No env vars are read; everything runs against the in-memory mock driver.
  */
 import { NextResponse } from "next/server";
+import { requireTenantRole } from "@/lib/auth/api";
 import {
   DEMO_LOCATION_DOWNTOWN_ID,
   DEMO_TENANT_ID,
@@ -46,6 +47,8 @@ interface MenuMutation {
   action: "upsert" | "delete";
   id?: string;
   payload?: unknown;
+  /** Active tenant for session authorization (sent by the client). */
+  tenantId?: string;
 }
 
 export async function POST(request: Request) {
@@ -55,6 +58,22 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
+
+  // Authorize the mutation against the session: owner|manager of the active
+  // tenant. The client always sends a top-level tenantId; fall back to the
+  // payload's tenant_id for safety.
+  const payload = (body.payload ?? {}) as { tenant_id?: string };
+  const mutationTenantId =
+    (body as { tenantId?: string }).tenantId ?? payload.tenant_id;
+  if (!mutationTenantId) {
+    return NextResponse.json(
+      { error: "tenant_id is required." },
+      { status: 422 },
+    );
+  }
+  const auth = await requireTenantRole(mutationTenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
+
   const driver = getPosDriver();
 
   try {

@@ -16,6 +16,7 @@ import {
   type InventoryItem,
   type MovementReason,
 } from "@/lib/db";
+import { requireTenantRole } from "@/lib/auth/api";
 
 export const runtime = "nodejs";
 
@@ -39,6 +40,8 @@ export async function GET(request: Request) {
 
 interface InventoryBody {
   action: "upsertItem" | "movement";
+  /** Active tenant for session authorization (sent by the client). */
+  tenantId?: string;
   item?: InventoryItem;
   inventoryItemId?: string;
   reason?: MovementReason;
@@ -53,6 +56,14 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
+  // Owner|manager of the active tenant only.
+  const tenantId = body.tenantId ?? body.item?.tenant_id;
+  if (!tenantId) {
+    return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
+  }
+  const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
+
   const driver = getPosDriver();
 
   try {

@@ -14,26 +14,22 @@
  *   suspend / reactivate                → flip tenant status (audited)
  */
 import { NextResponse } from "next/server";
-import {
-  PLATFORM_ADMIN_EMAIL,
-  PLATFORM_ADMIN_USER_ID,
-  getPosDriver,
-} from "@/lib/db";
+import { getPosDriver } from "@/lib/db";
 import type { AuditAction } from "@/lib/db";
+import { getCurrentUser } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 
 /**
- * Resolve the current platform operator. Real auth is deferred; we use the
- * seeded super-admin. Returns null if the user is not a platform admin (so the
- * surface is gated even with the stub identity).
+ * Resolve the current platform operator FROM THE SESSION. In real mode this is
+ * the logged-in user (gated by their `platform_admins` membership); in simulated
+ * mode it's the seeded platform-operator identity. Returns null when the caller
+ * is not a platform admin, so every sensitive action below stays gated.
  */
 async function requirePlatformAdmin(): Promise<{ id: string; email: string } | null> {
-  const driver = getPosDriver();
-  const ok = await driver.isPlatformAdmin(PLATFORM_ADMIN_USER_ID);
-  if (!ok) return null;
-  const user = await driver.getUser(PLATFORM_ADMIN_USER_ID);
-  return { id: PLATFORM_ADMIN_USER_ID, email: user?.email ?? PLATFORM_ADMIN_EMAIL };
+  const user = await getCurrentUser({ simulatedAs: "platform" });
+  if (!user || !user.isPlatformAdmin) return null;
+  return { id: user.id, email: user.email };
 }
 
 export async function GET(request: Request) {

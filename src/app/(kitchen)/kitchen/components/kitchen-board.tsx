@@ -20,9 +20,21 @@ import { TicketCard } from "./ticket-card";
 
 const STATION_VALUES: StationFilter[] = ["all", "oven", "cold", "fryer", "expo"];
 
-export function KitchenBoard() {
+/**
+ * `initialTenantId`/`initialLocationId` come from the server guard
+ * (requireLocationSurface) — the session-derived active location — replacing the
+ * old hardcoded demo context. They default to the demo context for the
+ * simulated/zero-env path.
+ */
+export function KitchenBoard({
+  initialTenantId,
+  initialLocationId,
+}: {
+  initialTenantId?: string;
+  initialLocationId?: string;
+} = {}) {
   const { board, loading, source, lastUpdated, bump, recall } =
-    useKitchenBoard();
+    useKitchenBoard(initialTenantId, initialLocationId);
   const [station, setStation] = useState<StationFilter>("all");
   const [busyId, setBusyId] = useState<string | null>(null);
 

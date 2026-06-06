@@ -19,4 +19,5 @@ export {
   PLATFORM_ADMIN_USER_ID,
   PLATFORM_ADMIN_EMAIL,
   DEMO_OWNER_USER_ID,
+  DEMO_OWNER_EMAIL,
 } from "./seed-data";

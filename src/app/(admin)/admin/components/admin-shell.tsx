@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { DEMO_TENANT_ID, type Location } from "@/lib/db";
 import { useEntitlements } from "@/lib/saas/use-entitlements";
+import { SignOutButton } from "@/components/auth/sign-out-button";
 import { cn } from "@/lib/utils";
 import { MenuManager } from "./menu-manager";
 import { InventoryManager } from "./inventory-manager";
@@ -50,19 +51,33 @@ type Tab =
   | "payments"
   | "delivery";
 
-function readTenantParam(): { tenantId: string; impersonate: boolean } {
+function readTenantParam(
+  fallbackTenantId: string,
+): { tenantId: string; impersonate: boolean } {
   if (typeof window === "undefined") {
-    return { tenantId: DEMO_TENANT_ID, impersonate: false };
+    return { tenantId: fallbackTenantId, impersonate: false };
   }
   const params = new URLSearchParams(window.location.search);
   return {
-    tenantId: params.get("tenant") ?? DEMO_TENANT_ID,
+    tenantId: params.get("tenant") ?? fallbackTenantId,
     impersonate: params.get("impersonate") === "1",
   };
 }
 
-export function AdminShell() {
-  const [{ tenantId, impersonate }] = useState(readTenantParam);
+/**
+ * `initialTenantId` is the SESSION-DERIVED active tenant resolved + authorized
+ * by the server guard (src/lib/auth/guard.ts#requireAdmin). It defaults to the
+ * demo tenant for the simulated/zero-env path. An explicit `?tenant=` (platform
+ * impersonation) still wins so the audited "view as tenant" flow is unchanged.
+ */
+export function AdminShell({
+  initialTenantId = DEMO_TENANT_ID,
+}: {
+  initialTenantId?: string;
+}) {
+  const [{ tenantId, impersonate }] = useState(() =>
+    readTenantParam(initialTenantId),
+  );
   const [tenantName, setTenantName] = useState("Back office");
   const [locations, setLocations] = useState<Location[]>([]);
   const [locationId, setLocationId] = useState<string>("");
@@ -130,22 +145,25 @@ export function AdminShell() {
                 </span>
               )}
             </div>
-            {locations.length > 0 && (
-              <label className="flex items-center gap-2 text-sm">
-                <span className="text-muted-foreground">Location</span>
-                <select
-                  className="rounded-md border bg-background px-2 py-1.5 text-sm"
-                  value={locationId}
-                  onChange={(e) => setLocationId(e.target.value)}
-                >
-                  {locations.map((l) => (
-                    <option key={l.id} value={l.id}>
-                      {l.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
+            <div className="flex items-center gap-3">
+              {locations.length > 0 && (
+                <label className="flex items-center gap-2 text-sm">
+                  <span className="text-muted-foreground">Location</span>
+                  <select
+                    className="rounded-md border bg-background px-2 py-1.5 text-sm"
+                    value={locationId}
+                    onChange={(e) => setLocationId(e.target.value)}
+                  >
+                    {locations.map((l) => (
+                      <option key={l.id} value={l.id}>
+                        {l.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <SignOutButton redirect="/login" />
+            </div>
           </div>
 
           {entitlements?.past_due && (

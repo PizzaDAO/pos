@@ -15,6 +15,7 @@ import {
   type OverrideInput,
   type OverrideTargetType,
 } from "@/lib/db";
+import { requireTenantRole } from "@/lib/auth/api";
 
 export const runtime = "nodejs";
 
@@ -45,6 +46,8 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
+  const auth = await requireTenantRole(body.tenant_id, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
   const override = await getPosDriver().upsertOverride(body);
   return NextResponse.json({ override }, { status: 201 });
 }
@@ -61,6 +64,8 @@ export async function DELETE(request: Request) {
       { status: 400 },
     );
   }
+  const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
   await getPosDriver().clearOverride(tenantId, locationId, targetType, targetId);
   return NextResponse.json({ ok: true });
 }
