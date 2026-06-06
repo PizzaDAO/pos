@@ -14,6 +14,7 @@ import { requireTenantMember } from "@/lib/auth/api";
 import {
   enforceRateLimit,
   isMoneyCents,
+  isUuid,
   readJsonBody,
   recordAudit,
 } from "@/lib/security";
@@ -39,9 +40,11 @@ export async function POST(request: Request) {
     );
   }
   const b = parsed.body as RefundBody;
-  if (!b || typeof b.paymentId !== "string") {
+  // Validate the id shape up front: a malformed/non-UUID paymentId must be a
+  // clean 422, never a 500 from a `uuid`-typed column rejecting the value.
+  if (!b || !isUuid(b.paymentId)) {
     return NextResponse.json(
-      { error: "paymentId is required." },
+      { error: "paymentId must be a valid UUID." },
       { status: 422 },
     );
   }
@@ -56,7 +59,14 @@ export async function POST(request: Request) {
 
   // The refund targets a specific payment; resolve it first so we can authorize
   // the caller against THAT payment's tenant (not a client-supplied tenant).
-  const existingPayment = await driver.getPayment(b.paymentId);
+  // A lookup failure (e.g. transient DB error) must not leak as a 500 that an
+  // unauthenticated caller could trigger — treat it as "not found".
+  let existingPayment;
+  try {
+    existingPayment = await driver.getPayment(b.paymentId);
+  } catch {
+    existingPayment = null;
+  }
   if (!existingPayment) {
     return NextResponse.json({ error: "Payment not found." }, { status: 404 });
   }

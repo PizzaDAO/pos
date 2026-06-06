@@ -5,6 +5,7 @@ import {
   isClientId,
   isEmail,
   isNonEmptyString,
+  isUuid,
   MAX_BODY_BYTES,
 } from "./validate";
 
@@ -82,5 +83,17 @@ describe("scalar guards", () => {
     expect(isNonEmptyString("x")).toBe(true);
     expect(isNonEmptyString("")).toBe(false);
     expect(isNonEmptyString("y".repeat(2000), 1024)).toBe(false);
+  });
+
+  it("isUuid accepts RFC-4122 UUIDs, rejects malformed ids", () => {
+    expect(isUuid("550e8400-e29b-41d4-a716-446655440000")).toBe(true);
+    expect(isUuid(crypto.randomUUID())).toBe(true);
+    expect(isUuid("550E8400-E29B-41D4-A716-446655440000")).toBe(true); // case-insensitive
+    expect(isUuid("cat-mq1zyqas-1")).toBe(false); // the old template id shape
+    expect(isUuid("not-a-uuid")).toBe(false);
+    expect(isUuid("550e8400e29b41d4a716446655440000")).toBe(false); // no hyphens
+    expect(isUuid("550e8400-e29b-41d4-a716-44665544000")).toBe(false); // too short
+    expect(isUuid("")).toBe(false);
+    expect(isUuid(123 as unknown)).toBe(false);
   });
 });
