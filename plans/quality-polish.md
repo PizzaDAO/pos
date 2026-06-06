@@ -96,12 +96,23 @@ realtime, RLS, security headers/CSP, or data-model changes. Zero-env build +
   under `npm run start`); the auth-gated specs are skipped in mock mode. CI's
   required gates are build + unit tests.
 
-## Lighthouse (preview)
+## Lighthouse (desktop preset)
 
-| Page | Metric | Before | After |
-|---|---|---|---|
-| `/` | _to fill from preview run_ | | |
-| `/shop/[slug]` | | | |
-| `/terminal` | | | |
+Before = production (`main`); After = this preview.
 
-(Run against the Vercel preview; see PR description for the captured scores.)
+| Page | Perf (before → after) | A11y | Best Practices | SEO |
+|---|---|---|---|---|
+| `/` | 100 → 100 | 100 → 100 | 96 → 93* | 60 → 63** |
+| `/shop/[slug]` | 100 → 96 | 100 → 100 | 96 → 93* | 60 → 66** |
+| `/terminal` (→ /login) | 100 → 100 | 100 → 100 | 96 → 93* | 60 → 54** |
+
+\* The −3 Best-Practices delta is **Vercel Live's preview-only feedback script**
+being blocked by the app's strict CSP (a console error Lighthouse counts). It
+does not appear in production and confirms the CSP is working — the app ships no
+inline/3rd-party scripts of its own.
+
+\** SEO is **capped on previews** by Vercel's automatic `X-Robots-Tag: noindex`
+header on every preview deploy (Lighthouse penalizes "blocked from indexing").
+In production the new metadata/OG/robots/sitemap apply and that header is absent.
+Verified on the preview via curl: title templates, OG/Twitter tags, favicons,
+and a correct `robots.txt` + `sitemap.xml` are all present.
