@@ -139,13 +139,35 @@ export interface TenantOnboarding {
 // Audit log (platform-operator actions, incl. impersonation)
 // ----------------------------------------------------------------------------
 
-/** Category of an audited platform action. */
+/**
+ * Category of an audited action. Beyond the original platform-operator actions
+ * (impersonation, tenant lifecycle), Phase 7 hardening broadens coverage to
+ * other sensitive, tenant-scoped operations: staff/admin sign-in, role &
+ * membership changes, payment refunds/voids, menu 86 (availability), Stripe
+ * Connect changes, and subscription/billing changes. Every entry is written
+ * through the existing append-only `audit_log` table and stays tenant-scoped
+ * (the `tenant_id` column), so `/platform` surfaces a single traceable trail.
+ */
 export type AuditAction =
+  // Platform-operator actions (original).
   | "impersonate_start"
   | "impersonate_end"
   | "tenant_suspend"
   | "tenant_reactivate"
-  | "subscription_override";
+  | "subscription_override"
+  // Auth / access (Phase 7).
+  | "auth_sign_in"
+  | "staff_pin_switch"
+  | "membership_change"
+  // Money (Phase 7).
+  | "payment_refund"
+  | "payment_void"
+  // Menu / catalogue (Phase 7).
+  | "menu_86"
+  // Tenant lifecycle / integrations (Phase 7).
+  | "connect_change"
+  | "subscription_change"
+  | "tenant_go_live";
 
 /**
  * An append-only audit entry written when a platform operator takes a

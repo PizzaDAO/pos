@@ -16,6 +16,7 @@ import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { takePayment, getOrderBalance } from "@/lib/payments/service";
+import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -41,18 +42,28 @@ function isValid(body: unknown): body is TakePaymentBody {
     typeof b.tenantId === "string" &&
     typeof b.locationId === "string" &&
     typeof b.rail === "string" &&
-    typeof b.amountCents === "number" &&
+    // Amount + optional tip must be non-negative integer cents (reject NaN /
+    // negative / fractional / absurd values before they reach the rail).
+    isMoneyCents(b.amountCents) &&
+    (b.tipCents === undefined || isMoneyCents(b.tipCents)) &&
+    (b.cashTenderedCents === undefined || isMoneyCents(b.cashTenderedCents)) &&
     typeof b.currency === "string"
   );
 }
 
 export async function POST(request: Request) {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  // Rate-limit payment capture per IP to blunt charge-spam / card-testing abuse.
+  const limited = enforceRateLimit(request, "payments");
+  if (limited) return limited;
+
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) {
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   }
+  const body = parsed.body;
   if (!isValid(body)) {
     return NextResponse.json(
       { error: "Malformed payment payload." },
@@ -106,7 +117,10 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const orderId = searchParams.get("orderId");
   if (!orderId) {
-    return NextResponse.json({ error: "orderId is required." }, { status: 400 });
+    return NextResponse.json(
+      { error: "orderId is required." },
+      { status: 400 },
+    );
   }
   const driver = getPosDriver();
   const order = await driver.getOrder(orderId);

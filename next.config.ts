@@ -1,12 +1,24 @@
 import path from "node:path";
 import type { NextConfig } from "next";
 import withSerwistInit from "@serwist/next";
+import { SECURITY_HEADERS } from "./src/lib/security/headers";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   // Pin the workspace root to this project. A stray lockfile in a parent
   // directory can otherwise cause Next to infer the wrong root for file tracing.
   outputFileTracingRoot: path.join(__dirname),
+  // Security headers + CSP applied to EVERY route (Phase 7 hardening). Static
+  // (no env reads) so the zero-env build is unaffected; see
+  // src/lib/security/headers.ts for the CSP design + no-nonce trade-off.
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: SECURITY_HEADERS,
+      },
+    ];
+  },
 };
 
 /**

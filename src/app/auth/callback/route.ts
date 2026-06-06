@@ -8,6 +8,8 @@
  */
 import { NextResponse } from "next/server";
 import { getServerSupabase } from "@/lib/auth/supabase-server";
+import { getPosDriver } from "@/lib/db";
+import { recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -23,6 +25,42 @@ export async function GET(request: Request) {
       const dest = new URL("/login", url.origin);
       dest.searchParams.set("error", "link_invalid");
       return NextResponse.redirect(dest);
+    }
+
+    // Audit the successful staff/admin sign-in, tenant-scoped per membership.
+    // Platform admins with no tenant membership get a single null-tenant entry.
+    // (Customer sign-ins — no membership, not admin — are not audited here.)
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (user) {
+        const driver = getPosDriver();
+        const [memberships, isAdmin] = await Promise.all([
+          driver.listMembershipsForUser(user.id),
+          driver.isPlatformAdmin(user.id),
+        ]);
+        const label = user.email ?? user.id;
+        if (memberships.length > 0) {
+          for (const m of memberships) {
+            await recordAudit({
+              actor: { id: user.id, label },
+              action: "auth_sign_in",
+              tenantId: m.tenant_id,
+              detail: `Signed in (role ${m.role}).`,
+            });
+          }
+        } else if (isAdmin) {
+          await recordAudit({
+            actor: { id: user.id, label },
+            action: "auth_sign_in",
+            tenantId: null,
+            detail: "Platform admin signed in.",
+          });
+        }
+      }
+    } catch {
+      // Auditing must never block login — swallow.
     }
   }
 

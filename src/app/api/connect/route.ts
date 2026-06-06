@@ -20,6 +20,8 @@ import {
   fetchConnectStatus,
   isSimulated,
 } from "@/lib/payments/connect";
+import { requireTenantRole } from "@/lib/auth/api";
+import { recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -62,6 +64,11 @@ export async function POST(request: Request) {
     );
   }
 
+  // Only an owner|manager of the tenant may start/modify Connect onboarding —
+  // this controls where the tenant's card revenue settles.
+  const auth = await requireTenantRole(body.tenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
+
   const driver = getPosDriver();
   try {
     // Reuse an existing account if onboarding was already started.
@@ -93,10 +100,25 @@ export async function POST(request: Request) {
       refreshUrl,
     );
 
-    return NextResponse.json({ account, onboardingUrl, simulated: isSimulated() });
+    // Audit the Connect change (tenant-scoped) — a money-routing-sensitive op.
+    await recordAudit({
+      actor: { id: auth.user.id, label: auth.user.email },
+      action: "connect_change",
+      tenantId: body.tenantId,
+      detail: `Stripe Connect onboarding ${isSimulated() ? "(simulated) " : ""}started/refreshed; account ${account.account_id}, status ${account.status}.`,
+    });
+
+    return NextResponse.json({
+      account,
+      onboardingUrl,
+      simulated: isSimulated(),
+    });
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Connect onboarding failed." },
+      {
+        error:
+          err instanceof Error ? err.message : "Connect onboarding failed.",
+      },
       { status: 502 },
     );
   }

@@ -13,6 +13,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
 import { requireTenantMember } from "@/lib/auth/api";
+import { enforceRateLimit, readJsonBody } from "@/lib/security";
 import {
   captureError,
   childLogger,
@@ -42,15 +43,18 @@ export async function POST(request: Request) {
   const log = childLogger({ requestId, route: "POST /api/orders" });
   const headers = traceResponseHeaders(requestId);
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
+  // Rate-limit order creation per IP to blunt automated order spam / abuse.
+  const limited = enforceRateLimit(request, "orders");
+  if (limited) return limited;
+
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) {
     return NextResponse.json(
-      { error: "Invalid JSON body." },
-      { status: 400, headers },
+      { error: parsed.error },
+      { status: parsed.status, headers },
     );
   }
+  const body = parsed.body;
 
   if (!isValidPayload(body)) {
     return NextResponse.json(

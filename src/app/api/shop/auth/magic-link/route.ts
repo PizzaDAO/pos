@@ -22,6 +22,7 @@ import {
   getServerSupabase,
   isSupabaseAuthConfigured,
 } from "@/lib/auth/supabase-server";
+import { enforceRateLimit, isEmail, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
 
@@ -34,19 +35,29 @@ interface Body {
 function isValid(body: unknown): body is Body {
   if (!body || typeof body !== "object") return false;
   const b = body as Record<string, unknown>;
-  return typeof b.locationSlug === "string" && typeof b.email === "string";
+  return typeof b.locationSlug === "string" && isEmail(b.email);
 }
 
 export async function POST(request: Request) {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) {
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   }
+  const body = parsed.body;
   if (!isValid(body)) {
-    return NextResponse.json({ error: "email is required." }, { status: 422 });
+    return NextResponse.json(
+      { error: "A valid email is required." },
+      { status: 422 },
+    );
   }
+
+  // Rate-limit magic-link sends per IP and per target email to blunt
+  // email-bombing / enumeration. (Auth bucket: strict.)
+  const limited = enforceRateLimit(request, "auth", { keys: [body.email] });
+  if (limited) return limited;
 
   const driver = getPosDriver();
   const location = await driver.getLocationBySlug(body.locationSlug);
