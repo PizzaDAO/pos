@@ -12,6 +12,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
+import { requireTenantRole } from "@/lib/auth/api";
 
 export const runtime = "nodejs";
 
@@ -54,6 +55,10 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
+  // Only an owner|manager of this tenant may add a location.
+  const auth = await requireTenantRole(body.tenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
+
   const driver = getPosDriver();
 
   // --- Plan gating: block adding a location beyond the tier cap. ---

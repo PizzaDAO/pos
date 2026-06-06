@@ -12,6 +12,10 @@ export interface StatusBarProps {
   pendingCount: number;
   driverName?: string;
   onFlush: () => void;
+  /** Active staff name (PIN quick-switch), or null when none. */
+  activeStaffName?: string | null;
+  /** Open the staff PIN switcher. */
+  onSwitchStaff?: () => void;
 }
 
 export function StatusBar({
@@ -20,6 +24,8 @@ export function StatusBar({
   pendingCount,
   driverName,
   onFlush,
+  activeStaffName,
+  onSwitchStaff,
 }: StatusBarProps) {
   return (
     <header className="flex items-center justify-between gap-3 border-b bg-background px-4 py-2">
@@ -29,6 +35,16 @@ export function StatusBar({
           <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-secondary-foreground">
             {driverName} data
           </span>
+        )}
+        {onSwitchStaff && (
+          <button
+            type="button"
+            onClick={onSwitchStaff}
+            className="rounded-full border px-2 py-0.5 text-xs font-medium hover:bg-secondary"
+            title="Switch the active staff member (PIN)"
+          >
+            {activeStaffName ? `Staff: ${activeStaffName}` : "Sign in staff"}
+          </button>
         )}
       </div>
 

@@ -22,6 +22,11 @@ supabase/
     20260605000200_least_privilege_grants.sql  # CORRECTIVE: revoke the over-broad anon/authenticated
                                        #   table grants down to least privilege; drop anon's tenant-
                                        #   registry read; scope anon's location read to active tenants
+    20260606000000_auth_user_bridge.sql # REAL AUTH: trigger linking auth.users -> public.users
+                                       #   (auth.uid() == users.id, links seed users by email);
+                                       #   + staff.pin_hash + orders.staff_id columns
+  bootstrap-auth.mjs                   # ONE-TIME: create the owner + platform-admin Supabase Auth users
+                                       #   (service-role; `npm run auth:bootstrap`) so you can log in
   tests/
     auth_shim.sql                     # auth.uid() shim so the migrations/test run on vanilla Postgres
     rls_isolation.sql                 # proves isolation on tenancy + orders/menu/payments
@@ -133,7 +138,15 @@ re-granting — tightening anon therefore cannot break the current app.
 3. **Set env** on Vercel (and `.env.local` for local): `NEXT_PUBLIC_SUPABASE_URL`,
    `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`.
    Presence of these flips `getPosDriver()` to the Supabase driver automatically.
-4. **Wire Supabase Auth** so `auth.uid() == public.users.id` (the RLS assumption).
+4. **Wire Supabase Auth** so `auth.uid() == public.users.id` — handled by the
+   `20260606000000_auth_user_bridge.sql` trigger (applied in step 1/2). Then:
+   - In the Supabase dashboard → **Authentication**: enable the **Email**
+     provider (magic link), set **Site URL** to the production domain, and add
+     **Redirect URLs** for `/auth/callback` and `/shop/*`.
+   - Run **`npm run auth:bootstrap`** (with `NEXT_PUBLIC_SUPABASE_URL` +
+     `SUPABASE_SERVICE_ROLE_KEY` set) to create the owner + platform-admin Auth
+     users; the bridge links them to the seeded rows by email. See
+     `docs/PRODUCTION_READINESS.md` §1a for the full walkthrough.
 5. **Verify** isolation against the live DB:
    `SKIP_AUTH_SHIM=1 DATABASE_URL=... bash supabase/tests/run-rls-isolation.sh`
    → expect `RLS isolation test PASSED`.

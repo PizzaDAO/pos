@@ -50,7 +50,13 @@ import type {
   Modifier,
   ModifierGroup,
 } from "./menu-types";
-import type { Location, PlatformAdmin, Tenant, User } from "./types";
+import type {
+  Location,
+  Membership,
+  PlatformAdmin,
+  Tenant,
+  User,
+} from "./types";
 import type {
   AuditLogEntry,
   CreateLocationInput,
@@ -148,6 +154,16 @@ export interface PosDriver {
 
   /** Resolve a user id → email label (for audit display); null if unknown. */
   getUser(userId: string): Promise<User | null>;
+
+  /** Resolve a user by email (real-auth bridges auth.users → this row). */
+  getUserByEmail(email: string): Promise<User | null>;
+
+  /**
+   * All tenant memberships for a user (user ↔ tenant ↔ role). Drives route/role
+   * gating for the session — never a hardcoded role. Empty for a user with no
+   * tenant access.
+   */
+  listMembershipsForUser(userId: string): Promise<Membership[]>;
 
   /** Aggregated per-tenant health for the super-admin tenant list. */
   listTenantHealth(): Promise<TenantHealth[]>;
@@ -387,6 +403,13 @@ export interface PosDriver {
 
   listStaff(tenantId: string): Promise<Staff[]>;
   upsertStaff(staff: Staff): Promise<Staff>;
+
+  /**
+   * Resolve a single active staff member for a tenant (incl. `pin_hash`) for
+   * server-side PIN quick-switch verification. Used ONLY by the trusted server
+   * PIN route — the hash never leaves the server. Returns null if unknown.
+   */
+  getStaffById(tenantId: string, staffId: string): Promise<Staff | null>;
 
   /** List shifts for a location (newest first). */
   listShifts(tenantId: string, locationId: string): Promise<Shift[]>;

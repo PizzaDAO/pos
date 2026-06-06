@@ -10,6 +10,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { requireTenantRole } from "@/lib/auth/api";
 
 export const runtime = "nodejs";
 
@@ -54,6 +55,8 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
+  const auth = await requireTenantRole(body.tenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
   const date = body.date ?? todayIso();
   const close = await getPosDriver().closeBusinessDay(
     body.tenantId,

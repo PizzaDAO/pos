@@ -63,7 +63,13 @@ import type {
   SizeInput,
   Staff,
 } from "./backoffice-types";
-import type { Location, PlatformAdmin, Tenant, User } from "./types";
+import type {
+  Location,
+  Membership,
+  PlatformAdmin,
+  Tenant,
+  User,
+} from "./types";
 import type {
   AuditLogEntry,
   CreateLocationInput,
@@ -87,6 +93,7 @@ import {
   modifiers as seedModifiers,
   paymentSettings as seedPaymentSettings,
   platformAdmins as seedPlatformAdmins,
+  memberships as seedMemberships,
   staff as seedStaff,
   storeSettings as seedStoreSettings,
   tenants as seedTenants,
@@ -120,6 +127,8 @@ const storeSettings = seedStoreSettings.map((s) => ({ ...s }));
 const paymentSettings = seedPaymentSettings.map((s) => ({ ...s }));
 const usersById = new Map<string, User>(seedUsers.map((u) => [u.id, { ...u }]));
 const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({ ...a }));
+/** Tenant memberships (user ↔ tenant ↔ role) — drives session role gating. */
+const memberships: Membership[] = seedMemberships.map((m) => ({ ...m }));
 /** Subscriptions keyed by tenant id (one per tenant). */
 const subscriptions = new Map<string, Subscription>();
 /** Onboarding state keyed by tenant id. */
@@ -720,6 +729,18 @@ export const mockDriver: PosDriver = {
     return usersById.get(userId) ?? null;
   },
 
+  async getUserByEmail(email: string): Promise<User | null> {
+    const target = email.trim().toLowerCase();
+    for (const u of usersById.values()) {
+      if (u.email.toLowerCase() === target) return { ...u };
+    }
+    return null;
+  },
+
+  async listMembershipsForUser(userId: string): Promise<Membership[]> {
+    return memberships.filter((m) => m.user_id === userId).map((m) => ({ ...m }));
+  },
+
   async listTenantHealth(): Promise<TenantHealth[]> {
     ensureKitchenSeed();
     const since = Date.now() - 30 * 86_400_000; // trailing 30 days
@@ -818,6 +839,7 @@ export const mockDriver: PosDriver = {
       notes: input.notes,
       order_number: input.order_number ?? nextOrderNumber(),
       customer_id: input.customer_id ?? null,
+      staff_id: input.staff_id ?? null,
       fulfillment: input.fulfillment,
       created_at: now,
       updated_at: now,
@@ -1423,10 +1445,18 @@ export const mockDriver: PosDriver = {
   // -- Staff & shifts --------------------------------------------------------
 
   async listStaff(tenantId: string): Promise<Staff[]> {
+    // Never expose pin_hash to list consumers (feeds the client). Server-side
+    // PIN verification uses getStaffById, which keeps the hash.
     return [...staffById.values()]
       .filter((s) => s.tenant_id === tenantId)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((s) => ({ ...s }));
+      .map((s) => ({ ...s, pin_hash: undefined }));
+  },
+
+  async getStaffById(tenantId: string, staffId: string): Promise<Staff | null> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return null;
+    return { ...s };
   },
 
   async upsertStaff(staff: Staff): Promise<Staff> {
@@ -1434,10 +1464,15 @@ export const mockDriver: PosDriver = {
     const merged: Staff = {
       ...staff,
       id: staff.id || genId("staff"),
+      // Preserve an existing PIN hash if the caller didn't supply a new one.
+      pin_hash:
+        staff.pin_hash === undefined
+          ? (existing?.pin_hash ?? null)
+          : staff.pin_hash,
       created_at: existing?.created_at ?? staff.created_at ?? nowIso(),
     };
     staffById.set(merged.id, merged);
-    return { ...merged };
+    return { ...merged, pin_hash: undefined };
   },
 
   async listShifts(tenantId: string, locationId: string): Promise<Shift[]> {

@@ -240,12 +240,27 @@ values
    'modifier', '60000000-0000-0000-0000-000000000024', '70000000-0000-0000-0000-000000000002', 75)
 on conflict (id) do nothing;
 
+-- Quick-switch PINs are scrypt hashes (plaintext NEVER stored) so the terminal
+-- PIN switch is demoable live: Tony 1111 · Carmela 2222 · Christopher 3333 ·
+-- Furio 4444. Set them via UPDATE (pin_hash is added by the auth_user_bridge
+-- migration). A tenant resets these in the back office.
 insert into public.staff (id, tenant_id, name, role, active) values
   ('80000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000001', 'Tony Soprano',    'owner',   true),
   ('80000000-0000-0000-0000-000000000002', '10000000-0000-0000-0000-000000000001', 'Carmela M.',      'manager', true),
   ('80000000-0000-0000-0000-000000000003', '10000000-0000-0000-0000-000000000001', 'Christopher M.',  'cashier', true),
   ('80000000-0000-0000-0000-000000000004', '10000000-0000-0000-0000-000000000001', 'Furio G.',        'kitchen', true)
 on conflict (id) do nothing;
+
+update public.staff set pin_hash = case id
+  when '80000000-0000-0000-0000-000000000001' then 'scrypt$4f488f0d1691c55d1556e31c507b239f$95f4f7ba3f253dbaacaa4a9f398c9b0d2c842ce4f9a96d4e66decda6adeb4720'
+  when '80000000-0000-0000-0000-000000000002' then 'scrypt$4ab34d7609f8e6617dcfea668f618370$ee86b11282bc48d711aa3394602fb6e1b51743050cb360529d27e151cdd34059'
+  when '80000000-0000-0000-0000-000000000003' then 'scrypt$f9711be6a1ca88216fb953d6de599969$c5bf37206b720347db1f626994a4388d55f5816c7bf92530d884db139f11cceb'
+  when '80000000-0000-0000-0000-000000000004' then 'scrypt$10470d3a8e1408764b3fca12c9c78eec$3f0f3c62bba15799f6f4a9dd5cdeaaceb1d91599f017d56be0ac0f23b1c36b3e'
+  else pin_hash end
+where id in (
+  '80000000-0000-0000-0000-000000000001','80000000-0000-0000-0000-000000000002',
+  '80000000-0000-0000-0000-000000000003','80000000-0000-0000-0000-000000000004'
+);
 
 -- ============================================================================
 -- SaaS LAYER — the demo tenant is already onboarded + on the Pro plan, so

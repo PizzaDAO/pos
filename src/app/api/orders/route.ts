@@ -12,6 +12,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
+import { requireTenantMember } from "@/lib/auth/api";
 import {
   captureError,
   childLogger,
@@ -57,6 +58,12 @@ export async function POST(request: Request) {
       { status: 422, headers },
     );
   }
+
+  // In-store terminal orders are placed by a signed-in device user who must be a
+  // member of the order's tenant. (Customer/online orders go through the public
+  // /api/shop/orders route instead.)
+  const auth = await requireTenantMember(body.tenant_id);
+  if (!auth.ok) return auth.res;
 
   try {
     const driver = getPosDriver();

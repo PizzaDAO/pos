@@ -14,10 +14,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "db:apply": "bash supabase/apply.sh",
-    "db:test:rls": "bash supabase/tests/run-rls-isolation.sh"
+    "db:test:rls": "bash supabase/tests/run-rls-isolation.sh",
+    "auth:bootstrap": "node supabase/bootstrap-auth.mjs"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.1.1",
+    "@supabase/ssr": "^0.5.2",
     "@supabase/supabase-js": "^2.107.0",
     "@tanstack/react-query": "^5.62.7",
     "class-variance-authority": "^0.7.1",

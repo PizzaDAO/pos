@@ -53,13 +53,15 @@ export function StaffShifts({ tenantId, locationId }: Props) {
     void load();
   }, [load]);
 
-  async function post(body: unknown) {
+  async function post(body: Record<string, unknown>) {
     setBusy(true);
     try {
+      // Always carry the active tenant so the server authorizes against the
+      // session (a member of this tenant), incl. clock-out / cash events.
       await fetch("/api/admin/staff", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ tenantId, ...body }),
       });
       await load();
     } finally {
@@ -249,7 +251,7 @@ function OpenDrawer({
   busy: boolean;
   tenantId: string;
   locationId: string;
-  onPost: (body: unknown) => Promise<void>;
+  onPost: (body: Record<string, unknown>) => Promise<void>;
 }) {
   const [cash, setCash] = useState("");
   const [counted, setCounted] = useState("");

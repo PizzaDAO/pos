@@ -89,6 +89,85 @@ settings + a location-by-slug (public) but **cannot** read `tenants`, `orders`,
 
 ---
 
+## 1a. Real Supabase Auth (sessions, identity bridge, role gating, PIN)
+
+Authentication is **env-guarded**, exactly like the data driver and the payment
+rails: with the Supabase public env vars **unset** the app runs **simulated
+auth** (no real login; every surface resolves a seeded demo session derived from
+`memberships`, so the build + Vitest + the preview stay green with zero env).
+With `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY` **set**, the app
+uses **real Supabase Auth**.
+
+### How it works
+- **Session plumbing** (`@supabase/ssr`): a browser client
+  (`src/lib/auth/supabase-browser.ts`), a cookie-backed server client
+  (`src/lib/auth/supabase-server.ts`), and **middleware** (`src/middleware.ts`)
+  that refreshes the session on every protected request and coarse-gates
+  signed-out visitors to the right login. `getServerSession()`/`getCurrentUser()`
+  (`src/lib/auth/session.ts`) returns the authed user + their `memberships`
+  (tenant_ids + roles) + a platform-admin flag — all derived from the session,
+  never a hardcoded constant.
+- **Identity bridge** (`supabase/migrations/20260606000000_auth_user_bridge.sql`):
+  a trigger on `auth.users` (insert) upserts a `public.users` row with
+  `id = auth.users.id` and email, so `auth.uid() == public.users.id` (the RLS
+  assumption). It links **existing seed users by email** by re-pointing the
+  seeded `public.users.id` to the new auth id (FKs cascade on update), so the
+  seeded owner/admin "become" real auth users when the bootstrap creates them.
+  Idempotent; the trigger is skipped on vanilla Postgres (no `auth` schema).
+- **Role gating matrix** (`src/lib/auth/roles.ts` + guards in
+  `src/lib/auth/guard.ts`, enforced in each surface's server component):
+  - `/admin` → **owner | manager** of the active tenant
+  - `/terminal`, `/kitchen` → **owner | manager | cashier | kitchen** of the
+    active location's tenant
+  - `/platform` → **platform_admin only**
+  - `/shop` → **public** (guest checkout; optional customer accounts)
+  Unauthenticated → redirect to `/login` (tenant) or `/platform/login`. A
+  multi-tenant user gets a chooser at `/login/choose`. Tenant-scoped **API
+  routes** additionally re-check the session/membership against the request's
+  tenant (`src/lib/auth/api.ts`) so a logged-in user can't act on another tenant.
+- **Data access**: all **authorization** decisions come from the real
+  session/memberships, and every tenant-scoped query is scoped to the
+  session-derived tenant. The Supabase **driver still uses the service-role key**
+  server-side (it implements the full `PosDriver` and filters every query by
+  `tenant_id`/`location_id`); it is reserved for trusted server ops. Per-query
+  user-scoped RLS clients are available (`getServerSupabase()`) and used by the
+  auth flows; a full per-query RLS switch across the entire feature-complete app
+  was intentionally **not** done in this pass (documented trade-off — RLS remains
+  the backstop, the session is the gate).
+- **Staff PIN quick-switch** (`src/lib/auth/pin.ts`, `/api/terminal/pin`): on a
+  shared terminal the **device** is logged in (real session); cashiers then
+  switch the **active staff** by a 4–8 digit PIN verified **server-side** against
+  `staff.pin_hash` (scrypt). The hash never leaves the server (`listStaff` strips
+  it; only `getStaffById` carries it). Placed orders attribute to the active
+  staff via `orders.staff_id`. Demo seed PINs: Tony 1111 · Carmela 2222 ·
+  Christopher 3333 · Furio 4444.
+
+### Live Supabase Auth dashboard settings the orchestrator MUST set
+In the Supabase project → **Authentication**:
+- [ ] **Providers → Email**: enable Email; enable "Confirm email"; enable magic
+      link (OTP). (Email/password optional.)
+- [ ] **URL Configuration → Site URL**: the production domain
+      (e.g. `https://pos.example.com`).
+- [ ] **URL Configuration → Redirect URLs**: allow
+      `https://<domain>/auth/callback` and `https://<domain>/shop/*` (the
+      customer magic-link returns to `/shop/<slug>?signedin=1`). Add the Vercel
+      preview domains too if you want auth to work on previews.
+- [ ] Configure the **SMTP** sender (or rely on Supabase's built-in email for
+      low volume) so magic links actually send.
+
+### Post-deploy bootstrap (so you can log in)
+1. `npm run db:apply` (applies all migrations incl. the identity bridge + seed).
+2. `npm run auth:bootstrap` (run with `NEXT_PUBLIC_SUPABASE_URL` +
+   `SUPABASE_SERVICE_ROLE_KEY` set; optional `BOOTSTRAP_*_PASSWORD`). Creates the
+   Supabase Auth users for the demo **owner** (`tony@tonys-pizza.example`) and
+   the **platform admin** (`ops@pizzapos.example`), email-confirmed; the bridge
+   links them to the seeded membership / platform_admins rows.
+3. Sign in at `/login` (owner → `/admin`, `/terminal`, `/kitchen`) and
+   `/platform/login` (platform admin → `/platform`). Magic-link or password
+   (if you set one). Then verify each role's gating per the matrix above.
+
+---
+
 ## 2. Idempotency & double-charge guarantees
 
 See `docs/IDEMPOTENCY_REVIEW.md` for the full review. Summary of the guarantees,
@@ -246,9 +325,14 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 - [ ] Provision Supabase; `npm run db:apply` (migrations + seed); enable + verify
       **RLS/FORCE** on all tenant tables; run the RLS isolation harness green
       (now covers orders/menu/payments).
-- [ ] Wire Supabase Auth (`auth.uid() == users.id`). Set the Supabase env vars —
-      `getPosDriver()` auto-selects the Supabase driver when they are present
-      (no call-site changes; the mock is the no-env default).
+- [ ] Wire Supabase Auth (`auth.uid() == users.id`) — the identity-bridge
+      migration handles this; set the Supabase env vars (auto-selects the
+      Supabase driver AND real auth; mock + simulated auth is the no-env
+      default). Then set the live **Auth dashboard settings** (Site URL, redirect
+      URLs, enable Email provider) and run **`npm run auth:bootstrap`** to create
+      the owner + platform-admin Auth accounts. See **§1a "Real Supabase Auth"**.
+- [ ] Verify the role-gating matrix live: signed-out → login; cashier blocked
+      from `/admin`; non-admin blocked from `/platform`; staff PIN switch works.
 - [ ] Enable **PITR/backups**; test a restore.
 - [ ] Stripe: live keys + **Connect onboarding per tenant** (KYC); Billing Prices
       per tier; verify webhooks (payments, Connect, Billing) signature-checked.

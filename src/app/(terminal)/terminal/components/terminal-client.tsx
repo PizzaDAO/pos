@@ -21,8 +21,10 @@ import type {
 import { computeOrderTotals } from "@/lib/pricing";
 import { useCartStore } from "@/lib/store/cart";
 import { useMenu } from "@/lib/store/use-menu";
+import { useActiveStaff } from "@/lib/store/use-active-staff";
 import { useOfflineSync } from "@/lib/offline/use-offline-sync";
 import { MenuBrowse } from "./menu-browse";
+import { StaffSwitch } from "./staff-switch";
 import { CartPanel } from "./cart-panel";
 import { PizzaBuilder } from "./pizza-builder";
 import { StatusBar } from "./status-bar";
@@ -49,9 +51,26 @@ function clientOrderNumber(): string {
   return `${hhmm}-${rand}`;
 }
 
-export function TerminalClient() {
-  const { data, isLoading, isError, refetch } = useMenu();
+/**
+ * `initialTenantId`/`initialLocationId` are resolved + authorized by the server
+ * guard (src/lib/auth/guard.ts#requireLocationSurface) from the device user's
+ * session, replacing the old hardcoded demo context. They default to the demo
+ * context for the simulated/zero-env path.
+ */
+export function TerminalClient({
+  initialTenantId,
+  initialLocationId,
+}: {
+  initialTenantId?: string;
+  initialLocationId?: string;
+} = {}) {
+  const { data, isLoading, isError, refetch } = useMenu(
+    initialTenantId,
+    initialLocationId,
+  );
   const sync = useOfflineSync();
+  const { activeStaff, signOut: signOutStaff, verifyPin } = useActiveStaff();
+  const [showStaffSwitch, setShowStaffSwitch] = useState(false);
 
   const items = useCartStore((s) => s.items);
   const discountCents = useCartStore((s) => s.discountCents);
@@ -140,6 +159,9 @@ export function TerminalClient() {
         notes: notes.trim() ? notes.trim() : null,
         order_number: orderNumber,
         status: "placed",
+        // Attribute to the PIN-switched active staff (if any) so orders/shifts
+        // tie to the person at the till.
+        staff_id: activeStaff?.id ?? null,
       };
 
       // Snapshot online state before the async enqueue/flush.
@@ -173,6 +195,8 @@ export function TerminalClient() {
         pendingCount={sync.pendingCount}
         driverName={data.driver}
         onFlush={() => void sync.flushNow()}
+        activeStaffName={activeStaff?.name ?? null}
+        onSwitchStaff={() => setShowStaffSwitch(true)}
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[1fr_400px]">
@@ -224,6 +248,15 @@ export function TerminalClient() {
           paymentSettings={paymentSettings}
           onClose={() => setPayOrderId(null)}
           onPaid={() => setPayOrderId(null)}
+        />
+      )}
+
+      {showStaffSwitch && (
+        <StaffSwitch
+          current={activeStaff}
+          onVerify={verifyPin}
+          onSignOut={signOutStaff}
+          onClose={() => setShowStaffSwitch(false)}
         />
       )}
     </div>

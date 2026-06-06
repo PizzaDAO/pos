@@ -79,13 +79,15 @@ export function MenuManager({ tenantId, locationId }: Props) {
     [overrides],
   );
 
-  async function mutate(body: unknown) {
+  async function mutate(body: Record<string, unknown>) {
     setBusy(true);
     try {
+      // Always carry the active tenant so the server can authorize the mutation
+      // against the session (owner|manager of this tenant) — incl. deletes.
       await fetch("/api/admin/menu", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ tenantId, ...body }),
       });
       await load();
     } finally {
@@ -216,7 +218,7 @@ function AddCategory({
 }
 
 interface MutateFn {
-  (body: unknown): Promise<void>;
+  (body: Record<string, unknown>): Promise<void>;
 }
 interface OverrideFns {
   overrideFor: (

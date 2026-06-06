@@ -185,6 +185,14 @@ export interface Staff {
   role: MembershipRole;
   /** Whether this staff member is currently employed/active. */
   active: boolean;
+  /**
+   * Salted hash of the staff member's quick-switch PIN (scrypt;
+   * `scrypt$<saltHex>$<hashHex>`), or null if no PIN is set. NEVER exposed to
+   * the client — the terminal verifies a PIN server-side via /api/terminal/pin
+   * and only ever receives the resulting active-staff id back. See
+   * `src/lib/auth/pin.ts`.
+   */
+  pin_hash?: string | null;
   created_at: string;
 }
 

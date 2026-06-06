@@ -65,6 +65,7 @@ export function InventoryManager({ tenantId, locationId }: Props) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "movement",
+          tenantId,
           inventoryItemId,
           reason,
           delta,
@@ -293,6 +294,7 @@ function NewInventoryItem({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "upsertItem",
+          tenantId,
           item: {
             id: "",
             tenant_id: tenantId,
