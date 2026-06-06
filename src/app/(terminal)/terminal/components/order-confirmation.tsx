@@ -6,6 +6,7 @@
 
 import { CheckCircle2, Clock } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
 import { formatMoney } from "@/lib/pricing";
 
 export interface PlacedOrderSummary {
@@ -24,14 +25,26 @@ export function OrderConfirmation({
   onNewOrder: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+    <Dialog
+      onClose={onNewOrder}
+      labelledBy="order-confirmation-title"
+      closeOnBackdrop={false}
+    >
       <div className="w-full max-w-sm rounded-2xl bg-background p-6 text-center shadow-xl">
         {order.synced ? (
-          <CheckCircle2 className="mx-auto h-14 w-14 text-emerald-500" />
+          <CheckCircle2
+            className="mx-auto h-14 w-14 text-emerald-500"
+            aria-hidden="true"
+          />
         ) : (
-          <Clock className="mx-auto h-14 w-14 text-amber-500" />
+          <Clock
+            className="mx-auto h-14 w-14 text-amber-500"
+            aria-hidden="true"
+          />
         )}
-        <h2 className="mt-3 text-xl font-bold">Order placed</h2>
+        <h2 id="order-confirmation-title" className="mt-3 text-xl font-bold">
+          Order placed
+        </h2>
         <p className="mt-1 text-3xl font-extrabold tracking-tight">
           {order.orderNumber}
         </p>
@@ -47,6 +60,6 @@ export function OrderConfirmation({
           New order
         </Button>
       </div>
-    </div>
+    </Dialog>
   );
 }

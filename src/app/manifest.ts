@@ -7,16 +7,36 @@ import type { MetadataRoute } from "next";
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
+    id: "/terminal",
     name: "Pizzeria POS Terminal",
     short_name: "POS Terminal",
     description:
       "Tablet-first, offline-first point-of-sale terminal for pizzerias.",
+    lang: "en",
+    dir: "ltr",
+    categories: ["business", "food", "productivity"],
     start_url: "/terminal",
     scope: "/",
     display: "standalone",
     orientation: "any",
     background_color: "#ffffff",
     theme_color: "#dc2626",
+    screenshots: [
+      {
+        src: "/screenshots/terminal-wide.png",
+        sizes: "1280x800",
+        type: "image/png",
+        form_factor: "wide",
+        label: "Counter terminal — offline-first ordering",
+      },
+      {
+        src: "/screenshots/shop-narrow.png",
+        sizes: "720x1280",
+        type: "image/png",
+        form_factor: "narrow",
+        label: "Customer online ordering storefront",
+      },
+    ],
     icons: [
       {
         src: "/icons/icon-192.png",

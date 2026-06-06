@@ -32,22 +32,20 @@ const surfaces = [
 
 export default function HomePage() {
   return (
-    <main className="mx-auto flex min-h-screen max-w-3xl flex-col justify-center gap-8 p-8">
+    <main
+      id="main-content"
+      className="mx-auto flex min-h-screen max-w-3xl flex-col justify-center gap-8 p-8"
+    >
       <header className="space-y-2">
         <h1 className="text-3xl font-bold tracking-tight">Pizzeria POS</h1>
         <p className="text-muted-foreground">
-          Multi-tenant SaaS point-of-sale platform. Phase 0 scaffold — surfaces
-          below are placeholders.
-        </p>
-        <p className="text-sm text-muted-foreground">
-          Health check:{" "}
-          <Link className="underline" href="/api/health">
-            /api/health
-          </Link>
+          A multi-tenant SaaS point-of-sale platform for independent pizzerias:
+          an offline-first counter terminal, kitchen display, customer online
+          ordering, and a tenant back office — all in one place.
         </p>
       </header>
 
-      <section className="grid gap-3 sm:grid-cols-2">
+      <nav aria-label="Product surfaces" className="grid gap-3 sm:grid-cols-2">
         {surfaces.map((s) => (
           <Link
             key={s.href}
@@ -58,7 +56,7 @@ export default function HomePage() {
             <div className="text-sm text-muted-foreground">{s.desc}</div>
           </Link>
         ))}
-      </section>
+      </nav>
 
       <div className="flex flex-wrap gap-3">
         <Button asChild>

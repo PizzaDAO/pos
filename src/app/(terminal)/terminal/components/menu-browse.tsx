@@ -4,7 +4,7 @@
  */
 "use client";
 
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { Menu, MenuItemDetail } from "@/lib/db";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
@@ -15,7 +15,7 @@ export interface MenuBrowseProps {
   onSelectItem: (item: MenuItemDetail) => void;
 }
 
-export function MenuBrowse({ menu, currency, onSelectItem }: MenuBrowseProps) {
+function MenuBrowseImpl({ menu, currency, onSelectItem }: MenuBrowseProps) {
   const [activeCategoryId, setActiveCategoryId] = useState<string>(
     menu.categories[0]?.id ?? "",
   );
@@ -31,23 +31,30 @@ export function MenuBrowse({ menu, currency, onSelectItem }: MenuBrowseProps) {
 
   return (
     <div className="flex h-full flex-col">
-      {/* Category tabs */}
-      <div className="flex gap-2 overflow-x-auto border-b p-3">
-        {menu.categories.map((c) => (
-          <button
-            key={c.id}
-            type="button"
-            onClick={() => setActiveCategoryId(c.id)}
-            className={cn(
-              "shrink-0 rounded-full px-4 py-2 text-sm font-medium transition-colors",
-              activeCategory?.id === c.id
-                ? "bg-primary text-primary-foreground"
-                : "bg-secondary text-secondary-foreground hover:bg-accent",
-            )}
-          >
-            {c.name}
-          </button>
-        ))}
+      {/* Category filter buttons */}
+      <div
+        aria-label="Menu categories"
+        className="flex gap-2 overflow-x-auto border-b p-3"
+      >
+        {menu.categories.map((c) => {
+          const selected = activeCategory?.id === c.id;
+          return (
+            <button
+              key={c.id}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => setActiveCategoryId(c.id)}
+              className={cn(
+                "shrink-0 rounded-full px-4 py-2 text-sm font-medium transition-colors",
+                selected
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-secondary text-secondary-foreground hover:bg-accent",
+              )}
+            >
+              {c.name}
+            </button>
+          );
+        })}
       </div>
 
       {/* Item grid */}
@@ -60,6 +67,11 @@ export function MenuBrowse({ menu, currency, onSelectItem }: MenuBrowseProps) {
                 key={item.id}
                 type="button"
                 onClick={() => onSelectItem(item)}
+                aria-label={
+                  from !== null
+                    ? `${item.name}, from ${formatMoney(from, currency)}. Customize and add.`
+                    : `${item.name}. Customize and add.`
+                }
                 className="flex min-h-[96px] flex-col items-start rounded-xl border p-4 text-left transition-colors hover:border-primary hover:bg-accent"
               >
                 <span className="font-semibold">{item.name}</span>
@@ -91,3 +103,6 @@ export function MenuBrowse({ menu, currency, onSelectItem }: MenuBrowseProps) {
     </div>
   );
 }
+
+/** Memoized: the item grid is a hot list re-rendered on cart/builder changes. */
+export const MenuBrowse = memo(MenuBrowseImpl);

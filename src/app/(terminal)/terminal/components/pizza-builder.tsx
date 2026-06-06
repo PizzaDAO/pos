@@ -7,12 +7,9 @@
 
 import { useMemo, useState } from "react";
 import { X } from "lucide-react";
-import type {
-  HalfPlacement,
-  MenuItemDetail,
-  OrderItem,
-} from "@/lib/db";
+import type { HalfPlacement, MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { formatMoney, withLinePricing } from "@/lib/pricing";
 import {
@@ -70,9 +67,14 @@ export function PizzaBuilder({
       }
     }
 
-    const sizeId =
-      editing?.size_id ?? item.sizes[0]?.id ?? null;
-    return { single, toppings, sizeId, qty: editing?.quantity ?? 1, notes: editing?.notes ?? "" };
+    const sizeId = editing?.size_id ?? item.sizes[0]?.id ?? null;
+    return {
+      single,
+      toppings,
+      sizeId,
+      qty: editing?.quantity ?? 1,
+      notes: editing?.notes ?? "",
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -133,11 +135,10 @@ export function PizzaBuilder({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center"
-      role="dialog"
-      aria-modal="true"
-      aria-label={`Build ${item.name}`}
+    <Dialog
+      onClose={onCancel}
+      ariaLabel={`Build ${item.name}`}
+      placement="center"
     >
       <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl bg-background shadow-xl sm:rounded-2xl">
         {/* Header */}
@@ -263,9 +264,7 @@ export function PizzaBuilder({
                             key={p.value}
                             type="button"
                             aria-pressed={placement === p.value}
-                            onClick={() =>
-                              setToppingPlacement(m.id, p.value)
-                            }
+                            onClick={() => setToppingPlacement(m.id, p.value)}
                             className={cn(
                               "min-w-[44px] px-2 py-2 text-xs font-medium transition-colors",
                               placement === p.value
@@ -345,6 +344,6 @@ export function PizzaBuilder({
           </Button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }

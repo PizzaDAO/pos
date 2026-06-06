@@ -1,5 +1,14 @@
+import type { Metadata } from "next";
 import { AdminShell } from "./components/admin-shell";
 import { requireAdmin } from "@/lib/auth/guard";
+
+export const metadata: Metadata = {
+  // Title intentionally avoids the literal "Back office" — the shell renders that
+  // phrase and the e2e suite asserts it via a strict/substring getByText.
+  title: "Tenant Dashboard",
+  description: "Tenant dashboard: menu, inventory, reports, staff, billing.",
+  robots: { index: false, follow: false },
+};
 
 /**
  * Tenant back office (Phase 5/6 + real-auth). This is now a SERVER component: it

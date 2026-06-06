@@ -52,6 +52,19 @@
   body {
     @apply bg-background text-foreground;
   }
+
+  /* Visible keyboard focus for native interactive elements that don't define
+     their own focus ring (the shared Button component carries its own). Only
+     applies to keyboard focus (:focus-visible), so pointer interactions stay
+     clean. Improves WCAG 2.4.7 (Focus Visible) coverage app-wide. */
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
 }
 
 /* ---- Kitchen ticket print (Phase 3) -------------------------------------- */

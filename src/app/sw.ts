@@ -35,6 +35,18 @@ const serwist = new Serwist({
     },
     ...defaultCache,
   ],
+  // When a navigation can't be served from network or precache (true offline,
+  // uncached route), fall back to the precached /offline shell instead of the
+  // browser's default error page. The terminal's own offline-first flow is
+  // unaffected — it serves from precache/IndexedDB before this ever triggers.
+  fallbacks: {
+    entries: [
+      {
+        url: "/offline",
+        matcher: ({ request }) => request.mode === "navigate",
+      },
+    ],
+  },
 });
 
 serwist.addEventListeners();

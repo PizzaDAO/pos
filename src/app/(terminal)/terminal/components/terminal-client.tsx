@@ -13,11 +13,12 @@
 "use client";
 
 import { useState } from "react";
-import type {
-  CreateOrderInput,
-  MenuItemDetail,
-  OrderItem,
-} from "@/lib/db";
+import { AlertTriangle } from "lucide-react";
+import type { CreateOrderInput, MenuItemDetail, OrderItem } from "@/lib/db";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/ui/empty-state";
+import { useToast } from "@/components/ui/toast";
 import { computeOrderTotals } from "@/lib/pricing";
 import { useCartStore } from "@/lib/store/cart";
 import { useMenu } from "@/lib/store/use-menu";
@@ -71,6 +72,7 @@ export function TerminalClient({
   const sync = useOfflineSync();
   const { activeStaff, signOut: signOutStaff, verifyPin } = useActiveStaff();
   const [showStaffSwitch, setShowStaffSwitch] = useState(false);
+  const toast = useToast();
 
   const items = useCartStore((s) => s.items);
   const discountCents = useCartStore((s) => s.discountCents);
@@ -88,22 +90,43 @@ export function TerminalClient({
 
   if (isLoading) {
     return (
-      <div className="flex h-screen items-center justify-center text-muted-foreground">
-        Loading menu…
+      <div
+        className="grid h-screen grid-cols-1 lg:grid-cols-[1fr_400px]"
+        aria-busy="true"
+        aria-label="Loading terminal"
+      >
+        <div className="space-y-3 border-r p-4">
+          <div className="flex gap-2">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <Skeleton key={i} className="h-9 w-24 rounded-full" />
+            ))}
+          </div>
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+            {Array.from({ length: 9 }).map((_, i) => (
+              <Skeleton key={i} className="h-24 rounded-xl" />
+            ))}
+          </div>
+        </div>
+        <div className="hidden p-4 lg:block">
+          <Skeleton className="h-full w-full rounded-lg" />
+        </div>
       </div>
     );
   }
 
   if (isError || !data) {
     return (
-      <div className="flex h-screen flex-col items-center justify-center gap-3">
-        <p className="text-muted-foreground">Could not load the menu.</p>
-        <button
-          className="rounded-md border px-4 py-2 text-sm"
-          onClick={() => refetch()}
-        >
-          Retry
-        </button>
+      <div className="flex h-screen flex-col items-center justify-center">
+        <EmptyState
+          icon={AlertTriangle}
+          title="Could not load the menu"
+          description="Check your connection and try again."
+          action={
+            <Button variant="outline" onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
+        />
       </div>
     );
   }
@@ -171,10 +194,16 @@ export function TerminalClient({
       clear();
       if (wasOnline) {
         // Order reached the server → go straight to taking payment.
+        toast({ title: `Order ${orderNumber} placed`, variant: "success" });
         setPayOrderId(orderId);
       } else {
         // Offline: payment needs connectivity (beyond reader store-and-forward),
         // so confirm the queued order; the cashier pays once back online.
+        toast({
+          title: `Order ${orderNumber} saved offline`,
+          description: "It will sync automatically when back online.",
+          variant: "info",
+        });
         setPlaced({
           orderNumber,
           totalCents: totals.total_cents,
@@ -182,13 +211,19 @@ export function TerminalClient({
           synced: false,
         });
       }
+    } catch {
+      toast({
+        title: "Couldn't place the order",
+        description: "Please try again.",
+        variant: "error",
+      });
     } finally {
       setPlacing(false);
     }
   }
 
   return (
-    <div className="flex h-screen flex-col">
+    <div id="main-content" className="flex h-screen flex-col">
       <StatusBar
         locationName={"Tony's Downtown"}
         online={sync.online}
@@ -234,10 +269,7 @@ export function TerminalClient({
       )}
 
       {placed && (
-        <OrderConfirmation
-          order={placed}
-          onNewOrder={() => setPlaced(null)}
-        />
+        <OrderConfirmation order={placed} onNewOrder={() => setPlaced(null)} />
       )}
 
       {payOrderId && (

@@ -6,9 +6,11 @@
  */
 "use client";
 
-import { Minus, Plus, Trash2, X } from "lucide-react";
+import { Minus, Plus, ShoppingBag, Trash2, X } from "lucide-react";
 import type { OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { formatMoney } from "@/lib/pricing";
 import { useCustomerCart } from "@/lib/store/customer-cart";
 
@@ -55,20 +57,29 @@ export function CustomerCart({
   const subtotalCents = useCustomerCart((s) => s.subtotalCents());
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end bg-black/40">
-      <div className="flex h-full w-full max-w-md flex-col bg-background shadow-xl">
+    <Dialog onClose={onClose} labelledBy="cart-title" placement="right">
+      <div className="flex h-full w-full max-w-md flex-col bg-background shadow-xl sm:h-[calc(100vh-2rem)]">
         <div className="flex items-center justify-between border-b p-4">
-          <h2 className="text-lg font-bold">Your order</h2>
-          <Button variant="ghost" size="icon" aria-label="Close" onClick={onClose}>
-            <X className="h-5 w-5" />
+          <h2 id="cart-title" className="text-lg font-bold">
+            Your order
+          </h2>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Close cart"
+            onClick={onClose}
+          >
+            <X className="h-5 w-5" aria-hidden="true" />
           </Button>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4">
           {empty ? (
-            <p className="py-12 text-center text-sm text-muted-foreground">
-              Your cart is empty. Add something tasty!
-            </p>
+            <EmptyState
+              icon={ShoppingBag}
+              title="Your cart is empty"
+              description="Add something tasty from the menu to get started."
+            />
           ) : (
             <ul className="space-y-3">
               {items.map((line) => (
@@ -158,6 +169,6 @@ export function CustomerCart({
           </Button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }

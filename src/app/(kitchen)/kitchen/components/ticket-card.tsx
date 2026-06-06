@@ -11,7 +11,7 @@
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { KdsThresholds } from "@/lib/db";
@@ -39,7 +39,10 @@ const AGE_STYLES: Record<AgeLevel, { card: string; header: string }> = {
 /** Elapsed seconds right now, anchored on created_at (independent of polls). */
 function useLiveElapsed(createdAtIso: string): number {
   const compute = () =>
-    Math.max(0, Math.floor((Date.now() - new Date(createdAtIso).getTime()) / 1000));
+    Math.max(
+      0,
+      Math.floor((Date.now() - new Date(createdAtIso).getTime()) / 1000),
+    );
   const [elapsed, setElapsed] = useState(compute);
   useEffect(() => {
     setElapsed(compute());
@@ -50,7 +53,7 @@ function useLiveElapsed(createdAtIso: string): number {
   return elapsed;
 }
 
-export function TicketCard({
+function TicketCardImpl({
   ticket,
   thresholds,
   stationFilter,
@@ -75,6 +78,7 @@ export function TicketCard({
 
   return (
     <article
+      aria-label={`Order ${order.order_number}, ${statusLabel(order.status)}, ${channelLabel(order.channel)}`}
       className={cn(
         "flex flex-col overflow-hidden rounded-lg border-2 bg-card shadow-sm",
         styles.card,
@@ -122,6 +126,7 @@ export function TicketCard({
             size="sm"
             className="flex-1"
             disabled={busy}
+            aria-label={`Recall order ${order.order_number}`}
             onClick={() => onRecall(order.id)}
           >
             Recall
@@ -131,6 +136,7 @@ export function TicketCard({
             size="sm"
             className="flex-1"
             disabled={busy}
+            aria-label={`Bump order ${order.order_number}`}
             onClick={() => onBump(order.id)}
           >
             Bump
@@ -141,6 +147,7 @@ export function TicketCard({
             href={`/kitchen/ticket/${order.id}`}
             target="_blank"
             rel="noopener noreferrer"
+            aria-label={`Print ticket for order ${order.order_number} (opens in a new tab)`}
           >
             Print
           </a>
@@ -149,3 +156,10 @@ export function TicketCard({
     </article>
   );
 }
+
+/**
+ * Memoized so unchanged tickets don't re-render on every board poll. The live
+ * elapsed clock is internal state (its own interval), so identical props between
+ * snapshots can safely skip a re-render — keeping a busy KDS smooth.
+ */
+export const TicketCard = memo(TicketCardImpl);

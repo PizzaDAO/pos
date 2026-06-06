@@ -8,6 +8,8 @@
 
 import { useEffect, useState } from "react";
 import type { ActiveStaff } from "@/lib/store/use-active-staff";
+import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
 
 interface StaffOption {
   id: string;
@@ -74,16 +76,15 @@ export function StaffSwitch({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+    <Dialog onClose={onClose} labelledBy="staff-switch-title">
       <div className="w-full max-w-md rounded-lg bg-background p-6 shadow-xl">
         <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Switch staff</h2>
-          <button
-            className="text-sm text-muted-foreground hover:underline"
-            onClick={onClose}
-          >
+          <h2 id="staff-switch-title" className="text-lg font-semibold">
+            Switch staff
+          </h2>
+          <Button variant="ghost" size="sm" onClick={onClose}>
             Close
-          </button>
+          </Button>
         </div>
 
         {current && (
@@ -93,9 +94,15 @@ export function StaffSwitch({
           </p>
         )}
 
-        <label className="mb-1 block text-sm font-medium">Staff member</label>
+        <label
+          htmlFor="staff-select"
+          className="mb-1 block text-sm font-medium"
+        >
+          Staff member
+        </label>
         <select
-          className="mb-3 w-full rounded-md border px-3 py-2"
+          id="staff-select"
+          className="mb-3 w-full rounded-md border bg-background px-3 py-2"
           value={selected}
           onChange={(e) => setSelected(e.target.value)}
         >
@@ -107,12 +114,17 @@ export function StaffSwitch({
           ))}
         </select>
 
-        <label className="mb-1 block text-sm font-medium">PIN</label>
+        <label htmlFor="staff-pin" className="mb-1 block text-sm font-medium">
+          PIN
+        </label>
         <input
+          id="staff-pin"
           type="password"
           inputMode="numeric"
           autoComplete="off"
-          className="mb-3 w-full rounded-md border px-3 py-2 tracking-widest"
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? "staff-pin-error" : undefined}
+          className="mb-3 w-full rounded-md border bg-background px-3 py-2 tracking-widest"
           value={pin}
           onChange={(e) => setPin(e.target.value.replace(/[^0-9]/g, ""))}
           onKeyDown={(e) => {
@@ -122,31 +134,36 @@ export function StaffSwitch({
           maxLength={8}
         />
 
-        {error && <p className="mb-3 text-sm text-red-600">{error}</p>}
+        {error && (
+          <p
+            id="staff-pin-error"
+            role="alert"
+            className="mb-3 text-sm text-destructive"
+          >
+            {error}
+          </p>
+        )}
 
         <div className="flex items-center justify-between gap-2">
           {current ? (
-            <button
-              className="rounded-md border px-4 py-2 text-sm"
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => {
                 onSignOut();
                 onClose();
               }}
             >
               Sign out staff
-            </button>
+            </Button>
           ) : (
             <span />
           )}
-          <button
-            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
-            disabled={busy}
-            onClick={() => void submit()}
-          >
+          <Button size="sm" disabled={busy} onClick={() => void submit()}>
             {busy ? "Verifying…" : "Switch"}
-          </button>
+          </Button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
