@@ -156,6 +156,73 @@ re-granting — tightening anon therefore cannot break the current app.
 > `location_id` filter, so it never crosses tenants even though it bypasses RLS.
 > Never expose it to the client; keep it in a secret manager.
 
+## Enabling Supabase Realtime (KDS + customer order tracking)
+
+The realtime layer (`src/lib/realtime/`) flips from **polling** to **Supabase
+Realtime** automatically when the public Supabase env is present
+(`getRealtimeProvider()` mirrors the `getPosDriver()` env-guard; with no env it
+stays on the poller, so the build/preview/Vitest suite remain green with zero
+config). The browser client (`@supabase/ssr`) opens a `postgres_changes`
+subscription on the **`orders`** table, scoped by `location_id` (KDS board) or
+`id` (customer tracker), and re-fetches the same server-computed payload on each
+change. This is **client-side and runs as the signed-in user**, so Realtime
+enforces the same RLS SELECT policies as PostgREST — a user only ever receives
+rows for tenants/locations they're a member of.
+
+For Postgres changes to actually be streamed, the `orders` table must be added
+to the **`supabase_realtime`** publication, and (so UPDATE/DELETE events carry
+the full old row that the `location_id`/`id` server-side filter matches on) set
+**`REPLICA IDENTITY FULL`**. Run this ONCE on the live DB (idempotent guards
+included):
+
+```sql
+-- 1. Stream the full row on UPDATE/DELETE so Realtime's row filter
+--    (location_id=eq.<id> / id=eq.<id>) can match the OLD row, not just NEW.
+alter table public.orders replica identity full;
+
+-- 2. Add orders to the realtime publication (create it first if the project
+--    somehow lacks the default one).
+do $$
+begin
+  if not exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    create publication supabase_realtime;
+  end if;
+end$$;
+
+alter publication supabase_realtime add table public.orders;
+```
+
+To verify it took:
+
+```sql
+-- orders should appear in the publication's table list:
+select schemaname, tablename
+from pg_publication_tables
+where pubname = 'supabase_realtime';
+
+-- replica identity should be 'f' (FULL) for orders:
+select relreplident from pg_class where oid = 'public.orders'::regclass;
+```
+
+Notes:
+- **RLS is the security boundary, not the filter.** The client-side
+  `location_id`/`id` filter is a narrowing convenience; the `orders` RLS SELECT
+  policies (customer-owns-their-orders / tenant-staff) already gate which rows a
+  user may receive over Realtime. No policy changes are needed to enable
+  Realtime — it reuses the existing SELECT policies.
+- **Only `orders` is subscribed today.** The KDS board derives station/age/
+  elapsed server-side and the tracker pulls live delivery state, both via the
+  same `fetcher` the poller used — so an `orders` status/row change is the single
+  trigger that fans out to both surfaces. If a future feature needs row-level
+  pushes from another table (e.g. `deliveries`), add it the same way:
+  `alter table public.deliveries replica identity full;` then
+  `alter publication supabase_realtime add table public.deliveries;`.
+- **Not required for the build.** None of this is needed for the app to build,
+  deploy, or pass tests — it only activates the websocket path once the live env
+  vars are set. Until applied, an env-configured deployment still works because
+  the client receives no change events and the initial-load fetch still renders;
+  applying the SQL is what makes updates *instant* instead of on next navigation.
+
 ## Running the RLS isolation test
 
 `tests/rls_isolation.sql` inserts two tenants + a member each + a platform admin,
