@@ -61,15 +61,35 @@ export function useCheckout(
 
   const refresh = useCallback(async () => {
     if (!orderId) return;
-    try {
-      const res = await fetch(`/api/payments?orderId=${encodeURIComponent(orderId)}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as PaymentsResponse;
-      setOrder(data.order);
-      setPayments(data.payments);
-      setBalanceCents(data.balanceCents);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load payments.");
+    // The terminal opens this screen immediately after placing the order, while
+    // the order is still flushing to the server via the offline queue
+    // (fire-and-forget). So a freshly-opened checkout can transiently 404 until
+    // the upsert lands. Retry a bounded number of times on "not found" before
+    // surfacing an error, so the cashier isn't shown a $0.00 / disabled charge.
+    const maxAttempts = 8;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const res = await fetch(
+          `/api/payments?orderId=${encodeURIComponent(orderId)}`,
+        );
+        if (res.status === 404 && attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as PaymentsResponse;
+        setOrder(data.order);
+        setPayments(data.payments);
+        setBalanceCents(data.balanceCents);
+        setError(null);
+        return;
+      } catch (e) {
+        if (attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+        setError(e instanceof Error ? e.message : "Failed to load payments.");
+      }
     }
   }, [orderId]);
 
@@ -100,7 +120,9 @@ export function useCheckout(
           p.status === "pending",
       );
       for (const p of stillPending) {
-        await fetch(`/api/payments/status?paymentId=${encodeURIComponent(p.id)}`);
+        await fetch(
+          `/api/payments/status?paymentId=${encodeURIComponent(p.id)}`,
+        );
       }
       await refresh();
     }, 2_500);

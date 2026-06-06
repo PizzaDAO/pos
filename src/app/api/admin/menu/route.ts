@@ -37,7 +37,9 @@ export async function GET(request: Request) {
   const [categories, modifierGroups, menu] = await Promise.all([
     driver.listCategories(tenantId),
     driver.listModifierGroups(tenantId),
-    driver.getMenu(tenantId, locationId),
+    // Back-office editor: include 86'd items/modifiers so they can be SEEN and
+    // un-86'd. (Customer reads at /api/menu + /api/shop/* exclude them.)
+    driver.getMenu(tenantId, locationId, { includeUnavailable: true }),
   ]);
   return NextResponse.json({ categories, modifierGroups, menu });
 }

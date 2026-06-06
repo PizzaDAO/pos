@@ -49,3 +49,9 @@ Thumbs.db
 
 # testing
 coverage/
+
+# playwright (E2E) — separate from Vitest
+/test-results/
+/playwright-report/
+/playwright/.cache/
+/e2e/.auth/

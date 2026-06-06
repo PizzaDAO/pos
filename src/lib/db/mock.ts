@@ -31,11 +31,7 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type {
-  ConnectAccount,
-  Payment,
-  PaymentSettings,
-} from "./payment-types";
+import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -108,10 +104,14 @@ import { buildSalesReport, isoDate } from "@/lib/reports";
 // it without touching the immutable seed module. A future Supabase driver
 // replaces these with table reads/writes; call sites are unchanged.
 // ---------------------------------------------------------------------------
-const menuCategories: MenuCategory[] = seedMenuCategories.map((c) => ({ ...c }));
+const menuCategories: MenuCategory[] = seedMenuCategories.map((c) => ({
+  ...c,
+}));
 const menuItems: MenuItem[] = seedMenuItems.map((i) => ({ ...i }));
 const itemSizes: ItemSize[] = seedItemSizes.map((s) => ({ ...s }));
-const modifierGroups: ModifierGroup[] = seedModifierGroups.map((g) => ({ ...g }));
+const modifierGroups: ModifierGroup[] = seedModifierGroups.map((g) => ({
+  ...g,
+}));
 const modifiers: Modifier[] = seedModifiers.map((m) => ({ ...m }));
 const itemModifierGroups = seedItemModifierGroups.map((l) => ({ ...l }));
 
@@ -126,7 +126,9 @@ const locations: Location[] = seedLocations.map((l) => ({ ...l }));
 const storeSettings = seedStoreSettings.map((s) => ({ ...s }));
 const paymentSettings = seedPaymentSettings.map((s) => ({ ...s }));
 const usersById = new Map<string, User>(seedUsers.map((u) => [u.id, { ...u }]));
-const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({ ...a }));
+const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({
+  ...a,
+}));
 /** Tenant memberships (user ↔ tenant ↔ role) — drives session role gating. */
 const memberships: Membership[] = seedMemberships.map((m) => ({ ...m }));
 /** Subscriptions keyed by tenant id (one per tenant). */
@@ -188,7 +190,9 @@ const itemInventoryLinks: ItemInventoryLink[] = seedItemInventoryLinks.map(
 const inventoryMovements: InventoryMovement[] = [];
 
 /** Staff keyed by id. */
-const staffById = new Map<string, Staff>(seedStaff.map((s) => [s.id, { ...s }]));
+const staffById = new Map<string, Staff>(
+  seedStaff.map((s) => [s.id, { ...s }]),
+);
 const shifts = new Map<string, Shift>();
 const shiftCashEvents: ShiftCashEvent[] = [];
 const businessDayCloses = new Map<string, BusinessDayClose>();
@@ -272,6 +276,7 @@ function getOverride(
 function buildMenuItemDetail(
   itemId: string,
   locationId: string,
+  includeUnavailable = false,
 ): MenuItemDetail | null {
   const item = menuItems.find((i) => i.id === itemId);
   if (!item) return null;
@@ -297,9 +302,12 @@ function buildMenuItemDetail(
       if (!group) return null;
       const mods = modifiers
         .filter((m) => m.group_id === group.id)
-        // 86'd modifiers drop out of the menu graph for this location.
+        // 86'd modifiers drop out of the customer menu graph for this location;
+        // the back office keeps them (flagged) so they can be un-86'd.
         .filter(
-          (m) => getOverride(locationId, "modifier", m.id)?.available !== false,
+          (m) =>
+            includeUnavailable ||
+            getOverride(locationId, "modifier", m.id)?.available !== false,
         )
         .sort((a, b) => a.sort_order - b.sort_order)
         .map((m) => {
@@ -315,7 +323,11 @@ function buildMenuItemDetail(
   return { ...item, sizes, modifierGroups: modifierGroupsForItem };
 }
 
-function assembleMenu(tenantId: string, locationId: string): Menu {
+function assembleMenu(
+  tenantId: string,
+  locationId: string,
+  includeUnavailable = false,
+): Menu {
   const categories: MenuCategoryWithItems[] = menuCategories
     .filter((c) => c.tenant_id === tenantId)
     .sort((a, b) => a.sort_order - b.sort_order)
@@ -324,11 +336,14 @@ function assembleMenu(tenantId: string, locationId: string): Menu {
         .filter(
           (i) => i.tenant_id === tenantId && i.category_id === category.id,
         )
-        // An item 86'd at this location drops out of the menu entirely.
+        // An item 86'd at this location drops out of the CUSTOMER menu entirely;
+        // the back office (includeUnavailable) keeps it so it can be un-86'd.
         .filter(
-          (i) => getOverride(locationId, "item", i.id)?.available !== false,
+          (i) =>
+            includeUnavailable ||
+            getOverride(locationId, "item", i.id)?.available !== false,
         )
-        .map((i) => buildMenuItemDetail(i.id, locationId))
+        .map((i) => buildMenuItemDetail(i.id, locationId, includeUnavailable))
         .filter((d): d is MenuItemDetail => d !== null);
       return { ...category, items } satisfies MenuCategoryWithItems;
     });
@@ -471,8 +486,7 @@ function computeReconciliation(shift: Shift): DrawerReconciliation {
     else if (e.type === "paid_in") paidIn += e.amount_cents;
     else payouts += Math.abs(e.amount_cents); // payout/drop
   }
-  const expected =
-    shift.opening_float_cents + cashSales + paidIn - payouts;
+  const expected = shift.opening_float_cents + cashSales + paidIn - payouts;
   const counted = shift.counted_cents;
   return {
     opening_float_cents: shift.opening_float_cents,
@@ -553,10 +567,7 @@ export const mockDriver: PosDriver = {
 
   async createLocation(input: CreateLocationInput): Promise<Location> {
     const now = nowIso();
-    const slug = uniqueSlug(
-      input.name,
-      new Set(locations.map((l) => l.slug)),
-    );
+    const slug = uniqueSlug(input.name, new Set(locations.map((l) => l.slug)));
     const location: Location = {
       id: genId("loc"),
       tenant_id: input.tenant_id,
@@ -738,7 +749,9 @@ export const mockDriver: PosDriver = {
   },
 
   async listMembershipsForUser(userId: string): Promise<Membership[]> {
-    return memberships.filter((m) => m.user_id === userId).map((m) => ({ ...m }));
+    return memberships
+      .filter((m) => m.user_id === userId)
+      .map((m) => ({ ...m }));
   },
 
   async listTenantHealth(): Promise<TenantHealth[]> {
@@ -802,8 +815,8 @@ export const mockDriver: PosDriver = {
     return locations.find((l) => l.slug === slug) ?? null;
   },
 
-  async getMenu(tenantId, locationId): Promise<Menu> {
-    return assembleMenu(tenantId, locationId);
+  async getMenu(tenantId, locationId, opts): Promise<Menu> {
+    return assembleMenu(tenantId, locationId, opts?.includeUnavailable);
   },
 
   async getStoreSettings(tenantId, locationId): Promise<StoreSettings> {
@@ -937,9 +950,7 @@ export const mockDriver: PosDriver = {
     return connectAccounts.get(tenantId) ?? null;
   },
 
-  async upsertConnectAccount(
-    account: ConnectAccount,
-  ): Promise<ConnectAccount> {
+  async upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount> {
     const existing = connectAccounts.get(account.tenant_id);
     const merged: ConnectAccount = {
       ...account,
@@ -1170,9 +1181,7 @@ export const mockDriver: PosDriver = {
       .map((g) => ({ ...g }));
   },
 
-  async upsertModifierGroup(
-    input: ModifierGroupInput,
-  ): Promise<ModifierGroup> {
+  async upsertModifierGroup(input: ModifierGroupInput): Promise<ModifierGroup> {
     if (input.id) {
       const idx = modifierGroups.findIndex((g) => g.id === input.id);
       const current = idx >= 0 ? modifierGroups[idx] : undefined;
@@ -1304,9 +1313,7 @@ export const mockDriver: PosDriver = {
     locationId: string,
   ): Promise<InventoryItemView[]> {
     return [...inventoryItems.values()]
-      .filter(
-        (i) => i.tenant_id === tenantId && i.location_id === locationId,
-      )
+      .filter((i) => i.tenant_id === tenantId && i.location_id === locationId)
       .sort((a, b) => a.name.localeCompare(b.name))
       .map((i) => ({ ...i, low: i.on_hand <= i.low_threshold }));
   },
@@ -1343,9 +1350,7 @@ export const mockDriver: PosDriver = {
     locationId: string,
   ): Promise<InventoryMovement[]> {
     return inventoryMovements
-      .filter(
-        (m) => m.tenant_id === tenantId && m.location_id === locationId,
-      )
+      .filter((m) => m.tenant_id === tenantId && m.location_id === locationId)
       .sort((a, b) => b.created_at.localeCompare(a.created_at))
       .map((m) => ({ ...m }));
   },
@@ -1383,9 +1388,7 @@ export const mockDriver: PosDriver = {
     locationId: string,
     businessDate: string,
   ): Promise<BusinessDayClose | null> {
-    return (
-      businessDayCloses.get(`${locationId}:${businessDate}`) ?? null
-    );
+    return businessDayCloses.get(`${locationId}:${businessDate}`) ?? null;
   },
 
   async closeBusinessDay(
@@ -1477,9 +1480,7 @@ export const mockDriver: PosDriver = {
 
   async listShifts(tenantId: string, locationId: string): Promise<Shift[]> {
     return [...shifts.values()]
-      .filter(
-        (s) => s.tenant_id === tenantId && s.location_id === locationId,
-      )
+      .filter((s) => s.tenant_id === tenantId && s.location_id === locationId)
       .sort((a, b) => b.opened_at.localeCompare(a.opened_at))
       .map((s) => ({ ...s }));
   },

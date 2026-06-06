@@ -13,11 +13,7 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type {
-  ConnectAccount,
-  Payment,
-  PaymentSettings,
-} from "./payment-types";
+import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -171,7 +167,9 @@ export interface PosDriver {
   // -- Audit log (impersonation + sensitive actions) -------------------------
 
   /** Append an audit entry (impersonation start/end, suspend, etc.). */
-  appendAuditLog(entry: Omit<AuditLogEntry, "id" | "created_at">): Promise<AuditLogEntry>;
+  appendAuditLog(
+    entry: Omit<AuditLogEntry, "id" | "created_at">,
+  ): Promise<AuditLogEntry>;
 
   /** Read the audit log (newest first), optionally scoped to a tenant. */
   listAuditLog(tenantId?: string): Promise<AuditLogEntry[]>;
@@ -186,8 +184,22 @@ export interface PosDriver {
   /** Resolve a location by its public slug (storefront URL), or null. */
   getLocationBySlug(slug: string): Promise<Location | null>;
 
-  /** Fully-assembled menu graph for a location (categories → items → sizes/modifiers). */
-  getMenu(tenantId: string, locationId: string): Promise<Menu>;
+  /**
+   * Fully-assembled menu graph for a location (categories → items →
+   * sizes/modifiers), with per-location price + availability (86) overrides
+   * folded in.
+   *
+   * By default items/modifiers 86'd at the location are EXCLUDED (the
+   * customer-facing read for terminal/shop). Pass `includeUnavailable: true`
+   * for the BACK-OFFICE menu manager, which must still list 86'd items (flagged
+   * via the override) so an owner can see and un-86 them — otherwise an 86'd
+   * item vanishes from the editor with no way to re-enable it.
+   */
+  getMenu(
+    tenantId: string,
+    locationId: string,
+    opts?: { includeUnavailable?: boolean },
+  ): Promise<Menu>;
 
   /** Per-location store settings (tax rate, currency, tip presets). */
   getStoreSettings(
