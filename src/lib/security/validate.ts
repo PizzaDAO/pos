@@ -75,6 +75,18 @@ export function isClientId(v: unknown): v is string {
   );
 }
 
+/**
+ * An RFC-4122 UUID (any version). Used to reject malformed ids BEFORE they
+ * reach a `uuid`-typed Supabase column (which would otherwise surface as a 500
+ * `invalid input syntax for type uuid` instead of a clean 422).
+ */
+export function isUuid(v: unknown): v is string {
+  return (
+    typeof v === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)
+  );
+}
+
 /** A minimal, length-bounded email shape (server is the source of truth). */
 export function isEmail(v: unknown, maxLen = 254): v is string {
   return (

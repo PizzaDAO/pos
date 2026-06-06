@@ -27,10 +27,16 @@ export interface MenuTemplate {
   itemModifierGroups: ItemModifierGroup[];
 }
 
-let templateSeq = 0;
-function tid(prefix: string): string {
-  templateSeq += 1;
-  return `${prefix}-${Date.now().toString(36)}-${templateSeq}`;
+/**
+ * Generate a primary-key id for a template row.
+ *
+ * MUST be a real UUID: the production Supabase schema types every id column as
+ * `uuid`, so a synthetic string like `cat-<rand>-1` is rejected with
+ * `invalid input syntax for type uuid` and a self-serve tenant ends up menu-less.
+ * The `prefix` is intentionally ignored (kept only for call-site readability).
+ */
+function tid(_prefix: string): string {
+  return crypto.randomUUID();
 }
 
 /**
