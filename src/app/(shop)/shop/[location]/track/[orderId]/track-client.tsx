@@ -73,7 +73,7 @@ export function TrackClient({
   const promised = order.fulfillment?.promised_at;
 
   return (
-    <div className="mx-auto min-h-screen max-w-md p-4">
+    <main id="main-content" className="mx-auto min-h-screen max-w-md p-4">
       <header className="mb-6 text-center">
         <p className="text-xs font-medium uppercase tracking-wide text-primary">
           {isDelivery ? "Delivery" : "Pickup"}
@@ -166,7 +166,7 @@ export function TrackClient({
           ← Back to {slug}
         </Link>
       </div>
-    </div>
+    </main>
   );
 }
 

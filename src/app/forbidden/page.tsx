@@ -5,7 +5,10 @@
  */
 export default function ForbiddenPage() {
   return (
-    <div className="mx-auto mt-24 w-full max-w-md rounded-lg border p-6 text-center">
+    <main
+      id="main-content"
+      className="mx-auto mt-24 w-full max-w-md rounded-lg border p-6 text-center"
+    >
       <h1 className="mb-2 text-xl font-semibold">No access</h1>
       <p className="mb-4 text-sm text-muted-foreground">
         Your account doesn&apos;t have permission for this area. If this is
@@ -16,6 +19,6 @@ export default function ForbiddenPage() {
           Sign out
         </button>
       </form>
-    </div>
+    </main>
   );
 }
