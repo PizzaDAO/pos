@@ -3,8 +3,9 @@ import { TerminalClient } from "./components/terminal-client";
 import { requireLocationSurface } from "@/lib/auth/guard";
 
 export const metadata: Metadata = {
-  title: "Terminal — Pizzeria POS",
+  title: "Terminal",
   description: "Offline-first counter POS terminal.",
+  robots: { index: false, follow: false },
 };
 
 /**

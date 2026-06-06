@@ -18,9 +18,13 @@ import { Loader2, RotateCcw, X } from "lucide-react";
 import type { PaymentSettings } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
-import { PAYMENT_RAIL_KEYS, PAYMENT_RAIL_LABELS } from "@/lib/payments/registry";
+import {
+  PAYMENT_RAIL_KEYS,
+  PAYMENT_RAIL_LABELS,
+} from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
 import { TipSelector } from "./tip-selector";
 import { ReceiptView } from "./receipt-view";
@@ -71,7 +75,8 @@ export function PaymentScreen({
       rail,
       amountCents: balance,
       tipCents,
-      cashTenderedCents: rail === "cash" ? cashTenderedCents || dueWithTip : undefined,
+      cashTenderedCents:
+        rail === "cash" ? cashTenderedCents || dueWithTip : undefined,
     });
     setTipCents(0);
     setCashTendered("");
@@ -84,12 +89,16 @@ export function PaymentScreen({
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+    <Dialog
+      onClose={onClose}
+      labelledBy="payment-screen-title"
+      closeOnBackdrop={false}
+    >
       <div className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-background shadow-xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b p-4">
           <div>
-            <h2 className="text-lg font-bold">
+            <h2 id="payment-screen-title" className="text-lg font-bold">
               {paid ? "Payment complete" : "Take payment"}
             </h2>
             <p className="text-sm text-muted-foreground">
@@ -98,8 +107,13 @@ export function PaymentScreen({
                 : `Balance due ${formatMoney(balance, currency)}`}
             </p>
           </div>
-          <Button variant="ghost" size="icon" aria-label="Close" onClick={onClose}>
-            <X className="h-5 w-5" />
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Close payment"
+            onClick={onClose}
+          >
+            <X className="h-5 w-5" aria-hidden="true" />
           </Button>
         </div>
 
@@ -182,7 +196,8 @@ export function PaymentScreen({
                     <p className="mt-1 text-xs text-muted-foreground">
                       {pendingCrypto.rail === "crypto_onchain_usdc"
                         ? `Send USDC on Base to ${String(
-                            pendingCrypto.raw?.payToAddress ?? "the pay-to address",
+                            pendingCrypto.raw?.payToAddress ??
+                              "the pay-to address",
                           )}.`
                         : "Complete the Coinbase Commerce checkout."}{" "}
                       Confirming automatically.
@@ -204,7 +219,8 @@ export function PaymentScreen({
                 >
                   {checkout.loading ? (
                     <>
-                      <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Processing…
+                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />{" "}
+                      Processing…
                     </>
                   ) : (
                     `Charge ${formatMoney(balance + tipCents, currency)}`
@@ -218,11 +234,7 @@ export function PaymentScreen({
                 <Button className="h-14 w-full text-base" onClick={onPaid}>
                   Done — new order
                 </Button>
-                <Button
-                  variant="outline"
-                  className="w-full"
-                  onClick={onClose}
-                >
+                <Button variant="outline" className="w-full" onClick={onClose}>
                   Keep order open
                 </Button>
               </div>
@@ -274,6 +286,6 @@ export function PaymentScreen({
           </div>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }

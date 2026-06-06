@@ -13,6 +13,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import dynamic from "next/dynamic";
 import {
   BarChart3,
   Boxes,
@@ -29,16 +30,58 @@ import {
 import { DEMO_TENANT_ID, type Location } from "@/lib/db";
 import { useEntitlements } from "@/lib/saas/use-entitlements";
 import { SignOutButton } from "@/components/auth/sign-out-button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { MenuManager } from "./menu-manager";
-import { InventoryManager } from "./inventory-manager";
-import { ReportsView } from "./reports-view";
-import { StaffShifts } from "./staff-shifts";
-import { EndOfDay } from "./end-of-day";
-import { LocationsManager } from "./locations-manager";
-import { PlanBilling } from "./plan-billing";
-import { ConnectOnboarding } from "../connect-onboarding";
-import { DeliveryDispatch } from "../delivery-dispatch";
+
+/**
+ * Tab panels are lazy-loaded: only one tab is visible at a time, so code-split
+ * each heavy manager and load it on demand. This trims the back-office initial
+ * JS substantially with no behaviour change (each module is the same component,
+ * just fetched when its tab opens). `ssr: false` is safe — these are
+ * client-only, data-fetching panels behind an authenticated shell.
+ */
+const PanelFallback = () => (
+  <div className="space-y-3" aria-busy="true" aria-label="Loading section">
+    <Skeleton className="h-8 w-48" />
+    <Skeleton className="h-40 w-full" />
+    <Skeleton className="h-40 w-full" />
+  </div>
+);
+const MenuManager = dynamic(
+  () => import("./menu-manager").then((m) => m.MenuManager),
+  { loading: PanelFallback },
+);
+const InventoryManager = dynamic(
+  () => import("./inventory-manager").then((m) => m.InventoryManager),
+  { loading: PanelFallback },
+);
+const ReportsView = dynamic(
+  () => import("./reports-view").then((m) => m.ReportsView),
+  { loading: PanelFallback },
+);
+const StaffShifts = dynamic(
+  () => import("./staff-shifts").then((m) => m.StaffShifts),
+  { loading: PanelFallback },
+);
+const EndOfDay = dynamic(() => import("./end-of-day").then((m) => m.EndOfDay), {
+  loading: PanelFallback,
+});
+const LocationsManager = dynamic(
+  () => import("./locations-manager").then((m) => m.LocationsManager),
+  { loading: PanelFallback },
+);
+const PlanBilling = dynamic(
+  () => import("./plan-billing").then((m) => m.PlanBilling),
+  { loading: PanelFallback },
+);
+const ConnectOnboarding = dynamic(
+  () => import("../connect-onboarding").then((m) => m.ConnectOnboarding),
+  { loading: PanelFallback },
+);
+const DeliveryDispatch = dynamic(
+  () => import("../delivery-dispatch").then((m) => m.DeliveryDispatch),
+  { loading: PanelFallback },
+);
 
 type Tab =
   | "menu"
@@ -51,9 +94,10 @@ type Tab =
   | "payments"
   | "delivery";
 
-function readTenantParam(
-  fallbackTenantId: string,
-): { tenantId: string; impersonate: boolean } {
+function readTenantParam(fallbackTenantId: string): {
+  tenantId: string;
+  impersonate: boolean;
+} {
   if (typeof window === "undefined") {
     return { tenantId: fallbackTenantId, impersonate: false };
   }
@@ -173,21 +217,26 @@ export function AdminShell({
             </div>
           )}
 
-          <nav className="mt-3 flex flex-wrap gap-1">
+          <nav
+            aria-label="Back office sections"
+            className="mt-3 flex flex-wrap gap-1"
+          >
             {tabs.map((t) => {
               const Icon = t.icon;
+              const active = tab === t.id;
               return (
                 <button
                   key={t.id}
                   onClick={() => setTab(t.id)}
+                  aria-current={active ? "page" : undefined}
                   className={cn(
                     "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
-                    tab === t.id
+                    active
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
                   )}
                 >
-                  <Icon className="h-4 w-4" />
+                  <Icon className="h-4 w-4" aria-hidden="true" />
                   {t.label}
                 </button>
               );
@@ -196,7 +245,7 @@ export function AdminShell({
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 py-6">
+      <main id="main-content" className="mx-auto max-w-6xl px-4 py-6">
         {tab === "menu" && locationId && (
           <MenuManager tenantId={tenantId} locationId={locationId} />
         )}

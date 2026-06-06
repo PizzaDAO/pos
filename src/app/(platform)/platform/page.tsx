@@ -1,5 +1,12 @@
+import type { Metadata } from "next";
 import { PlatformConsole } from "./platform-console";
 import { requirePlatformAdmin } from "@/lib/auth/guard";
+
+export const metadata: Metadata = {
+  title: "Platform Admin",
+  description: "Super-admin console: tenants, billing, and support.",
+  robots: { index: false, follow: false },
+};
 
 /**
  * Super-admin platform console (real-auth). SERVER component: gated to

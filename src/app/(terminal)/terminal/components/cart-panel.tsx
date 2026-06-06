@@ -4,9 +4,10 @@
  */
 "use client";
 
-import { Pencil, Trash2, Ban } from "lucide-react";
+import { Pencil, Trash2, Ban, ShoppingCart } from "lucide-react";
 import type { OrderItem, OrderItemModifier, StoreSettings } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
 import { cn } from "@/lib/utils";
 import { computeOrderTotals, formatMoney } from "@/lib/pricing";
 import { useCartStore } from "@/lib/store/cart";
@@ -68,9 +69,11 @@ export function CartPanel({
       {/* Lines */}
       <div className="flex-1 overflow-y-auto p-3">
         {items.length === 0 && (
-          <p className="p-8 text-center text-sm text-muted-foreground">
-            No items yet. Tap a menu item to start.
-          </p>
+          <EmptyState
+            icon={ShoppingCart}
+            title="No items yet"
+            description="Tap a menu item to start building the order."
+          />
         )}
         <ul className="space-y-2">
           {items.map((item) => {
@@ -117,9 +120,7 @@ export function CartPanel({
                         type="button"
                         className="px-3 py-1 text-sm hover:bg-accent"
                         aria-label="Decrease quantity"
-                        onClick={() =>
-                          setQuantity(item.id, item.quantity - 1)
-                        }
+                        onClick={() => setQuantity(item.id, item.quantity - 1)}
                       >
                         −
                       </button>
@@ -130,9 +131,7 @@ export function CartPanel({
                         type="button"
                         className="px-3 py-1 text-sm hover:bg-accent"
                         aria-label="Increase quantity"
-                        onClick={() =>
-                          setQuantity(item.id, item.quantity + 1)
-                        }
+                        onClick={() => setQuantity(item.id, item.quantity + 1)}
                       >
                         +
                       </button>

@@ -1,4 +1,11 @@
+import type { Metadata } from "next";
 import { SignupWizard } from "./signup-wizard";
+
+export const metadata: Metadata = {
+  title: "Start your pizzeria",
+  description:
+    "Self-serve onboarding: create your pizzeria, add a location, connect payouts, import a starter menu, and go live.",
+};
 
 /**
  * Self-serve tenant signup + onboarding wizard (Phase 6, public route).

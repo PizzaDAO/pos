@@ -15,7 +15,10 @@ export function SurfacePlaceholder({
   children?: React.ReactNode;
 }) {
   return (
-    <main className="mx-auto flex min-h-screen max-w-2xl flex-col justify-center gap-4 p-8">
+    <main
+      id="main-content"
+      className="mx-auto flex min-h-screen max-w-2xl flex-col justify-center gap-4 p-8"
+    >
       <div className="space-y-1">
         <p className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
           {surface}

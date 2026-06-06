@@ -224,7 +224,7 @@ export function SignupWizard() {
   const connected = connect?.status === "connected";
 
   return (
-    <main className="mx-auto max-w-2xl px-4 py-8">
+    <main id="main-content" className="mx-auto max-w-2xl px-4 py-8">
       <header className="mb-6">
         <h1 className="text-2xl font-bold tracking-tight">
           Start your pizzeria
@@ -382,7 +382,8 @@ export function SignupWizard() {
               </div>
               {connect?.simulated && (
                 <p className="mt-2 text-xs text-amber-700">
-                  Simulated — no live Stripe keys. Onboarding completes instantly.
+                  Simulated — no live Stripe keys. Onboarding completes
+                  instantly.
                 </p>
               )}
             </div>
@@ -459,7 +460,9 @@ export function SignupWizard() {
                       /mo
                     </span>
                   </div>
-                  <p className="mt-1 text-xs text-muted-foreground">{p.blurb}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {p.blurb}
+                  </p>
                   <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
                     <li>
                       {p.entitlements.max_locations === null
@@ -467,7 +470,8 @@ export function SignupWizard() {
                         : `${p.entitlements.max_locations} location${p.entitlements.max_locations === 1 ? "" : "s"}`}
                     </li>
                     <li>
-                      {p.entitlements.online_ordering ? "✓" : "—"} Online ordering
+                      {p.entitlements.online_ordering ? "✓" : "—"} Online
+                      ordering
                     </li>
                     <li>
                       {p.entitlements.advanced_reports ? "✓" : "—"} Advanced
@@ -477,7 +481,9 @@ export function SignupWizard() {
                   <Button
                     className="mt-3"
                     size="sm"
-                    variant={subscription?.tier === p.tier ? "default" : "outline"}
+                    variant={
+                      subscription?.tier === p.tier ? "default" : "outline"
+                    }
                     onClick={() => pickPlan(p.tier)}
                     disabled={busy}
                   >
@@ -526,8 +532,8 @@ export function SignupWizard() {
                   <CheckCircle2 className="h-5 w-5" /> You&apos;re live!
                 </div>
                 <p className="text-sm text-muted-foreground">
-                  {tenant.name} is active. Open your back office and storefront —
-                  fully isolated from every other tenant.
+                  {tenant.name} is active. Open your back office and storefront
+                  — fully isolated from every other tenant.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   <Button asChild size="sm">

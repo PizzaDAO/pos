@@ -39,7 +39,10 @@ export function SignInForm({
   // ---- SIMULATED MODE ----
   if (!configured) {
     return (
-      <div className="mx-auto mt-24 w-full max-w-sm rounded-lg border p-6 text-center">
+      <main
+        id="main-content"
+        className="mx-auto mt-24 w-full max-w-sm rounded-lg border p-6 text-center"
+      >
         <h1 className="mb-2 text-xl font-semibold">{heading}</h1>
         <p className="mb-4 text-sm text-muted-foreground">
           This deployment is running with <strong>simulated auth</strong> (no
@@ -52,7 +55,7 @@ export function SignInForm({
         >
           Continue
         </a>
-      </div>
+      </main>
     );
   }
 
@@ -95,7 +98,10 @@ export function SignInForm({
 
   // ---- REAL MODE ----
   return (
-    <div className="mx-auto mt-24 w-full max-w-sm rounded-lg border p-6">
+    <main
+      id="main-content"
+      className="mx-auto mt-24 w-full max-w-sm rounded-lg border p-6"
+    >
       <h1 className="mb-1 text-xl font-semibold">{heading}</h1>
       {subheading && (
         <p className="mb-4 text-sm text-muted-foreground">{subheading}</p>
@@ -156,6 +162,6 @@ export function SignInForm({
       >
         {usePassword ? "Use a magic link instead" : "Use a password instead"}
       </button>
-    </div>
+    </main>
   );
 }

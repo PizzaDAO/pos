@@ -1,5 +1,12 @@
+import type { Metadata } from "next";
 import { KitchenBoard } from "./components/kitchen-board";
 import { requireLocationSurface } from "@/lib/auth/guard";
+
+export const metadata: Metadata = {
+  title: "Kitchen Display",
+  description: "Realtime kitchen display system for active orders.",
+  robots: { index: false, follow: false },
+};
 
 /**
  * Kitchen Display System (real-auth). SERVER component: the device must be

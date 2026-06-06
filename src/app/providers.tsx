@@ -2,10 +2,11 @@
 
 import { useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ToastProvider } from "@/components/ui/toast";
 
 /**
  * Client-side providers wrapping the whole app.
- * Phase 0: TanStack Query only. Auth/Supabase/realtime providers land in later phases.
+ * TanStack Query for server-state + a presentational toast layer (aria-live).
  */
 export function Providers({ children }: { children: ReactNode }) {
   const [queryClient] = useState(
@@ -21,6 +22,8 @@ export function Providers({ children }: { children: ReactNode }) {
   );
 
   return (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      <ToastProvider>{children}</ToastProvider>
+    </QueryClientProvider>
   );
 }

@@ -144,7 +144,7 @@ export function PlatformConsole() {
   }
 
   return (
-    <main className="mx-auto max-w-5xl px-4 py-6">
+    <main id="main-content" className="mx-auto max-w-5xl px-4 py-6">
       <header className="mb-4 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <ShieldCheck className="h-5 w-5" />
@@ -409,7 +409,9 @@ function TenantDetail({
           )}
         </div>
         <div className="rounded-lg border p-4">
-          <div className="text-xs uppercase text-muted-foreground">Payments</div>
+          <div className="text-xs uppercase text-muted-foreground">
+            Payments
+          </div>
           <div className="mt-1 font-semibold">
             {connect?.status === "connected" ? "Connected" : "Not connected"}
           </div>
@@ -418,12 +420,15 @@ function TenantDetail({
           </div>
         </div>
         <div className="rounded-lg border p-4">
-          <div className="text-xs uppercase text-muted-foreground">Footprint</div>
+          <div className="text-xs uppercase text-muted-foreground">
+            Footprint
+          </div>
           <div className="mt-1 font-semibold">
             {locations.length} location{locations.length === 1 ? "" : "s"}
           </div>
           <div className="mt-2 text-xs text-muted-foreground">
-            Onboarding {onboarding?.live ? "live" : (onboarding?.current_step ?? "—")}
+            Onboarding{" "}
+            {onboarding?.live ? "live" : (onboarding?.current_step ?? "—")}
           </div>
         </div>
       </section>

@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { RegisterServiceWorker } from "./register-sw";
+import { InstallPrompt } from "./install-prompt";
 
 export const metadata: Metadata = {
   appleWebApp: {
@@ -27,6 +28,7 @@ export default function TerminalLayout({
     <>
       <RegisterServiceWorker />
       {children}
+      <InstallPrompt />
     </>
   );
 }

@@ -12,9 +12,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ShoppingBag } from "lucide-react";
+import { AlertTriangle, ShoppingBag } from "lucide-react";
 import type { MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/ui/empty-state";
 import { formatMoney } from "@/lib/pricing";
 import { useShop } from "@/lib/store/use-shop";
 import { useCustomerCart } from "@/lib/store/customer-cart";
@@ -51,18 +53,38 @@ export function ShopClient({
 
   if (isLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center text-muted-foreground">
-        Loading menu…
+      <div
+        className="mx-auto min-h-screen w-full max-w-5xl p-4"
+        aria-busy="true"
+        aria-label="Loading menu"
+      >
+        <Skeleton className="mb-4 h-10 w-48" />
+        <div className="mb-4 flex gap-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-9 w-24 rounded-full" />
+          ))}
+        </div>
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Skeleton key={i} className="h-24 rounded-xl" />
+          ))}
+        </div>
       </div>
     );
   }
   if (isError || !data) {
     return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-3">
-        <p className="text-muted-foreground">Could not load this store.</p>
-        <Button variant="outline" onClick={() => refetch()}>
-          Retry
-        </Button>
+      <div className="flex min-h-screen flex-col items-center justify-center">
+        <EmptyState
+          icon={AlertTriangle}
+          title="Could not load this store"
+          description="The store may be temporarily unavailable. Please try again."
+          action={
+            <Button variant="outline" onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
+        />
       </div>
     );
   }
@@ -103,9 +125,10 @@ export function ShopClient({
           <Button
             variant="outline"
             className="relative"
+            aria-label={`Open cart, ${itemCount} item${itemCount === 1 ? "" : "s"}, ${formatMoney(subtotalCents, currency)}`}
             onClick={() => setCartOpen(true)}
           >
-            <ShoppingBag className="mr-2 h-4 w-4" />
+            <ShoppingBag className="mr-2 h-4 w-4" aria-hidden="true" />
             {formatMoney(subtotalCents, currency)}
             {itemCount > 0 && (
               <span className="ml-2 rounded-full bg-primary px-2 py-0.5 text-xs font-bold text-primary-foreground">
@@ -117,12 +140,8 @@ export function ShopClient({
       </header>
 
       {/* Menu */}
-      <main className="mx-auto w-full max-w-5xl flex-1">
-        <MenuBrowse
-          menu={menu}
-          currency={currency}
-          onSelectItem={openBuilder}
-        />
+      <main id="main-content" className="mx-auto w-full max-w-5xl flex-1">
+        <MenuBrowse menu={menu} currency={currency} onSelectItem={openBuilder} />
       </main>
 
       {/* Sticky checkout bar (mobile) */}
