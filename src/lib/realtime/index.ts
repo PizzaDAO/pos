@@ -4,6 +4,7 @@
  * one place without touching call sites — mirroring `@/lib/db`.
  */
 import { createPollingProvider } from "./polling";
+import { createSupabaseRealtimeProvider } from "./supabase";
 import type { RealtimeProvider } from "./provider";
 
 export * from "./provider";
@@ -11,20 +12,33 @@ export * from "./provider";
 let cached: RealtimeProvider | null = null;
 
 /**
- * Returns the active realtime provider.
+ * True when the public Supabase env is present (production / preview with the
+ * project wired). Read at CALL time — nothing here touches env at module load,
+ * so the bundle evaluates and every build/test runs with NO env vars. This
+ * mirrors the `getPosDriver()` / `readDbConfig()` guard in `@/lib/db`.
+ */
+function isSupabaseConfigured(): boolean {
+  return Boolean(
+    process.env.NEXT_PUBLIC_SUPABASE_URL &&
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+  );
+}
+
+/**
+ * Returns the active realtime provider, chosen lazily by env (memoized):
+ *   - Supabase env present  → Supabase Realtime (websocket push; falls back to
+ *     polling internally for any subscription it can't serve, e.g. SSR render).
+ *   - Otherwise (local/CI)  → the interval poller (the zero-env default, so the
+ *     build, Vercel preview, and the full Vitest suite stay green with no env).
  *
- * Today this is always the polling provider (Supabase Realtime deferred — see
- * `supabase.ts`). When a live Supabase project is provisioned, swap the
- * selection here based on `readDbConfig()`:
- *
- *   const config = readDbConfig();
- *   cached = config ? createSupabaseRealtimeProvider(config) : createPollingProvider();
- *
- * No env vars are read here, so the bundle evaluates with nothing configured.
+ * Both implement the same `subscribe()` contract, so `use-kitchen-board` and
+ * `use-order-tracking` are unchanged either way.
  */
 export function getRealtimeProvider(): RealtimeProvider {
   if (cached) return cached;
-  cached = createPollingProvider();
+  cached = isSupabaseConfigured()
+    ? createSupabaseRealtimeProvider()
+    : createPollingProvider();
   return cached;
 }
 
