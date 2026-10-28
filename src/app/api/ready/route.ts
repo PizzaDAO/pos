@@ -55,6 +55,7 @@ export async function GET(request: Request) {
       checks,
       trainingMode: demo.trainingMode,
       driver: demo.driver,
+      paymentsSimulated: demo.paymentsSimulated,
       time: new Date().toISOString(),
       requestId,
     },

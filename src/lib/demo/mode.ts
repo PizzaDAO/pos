@@ -9,12 +9,21 @@
  * Semantics (documented in docs/PRODUCTION_READINESS.md):
  *  - `TRAINING_MODE=1` (or the mock driver being active) => the environment is
  *    NOT taking real money/orders. Surfaces should badge "TRAINING".
+ *  - Training is ALSO on whenever payments would be simulated (Stripe secret key
+ *    unset — the same `isStripeConfigured()` check every rail uses to decide to
+ *    simulate), even on the live Supabase driver, so a half-wired production never
+ *    looks like it is taking real money.
  *  - In training mode, payment rails run simulated and orders are seed/disposable
  *    — exactly the current zero-env behaviour, now nameable + assertable.
  *
  * Lazy env read, no throw on unset, safe to import anywhere.
  */
 import { getPosDriver } from "@/lib/db";
+import { isStripeConfigured } from "@/lib/payments/env";
+
+/** Banner copy shown on terminal/kitchen/admin chrome while in training mode. */
+export const TRAINING_BANNER =
+  "TRAINING MODE — orders and payments are simulated";
 
 /** True when `TRAINING_MODE` is explicitly enabled via env. */
 export function isTrainingModeEnv(): boolean {
@@ -24,11 +33,12 @@ export function isTrainingModeEnv(): boolean {
 
 /**
  * Whether the running environment is in training/demo mode. True when either the
- * `TRAINING_MODE` env flag is set, OR the active data driver is the mock/seed
- * driver (no live DB) — in which case nothing is real production data.
+ * `TRAINING_MODE` env flag is set, the active data driver is the mock/seed
+ * driver (no live DB), OR payments would be simulated (no Stripe secret key).
  */
 export function isTrainingMode(): boolean {
   if (isTrainingModeEnv()) return true;
+  if (!isStripeConfigured()) return true;
   try {
     return getPosDriver().name === "mock";
   } catch {
@@ -39,6 +49,8 @@ export function isTrainingMode(): boolean {
 export interface DemoModeInfo {
   trainingMode: boolean;
   driver: "mock" | "supabase";
+  /** True when payments run simulated (no Stripe secret key). */
+  paymentsSimulated: boolean;
   /** Customer/staff-facing banner copy when in training mode. */
   banner: string | null;
 }
@@ -51,12 +63,12 @@ export function demoModeInfo(): DemoModeInfo {
   } catch {
     driver = "mock";
   }
-  const trainingMode = isTrainingModeEnv() || driver === "mock";
+  const trainingMode =
+    isTrainingModeEnv() || driver === "mock" || !isStripeConfigured();
   return {
     trainingMode,
     driver,
-    banner: trainingMode
-      ? "TRAINING MODE — orders and payments are simulated and not charged."
-      : null,
+    paymentsSimulated: !isStripeConfigured(),
+    banner: trainingMode ? TRAINING_BANNER : null,
   };
 }

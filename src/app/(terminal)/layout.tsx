@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { RegisterServiceWorker } from "./register-sw";
 import { InstallPrompt } from "./install-prompt";
+import { TrainingBanner } from "@/components/training-banner";
 
 export const metadata: Metadata = {
   appleWebApp: {
@@ -27,6 +28,7 @@ export default function TerminalLayout({
   return (
     <>
       <RegisterServiceWorker />
+      <TrainingBanner />
       {children}
       <InstallPrompt />
     </>
