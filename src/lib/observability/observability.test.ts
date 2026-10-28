@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import * as Sentry from "@sentry/nextjs";
 import { buildRecord, shouldLog } from "@/lib/observability/logger";
 import {
   newRequestId,
@@ -12,10 +13,13 @@ import {
   normalizeError,
 } from "@/lib/observability/errors";
 
+vi.mock("@sentry/nextjs", () => ({ captureException: vi.fn() }));
+
 afterEach(() => {
   delete process.env.LOG_LEVEL;
   delete process.env.SENTRY_DSN;
   vi.restoreAllMocks();
+  vi.mocked(Sentry.captureException).mockClear();
 });
 
 describe("structured logger", () => {
@@ -81,13 +85,15 @@ describe("error-tracking seam", () => {
     const sink = captureError(new Error("boom"), { scope: "test" });
     expect(sink).toBe("log");
     expect(spy).toHaveBeenCalledOnce();
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
   it("reports the sentry sink when SENTRY_DSN is configured", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     process.env.SENTRY_DSN = "https://example@sentry.io/123";
     expect(isErrorTrackingConfigured()).toBe(true);
-    expect(captureError(new Error("boom"))).toBe("sentry");
+    expect(captureError(new Error("boom"), { scope: "t" })).toBe("sentry");
+    expect(Sentry.captureException).toHaveBeenCalledOnce();
   });
 
   it("normalizes Errors and non-Errors", () => {

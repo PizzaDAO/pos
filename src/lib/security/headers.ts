@@ -33,8 +33,9 @@
  *   - `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`,
  *     `upgrade-insecure-requests`.
  *
- * Everything here is STATIC — no env vars are read — so the zero-env build is
- * unaffected. We intentionally widen `connect-src`/`frame-src` to the whole
+ * Everything here is STATIC — this module reads no env vars (the one env-derived
+ * input, the Sentry DSN, is passed in by `next.config.ts` and adds an origin ONLY
+ * when a DSN is set) — so the zero-env build is unaffected. We intentionally widen `connect-src`/`frame-src` to the whole
  * `*.supabase.co` / Stripe / common Base-RPC origins rather than reading env at
  * build time, so a later env flip needs no header change.
  */
@@ -90,7 +91,32 @@ export const CSP_DIRECTIVES: Record<string, string[]> = {
   "upgrade-insecure-requests": [],
 };
 
-/** The serialized CSP header value. */
+/**
+ * The ingest origin for a Sentry DSN (`https://<key>@<host>/<project>` ->
+ * `https://<host>`), or null when unset/unparseable. Lets the CSP allow the error
+ * tracker's host only when one is configured.
+ */
+export function sentryIngestOrigin(dsn: string | undefined): string | null {
+  if (!dsn) return null;
+  try {
+    const u = new URL(dsn);
+    return u.protocol === "https:" ? u.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Build the serialized CSP, widening `connect-src` for an optional Sentry DSN. */
+export function buildContentSecurityPolicy(sentryDsn?: string): string {
+  const origin = sentryIngestOrigin(sentryDsn);
+  if (!origin) return serializeCsp(CSP_DIRECTIVES);
+  return serializeCsp({
+    ...CSP_DIRECTIVES,
+    "connect-src": [...(CSP_DIRECTIVES["connect-src"] ?? []), origin],
+  });
+}
+
+/** The serialized CSP header value (no error tracker). */
 export const CONTENT_SECURITY_POLICY = serializeCsp(CSP_DIRECTIVES);
 
 /** Permissions-Policy: deny powerful features the POS does not use. */
@@ -113,17 +139,25 @@ export interface SecurityHeader {
  * it is inert over plain HTTP (browsers ignore it) so it is safe on localhost
  * and only takes effect once served over HTTPS (Vercel/prod).
  */
-export const SECURITY_HEADERS: SecurityHeader[] = [
-  { key: "Content-Security-Policy", value: CONTENT_SECURITY_POLICY },
-  {
-    key: "Strict-Transport-Security",
-    value: "max-age=63072000; includeSubDomains; preload",
-  },
-  { key: "X-Content-Type-Options", value: "nosniff" },
-  { key: "X-Frame-Options", value: "DENY" },
-  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-  { key: "Permissions-Policy", value: PERMISSIONS_POLICY },
-  // Spectre-class isolation hints (safe defaults; do not break same-origin).
-  { key: "X-DNS-Prefetch-Control", value: "off" },
-  { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
-];
+export function buildSecurityHeaders(sentryDsn?: string): SecurityHeader[] {
+  return [
+    {
+      key: "Content-Security-Policy",
+      value: buildContentSecurityPolicy(sentryDsn),
+    },
+    {
+      key: "Strict-Transport-Security",
+      value: "max-age=63072000; includeSubDomains; preload",
+    },
+    { key: "X-Content-Type-Options", value: "nosniff" },
+    { key: "X-Frame-Options", value: "DENY" },
+    { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+    { key: "Permissions-Policy", value: PERMISSIONS_POLICY },
+    // Spectre-class isolation hints (safe defaults; do not break same-origin).
+    { key: "X-DNS-Prefetch-Control", value: "off" },
+    { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+  ];
+}
+
+/** Default header set (no error tracker); `next.config.ts` uses the builder. */
+export const SECURITY_HEADERS: SecurityHeader[] = buildSecurityHeaders();

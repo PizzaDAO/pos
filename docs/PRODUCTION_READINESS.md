@@ -73,6 +73,15 @@ settings + a location-by-slug (public) but **cannot** read `tenants`, `orders`,
 - Explicit `GRANT`s: `authenticated` gets full DML on every domain table (rows
   gated by policies); `anon` gets `SELECT` only on the storefront-public surface.
 
+- **`users` + `platform_admins` are FORCED too** (migration
+  `20260607000000_force_rls_users_platform_admins.sql`; they had RLS enabled but
+  not forced). Safe because the identity-bridge trigger and the `is_*` helpers are
+  `SECURITY DEFINER` and run as the function owner (`postgres`, BYPASSRLS/superuser
+  on Supabase), which skips RLS even on forced tables; seed/`apply.sh` run as that
+  same role and the app uses `service_role` (BYPASSRLS). The migration refuses to
+  apply if `is_platform_admin()`'s owner can't bypass RLS (it would recurse). The
+  isolation test asserts no public table is RLS-enabled-but-unforced.
+
 **Go-live dependencies:**
 - [x] Schema + RLS for orders/payments/menu/inventory/staff/settings/SaaS exist
       with the same `memberships`-keyed policies (RLS ON + FORCED on all).
@@ -274,14 +283,19 @@ Scaffolding added this phase, all **env-optional** and no-op-safe:
   `x-request-id` / `x-trace-id` / W3C `traceparent`, else mint one; echoed on the
   response. Wired into `/api/orders` (representative) + the health/ready endpoints.
 - **Error-tracking seam** (`src/lib/observability/errors.ts`) — `captureError`
-  always emits a structured error log and routes to an external tracker (Sentry)
-  **only when `SENTRY_DSN` is set**; a no-op otherwise (SDK intentionally not yet
-  a dependency).
+  always emits a structured error log and routes to Sentry
+  (`@sentry/nextjs`, `Sentry.captureException`) **only when `SENTRY_DSN` /
+  `NEXT_PUBLIC_SENTRY_DSN` is set**; log-only otherwise. Init lives in
+  `src/instrumentation.ts` (server/edge) and `src/instrumentation-client.ts`
+  (browser); `next.config.ts` wraps with `withSentryConfig` only when a DSN is
+  set, uploads source maps only with `SENTRY_AUTH_TOKEN`, and the CSP gains the
+  DSN's ingest origin in `connect-src` only then. Zero-env build is unchanged.
 - **Health/readiness** — `/api/health` (liveness) and `/api/ready` (readiness:
   probes the driver, reports training-mode + 503 if a future dependency is down).
 
-**Go-live dependencies:** add the Sentry SDK behind `SENTRY_DSN`; point a log
-drain at the JSON logs; alert on `/api/ready` 503s + error-rate.
+**Go-live dependencies:** set `SENTRY_DSN` + `NEXT_PUBLIC_SENTRY_DSN` (and
+`SENTRY_AUTH_TOKEN`/`SENTRY_ORG`/`SENTRY_PROJECT` for source maps) in Vercel;
+point a log drain at the JSON logs; alert on `/api/ready` 503s + error-rate.
 
 ---
 
@@ -291,11 +305,17 @@ drain at the JSON logs; alert on `/api/ready` 503s + error-rate.
 the **mock driver** is active — the current default, where nothing is real). In
 training mode, payments simulate and orders are disposable, so a tenant can train
 staff without real charges. `/api/ready` and `demoModeInfo()` expose a badge
-(`"TRAINING MODE — orders and payments are simulated and not charged."`).
+(`"TRAINING MODE — orders and payments are simulated"`).
 
-**Go-live dependencies:** surface the training badge in the terminal/admin
-chrome; ensure flipping `TRAINING_MODE` off (with live keys) is the explicit
-"now taking real orders" switch.
+Training is **also on whenever payments would be simulated** — i.e. the Stripe
+secret key is unset (the same `isStripeConfigured()` check the rails use) — even
+on the Supabase driver, so a half-wired production never reports
+`trainingMode:false`. `/api/ready` also returns `paymentsSimulated`. The badge is
+rendered server-side (`src/components/training-banner.tsx`) in the terminal,
+kitchen, and admin layouts.
+
+**Go-live:** the badge clears only when Supabase AND `STRIPE_SECRET_KEY` are set
+and `TRAINING_MODE` is off — that is the explicit "now taking real orders" switch.
 
 ---
 
@@ -314,8 +334,8 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 | Crypto Coinbase | `COINBASE_COMMERCE_API_KEY`, `COINBASE_COMMERCE_WEBHOOK_SECRET` | Simulated auto-confirm |
 | KDS | `KDS_POLL_INTERVAL_MS`, `KITCHEN_PRINTER_URL` | Polling realtime + browser print |
 | Delivery | `DOORDASH_DEVELOPER_ID`, `DOORDASH_KEY_ID`, `DOORDASH_SIGNING_SECRET`, `DOORDASH_BASE_URL` | In-house real, DoorDash simulated |
-| Observability | `LOG_LEVEL`, `SENTRY_DSN` | info logs, error-tracking no-op |
-| Training | `TRAINING_MODE` | Mock driver ⇒ training on |
+| Observability | `LOG_LEVEL`, `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT` | info logs, Sentry fully inert, no source-map upload |
+| Training | `TRAINING_MODE` | Mock driver or no `STRIPE_SECRET_KEY` ⇒ training on |
 | App | `NEXT_PUBLIC_APP_URL` | Request origin |
 
 ---

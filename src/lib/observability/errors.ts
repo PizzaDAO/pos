@@ -7,17 +7,17 @@
  * code path exists but stays dormant with zero env vars, so the app builds and
  * tests run without any secrets or network calls.
  *
- * The actual Sentry SDK is intentionally NOT a dependency here (live wiring is a
- * later phase). When a DSN is configured we still record the error via the
- * structured logger tagged `sink: "sentry"`, and document where the real
- * `Sentry.captureException` call slots in. Swapping in the SDK later requires no
- * call-site changes.
+ * The Sentry SDK (`@sentry/nextjs`) is initialised in `src/instrumentation.ts`
+ * (server/edge, `SENTRY_DSN`) and `src/instrumentation-client.ts` (browser,
+ * `NEXT_PUBLIC_SENTRY_DSN`); with no DSN it is never initialised, so
+ * `Sentry.captureException` would be a no-op and we skip it entirely.
  */
+import * as Sentry from "@sentry/nextjs";
 import { logger } from "./logger";
 
 /** Whether an external error tracker is configured (lazy env read). */
 export function isErrorTrackingConfigured(): boolean {
-  return Boolean(process.env.SENTRY_DSN);
+  return Boolean(process.env.SENTRY_DSN || process.env.NEXT_PUBLIC_SENTRY_DSN);
 }
 
 export interface ErrorContext {
@@ -61,9 +61,15 @@ export function captureError(
     stack: normalized.stack,
     sink: tracked ? "sentry" : "log",
   });
-  // When SENTRY_DSN is set, the real SDK call slots in here:
-  //   import * as Sentry from "@sentry/nextjs";
-  //   Sentry.captureException(err, { tags: context });
-  // Kept dormant (no dependency) until the live-wiring phase.
+  if (tracked) {
+    try {
+      Sentry.captureException(err, {
+        tags: { scope: context.scope },
+        extra: context,
+      });
+    } catch {
+      // Error tracking must never break the caller.
+    }
+  }
   return tracked ? "sentry" : "log";
 }
