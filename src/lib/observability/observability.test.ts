@@ -88,12 +88,14 @@ describe("error-tracking seam", () => {
     expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
-  it("reports the sentry sink when SENTRY_DSN is configured", () => {
+  it("reports the sentry sink when SENTRY_DSN is configured", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     process.env.SENTRY_DSN = "https://example@sentry.io/123";
     expect(isErrorTrackingConfigured()).toBe(true);
     expect(captureError(new Error("boom"), { scope: "t" })).toBe("sentry");
-    expect(Sentry.captureException).toHaveBeenCalledOnce();
+    await vi.waitFor(() =>
+      expect(Sentry.captureException).toHaveBeenCalledOnce(),
+    );
   });
 
   it("normalizes Errors and non-Errors", () => {

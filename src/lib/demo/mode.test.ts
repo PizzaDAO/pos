@@ -4,6 +4,8 @@ import {
   demoModeInfo,
   isTrainingMode,
   isTrainingModeEnv,
+  TRAINING_BANNER,
+  TRAINING_BANNER_STRIPE,
 } from "@/lib/demo/mode";
 
 afterEach(() => {
@@ -44,7 +46,20 @@ describe("training / demo mode", () => {
     const info = demoModeInfo();
     expect(info.driver).toBe("supabase");
     expect(info.trainingMode).toBe(true);
-    expect(info.banner).toMatch(/TRAINING/i);
+    expect(info.reason).toBe("stripe-unset");
+    expect(info.banner).toBe(TRAINING_BANNER_STRIPE);
+  });
+
+  it("uses the full simulated copy for the mock driver and the flag", () => {
+    expect(demoModeInfo().reason).toBe("mock");
+    expect(demoModeInfo().banner).toBe(TRAINING_BANNER);
+    vi.spyOn(db, "getPosDriver").mockReturnValue({
+      name: "supabase",
+    } as unknown as ReturnType<typeof db.getPosDriver>);
+    vi.stubEnv("STRIPE_SECRET_KEY", "");
+    vi.stubEnv("TRAINING_MODE", "1");
+    expect(demoModeInfo().reason).toBe("flag");
+    expect(demoModeInfo().banner).toBe(TRAINING_BANNER);
   });
 
   it("is OFF on the supabase driver with Stripe configured and no flag", () => {
@@ -55,6 +70,7 @@ describe("training / demo mode", () => {
     expect(isTrainingMode()).toBe(false);
     const info = demoModeInfo();
     expect(info.trainingMode).toBe(false);
+    expect(info.reason).toBeNull();
     expect(info.banner).toBeNull();
   });
 

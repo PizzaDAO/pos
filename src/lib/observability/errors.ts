@@ -12,7 +12,6 @@
  * `NEXT_PUBLIC_SENTRY_DSN`); with no DSN it is never initialised, so
  * `Sentry.captureException` would be a no-op and we skip it entirely.
  */
-import * as Sentry from "@sentry/nextjs";
 import { logger } from "./logger";
 
 /** Whether an external error tracker is configured (lazy env read). */
@@ -62,14 +61,16 @@ export function captureError(
     sink: tracked ? "sentry" : "log",
   });
   if (tracked) {
-    try {
-      Sentry.captureException(err, {
-        tags: { scope: context.scope },
-        extra: context,
-      });
-    } catch {
-      // Error tracking must never break the caller.
-    }
+    // Lazy-loaded so the SDK is never part of a no-DSN client bundle. Fire and
+    // forget: error tracking must never break (or delay) the caller.
+    void import("@sentry/nextjs")
+      .then((Sentry) =>
+        Sentry.captureException(err, {
+          tags: { scope: context.scope },
+          extra: context,
+        }),
+      )
+      .catch(() => {});
   }
   return tracked ? "sentry" : "log";
 }

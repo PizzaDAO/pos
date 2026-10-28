@@ -38,8 +38,9 @@ const withSerwist = withSerwistInit({
 const configured = withSerwist(nextConfig);
 
 /**
- * Sentry (§7) wraps the config ONLY when a DSN is set, so the zero-env build is
- * byte-for-byte what it was. Source maps upload only with SENTRY_AUTH_TOKEN
+ * Sentry (§7) wraps the config ONLY when a DSN is set, so the zero-env build
+ * skips the Sentry build plugin (the SDK itself is lazy-imported behind the DSN
+ * vars and is absent from the no-env bundles). Source maps upload only with SENTRY_AUTH_TOKEN
  * (+ SENTRY_ORG / SENTRY_PROJECT); otherwise the build plugin is told to skip it.
  */
 const sentryEnabled = Boolean(

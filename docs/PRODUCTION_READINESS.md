@@ -289,7 +289,9 @@ Scaffolding added this phase, all **env-optional** and no-op-safe:
   `src/instrumentation.ts` (server/edge) and `src/instrumentation-client.ts`
   (browser); `next.config.ts` wraps with `withSentryConfig` only when a DSN is
   set, uploads source maps only with `SENTRY_AUTH_TOKEN`, and the CSP gains the
-  DSN's ingest origin in `connect-src` only then. Zero-env build is unchanged.
+  DSN's ingest origin in `connect-src` only then. All SDK imports are dynamic and gated on the DSN env vars, so a no-env build
+  ships no Sentry code (first-load JS and middleware match the pre-Sentry sizes).
+  Edge/middleware errors are not reported (the SDK is Node-runtime only).
 - **Health/readiness** — `/api/health` (liveness) and `/api/ready` (readiness:
   probes the driver, reports training-mode + 503 if a future dependency is down).
 
@@ -305,13 +307,15 @@ point a log drain at the JSON logs; alert on `/api/ready` 503s + error-rate.
 the **mock driver** is active — the current default, where nothing is real). In
 training mode, payments simulate and orders are disposable, so a tenant can train
 staff without real charges. `/api/ready` and `demoModeInfo()` expose a badge
-(`"TRAINING MODE — orders and payments are simulated"`).
+(`"TRAINING MODE — orders and payments are simulated"`; when training is on
+only because Stripe is unset on a live driver: `"… card payments are simulated
+(Stripe not configured)"`, since cash and crypto rails are unaffected).
 
 Training is **also on whenever payments would be simulated** — i.e. the Stripe
 secret key is unset (the same `isStripeConfigured()` check the rails use) — even
 on the Supabase driver, so a half-wired production never reports
 `trainingMode:false`. `/api/ready` also returns `paymentsSimulated`. The badge is
-rendered server-side (`src/components/training-banner.tsx`) in the terminal,
+rendered server-side as an in-flow labelled `<aside>` (`src/components/training-banner.tsx`) in the terminal,
 kitchen, and admin layouts.
 
 **Go-live:** the badge clears only when Supabase AND `STRIPE_SECRET_KEY` are set

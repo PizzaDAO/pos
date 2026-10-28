@@ -28,8 +28,12 @@ export default function TerminalLayout({
   return (
     <>
       <RegisterServiceWorker />
-      <TrainingBanner />
-      {children}
+      {/* Column shell: the in-flow banner takes its height, the terminal (h-full)
+          fills the rest, so the full-height POS grid never overflows. */}
+      <div className="flex h-screen flex-col">
+        <TrainingBanner />
+        <div className="min-h-0 flex-1">{children}</div>
+      </div>
       <InstallPrompt />
     </>
   );

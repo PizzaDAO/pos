@@ -21,9 +21,19 @@
 import { getPosDriver } from "@/lib/db";
 import { isStripeConfigured } from "@/lib/payments/env";
 
-/** Banner copy shown on terminal/kitchen/admin chrome while in training mode. */
+/** Banner copy: mock driver or explicit `TRAINING_MODE` (nothing is real). */
 export const TRAINING_BANNER =
   "TRAINING MODE — orders and payments are simulated";
+
+/**
+ * Banner copy when ONLY Stripe is unconfigured (live driver, no flag): cash is
+ * still real and crypto rails go live on their own keys, so claim just cards.
+ */
+export const TRAINING_BANNER_STRIPE =
+  "TRAINING MODE — card payments are simulated (Stripe not configured)";
+
+/** Why training mode is on (null when off). */
+export type TrainingReason = "flag" | "mock" | "stripe-unset" | null;
 
 /** True when `TRAINING_MODE` is explicitly enabled via env. */
 export function isTrainingModeEnv(): boolean {
@@ -51,6 +61,8 @@ export interface DemoModeInfo {
   driver: "mock" | "supabase";
   /** True when payments run simulated (no Stripe secret key). */
   paymentsSimulated: boolean;
+  /** Why training mode is on; the flag/mock reasons take precedence. */
+  reason: TrainingReason;
   /** Customer/staff-facing banner copy when in training mode. */
   banner: string | null;
 }
@@ -63,12 +75,24 @@ export function demoModeInfo(): DemoModeInfo {
   } catch {
     driver = "mock";
   }
-  const trainingMode =
-    isTrainingModeEnv() || driver === "mock" || !isStripeConfigured();
+  const paymentsSimulated = !isStripeConfigured();
+  const reason: TrainingReason = isTrainingModeEnv()
+    ? "flag"
+    : driver === "mock"
+      ? "mock"
+      : paymentsSimulated
+        ? "stripe-unset"
+        : null;
   return {
-    trainingMode,
+    trainingMode: reason !== null,
     driver,
-    paymentsSimulated: !isStripeConfigured(),
-    banner: trainingMode ? TRAINING_BANNER : null,
+    paymentsSimulated,
+    reason,
+    banner:
+      reason === null
+        ? null
+        : reason === "stripe-unset"
+          ? TRAINING_BANNER_STRIPE
+          : TRAINING_BANNER,
   };
 }
