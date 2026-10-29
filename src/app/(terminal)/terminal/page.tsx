@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { isCardReady } from "@/lib/payments/connect";
 import { TerminalClient } from "./components/terminal-client";
 import { requireLocationSurface } from "@/lib/auth/guard";
 
@@ -33,6 +34,7 @@ export default async function TerminalPage({
     <TerminalClient
       initialTenantId={ctx.tenantId}
       initialLocationId={ctx.locationId ?? undefined}
+      cardReady={await isCardReady(ctx.tenantId)}
     />
   );
 }

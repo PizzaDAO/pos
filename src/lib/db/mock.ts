@@ -15,6 +15,7 @@
  * Everything here is pure data + maps; it never reads env vars and works with no
  * configuration, so the app builds and runs offline in the Vercel preview.
  */
+import { isConnectedForHealth } from "@/lib/payments/connect-status";
 import type { PosDriver } from "./driver";
 import type {
   CreateOrderInput,
@@ -780,7 +781,7 @@ export const mockDriver: PosDriver = {
         ),
         subscription: subscriptions.get(t.id) ?? null,
         onboarding: onboardingState.get(t.id) ?? null,
-        connected: connect?.status === "connected",
+        connected: isConnectedForHealth(connect ?? null),
       });
     }
     return out;
@@ -948,6 +949,15 @@ export const mockDriver: PosDriver = {
 
   async getConnectAccount(tenantId: string): Promise<ConnectAccount | null> {
     return connectAccounts.get(tenantId) ?? null;
+  },
+
+  async getConnectAccountByAccountId(
+    accountId: string,
+  ): Promise<ConnectAccount | null> {
+    return (
+      [...connectAccounts.values()].find((a) => a.account_id === accountId) ??
+      null
+    );
   },
 
   async upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount> {

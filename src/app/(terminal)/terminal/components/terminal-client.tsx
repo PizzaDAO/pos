@@ -61,9 +61,12 @@ function clientOrderNumber(): string {
 export function TerminalClient({
   initialTenantId,
   initialLocationId,
+  cardReady = true,
 }: {
   initialTenantId?: string;
   initialLocationId?: string;
+  /** Server-computed: false hides card tenders (see isCardReady). */
+  cardReady?: boolean;
 } = {}) {
   const { data, isLoading, isError, refetch } = useMenu(
     initialTenantId,
@@ -278,6 +281,7 @@ export function TerminalClient({
           tenantId={menu.tenantId}
           locationId={location}
           paymentSettings={paymentSettings}
+          cardReady={cardReady}
           onClose={() => setPayOrderId(null)}
           onPaid={() => setPayOrderId(null)}
         />

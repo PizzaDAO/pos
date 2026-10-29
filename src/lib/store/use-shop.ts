@@ -18,6 +18,8 @@ export interface ShopResponse {
   menu: Menu;
   settings: StoreSettings;
   paymentSettings: PaymentSettings;
+  /** False when card tender would be refused (tenant not Stripe-onboarded). */
+  cardReady?: boolean;
   driver: string;
 }
 

@@ -15,6 +15,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { effectiveConnectAccount } from "@/lib/payments/connect";
 import type { AuditAction } from "@/lib/db";
 import { getCurrentUser } from "@/lib/auth/session";
 
@@ -48,7 +49,7 @@ export async function GET(request: Request) {
         driver.listTenantHealth(),
         driver.listLocations(tenantId),
         driver.getSubscription(tenantId),
-        driver.getConnectAccount(tenantId),
+        driver.getConnectAccount(tenantId).then(effectiveConnectAccount),
         driver.getOnboarding(tenantId),
         driver.listAuditLog(tenantId),
       ]);

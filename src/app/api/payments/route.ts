@@ -14,8 +14,16 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import {
+  CardPaymentsNotReadyError,
+  resolveCardConnectAccountId,
+} from "@/lib/payments/connect";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
-import { takePayment, getOrderBalance } from "@/lib/payments/service";
+import {
+  PaymentConflictError,
+  takePayment,
+  getOrderBalance,
+} from "@/lib/payments/service";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -77,19 +85,57 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
 
-  // Resolve the connected account for card rails (simulated when no Stripe key).
-  let connectAccountId: string | null = null;
-  if (body.rail === "stripe_terminal" || body.rail === "stripe_online") {
-    const account = await driver.getConnectAccount(body.tenantId);
-    connectAccountId = account?.account_id ?? null;
+  // NEVER trust the client's tenant/location: the order is the source of truth.
+  // A body that names a different tenant/location is rejected outright.
+  if (
+    body.tenantId !== order.tenant_id ||
+    body.locationId !== order.location_id
+  ) {
+    return NextResponse.json(
+      { error: "tenantId/locationId do not match the order." },
+      { status: 400 },
+    );
+  }
+  const tenantId = order.tenant_id;
+  const locationId = order.location_id;
+
+  // Idempotent retry: return the existing tender BEFORE the card gate, so a
+  // retry after a successful charge is never turned into a refusal.
+  try {
+    const existing = await driver.getPayment(body.paymentId);
+    if (existing) {
+      if (existing.order_id !== order.id) {
+        return NextResponse.json(
+          { error: "paymentId already used for another order." },
+          { status: 409 },
+        );
+      }
+      const current = await driver.getOrder(order.id);
+      return NextResponse.json(
+        {
+          payment: existing,
+          balanceCents: current ? await getOrderBalance(current) : 0,
+          orderStatus: current?.status,
+        },
+        { status: 201 },
+      );
+    }
+  } catch {
+    // Fall through: takePayment repeats the idempotency check.
   }
 
+  // Resolve the connected account for card rails (simulated when no Stripe key).
+  // In real mode a tenant without a charges-enabled account is refused (409).
   try {
+    let connectAccountId: string | null = null;
+    if (body.rail === "stripe_terminal" || body.rail === "stripe_online") {
+      connectAccountId = await resolveCardConnectAccountId(tenantId);
+    }
     const payment = await takePayment({
       paymentId: body.paymentId,
       orderId: body.orderId,
-      tenantId: body.tenantId,
-      locationId: body.locationId,
+      tenantId,
+      locationId,
       rail: body.rail,
       amountCents: body.amountCents,
       tipCents: body.tipCents ?? 0,
@@ -106,6 +152,12 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
+    if (
+      err instanceof CardPaymentsNotReadyError ||
+      err instanceof PaymentConflictError
+    ) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Payment failed." },
       { status: 502 },

@@ -8,6 +8,11 @@
 -- HOW TO RUN (once a live Supabase DB exists — see supabase/README.md):
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/rls_isolation.sql
 --
+-- Assertions are FIXTURE-SCOPED (the two fixture tenants aaaaaaaa-… and
+-- bbbbbbbb-…), so this file is valid against a live, non-empty database as well
+-- as a fresh one; it runs in a transaction and rolls back. (The harness script
+-- run-rls-isolation.sh also applies migrations, so that script needs a fresh DB.)
+--
 -- This script simulates the authenticated user by setting `request.jwt.claims`
 -- (which Supabase's `auth.uid()` reads) and switching to the `authenticated`
 -- role so RLS is enforced. It rolls everything back at the end — it does not
@@ -97,6 +102,11 @@ insert into public.staff (id, tenant_id, name, role, active) values
    'Staff A', 'cashier', true),
   ('57b00001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
    'Staff B', 'cashier', true);
+
+-- A connect_accounts row per tenant (server/service path writes these).
+insert into public.connect_accounts (tenant_id, account_id, status, simulated) values
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'acct_fixture_a', 'connected', false),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'acct_fixture_b', 'connected', false);
 
 -- A store_settings row per location so anon's public-surface read returns rows.
 insert into public.store_settings (tenant_id, location_id, currency, tax_rate_bps) values
@@ -200,7 +210,9 @@ select pg_temp.act_as('33333333-3333-3333-3333-333333333333');
 do $$
 declare n int;
 begin
-  select count(*) into n from public.tenants;
+  -- Scoped to the two fixture tenants so this holds on a non-empty database.
+  select count(*) into n from public.tenants
+    where id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('Platform admin should see 2 tenants, saw %s', n);
 end $$;
 reset role;
@@ -270,6 +282,9 @@ end $$;
 -- (would error), whereas '{}'::json ->> 'sub' is NULL → auth.uid() = NULL.
 select set_config('request.jwt.claims', '{}', true);
 
+-- NOTE: every count over a whole table above/below is scoped to the two fixture
+-- tenants (or to RLS-restricted fixture users), so the file is valid against a
+-- non-empty database, not just a fresh one.
 -- 12) MENU is intentionally PUBLIC-READABLE (storefront). The `anon` role sees
 --     BOTH tenants' menu items (public reads), but writes stay tenant-scoped.
 --     This is the storefront-public surface anon retains SELECT on after the
@@ -278,12 +293,15 @@ set local role anon;
 do $$
 declare n int;
 begin
-  select count(*) into n from public.menu_items;
+  select count(*) into n from public.menu_items
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('anon (storefront) should read both menus (2 items), saw %s', n);
-  select count(*) into n from public.menu_categories;
+  select count(*) into n from public.menu_categories
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('anon should read both menu categories, saw %s', n);
   -- store_settings is part of the public surface (currency/tax/hours).
-  select count(*) into n from public.store_settings;
+  select count(*) into n from public.store_settings
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('anon should read both stores'' settings, saw %s', n);
   -- A storefront resolves a LOCATION by slug; anon can read the location row
   -- (active tenant) so the slug lookup works.
@@ -349,6 +367,54 @@ begin
     and c.relrowsecurity and not c.relforcerowsecurity;
   assert unforced is null,
     format('RLS enabled but not FORCED on: %s', unforced);
+end $$;
+
+-- 16) connect_accounts is READ-ONLY to tenant staff: an owner can read their own
+--     tenant's row (not Bob's) but CANNOT insert, update or delete it (money-
+--     routing config is written only by the service-role server path), and
+--     account_id is unique.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int; blocked boolean;
+begin
+  select count(*) into n from public.connect_accounts
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+  assert n = 1, format('owner should read only own connect account, saw %s', n);
+
+  blocked := false;
+  begin
+    insert into public.connect_accounts (tenant_id, account_id)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'acct_owner_insert');
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to insert connect_accounts';
+
+  blocked := false;
+  begin
+    update public.connect_accounts set account_id = 'acct_owner_hijack'
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to update connect_accounts';
+
+  blocked := false;
+  begin
+    delete from public.connect_accounts
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to delete connect_accounts';
+end $$;
+reset role;
+
+do $$
+declare dup boolean := false; id text;
+begin
+  select account_id into id from public.connect_accounts
+    where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  assert id = 'acct_fixture_a', format('owner update must have left account_id untouched, saw %s', id);
+  begin
+    update public.connect_accounts set account_id = 'acct_fixture_b'
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when unique_violation then dup := true; end;
+  assert dup, 'connect_accounts.account_id must be unique';
 end $$;
 
 select 'RLS isolation test PASSED' as result;

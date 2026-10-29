@@ -23,6 +23,7 @@
  *
  * Money is always integer minor units; nothing here uses floats.
  */
+import { isConnectedForHealth } from "@/lib/payments/connect-status";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { PosDriver } from "./driver";
 import type {
@@ -1242,7 +1243,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           ),
           subscription: await this.getSubscription(t.id),
           onboarding: await this.getOnboarding(t.id),
-          connected: connect?.status === "connected",
+          connected: isConnectedForHealth(connect),
         });
       }
       return out;
@@ -1466,6 +1467,17 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .from("connect_accounts")
           .select("*")
           .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapConnect(r) : null;
+    },
+
+    async getConnectAccountByAccountId(accountId) {
+      const r = unwrap(
+        await sb
+          .from("connect_accounts")
+          .select("*")
+          .eq("account_id", accountId)
           .maybeSingle(),
       ) as Row | null;
       return r ? mapConnect(r) : null;
