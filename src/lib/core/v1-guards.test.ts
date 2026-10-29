@@ -200,6 +200,47 @@ describe("write guards", () => {
   });
 });
 
+describe("tender settlement + active staff", () => {
+  it("cancel voids an abandoned (stale, never-on-rail) tender but not a live one", async () => {
+    const driver = getPosDriver();
+    const stale = await call("POST", "/orders", {
+      p: agent(),
+      body: await orderBody({}, "b7000000-0000-4000-8000-000000000001"),
+    });
+    const old = { ...pay(stale.json.id, "pending"), created_at: new Date(NOW.getTime() - 3_600_000).toISOString() };
+    await driver.upsertPayment(old);
+    const ok = await call("POST", `/orders/${stale.json.id}/cancel`, { p: agent(), body: { reason: "x" } });
+    expect(ok.status).toBe(200);
+    expect((await driver.getPayment(old.id))?.status).toBe("canceled");
+
+    const live = await call("POST", "/orders", {
+      p: agent(),
+      body: await orderBody({}, "b7000000-0000-4000-8000-000000000002"),
+    });
+    await driver.upsertPayment({ ...pay(live.json.id, "pending"), charge_id: "pi_live", created_at: old.created_at });
+    const refused = await call("POST", `/orders/${live.json.id}/cancel`, { p: agent(), body: { reason: "x" } });
+    expect(refused.status).toBe(409);
+  });
+
+  it("staff attribution must be an ACTIVE staff member", async () => {
+    const driver = getPosDriver();
+    const now = new Date().toISOString();
+    const gone = await driver.upsertStaff({
+      id: "44000000-0000-4000-8000-0000000000aa",
+      tenant_id: DEMO_TENANT_ID,
+      name: "Left",
+      role: "cashier",
+      active: false,
+      created_at: now,
+    });
+    const r = await call("POST", "/orders", {
+      p: agent(),
+      body: await orderBody({ staff_id: gone.id }, "b8000000-0000-4000-8000-000000000001"),
+    });
+    expect(r.status).toBe(404);
+  });
+});
+
 describe("atomic transitions", () => {
   it("only one caller wins draft -> placed and inventory depletes once", async () => {
     const driver = getPosDriver();

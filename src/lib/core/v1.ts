@@ -48,6 +48,7 @@ import {
   type OrderFulfillment,
 } from "@/lib/db";
 import { priceOrder } from "@/lib/order-pricing";
+import { isStaleUnsettled } from "@/lib/payments/balance";
 import { RepriceError, maxTipCents } from "@/lib/reprice";
 import { getPlan } from "@/lib/saas/plans";
 import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlements";
@@ -481,10 +482,20 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
       });
     }
     const payments = await ctx.driver.listPaymentsForOrder(order.id);
-    // In-flight money can still capture after we void: refuse until it settles.
-    if (payments.some((p) => ["pending", "authorized", "requires_action"].includes(p.status))) {
+    // In-flight money can still capture after we void. Use the POS tender
+    // settlement semantics: an abandoned attempt (unsettled, never reached a
+    // rail, past the stale TTL) is voided here (same row-locked voidTender the
+    // terminal uses); anything else in flight must settle or be voided first.
+    const inFlight = payments.filter((p) =>
+      ["pending", "authorized", "requires_action"].includes(p.status),
+    );
+    for (const p of inFlight) {
+      if (isStaleUnsettled(p, ctx.now().getTime())) {
+        const v = await ctx.driver.voidTender(p.id);
+        if (v.ok) continue;
+      }
       throw ProblemError.of("CANCEL_NOT_ALLOWED", {
-        detail: "Order has payments in flight; wait for them to settle or cancel them first.",
+        detail: "Order has payments in flight; wait for them to settle or void them first.",
       });
     }
     const live = payments.filter(
@@ -980,8 +991,10 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   }
   let staffId: string | null = null;
   if (input.staff_id) {
+    // Attribution must be a real, ACTIVE staff member of this tenant (the same
+    // rule the terminal applies to its PIN-switched active staff).
     const s = await ctx.driver.getStaffById(tenantId, input.staff_id);
-    if (!s) throw notFound("Staff member");
+    if (!s || !s.active) throw notFound("Staff member");
     staffId = s.id;
   }
 
