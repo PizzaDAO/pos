@@ -547,6 +547,15 @@ begin
   assert n = 2, 'one canceled + one live stripe_online tender expected';
 end $$;
 
+-- 20) Audit actions (20261101000200): the late-payment actions and the Phase 7
+--     values the app already writes are valid enum members.
+insert into public.audit_log (actor_user_id, actor_label, action, tenant_id, detail) values
+  ('00000000-0000-0000-0000-000000000000', 'system', 'late_payment_flagged', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't'),
+  ('00000000-0000-0000-0000-000000000000', 'system', 'late_payment_accepted', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't'),
+  ('00000000-0000-0000-0000-000000000000', 'system', 'late_payment_refunded', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't'),
+  ('00000000-0000-0000-0000-000000000000', 'system', 'payment_refund', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't'),
+  ('00000000-0000-0000-0000-000000000000', 'system', 'payment_void', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't');
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;

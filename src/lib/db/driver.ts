@@ -248,14 +248,48 @@ export interface PosDriver {
    * Deplete linked inventory for an order. `createOrder` calls this itself for
    * orders created live; an `awaiting_payment` online order skips it and the
    * finalize step (`finalizeOnlinePayment`) calls it once payment settles.
+   * IDEMPOTENT: an order that already has `depletion` movements is not depleted
+   * again, so the crash-recovery sweep can safely re-run the post-payment steps.
    */
   depleteInventoryForOrder(orderId: string): Promise<void>;
 
   /**
    * `awaiting_payment` orders created before `createdBefore` (ISO), oldest first
-   * (all tenants). Input to the abandonment sweeper.
+   * (all tenants), ordered by (created_at, id). Input to the abandonment sweeper.
+   * Keyset-paged: `after` is the (created_at, id) of the last order already seen,
+   * `limit` the page size. `checkoutMode` keeps
+   * only orders created by that deployment kind (plus legacy orders with no
+   * marker), so a prod sweeper never scans staging/test-mode orders that share
+   * the database.
    */
-  listAwaitingPaymentOrders(createdBefore: string): Promise<Order[]>;
+  listAwaitingPaymentOrders(
+    createdBefore: string,
+    opts?: {
+      limit?: number;
+      after?: { created_at: string; id: string };
+      checkoutMode?: "live" | "test" | "sim";
+    },
+  ): Promise<Order[]>;
+
+  /**
+   * Online orders promoted to paid (`fulfillment.paid_at` set) before `paidBefore`
+   * whose post-payment steps never completed (`fulfillment.finalized_at` unset),
+   * oldest first. Input to the crash-recovery sweep.
+   */
+  listUnfinalizedPaidOrders(
+    paidBefore: string,
+    limit?: number,
+  ): Promise<Order[]>;
+
+  /**
+   * Shallow-merge keys into an order's `fulfillment` WITHOUT touching its status
+   * (lifecycle markers: finalized_at, late_payment). Returns null if the order
+   * does not exist or has no fulfillment (not an online order).
+   */
+  mergeOrderFulfillment(
+    id: string,
+    patch: Partial<OrderFulfillment>,
+  ): Promise<Order | null>;
 
   // --------------------------------------------------------------------------
   // Payments (Phase 2)

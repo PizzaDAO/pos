@@ -33,14 +33,14 @@ import {
   PaymentConflictError,
   takePaymentDetailed,
   deriveOnlineTender,
-  cancelOpenOnlineIntents,
+  cancelPendingTender,
+  cancelSupersededTenders,
   freshClientSecret,
   getOrderBalance,
   nextOnlineTenderId,
 } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
-import { cancelOnlineCheckout, checkoutWindowKind } from "@/lib/shop/lifecycle";
-import { onlineCheckoutWindowMs } from "@/lib/payments/env";
+import { cancelOnlineCheckout, orderExpiresAt } from "@/lib/shop/lifecycle";
 import { asapAvailability } from "@/lib/shop/scheduling";
 import {
   isOnlineOrderRail,
@@ -145,7 +145,10 @@ export async function POST(request: Request) {
   // ONLINE orders: the server owns the tender id (derived from order + rail).
   let paymentId = body.paymentId;
   const isOnline = order.channel !== "in_store";
-  if (isOnline && isOnlineOrderRail(body.rail)) {
+  // (Cash is the exception: a till role may take SEVERAL cash tenders to split a
+  // bill, so it keeps the client's tender id -- the same idempotency model as the
+  // terminal -- instead of one derived id per rail.)
+  if (isOnline && isOnlineOrderRail(body.rail) && body.rail !== "cash") {
     paymentId = await nextOnlineTenderId(order.id, body.rail);
   }
 
@@ -207,14 +210,33 @@ export async function POST(request: Request) {
       );
     }
     if (order.status === "awaiting_payment") {
-      // TTL gate: the window of the rail being paid with.
-      const window = onlineCheckoutWindowMs(checkoutWindowKind(body.rail));
-      if (Date.now() - new Date(order.created_at).getTime() > window) {
-        await cancelOnlineCheckout(order.id).catch(() => undefined);
+      // TTL gate: the SAME expiry the sweeper uses (earliest window of the
+      // order's live tenders, else the requested rail's). Past it, try to give
+      // the order up. `checkout_abandoned` is only ever returned when the order
+      // really is abandoned; if a payment exists/may be in flight, tell the
+      // client to keep waiting on it instead.
+      const existingTenders = await driver.listPaymentsForOrder(order.id);
+      if (
+        Date.now() >
+        orderExpiresAt(order, existingTenders, body.rail).getTime()
+      ) {
+        const cancelled = await cancelOnlineCheckout(order.id).catch(
+          () => null,
+        );
+        if (cancelled?.ok) {
+          return NextResponse.json(
+            {
+              error: "This checkout expired. Please start again.",
+              code: "checkout_abandoned",
+            },
+            { status: 409 },
+          );
+        }
         return NextResponse.json(
           {
-            error: "This checkout expired. Please start again.",
-            code: "checkout_abandoned",
+            error:
+              "Your payment is still being confirmed. Please keep waiting.",
+            code: "payment_pending",
           },
           { status: 409 },
         );
@@ -249,17 +271,23 @@ export async function POST(request: Request) {
         { status: 409 },
       );
     }
-    // Never leave two live intents open for one order -- including when the
-    // customer switches to another rail: the open card intent is canceled first.
+    // Exactly one rail is live per order: every OTHER open tender (card intent,
+    // pending USDC, pending Coinbase charge) is canceled before a new one is made.
     try {
-      await cancelOpenOnlineIntents(order.id, paymentId);
+      await cancelSupersededTenders(order.id, paymentId);
     } catch (err) {
       return NextResponse.json(
         { error: err instanceof Error ? err.message : "Payment failed." },
         { status: 502 },
       );
     }
-    ({ amountCents, tipCents } = await deriveOnlineTender(order));
+    const owed = await deriveOnlineTender(order);
+    amountCents = owed.amountCents;
+    tipCents = owed.tipCents;
+    // Split cash: a till role may take part of the bill (never more than is owed).
+    if (body.rail === "cash" && body.amountCents > 0 && body.amountCents < amountCents) {
+      amountCents = body.amountCents;
+    }
     if (amountCents <= 0) {
       return NextResponse.json(
         { error: "This order has nothing left to pay." },
@@ -290,6 +318,23 @@ export async function POST(request: Request) {
     });
 
     const refreshed = await driver.getOrder(body.orderId);
+    // The sweeper / a cancel may have abandoned the order between the gate above
+    // and the tender being written. Never hand out a secret or a URL for it:
+    // close the provider object and the tender, and tell the client to start over.
+    if (
+      isOnline &&
+      refreshed &&
+      (refreshed.status === "abandoned" || refreshed.status === "voided")
+    ) {
+      await cancelPendingTender(payment);
+      return NextResponse.json(
+        {
+          error: "This checkout expired. Please start again.",
+          code: "checkout_abandoned",
+        },
+        { status: 409 },
+      );
+    }
     const balance = refreshed ? await getOrderBalance(refreshed) : 0;
     return NextResponse.json(
       {

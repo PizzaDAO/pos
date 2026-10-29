@@ -595,6 +595,41 @@ in-store: unchanged (placed -> paid)
   SERVER to re-check an order's open tenders (a crypto payment confirming). The
   UI treats only `orderStatus === 'paid'` as money received.
 - Gaps in order numbers (abandoned orders consume one) are accepted.
+- **Review hardening.**
+  - *Race:* after a tender is written, `/api/payments` re-reads the order; if the
+    sweeper/cancel abandoned it meanwhile, the PaymentIntent/Coinbase charge is
+    canceled, the tender canceled, and the client gets 409 `checkout_abandoned`
+    with no secret/URL. `checkout_abandoned` is only returned when the order really
+    is abandoned; if a payment is in flight the code is `payment_pending` (keep
+    waiting). The route and the sweeper share `orderExpiresAt` (earliest window of
+    the live tenders).
+  - *Late payments:* money settling on an `abandoned`/`voided` order does not
+    promote it. It sets `fulfillment.late_payment` (durable, no schema change),
+    alerts (`captureError`), writes an audit row (`late_payment_flagged`), and the
+    order appears under Admin -> Late payments (owner/manager) where Accept
+    (`finalizeOnlinePayment` from `abandoned`, compare-and-set) or Refund
+    (`refundPayment`) resolves it. The tracking page says so instead of "Nothing
+    was charged". `refundPayment` never turns an abandoned order into `refunded`.
+    Closing a pending Coinbase tender cancels the charge at Coinbase (best effort,
+    logged). Webhooks cannot 500 on the one-live-tender index: a settling flip
+    cancels the newer unsettled tender and records the money; a double settlement
+    is alerted.
+  - *Crash recovery:* promotion stamps `fulfillment.paid_at`; inventory +
+    dispatch (both idempotent) then stamp `finalized_at`. The sweeper re-runs the
+    steps for paid orders with no `finalized_at` older than 2 minutes. A failed
+    delivery dispatch is surfaced as a `failed` delivery record and does not block
+    `finalized_at`.
+  - *Sweeper:* keyset paging (100 x 20 per run), orders carry
+    `fulfillment.checkout_mode` (live/test/sim) and a deployment only queries its
+    own mode (unmarked legacy orders included), settled-but-uncovering expired
+    orders raise `checkout.in_flight` alerts, `maxDuration = 60`.
+  - *Switching rails* cancels the other open tender (card intent, pending USDC
+    locally, pending Coinbase with the provider; a USDC tender with a reported tx
+    hash and a processing card are never canceled). Several cash tenders (client
+    ids) may split an online bill. `/pay/sync` has its own `paySync` rate bucket.
+  - Migration `20261101000200_audit_action_values.sql` adds the late-payment audit
+    actions and the Phase 7 actions (`payment_refund`, `payment_void`, ...) that
+    were never in the DB enum, so those audit rows had been silently dropped.
 
 - **Shop orders are repriced server-side.** `POST /api/shop/orders` rebuilds every
   line from `driver.getMenu` (location overrides applied, 86'd items excluded) via

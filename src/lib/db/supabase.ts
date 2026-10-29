@@ -40,6 +40,7 @@ import type {
   Modifier,
   ModifierGroup,
   Order,
+  OrderFulfillment,
   OrderItem,
   OrderItemModifier,
   OrderStatus,
@@ -1443,19 +1444,75 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       const r = unwrap(
         await sb.from("orders").select("*").eq("id", orderId).maybeSingle(),
       ) as Row | null;
-      if (r) await depleteForOrder(await readOrderRow(r));
+      if (!r) return;
+      // Idempotent for crash recovery: never deplete an order twice.
+      const prior = unwrap(
+        await sb
+          .from("inventory_movements")
+          .select("id")
+          .eq("order_id", orderId)
+          .eq("reason", "depletion")
+          .limit(1),
+      ) as Row[];
+      if (prior.length > 0) return;
+      await depleteForOrder(await readOrderRow(r));
     },
 
-    async listAwaitingPaymentOrders(createdBefore) {
+    async listAwaitingPaymentOrders(createdBefore, opts) {
+      let q = sb
+        .from("orders")
+        .select("*")
+        .eq("status", "awaiting_payment")
+        .lt("created_at", createdBefore);
+      if (opts?.after) {
+        q = q.or(
+          `created_at.gt.${opts.after.created_at},and(created_at.eq.${opts.after.created_at},id.gt.${opts.after.id})`,
+        );
+      }
+      if (opts?.checkoutMode) {
+        // Filter in SQL: other deployments' orders are never even scanned.
+        q = q.or(
+          `fulfillment->>checkout_mode.eq.${opts.checkoutMode},fulfillment->>checkout_mode.is.null`,
+        );
+      }
+      const rows = unwrap(
+        await q
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(opts?.limit ?? 1000),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
+    },
+
+    async listUnfinalizedPaidOrders(paidBefore, limit = 100) {
       const rows = unwrap(
         await sb
           .from("orders")
           .select("*")
-          .eq("status", "awaiting_payment")
-          .lt("created_at", createdBefore)
-          .order("created_at", { ascending: true }),
+          .in("status", ["paid", "in_kitchen", "ready", "recall", "out_for_delivery"])
+          .not("fulfillment->>paid_at", "is", null)
+          .lt("fulfillment->>paid_at", paidBefore)
+          .is("fulfillment->>finalized_at", null)
+          .limit(limit),
       ) as Row[];
       return Promise.all(rows.map((r) => readOrderRow(r)));
+    },
+
+    async mergeOrderFulfillment(id, patch) {
+      const cur = unwrap(
+        await sb.from("orders").select("fulfillment").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      const f = cur?.fulfillment as OrderFulfillment | null | undefined;
+      if (!f) return null;
+      const r = unwrap(
+        await sb
+          .from("orders")
+          .update({ fulfillment: { ...f, ...patch }, updated_at: nowIso() })
+          .eq("id", id)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? readOrderRow(r) : null;
     },
 
     // -- Payments ----------------------------------------------------------

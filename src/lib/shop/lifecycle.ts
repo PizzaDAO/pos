@@ -18,12 +18,14 @@ import type { Order, Payment } from "@/lib/db";
 import { tenderFreesSlot } from "@/lib/db/payment-types";
 import { captureError } from "@/lib/observability";
 import {
-  applyRailStatus,
   cancelOpenOnlineIntents,
+  cancelPendingTender,
   refreshPaymentStatus,
 } from "@/lib/payments/service";
+import { runPostPaymentSteps } from "./finalize";
 import {
   cardRailsSimulated,
+  deploymentCheckoutMode,
   isStripeLiveKey,
   onlineCheckoutWindowMs,
   type CheckoutWindowKind,
@@ -42,18 +44,25 @@ export function checkoutWindowKind(rail: Payment["rail"]): CheckoutWindowKind {
 }
 
 /**
- * When an `awaiting_payment` order expires: `created_at` + the window of the rail
- * of its live tender (the most recently created tender that is not canceled or
- * failed), or the card window when no tender exists yet.
+ * When an `awaiting_payment` order expires: `created_at` + the EARLIEST window
+ * among its live tenders' rails (tenders that are not canceled/failed), or the
+ * window of `requestedRail` (default card) when it has none. The sweeper and the
+ * `/api/payments` gate both call this, so they can never disagree about whether
+ * an order is expired; only the gate passes `requestedRail`, and it only matters
+ * for an order that has no live tender yet.
  */
-export function orderExpiresAt(order: Order, payments: Payment[]): Date {
-  const live = payments
-    .filter((p) => !tenderFreesSlot(p.status))
-    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-  const kind = live ? checkoutWindowKind(live.rail) : "card";
-  return new Date(
-    new Date(order.created_at).getTime() + onlineCheckoutWindowMs(kind),
-  );
+export function orderExpiresAt(
+  order: Order,
+  payments: Payment[],
+  requestedRail?: Payment["rail"],
+): Date {
+  const live = payments.filter((p) => !tenderFreesSlot(p.status));
+  const kinds: CheckoutWindowKind[] =
+    live.length > 0
+      ? live.map((p) => checkoutWindowKind(p.rail))
+      : [requestedRail ? checkoutWindowKind(requestedRail) : "card"];
+  const window = Math.min(...kinds.map((k) => onlineCheckoutWindowMs(k)));
+  return new Date(new Date(order.created_at).getTime() + window);
 }
 
 export type CloseOutcome =
@@ -102,15 +111,32 @@ export async function closeOpenTenders(
 
   const after = await driver.listPaymentsForOrder(orderId);
   // Settled money that did not finalize the order (an underpay) or a card the
-  // provider is still processing: leave it for a human / the next sweep.
-  if (after.some((p) => p.status === "authorized" || p.status === "captured")) {
+  // provider is still processing: leave it for a human / the next sweep, and
+  // alert -- an expired order holding customer money needs attention.
+  const settledMoney = after.filter(
+    (p) => p.status === "authorized" || p.status === "captured",
+  );
+  if (settledMoney.length > 0) {
+    captureError(
+      new Error("expired online order holds settled money that does not cover it"),
+      {
+        scope: "checkout.in_flight",
+        orderId,
+        settledCents: settledMoney.reduce(
+          (n, p) => n + p.amount_cents + p.tip_cents,
+          0,
+        ),
+      },
+    );
     return "in_flight";
   }
   for (const p of after) {
     if (p.status !== "pending") continue;
     if (p.rail === "stripe_online" && !p.simulated) return "in_flight";
     if (!p.simulated && !opts.cancelPendingCrypto) return "in_flight";
-    await applyRailStatus(p.id, "canceled");
+    // Coinbase: cancel the charge with the provider (best effort, logged), then
+    // the local row. USDC has nothing held at a provider: local only.
+    await cancelPendingTender(p);
   }
   return (await driver.getOrder(orderId))?.status === "awaiting_payment"
     ? "closed"
@@ -162,6 +188,8 @@ export interface ExpireSummary {
   finalized: number;
   skipped: number;
   errors: number;
+  /** Paid orders whose post-payment steps were re-run (crash recovery). */
+  recovered: number;
 }
 
 /**
@@ -182,10 +210,47 @@ function foreignMode(payments: Payment[]): boolean {
   return false;
 }
 
+const PAGE_SIZE = 100;
+/** Hard cap per run (PAGE_SIZE x MAX_PAGES orders); the next run continues. */
+const MAX_PAGES = 20;
+/** A paid order is only recovered once this old, so a live finalize is not raced. */
+const RECOVERY_GRACE_MS = 2 * 60_000;
+
+/**
+ * Crash recovery: paid online orders whose post-payment steps (inventory,
+ * dispatch) never completed -- the process died after the `awaiting_payment ->
+ * paid` compare-and-set -- re-run them. The steps are idempotent. Only orders of
+ * this deployment's mode are touched.
+ */
+export async function recoverUnfinalizedOrders(
+  now: Date = new Date(),
+): Promise<number> {
+  const driver = getPosDriver();
+  const mode = deploymentCheckoutMode();
+  const stuck = await driver.listUnfinalizedPaidOrders(
+    new Date(now.getTime() - RECOVERY_GRACE_MS).toISOString(),
+    PAGE_SIZE,
+  );
+  let recovered = 0;
+  for (const order of stuck) {
+    const m = order.fulfillment?.checkout_mode;
+    if (m !== undefined && m !== mode) continue;
+    try {
+      if (await runPostPaymentSteps(order)) recovered += 1;
+    } catch (err) {
+      captureError(err, { scope: "recoverUnfinalizedOrders", orderId: order.id });
+    }
+  }
+  return recovered;
+}
+
 /**
  * The abandonment sweeper (Vercel cron every 5 min): every `awaiting_payment`
- * order past its expiry is closed on its provider and moved to `abandoned`, or
- * finalized if its payment turned out to have landed.
+ * order past its expiry window is closed on its provider and moved to
+ * `abandoned`, or finalized if its payment landed. Orders are read in keyset
+ * pages (a long-lived skipped order cannot starve newer ones) and filtered in the
+ * query to this deployment's mode (staging/test orders in a shared DB are never
+ * scanned). Then paid-but-unfinalized orders are recovered.
  */
 export async function expireOnlineOrders(
   now: Date = new Date(),
@@ -197,46 +262,66 @@ export async function expireOnlineOrders(
     finalized: 0,
     skipped: 0,
     errors: 0,
+    recovered: 0,
   };
   const shortest = Math.min(
     onlineCheckoutWindowMs("card"),
     onlineCheckoutWindowMs("coinbase"),
     onlineCheckoutWindowMs("usdc"),
   );
-  const candidates = await driver.listAwaitingPaymentOrders(
-    new Date(now.getTime() - shortest).toISOString(),
-  );
-  for (const order of candidates) {
-    try {
-      const payments = await driver.listPaymentsForOrder(order.id);
-      if (orderExpiresAt(order, payments).getTime() > now.getTime()) continue;
-      summary.checked += 1;
-      if (foreignMode(payments)) {
-        summary.skipped += 1;
-        continue;
-      }
-      const outcome = await closeOpenTenders(order.id, {
-        cancelPendingCrypto: true,
-      });
-      if (outcome === "paid") {
-        summary.finalized += 1;
-      } else if (outcome === "in_flight") {
-        summary.skipped += 1;
-      } else if (
-        await driver.transitionOrderStatus(
-          order.id,
-          ["awaiting_payment"],
-          "abandoned",
-        )
-      ) {
-        summary.abandoned += 1;
-      } else {
-        summary.finalized += 1; // paid between the last look and the move
-      }
-    } catch (err) {
-      summary.errors += 1;
-      captureError(err, { scope: "expireOnlineOrders", orderId: order.id });
-    }
+  const cutoff = new Date(now.getTime() - shortest).toISOString();
+  const mode = deploymentCheckoutMode();
+  let after: { created_at: string; id: string } | undefined;
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const batch = await driver.listAwaitingPaymentOrders(cutoff, {
+      limit: PAGE_SIZE,
+      after,
+      checkoutMode: mode,
+    });
+    if (batch.length === 0) break;
+    for (const order of batch) await sweepOne(order, now, summary);
+    const last = batch[batch.length - 1]!;
+    after = { created_at: last.created_at, id: last.id };
+    if (batch.length < PAGE_SIZE) break;
   }
+  summary.recovered = await recoverUnfinalizedOrders(now);
   return summary;
+}
+
+async function sweepOne(
+  order: Order,
+  now: Date,
+  summary: ExpireSummary,
+): Promise<void> {
+  const driver = getPosDriver();
+  try {
+    const payments = await driver.listPaymentsForOrder(order.id);
+    if (orderExpiresAt(order, payments).getTime() > now.getTime()) return;
+    summary.checked += 1;
+    if (foreignMode(payments)) {
+      summary.skipped += 1;
+      return;
+    }
+    const outcome = await closeOpenTenders(order.id, {
+      cancelPendingCrypto: true,
+    });
+    if (outcome === "paid") {
+      summary.finalized += 1;
+    } else if (outcome === "in_flight") {
+      summary.skipped += 1;
+    } else if (
+      await driver.transitionOrderStatus(
+        order.id,
+        ["awaiting_payment"],
+        "abandoned",
+      )
+    ) {
+      summary.abandoned += 1;
+    } else {
+      summary.finalized += 1; // paid between the last look and the move
+    }
+  } catch (err) {
+    summary.errors += 1;
+    captureError(err, { scope: "expireOnlineOrders", orderId: order.id });
+  }
 }

@@ -167,7 +167,11 @@ export type AuditAction =
   // Tenant lifecycle / integrations (Phase 7).
   | "connect_change"
   | "subscription_change"
-  | "tenant_go_live";
+  | "tenant_go_live"
+  // Online checkout lifecycle: money landed on an abandoned order.
+  | "late_payment_flagged"
+  | "late_payment_accepted"
+  | "late_payment_refunded";
 
 /**
  * An append-only audit entry written when a platform operator takes a

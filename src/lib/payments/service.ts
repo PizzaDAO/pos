@@ -23,7 +23,10 @@ import "./rails";
 import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
 import type { RefundReservation } from "@/lib/db/payment-types";
-import { LiveTenderConflictError } from "@/lib/db/payment-types";
+import { LiveTenderConflictError, tenderFreesSlot } from "@/lib/db/payment-types";
+import { captureError } from "@/lib/observability";
+import { recordAudit } from "@/lib/security/audit";
+import { cancelCoinbaseCharge } from "./providers/coinbase-client";
 import { finalizeOnlinePayment } from "@/lib/shop/finalize";
 import { deriveTenderId } from "./ids";
 import type { PaymentRailKey } from "./PaymentRail";
@@ -329,15 +332,141 @@ export async function applyRailStatus(
     payment.status === "refunded" ||
     (payment.status === "captured" && status !== "refunded");
   if (!locked && (status !== payment.status || opts.raw)) {
-    saved = await driver.upsertPayment({
+    const next: Payment = {
       ...payment,
       status,
       raw: opts.raw ? { ...(payment.raw ?? {}), ...opts.raw } : payment.raw,
       updated_at: nowIso(),
-    });
+    };
+    try {
+      saved = await driver.upsertPayment(next);
+    } catch (err) {
+      if (!(err instanceof LiveTenderConflictError)) throw err;
+      saved = await resolveLiveTenderConflict(payment, next);
+    }
   }
   await maybeMarkOrderPaid(payment.order_id);
   return saved;
+}
+
+/**
+ * A status flip would make a second tender of the same card/Coinbase rail LIVE on
+ * the order (`payments_one_live_card_or_cb`): typically a webhook settling a tender
+ * that was canceled when the customer switched rail or retried, while a newer
+ * tender holds the slot. Money that actually settled must be recorded, so for a
+ * settling status the newer, not-yet-settled tender is canceled (on the provider,
+ * best effort) and the flip retried. Any other flip is ignored (the tender stays
+ * canceled), and a genuine double settlement is flagged loudly for a refund.
+ * Never throws for the conflict, so the webhook answers 200 instead of retrying
+ * forever.
+ */
+async function resolveLiveTenderConflict(
+  current: Payment,
+  next: Payment,
+): Promise<Payment> {
+  const driver = getPosDriver();
+  const scope = { scope: "live-tender-conflict", paymentId: current.id, orderId: current.order_id };
+  if (next.status !== "captured" && next.status !== "authorized") {
+    captureError(new Error("ignored status flip that would duplicate a live tender"), scope);
+    return current;
+  }
+  const others = (await driver.listPaymentsForOrder(current.order_id)).filter(
+    (o) =>
+      o.id !== current.id && o.rail === current.rail && !tenderFreesSlot(o.status),
+  );
+  if (others.some((o) => o.status === "captured" || o.status === "authorized" || o.status === "refunded")) {
+    captureError(
+      new Error("DOUBLE SETTLEMENT: two tenders on one rail both settled; refund one"),
+      scope,
+    );
+    return current;
+  }
+  for (const o of others) {
+    await cancelTenderOnProvider(o).catch((err) => captureError(err, scope));
+    await driver.upsertPayment({ ...o, status: "canceled", updated_at: nowIso() });
+  }
+  try {
+    return await driver.upsertPayment(next);
+  } catch (err) {
+    if (!(err instanceof LiveTenderConflictError)) throw err;
+    captureError(err, scope);
+    return current;
+  }
+}
+
+/**
+ * Cancel a tender's provider-side object, if it has one that is still open: a
+ * real Stripe PaymentIntent (on the connected account) or a real Coinbase charge.
+ * Throws when the provider refuses. Does NOT touch the local row.
+ */
+export async function cancelTenderOnProvider(p: Payment): Promise<void> {
+  if (isRealIntentTender(p)) {
+    await stripeRequest(
+      `/payment_intents/${p.charge_id}/cancel`,
+      {},
+      { stripeAccount: p.connect_account_id },
+    );
+    return;
+  }
+  if (p.rail === "crypto_coinbase" && !p.simulated && p.charge_id) {
+    await cancelCoinbaseCharge(p.charge_id);
+  }
+}
+
+/**
+ * Cancel an open (`requires_action`/`pending`) tender: provider first, BEST EFFORT
+ * (a refusal is logged, the local row is canceled regardless), then the local
+ * row. A settled tender is left alone. Used where the order itself is being
+ * given up (sweeper, cancel, a tender created on an abandoned order).
+ */
+export async function cancelPendingTender(p: Payment): Promise<void> {
+  if (p.status !== "requires_action" && p.status !== "pending") return;
+  await cancelTenderOnProvider(p).catch((err) =>
+    captureError(err, {
+      scope: "cancel-tender-provider",
+      paymentId: p.id,
+      orderId: p.order_id,
+      rail: p.rail,
+    }),
+  );
+  await applyRailStatus(p.id, "canceled");
+}
+
+/**
+ * Before a NEW online tender is created, close every OTHER open tender on the
+ * order so exactly one rail is live (rail switch): open card intents are
+ * canceled on Stripe (strict, see `cancelOpenOnlineIntents`), a pending USDC
+ * tender is canceled locally (nothing is held on the provider; skipped when a
+ * real tx hash was reported, i.e. money may be in flight), and a pending Coinbase
+ * charge is canceled with Coinbase (if Coinbase refuses, the charge is re-synced;
+ * still-pending means it may be paid, so the switch is refused). A card that is
+ * `processing` is never canceled.
+ */
+export async function cancelSupersededTenders(
+  orderId: string,
+  exceptPaymentId: string,
+): Promise<void> {
+  await cancelOpenOnlineIntents(orderId, exceptPaymentId);
+  const pending = (await getPosDriver().listPaymentsForOrder(orderId)).filter(
+    (p) => p.status === "pending" && p.id !== exceptPaymentId,
+  );
+  for (const p of pending) {
+    if (p.rail === "stripe_online") continue;
+    if (p.rail === "crypto_onchain_usdc") {
+      if (!p.simulated && p.crypto_tx_hash) continue;
+    } else if (p.rail === "crypto_coinbase") {
+      try {
+        await cancelTenderOnProvider(p);
+      } catch (err) {
+        const synced = await refreshPaymentStatus(p.id).catch(() => null);
+        if (synced && synced.status !== "pending") continue;
+        throw err;
+      }
+    } else {
+      continue;
+    }
+    await applyRailStatus(p.id, "canceled");
+  }
 }
 
 /**
@@ -559,7 +688,24 @@ export async function refundPayment(input: {
   const all = await driver.listPaymentsForOrder(payment.order_id);
   const allRefunded =
     all.length > 0 && all.every((p) => p.status === "refunded");
-  if (allRefunded) await driver.updateOrderStatus(payment.order_id, "refunded");
+  // Compare-and-set from a "real" order status only: an abandoned/voided/awaiting
+  // order (a refunded LATE payment) must keep its status, not turn `refunded`.
+  if (allRefunded) {
+    await driver.transitionOrderStatus(
+      payment.order_id,
+      [
+        "draft",
+        "placed",
+        "paid",
+        "in_kitchen",
+        "ready",
+        "recall",
+        "out_for_delivery",
+        "completed",
+      ],
+      "refunded",
+    );
+  }
 
   return { ...updated, refundedNowCents: refundAmount };
 }
@@ -592,12 +738,58 @@ async function maybeMarkOrderPaid(orderId: string): Promise<void> {
   } else if (order.status === "awaiting_payment") {
     await finalizeOnlinePayment(orderId);
   } else if (order.status === "abandoned" || order.status === "voided") {
-    console.warn(
-      `[payments] order ${orderId} settled while ${order.status}; NOT promoted -- needs a manual accept-or-refund`,
-    );
+    await flagLatePayment(order, payments);
   } else if (order.status !== "paid") {
     console.info(
       `[payments] order ${orderId} settled while ${order.status}; status left unchanged`,
     );
   }
+}
+
+/** Nil UUID: the `actor_user_id` of audit rows written by the system itself. */
+const SYSTEM_ACTOR = {
+  id: "00000000-0000-0000-0000-000000000000",
+  label: "checkout lifecycle",
+};
+
+/**
+ * Money settled on an order we already gave up on (`abandoned`, or a legacy
+ * `voided` online order). The order is NOT promoted (the customer was told the
+ * checkout expired; the kitchen must not cook it unasked). Instead:
+ *  - the error sink is alerted;
+ *  - a durable `late_payment` marker is set in the order's fulfillment (no schema
+ *    change; survives restarts; makes the order appear in the admin "Late
+ *    payments" list until accepted or refunded);
+ *  - an audit row is written.
+ * Idempotent: re-evaluations with an unchanged settled amount do nothing.
+ */
+async function flagLatePayment(order: Order, payments: Payment[]): Promise<void> {
+  const settled = payments.filter(
+    (p) => p.status === "captured" || p.status === "authorized",
+  );
+  const amount = settled.reduce((n, p) => n + p.amount_cents + p.tip_cents, 0);
+  if (settled.length === 0) return;
+  const prior = order.fulfillment?.late_payment;
+  if (prior && prior.amount_cents === amount) return;
+  captureError(new Error("payment settled on an abandoned order"), {
+    scope: "late-payment",
+    orderId: order.id,
+    tenantId: order.tenant_id,
+    amountCents: amount,
+  });
+  if (!order.fulfillment) return; // not an online order: nothing to mark
+  const now = nowIso();
+  await getPosDriver().mergeOrderFulfillment(order.id, {
+    late_payment: {
+      payment_id: settled[0]!.id,
+      amount_cents: amount,
+      flagged_at: prior?.flagged_at ?? now,
+    },
+  });
+  await recordAudit({
+    actor: SYSTEM_ACTOR,
+    action: "late_payment_flagged",
+    tenantId: order.tenant_id,
+    detail: `${amount}c settled on ${order.status} order ${order.id} (payment ${settled[0]!.id}); needs accept or refund.`,
+  });
 }

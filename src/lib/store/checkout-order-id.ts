@@ -24,6 +24,11 @@ export interface CheckoutSignatureInput {
   scheduledFor: string;
   address?: DeliveryAddress;
   email: string;
+  /** Contact + notes are part of the order the server stores, so a change is a new checkout. */
+  name?: string;
+  phone?: string;
+  notes?: string;
+  deliveryNotes?: string;
   tipCents: number;
 }
 
@@ -56,6 +61,10 @@ export function checkoutSignature(input: CheckoutSignatureInput): string {
       input.scheduledFor,
       addr,
       input.email.trim().toLowerCase(),
+      (input.name ?? "").trim(),
+      (input.phone ?? "").trim(),
+      (input.notes ?? "").trim(),
+      (input.deliveryNotes ?? "").trim(),
       input.tipCents,
     ]),
   );

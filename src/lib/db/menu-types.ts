@@ -264,10 +264,38 @@ export interface OrderFulfillment {
    */
   delivery_provider?: string;
   eta_minutes?: number | null;
+  /**
+   * Online-checkout lifecycle markers (server-owned; written by the lifecycle
+   * code, never the client):
+   *  - `checkout_mode`: which deployment kind created the order ("live" | "test"
+   *    | "sim"), so the sweeper of another mode (prod vs staging on a shared DB)
+   *    never scans it.
+   *  - `paid_at` / `finalized_at`: set when the order is promoted to paid /
+   *    after inventory depletion and delivery dispatch completed. A paid order
+   *    with `paid_at` but no `finalized_at` crashed mid-finalize and is recovered
+   *    by the sweeper.
+   *  - `late_payment`: money settled on an order that was already abandoned. The
+   *    order stays abandoned; this durable marker puts it in the admin "late
+   *    payments" list until accepted or refunded.
+   */
+  checkout_mode?: "live" | "test" | "sim";
+  paid_at?: string;
+  finalized_at?: string;
+  late_payment?: LatePaymentMarker;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */
   delivery_notes?: string;
+}
+
+/** See `OrderFulfillment.late_payment`. */
+export interface LatePaymentMarker {
+  payment_id: string;
+  /** Settled amount (base + tip) at the time of flagging, in cents. */
+  amount_cents: number;
+  flagged_at: string;
+  resolved?: "accepted" | "refunded";
+  resolved_at?: string;
 }
 
 /** A structured delivery address (Phase 4). */

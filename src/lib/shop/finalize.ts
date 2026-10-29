@@ -29,6 +29,7 @@ import type {
   DeliveryRecord,
   Order,
   OrderFulfillment,
+  OrderStatus,
 } from "@/lib/db";
 import type { DeliveryProviderKey } from "@/lib/delivery";
 import { dispatchDelivery } from "@/lib/delivery/service";
@@ -38,45 +39,89 @@ import { asapPromisedAt } from "./scheduling";
 export interface FinalizeResult {
   /** The order after the call (null if it does not exist). */
   order: Order | null;
-  /** True only for the one caller that performed the `awaiting_payment -> paid` move. */
+  /** True only for the one caller that performed the move to `paid`. */
   won: boolean;
+}
+
+export interface FinalizeOptions {
+  /**
+   * Statuses the order may be promoted FROM (default `awaiting_payment`). The
+   * admin "accept late payment" action passes `["abandoned"]`.
+   */
+  from?: OrderStatus[];
+  /** Extra fulfillment keys written in the SAME atomic update (e.g. resolving a late payment). */
+  fulfillmentExtra?: Partial<OrderFulfillment>;
 }
 
 export async function finalizeOnlinePayment(
   orderId: string,
+  opts: FinalizeOptions = {},
 ): Promise<FinalizeResult> {
   const driver = getPosDriver();
+  const from = opts.from ?? ["awaiting_payment"];
   const order = await driver.getOrder(orderId);
   if (!order) return { order: null, won: false };
-  if (order.status !== "awaiting_payment") return { order, won: false };
+  if (!from.includes(order.status) || !order.fulfillment) {
+    return { order, won: false };
+  }
 
   const settings = await driver.getStoreSettings(
     order.tenant_id,
     order.location_id,
   );
 
-  // (2) ASAP: prep starts at payment. A scheduled order keeps its slot.
-  let fulfillmentPatch: OrderFulfillment | undefined;
-  if (order.fulfillment?.scheduled_for === "asap" && settings.fulfillment) {
-    fulfillmentPatch = {
-      ...order.fulfillment,
-      promised_at: asapPromisedAt(settings.fulfillment, new Date()).toISOString(),
-    };
+  // (2) ASAP: prep starts at payment. A scheduled order keeps its slot. `paid_at`
+  // marks the promotion; `finalized_at` (set after the steps below) marks that the
+  // post-payment steps completed, so a crash in between is recoverable.
+  const now = new Date();
+  const fulfillmentPatch: OrderFulfillment = {
+    ...order.fulfillment,
+    ...opts.fulfillmentExtra,
+    paid_at: now.toISOString(),
+    finalized_at: undefined,
+  };
+  delete fulfillmentPatch.finalized_at;
+  if (order.fulfillment.scheduled_for === "asap" && settings.fulfillment) {
+    fulfillmentPatch.promised_at = asapPromisedAt(
+      settings.fulfillment,
+      now,
+    ).toISOString();
   }
 
   // (1) Compare-and-set. Losers stop here.
-  const paid = await driver.transitionOrderStatus(
-    orderId,
-    ["awaiting_payment"],
-    "paid",
-    fulfillmentPatch ? { fulfillment: fulfillmentPatch } : undefined,
-  );
-  if (!paid) return { order: (await driver.getOrder(orderId)) ?? order, won: false };
+  const paid = await driver.transitionOrderStatus(orderId, from, "paid", {
+    fulfillment: fulfillmentPatch,
+  });
+  if (!paid) {
+    return { order: (await driver.getOrder(orderId)) ?? order, won: false };
+  }
+
+  await runPostPaymentSteps(paid);
+  return { order: (await driver.getOrder(orderId)) ?? paid, won: true };
+}
+
+/**
+ * Steps (3) and (4): deplete inventory and dispatch the delivery, then stamp
+ * `fulfillment.finalized_at`. IDEMPOTENT -- depletion skips an order that already
+ * has depletion movements, `dispatchDelivery` returns an existing delivery -- so
+ * the crash-recovery sweep (`recoverUnfinalizedOrders`) re-runs it safely for an
+ * order whose process died after the compare-and-set.
+ *
+ * A depletion failure leaves `finalized_at` unset (the sweep retries and alerts).
+ * A dispatch failure is surfaced via a `failed` delivery record + alert and does
+ * NOT block `finalized_at` (retrying a persistently failing provider forever would
+ * not help; the dispatcher handles the failed record).
+ */
+export async function runPostPaymentSteps(paid: Order): Promise<boolean> {
+  const driver = getPosDriver();
+  const orderId = paid.id;
+  let ok = true;
 
   // (3) Inventory. A failure must not un-pay the order; surface it.
   try {
     await driver.depleteInventoryForOrder(orderId);
   } catch (err) {
+    ok = false;
     captureError(err, { scope: "finalizeOnlinePayment.deplete", orderId });
     console.error(`[finalize] inventory depletion failed for ${orderId}`, err);
   }
@@ -84,6 +129,10 @@ export async function finalizeOnlinePayment(
   // (4) Delivery dispatch from the persisted quote.
   const f = paid.fulfillment;
   if (f?.type === "delivery" && f.address && f.delivery_provider) {
+    const settings = await driver.getStoreSettings(
+      paid.tenant_id,
+      paid.location_id,
+    );
     const pickup: DeliveryAddress = {
       line1: settings.fulfillment?.pickup_address ?? "Pickup",
       city: "",
@@ -112,7 +161,12 @@ export async function finalizeOnlinePayment(
     }
   }
 
-  return { order: paid, won: true };
+  if (ok) {
+    await driver.mergeOrderFulfillment(orderId, {
+      finalized_at: new Date().toISOString(),
+    });
+  }
+  return ok;
 }
 
 /** A `failed` delivery record so the dispatcher sees the order needs attention. */

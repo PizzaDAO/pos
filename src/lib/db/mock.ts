@@ -931,16 +931,86 @@ export const mockDriver: PosDriver = {
 
   async depleteInventoryForOrder(orderId: string): Promise<void> {
     const order = orders.get(orderId);
-    if (order) depleteForOrder(order);
+    if (!order) return;
+    if (
+      inventoryMovements.some(
+        (m) => m.order_id === orderId && m.reason === "depletion",
+      )
+    ) {
+      return; // already depleted (idempotent for crash recovery)
+    }
+    depleteForOrder(order);
   },
 
-  async listAwaitingPaymentOrders(createdBefore: string): Promise<Order[]> {
+  async listAwaitingPaymentOrders(
+    createdBefore: string,
+    opts?: {
+      limit?: number;
+      after?: { created_at: string; id: string };
+      checkoutMode?: "live" | "test" | "sim";
+    },
+  ): Promise<Order[]> {
     ensureKitchenSeed();
+    const after = opts?.after;
     return [...orders.values()]
       .filter(
-        (o) => o.status === "awaiting_payment" && o.created_at < createdBefore,
+        (o) =>
+          o.status === "awaiting_payment" &&
+          o.created_at < createdBefore &&
+          (after === undefined ||
+            o.created_at > after.created_at ||
+            (o.created_at === after.created_at && o.id > after.id)) &&
+          (opts?.checkoutMode === undefined ||
+            o.fulfillment?.checkout_mode === undefined ||
+            o.fulfillment.checkout_mode === opts.checkoutMode),
       )
-      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      .sort(
+        (a, b) =>
+          a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
+      )
+      .slice(0, opts?.limit ?? Number.MAX_SAFE_INTEGER);
+  },
+
+  async listUnfinalizedPaidOrders(
+    paidBefore: string,
+    limit = 100,
+  ): Promise<Order[]> {
+    ensureKitchenSeed();
+    const live = new Set<OrderStatus>([
+      "paid",
+      "in_kitchen",
+      "ready",
+      "recall",
+      "out_for_delivery",
+    ]);
+    return [...orders.values()]
+      .filter(
+        (o) =>
+          live.has(o.status) &&
+          o.fulfillment?.paid_at !== undefined &&
+          o.fulfillment.paid_at < paidBefore &&
+          o.fulfillment.finalized_at === undefined,
+      )
+      .sort((a, b) =>
+        (a.fulfillment!.paid_at ?? "").localeCompare(b.fulfillment!.paid_at ?? ""),
+      )
+      .slice(0, limit);
+  },
+
+  async mergeOrderFulfillment(
+    id: string,
+    patch: Partial<OrderFulfillment>,
+  ): Promise<Order | null> {
+    ensureKitchenSeed();
+    const order = orders.get(id);
+    if (!order || !order.fulfillment) return null;
+    const updated: Order = {
+      ...order,
+      fulfillment: { ...order.fulfillment, ...patch },
+      updated_at: nowIso(),
+    };
+    orders.set(id, updated);
+    return updated;
   },
 
   // -- Payments --------------------------------------------------------------

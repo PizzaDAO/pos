@@ -38,6 +38,7 @@ import {
   checkScheduledTime,
 } from "@/lib/shop/scheduling";
 import { quoteDelivery } from "@/lib/delivery/service";
+import { deploymentCheckoutMode } from "@/lib/payments/env";
 import { DeliveryUnavailableError } from "@/lib/delivery";
 import {
   canUseOnlineOrdering,
@@ -292,6 +293,8 @@ export async function POST(request: Request) {
     type: body.fulfillmentType,
     scheduled_for: body.scheduledFor,
     promised_at: promisedAt,
+    // Which deployment kind owns this order's sweeping (prod vs staging).
+    checkout_mode: deploymentCheckoutMode(),
     ...(body.fulfillmentType === "delivery"
       ? {
           address: body.address,

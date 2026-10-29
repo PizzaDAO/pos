@@ -23,7 +23,7 @@ export async function POST(
   request: Request,
   ctx: { params: Promise<{ id: string }> },
 ) {
-  const limited = enforceRateLimit(request, "payments");
+  const limited = enforceRateLimit(request, "paySync");
   if (limited) return limited;
 
   const { id } = await ctx.params;

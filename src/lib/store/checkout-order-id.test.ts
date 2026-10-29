@@ -93,6 +93,28 @@ describe("one order id per checkout", () => {
     expect(a.id).toBe("id-1");
   });
 
+  it("contact details and notes are part of the checkout signature", () => {
+    const s = memoryStorage();
+    const mint = counter();
+    const a = getCheckoutOrderId({ ...base, name: "Ann", phone: "555-0100" }, mint, s);
+    expect(getCheckoutOrderId({ ...base, name: "Ann", phone: "555-0100" }, mint, s).id).toBe(a.id);
+    for (const change of [
+      { name: "Bob" },
+      { phone: "555-0199" },
+      { notes: "no onions" },
+      { deliveryNotes: "ring twice" },
+    ]) {
+      const next = getCheckoutOrderId(
+        { ...base, name: "Ann", phone: "555-0100", ...change },
+        mint,
+        s,
+      );
+      expect(next.id).not.toBe(a.id);
+      // restore for the next iteration
+      getCheckoutOrderId({ ...base, name: "Ann", phone: "555-0100" }, () => a.id, s);
+    }
+  });
+
   it("forget starts a fresh checkout", () => {
     const s = memoryStorage();
     const mint = counter();

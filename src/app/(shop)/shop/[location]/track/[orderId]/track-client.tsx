@@ -130,10 +130,23 @@ export function TrackClient({
           {expired ? (
             <>
               <h2 className="text-lg font-semibold">Checkout expired</h2>
-              <p className="text-sm text-muted-foreground">
-                This order was not paid in time, so it was never sent to the
-                kitchen. Nothing was charged.
-              </p>
+              {order.late_payment === null ? (
+                <p className="text-sm text-muted-foreground">
+                  This order was not paid in time, so it was never sent to the
+                  kitchen. Nothing was charged.
+                </p>
+              ) : order.late_payment === "refunded" ? (
+                <p className="text-sm text-muted-foreground" data-testid="late-refunded">
+                  This order was not paid in time, so it was never sent to the
+                  kitchen. Your late payment has been refunded.
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground" data-testid="late-payment-notice">
+                  We received your payment after this checkout expired. The
+                  restaurant has been alerted and will either make your order or
+                  refund you in full.
+                </p>
+              )}
               <Link href={`/shop/${slug}`}>
                 <Button className="w-full">Start a new order</Button>
               </Link>

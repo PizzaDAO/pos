@@ -44,7 +44,21 @@ export async function GET(request: Request) {
         channel: order.channel,
         currency: order.currency,
         totals: order.totals,
-        fulfillment: order.fulfillment ?? null,
+        // Server-owned lifecycle markers are not part of the public view.
+        fulfillment: order.fulfillment
+          ? (({ late_payment, checkout_mode, paid_at, finalized_at, ...pub }) => {
+              void late_payment;
+              void checkout_mode;
+              void paid_at;
+              void finalized_at;
+              return pub;
+            })(order.fulfillment)
+          : null,
+        // Money settled after the checkout expired: "unresolved" until the
+        // restaurant accepts or refunds it, then "accepted"/"refunded".
+        late_payment: order.fulfillment?.late_payment
+          ? (order.fulfillment.late_payment.resolved ?? "unresolved")
+          : null,
         created_at: order.created_at,
         updated_at: order.updated_at,
       },

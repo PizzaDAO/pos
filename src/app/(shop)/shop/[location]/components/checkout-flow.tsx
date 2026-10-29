@@ -20,6 +20,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, Loader2, X } from "lucide-react";
 import type { DeliveryAddress, Order } from "@/lib/db";
+import { hasProgressedPastPayment } from "@/lib/shop/order-status";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -174,6 +175,10 @@ export function CheckoutFlow({
       scheduledFor: when,
       address: fulfillment === "delivery" ? address : undefined,
       email,
+      name,
+      phone,
+      notes: undefined,
+      deliveryNotes: undefined,
       tipCents,
     };
     let placed: Awaited<ReturnType<typeof checkout.placeOrder>> = null;
@@ -202,8 +207,11 @@ export function CheckoutFlow({
       break;
     }
     if (!placed) return;
-    // A previous attempt may already have been paid (reload after paying).
-    if (placed.order.status === "paid") {
+    // A retry after a lost response (or a reload): the order may already have
+    // progressed past payment (paid, in the kitchen, ready...). It exists and is
+    // not waiting for money, so confirm it instead of paying again. (An
+    // abandoned order never gets here: the server answers 409 and we start over.)
+    if (hasProgressedPastPayment(placed.order.status)) {
       finishPaid(placed.order);
       return;
     }
@@ -244,6 +252,15 @@ export function CheckoutFlow({
       tipCents: orderTip,
     });
     if (!result) {
+      if (checkout.lastCode.current === "payment_pending") {
+        // A payment already exists and is still being confirmed: keep waiting on it.
+        setPlacedOrderId(order.id);
+        setPlacedOrderNumber(order.order_number);
+        setPriceChange(null);
+        checkout.setError(null);
+        setStep("waiting");
+        return;
+      }
       if (checkout.lastCode.current === "checkout_abandoned") {
         forgetCheckoutOrderId(slug);
         setPriceChange(null);

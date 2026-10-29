@@ -17,6 +17,8 @@ import { usingMockDriver } from "@/lib/payments/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Provider cancels + paging can take a while on a busy night; give the sweep room.
+export const maxDuration = 60;
 
 function authorized(request: Request): boolean {
   const secret = process.env.CRON_SECRET;

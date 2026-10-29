@@ -165,6 +165,17 @@ export function getDefaultPlatformFee(): {
 }
 
 /**
+ * The kind of deployment creating/sweeping online orders. Orders are stamped with
+ * it (`fulfillment.checkout_mode`) and a sweeper only scans its own kind, so prod
+ * (live keys) and staging (test keys) can share one database without sweeping
+ * each other's orders.
+ */
+export function deploymentCheckoutMode(): "live" | "test" | "sim" {
+  if (cardRailsSimulated()) return "sim";
+  return isStripeLiveKey() ? "live" : "test";
+}
+
+/**
  * How long an unpaid ONLINE order may sit in `awaiting_payment` before the
  * sweeper abandons it, by the rail of its live tender. Overridable via env
  * (minutes): card/wallets 30 (covers 3DS), Coinbase 60, onchain USDC 60 (a manual
