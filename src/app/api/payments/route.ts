@@ -14,6 +14,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { effectiveConnectAccount } from "@/lib/payments/connect";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { takePayment, getOrderBalance } from "@/lib/payments/service";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
@@ -81,7 +82,8 @@ export async function POST(request: Request) {
   let connectAccountId: string | null = null;
   if (body.rail === "stripe_terminal" || body.rail === "stripe_online") {
     const account = await driver.getConnectAccount(body.tenantId);
-    connectAccountId = account?.account_id ?? null;
+    connectAccountId =
+      effectiveConnectAccount(account)?.account_id ?? null;
   }
 
   try {

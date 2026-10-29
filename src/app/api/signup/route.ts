@@ -16,6 +16,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { effectiveConnectAccount } from "@/lib/payments/connect";
 import { getCurrentUser } from "@/lib/auth/session";
 import { recordAudit } from "@/lib/security";
 
@@ -37,7 +38,7 @@ export async function GET(request: Request) {
       driver.getOnboarding(tenantId),
       driver.listLocations(tenantId),
       driver.getSubscription(tenantId),
-      driver.getConnectAccount(tenantId),
+      driver.getConnectAccount(tenantId).then(effectiveConnectAccount),
     ]);
   if (!tenant) {
     return NextResponse.json({ error: "Tenant not found." }, { status: 404 });

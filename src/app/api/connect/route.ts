@@ -2,7 +2,8 @@
  * Stripe Connect onboarding endpoint (Phase 2 scaffold).
  *
  * GET  /api/connect?tenantId=  — current Connect status for the tenant (from the
- *      DB abstraction); refreshes from Stripe when configured.
+ *      DB abstraction); refreshes from Stripe when configured. owner|manager
+ *      only (it exposes the account id and triggers a Stripe fetch + upsert).
  * POST /api/connect            — start onboarding for the tenant: create (or
  *      simulate) a connected account, persist it, and return an onboarding URL.
  *      `{ tenantId, returnUrl?, refreshUrl? }`.
@@ -17,8 +18,10 @@ import { getPosDriver } from "@/lib/db";
 import {
   createAccountLink,
   createConnectAccount,
+  effectiveConnectAccount,
   fetchConnectStatus,
   isSimulated,
+  isSimulatedAccount,
 } from "@/lib/payments/connect";
 import { requireTenantRole } from "@/lib/auth/api";
 import { recordAudit } from "@/lib/security";
@@ -34,11 +37,19 @@ export async function GET(request: Request) {
       { status: 400 },
     );
   }
+
+  // Same gate as POST; the only caller is the owner/manager admin payments UI.
+  const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+  if (!auth.ok) return auth.res;
+
   const driver = getPosDriver();
-  let account = await driver.getConnectAccount(tenantId);
+  // A leftover simulated account is "not connected" once Stripe is configured.
+  let account = effectiveConnectAccount(
+    await driver.getConnectAccount(tenantId),
+  );
 
   // If we have a stored real account, refresh its live status from Stripe.
-  if (account && !account.simulated) {
+  if (account && !isSimulatedAccount(account)) {
     try {
       const fresh = await fetchConnectStatus(tenantId, account.account_id);
       account = await driver.upsertConnectAccount(fresh);
@@ -72,7 +83,11 @@ export async function POST(request: Request) {
   const driver = getPosDriver();
   try {
     // Reuse an existing account if onboarding was already started.
-    let account = await driver.getConnectAccount(body.tenantId);
+    // A simulated account left over from before Stripe was configured is
+    // replaced with a real one (it can't be used with real Stripe).
+    let account = effectiveConnectAccount(
+      await driver.getConnectAccount(body.tenantId),
+    );
     if (!account) {
       account = await createConnectAccount(body.tenantId);
       account = await driver.upsertConnectAccount(account);

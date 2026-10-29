@@ -10,6 +10,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { effectiveConnectAccount } from "@/lib/payments/connect";
 import { isStripeConfigured } from "@/lib/payments/env";
 import { stripeRequest } from "@/lib/payments/providers/stripe-client";
 
@@ -34,7 +35,8 @@ export async function POST(request: Request) {
   let connectAccountId: string | null = null;
   if (tenantId) {
     const account = await getPosDriver().getConnectAccount(tenantId);
-    connectAccountId = account?.account_id ?? null;
+    connectAccountId =
+      effectiveConnectAccount(account)?.account_id ?? null;
   }
 
   try {

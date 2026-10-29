@@ -133,4 +133,26 @@ export function isSimulated(): boolean {
   return !isStripeConfigured();
 }
 
+/** True for a stored account that was simulated (never a real Stripe account). */
+export function isSimulatedAccount(
+  account: Pick<ConnectAccount, "account_id" | "simulated"> | null | undefined,
+): boolean {
+  return (
+    !!account && (account.simulated || account.account_id.startsWith("acct_sim_"))
+  );
+}
+
+/**
+ * The stored account as it should be treated right now. When Stripe is
+ * configured a simulated `acct_sim_…` row (left over from onboarding before the
+ * key was set) is NOT a real account: treat it as not connected so it is never
+ * shown as connected or passed to real Stripe as a connected-account id.
+ */
+export function effectiveConnectAccount(
+  account: ConnectAccount | null,
+): ConnectAccount | null {
+  if (account && !isSimulated() && isSimulatedAccount(account)) return null;
+  return account;
+}
+
 export { getStripeConfig };
