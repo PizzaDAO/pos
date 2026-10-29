@@ -17,7 +17,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
 import { publicTender } from "@/lib/payments/public";
 import {
   CardPaymentsNotReadyError,
@@ -104,6 +104,19 @@ export async function POST(request: Request) {
   }
   const tenantId = order.tenant_id;
   const locationId = order.location_id;
+
+  // IN-STORE orders are taken at the till: every rail (cash, card, crypto) needs
+  // a signed-in owner/manager/cashier of the order's tenant. The terminal's
+  // Supabase session carries the device user's membership role (the staff PIN
+  // switch does not change it). Online orders stay anonymous for card/crypto.
+  if (order.channel === "in_store") {
+    const auth = await requireTenantRole(tenantId, [
+      "owner",
+      "manager",
+      "cashier",
+    ]);
+    if (!auth.ok) return auth.res;
+  }
 
   // Idempotent retry: return the existing tender BEFORE the card gate, so a
   // retry after a successful charge is never turned into a refusal.
