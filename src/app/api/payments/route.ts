@@ -32,6 +32,7 @@ import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
   BalanceExceededError,
   getOrderBalance,
+  isDefinitiveRailFailure,
   PaymentOutcomeUnknownError,
   railIsSimulated,
   takePayment,
@@ -282,9 +283,11 @@ export async function POST(request: Request) {
         { status: 409 },
       );
     }
+    // A definitive decline (no money moved) is a 402 — the client may start
+    // over with a new id. Anything else stays ambiguous (502).
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Payment failed." },
-      { status: 502 },
+      { status: isDefinitiveRailFailure(err) ? 402 : 502 },
     );
   }
 }

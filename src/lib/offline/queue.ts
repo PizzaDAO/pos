@@ -12,7 +12,16 @@
 import Dexie, { type Table } from "dexie";
 import type { CreateOrderInput } from "@/lib/db";
 
-export type QueueEntryStatus = "pending" | "syncing" | "synced" | "error";
+/**
+ * `rejected` = the server refused the order with a non-retryable 4xx (e.g. a
+ * forbidden discount, an 86'd item). It is NOT retried; the cashier is told.
+ */
+export type QueueEntryStatus =
+  | "pending"
+  | "syncing"
+  | "synced"
+  | "error"
+  | "rejected";
 
 export interface QueuedOrder {
   /** Primary key = the order's client UUID (idempotency key). */
@@ -71,7 +80,7 @@ export async function enqueueOrder(payload: CreateOrderInput): Promise<void> {
 /** All entries not yet successfully synced, oldest first. */
 export async function getPendingOrders(): Promise<QueuedOrder[]> {
   const all = await db().orders.orderBy("createdAt").toArray();
-  return all.filter((o) => o.status !== "synced");
+  return all.filter((o) => o.status !== "synced" && o.status !== "rejected");
 }
 
 /** Count of entries still awaiting (or retrying) sync. */
@@ -91,6 +100,17 @@ export async function markError(id: string, message: string): Promise<void> {
   const entry = await db().orders.get(id);
   await db().orders.update(id, {
     status: "error",
+    attempts: (entry?.attempts ?? 0) + 1,
+    lastError: message,
+    updatedAt: Date.now(),
+  });
+}
+
+/** Mark an entry permanently refused by the server (never retried). */
+export async function markRejected(id: string, message: string): Promise<void> {
+  const entry = await db().orders.get(id);
+  await db().orders.update(id, {
+    status: "rejected",
     attempts: (entry?.attempts ?? 0) + 1,
     lastError: message,
     updatedAt: Date.now(),

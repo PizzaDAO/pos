@@ -30,6 +30,8 @@ export interface CartPanelProps {
   onEditLine: (line: OrderItem) => void;
   onPlaceOrder: () => void;
   placing: boolean;
+  /** Whether the active staff member may apply an order discount. */
+  canDiscount?: boolean;
 }
 
 export function CartPanel({
@@ -37,6 +39,7 @@ export function CartPanel({
   onEditLine,
   onPlaceOrder,
   placing,
+  canDiscount = false,
 }: CartPanelProps) {
   const items = useCartStore((s) => s.items);
   const discountCents = useCartStore((s) => s.discountCents);
@@ -168,27 +171,29 @@ export function CartPanel({
 
       {/* Discount + totals */}
       <div className="space-y-3 border-t p-4">
-        <div className="flex items-center justify-between gap-2">
-          <label htmlFor="discount" className="text-sm text-muted-foreground">
-            Order discount
-          </label>
-          <div className="flex items-center gap-1">
-            <span className="text-sm text-muted-foreground">$</span>
-            <input
-              id="discount"
-              type="number"
-              min={0}
-              step="0.01"
-              value={discountCents ? (discountCents / 100).toString() : ""}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                setDiscount(Number.isFinite(v) ? Math.round(v * 100) : 0);
-              }}
-              placeholder="0.00"
-              className="w-24 rounded-md border bg-background px-2 py-1 text-right text-sm"
-            />
+        {canDiscount && (
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="discount" className="text-sm text-muted-foreground">
+              Order discount
+            </label>
+            <div className="flex items-center gap-1">
+              <span className="text-sm text-muted-foreground">$</span>
+              <input
+                id="discount"
+                type="number"
+                min={0}
+                step="0.01"
+                value={discountCents ? (discountCents / 100).toString() : ""}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setDiscount(Number.isFinite(v) ? Math.round(v * 100) : 0);
+                }}
+                placeholder="0.00"
+                className="w-24 rounded-md border bg-background px-2 py-1 text-right text-sm"
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         <dl className="space-y-1 text-sm">
           <div className="flex justify-between">

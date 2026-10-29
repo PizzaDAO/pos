@@ -10,7 +10,7 @@
  */
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, Loader2, X } from "lucide-react";
 import type { DeliveryAddress } from "@/lib/db";
@@ -23,10 +23,7 @@ import {
   useShopCheckout,
   type DeliveryQuoteResult,
 } from "@/lib/store/use-shop-checkout";
-import {
-  asapAvailability,
-  generateSlots,
-} from "@/lib/shop/scheduling";
+import { asapAvailability, generateSlots } from "@/lib/shop/scheduling";
 import type { ShopResponse } from "@/lib/store/use-shop";
 import { storefrontPath, type StorefrontRef } from "@/lib/shop/storefront";
 
@@ -48,6 +45,9 @@ export function CheckoutFlow({
   onClose: () => void;
 }) {
   const checkout = useShopCheckout();
+  const attemptRef = useRef<{ signature: string; orderId: string } | null>(
+    null,
+  );
   const items = useCustomerCart((s) => s.items);
   const subtotalCents = useCustomerCart((s) => s.subtotalCents());
   const clearCart = useCustomerCart((s) => s.clear);
@@ -94,12 +94,11 @@ export function CheckoutFlow({
     ? asapAvailability(fulfillmentSettings, now)
     : { available: false, reason: "Unavailable" };
   const slots = useMemo(
-    () =>
-      fulfillmentSettings ? generateSlots(fulfillmentSettings, now) : [],
+    () => (fulfillmentSettings ? generateSlots(fulfillmentSettings, now) : []),
     [fulfillmentSettings, now],
   );
 
-  const deliveryFee = fulfillment === "delivery" ? quote?.feeCents ?? 0 : 0;
+  const deliveryFee = fulfillment === "delivery" ? (quote?.feeCents ?? 0) : 0;
   const totals = useMemo(
     () =>
       computeOrderTotals({
@@ -129,7 +128,20 @@ export function CheckoutFlow({
     (fulfillment === "pickup" || (Boolean(quote) && Boolean(address.line1)));
 
   async function handlePlaceAndPay() {
-    const orderId = checkout.newUuid();
+    // Reuse the same order id across retries of THIS checkout (placing is
+    // idempotent on it), so a failed/uncertain payment never creates a second
+    // order; a changed cart gets a fresh id.
+    const signature = JSON.stringify([
+      items,
+      fulfillment,
+      when,
+      tipCents,
+      address,
+    ]);
+    if (!attemptRef.current || attemptRef.current.signature !== signature) {
+      attemptRef.current = { signature, orderId: checkout.newUuid() };
+    }
+    const orderId = attemptRef.current.orderId;
     const placed = await checkout.placeOrder({
       orderId,
       tenantSlug: store.tenantSlug,
@@ -152,6 +164,7 @@ export function CheckoutFlow({
       tipCents: 0,
     });
     if (!pay) return;
+    attemptRef.current = null;
     setPlacedOrderId(placed.order.id);
     setPlacedOrderNumber(placed.order.order_number);
     clearCart();
@@ -181,7 +194,12 @@ export function CheckoutFlow({
           <h2 className="text-lg font-bold">
             {step === "done" ? "Order confirmed" : "Checkout"}
           </h2>
-          <Button variant="ghost" size="icon" aria-label="Close" onClick={onClose}>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Close"
+            onClick={onClose}
+          >
             <X className="h-5 w-5" />
           </Button>
         </div>
@@ -327,9 +345,7 @@ export function CheckoutFlow({
                   </button>
                   <select
                     value={when === "asap" ? "" : when}
-                    onChange={(e) =>
-                      setWhen(e.target.value || "asap")
-                    }
+                    onChange={(e) => setWhen(e.target.value || "asap")}
                     className="flex-1 rounded-lg border bg-background px-2 text-sm"
                   >
                     <option value="">Schedule for later…</option>
@@ -475,11 +491,20 @@ export function CheckoutFlow({
 
               {/* Totals */}
               <section className="space-y-1 rounded-md bg-muted p-3 text-sm">
-                <Row label="Subtotal" value={formatMoney(totals.subtotal_cents, currency)} />
+                <Row
+                  label="Subtotal"
+                  value={formatMoney(totals.subtotal_cents, currency)}
+                />
                 {deliveryFee > 0 && (
-                  <Row label="Delivery" value={formatMoney(deliveryFee, currency)} />
+                  <Row
+                    label="Delivery"
+                    value={formatMoney(deliveryFee, currency)}
+                  />
                 )}
-                <Row label="Tax" value={formatMoney(totals.tax_cents, currency)} />
+                <Row
+                  label="Tax"
+                  value={formatMoney(totals.tax_cents, currency)}
+                />
                 {tipCents > 0 && (
                   <Row label="Tip" value={formatMoney(tipCents, currency)} />
                 )}

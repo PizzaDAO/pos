@@ -12,21 +12,15 @@
  */
 "use client";
 
-import { useCallback, useState } from "react";
-import type {
-  DeliveryAddress,
-  Order,
-  OrderItem,
-  Payment,
-} from "@/lib/db";
+import { useCallback, useRef, useState } from "react";
+import {
+  idForAttempt,
+  newUuid,
+  settleAttempt,
+  type RetryIdSlot,
+} from "./retry-id";
+import type { DeliveryAddress, Order, OrderItem, Payment } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
-
-function newUuid(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `id-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
 
 export interface DeliveryQuoteResult {
   provider: string;
@@ -53,6 +47,8 @@ export interface PlaceOrderInput {
 export function useShopCheckout() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Payment id kept across an AMBIGUOUS failure so the retry can't charge twice.
+  const paySlot = useRef<RetryIdSlot["current"]>(null);
 
   /** Price + gate a delivery address. Returns null + sets `error` on rejection. */
   const quoteDelivery = useCallback(
@@ -142,26 +138,42 @@ export function useShopCheckout() {
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch("/api/payments", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            paymentId: newUuid(),
-            orderId: input.order.id,
-            tenantId: input.order.tenant_id,
-            locationId: input.order.location_id,
-            rail: input.rail,
-            amountCents: input.amountCents,
-            tipCents: input.tipCents,
-            currency: input.order.currency,
-          }),
-        });
-        const data = (await res.json()) as {
+        const paymentId = idForAttempt(
+          paySlot,
+          `${input.order.id}:${input.rail}:${input.amountCents}:${input.tipCents}`,
+        );
+        let res: Response;
+        try {
+          res = await fetch("/api/payments", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              paymentId,
+              orderId: input.order.id,
+              tenantId: input.order.tenant_id,
+              locationId: input.order.location_id,
+              rail: input.rail,
+              amountCents: input.amountCents,
+              tipCents: input.tipCents,
+              currency: input.order.currency,
+            }),
+          });
+        } catch (netErr) {
+          settleAttempt(paySlot, { networkError: true });
+          throw netErr;
+        }
+        const data = (await res.json().catch(() => ({}))) as {
           payment?: Payment;
           error?: string;
+          retry?: boolean;
         };
+        settleAttempt(paySlot, { status: res.status, retry: data.retry });
         if (!res.ok || !data.payment) {
-          throw new Error(data.error ?? `HTTP ${res.status}`);
+          throw new Error(
+            data.retry
+              ? `${data.error ?? "Payment not confirmed."} Please try again — you won't be charged twice.`
+              : (data.error ?? `HTTP ${res.status}`),
+          );
         }
         return data.payment;
       } catch (e) {

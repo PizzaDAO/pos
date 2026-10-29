@@ -3,21 +3,17 @@
  *
  * Loads an order + its tenders, takes new tenders (split payment across rails),
  * polls pending crypto tenders until confirmed, and issues refunds. Every tender
- * carries a freshly-generated client UUID that is the idempotency key end-to-end
- * (`/api/payments` upserts by it), so a retry/double-tap never double-charges.
+ * carries a client UUID that is the idempotency key end-to-end (`/api/payments`
+ * upserts by it). After an AMBIGUOUS failure (503 retry / network error) the
+ * retry of the same tender or refund REUSES that id, so it never double-charges
+ * or double-refunds (see ./retry-id).
  */
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Order, Payment } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
-
-function newUuid(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `pay-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
+import { idForAttempt, settleAttempt, type RetryIdSlot } from "./retry-id";
 
 export interface CheckoutState {
   order: Order | null;
@@ -58,6 +54,9 @@ export function useCheckout(
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
+  // Unresolved idempotency ids (reused only after an ambiguous failure).
+  const tenderSlot = useRef<RetryIdSlot["current"]>(null);
+  const refundSlot = useRef<RetryIdSlot["current"]>(null);
 
   const refresh = useCallback(async () => {
     if (!orderId) return;
@@ -140,27 +139,45 @@ export function useCheckout(
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch("/api/payments", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            paymentId: newUuid(),
-            orderId,
-            tenantId,
-            locationId,
-            rail: input.rail,
-            amountCents: input.amountCents,
-            tipCents: input.tipCents,
-            currency,
-            cashTenderedCents: input.cashTenderedCents,
-          }),
-        });
-        const data = (await res.json()) as {
+        const paymentId = idForAttempt(
+          tenderSlot,
+          `${orderId}:${input.rail}:${input.amountCents}:${input.tipCents}`,
+        );
+        let res: Response;
+        try {
+          res = await fetch("/api/payments", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              paymentId,
+              orderId,
+              tenantId,
+              locationId,
+              rail: input.rail,
+              amountCents: input.amountCents,
+              tipCents: input.tipCents,
+              currency,
+              cashTenderedCents: input.cashTenderedCents,
+            }),
+          });
+        } catch (netErr) {
+          settleAttempt(tenderSlot, { networkError: true });
+          throw netErr;
+        }
+        const data = (await res.json().catch(() => ({}))) as {
           payment?: Payment;
           balanceCents?: number;
           error?: string;
+          retry?: boolean;
         };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        settleAttempt(tenderSlot, { status: res.status, retry: data.retry });
+        if (!res.ok) {
+          throw new Error(
+            data.retry
+              ? `${data.error ?? "Payment not confirmed."} Tap again to retry the same payment.`
+              : (data.error ?? `HTTP ${res.status}`),
+          );
+        }
         await refresh();
         return data.payment ?? null;
       } catch (e) {
@@ -178,15 +195,35 @@ export function useCheckout(
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch("/api/payments/refund", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          // One idempotency key per refund REQUEST (retries of this request
-          // reuse it; a new partial refund gets a new one).
-          body: JSON.stringify({ paymentId, amountCents, refundId: newUuid() }),
-        });
-        const data = (await res.json()) as { error?: string };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        // One idempotency key per refund REQUEST; an ambiguous failure keeps
+        // it so the retry can't refund twice.
+        const refundId = idForAttempt(
+          refundSlot,
+          `${paymentId}:${amountCents ?? "full"}`,
+        );
+        let res: Response;
+        try {
+          res = await fetch("/api/payments/refund", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paymentId, amountCents, refundId }),
+          });
+        } catch (netErr) {
+          settleAttempt(refundSlot, { networkError: true });
+          throw netErr;
+        }
+        const data = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          retry?: boolean;
+        };
+        settleAttempt(refundSlot, { status: res.status, retry: data.retry });
+        if (!res.ok) {
+          throw new Error(
+            data.retry
+              ? `${data.error ?? "Refund not confirmed."} Tap again to retry the same refund.`
+              : (data.error ?? `HTTP ${res.status}`),
+          );
+        }
         await refresh();
       } catch (e) {
         setError(e instanceof Error ? e.message : "Refund failed.");
