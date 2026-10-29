@@ -21,6 +21,7 @@ import type { Order, Payment, PaymentStatus } from "@/lib/db";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { railChargesApplicationFee } from "./fees";
+import { CardPaymentsNotReadyError } from "./connect";
 import {
   isCoinbaseConfigured,
   isOnchainConfigured,
@@ -105,6 +106,16 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
   // Idempotency guard: a tender with this id already exists → return it.
   const existing = await driver.getPayment(input.paymentId);
   if (existing) return existing;
+
+  // Defense in depth: in real mode a card rail must always be scoped to a real
+  // connected account — never fall back to the platform account.
+  if (
+    railChargesApplicationFee(input.rail) &&
+    isStripeConfigured() &&
+    (!input.connectAccountId || input.connectAccountId.startsWith("acct_sim_"))
+  ) {
+    throw new CardPaymentsNotReadyError();
+  }
 
   const rail = requirePaymentRail(input.rail);
   const amount = { amount: input.amountCents, currency: input.currency };

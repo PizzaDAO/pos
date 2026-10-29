@@ -14,6 +14,7 @@
  * Connect status is persisted via the DB abstraction (mock driver) in the route.
  */
 import type { ConnectAccount, ConnectStatus } from "@/lib/db/payment-types";
+import { getPosDriver } from "@/lib/db";
 import { getStripeConfig, isStripeConfigured } from "./env";
 import { stripeGet, stripeRequest } from "./providers/stripe-client";
 
@@ -156,3 +157,35 @@ export function effectiveConnectAccount(
 }
 
 export { getStripeConfig };
+
+export const CARD_NOT_READY_MESSAGE =
+  "Card payments aren't set up for this pizzeria yet — finish Stripe onboarding in Admin → Payments.";
+
+/** Thrown when a card operation would run without a usable connected account. */
+export class CardPaymentsNotReadyError extends Error {
+  constructor() {
+    super(CARD_NOT_READY_MESSAGE);
+    this.name = "CardPaymentsNotReadyError";
+  }
+}
+
+/**
+ * Resolve the connected-account id a card rail may charge on behalf of.
+ *
+ * REAL mode (Stripe configured): the tenant MUST have a real (non-simulated)
+ * account with `charges_enabled`; otherwise throws CardPaymentsNotReadyError so
+ * nothing card-related ever runs on the platform account ("we never custody
+ * tenant card funds"). SIMULATED mode: returns the stored id or null, exactly as
+ * before (rails settle simulated, no Stripe call).
+ */
+export async function resolveCardConnectAccountId(
+  tenantId: string | null | undefined,
+): Promise<string | null> {
+  const stored = tenantId
+    ? await getPosDriver().getConnectAccount(tenantId)
+    : null;
+  if (isSimulated()) return stored?.account_id ?? null;
+  const account = effectiveConnectAccount(stored);
+  if (!account || !account.charges_enabled) throw new CardPaymentsNotReadyError();
+  return account.account_id;
+}

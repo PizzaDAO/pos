@@ -9,8 +9,10 @@
  * Body: `{ tenantId }`.
  */
 import { NextResponse } from "next/server";
-import { getPosDriver } from "@/lib/db";
-import { effectiveConnectAccount } from "@/lib/payments/connect";
+import {
+  CardPaymentsNotReadyError,
+  resolveCardConnectAccountId,
+} from "@/lib/payments/connect";
 import { isStripeConfigured } from "@/lib/payments/env";
 import { stripeRequest } from "@/lib/payments/providers/stripe-client";
 
@@ -31,15 +33,10 @@ export async function POST(request: Request) {
     });
   }
 
-  const tenantId = body.tenantId;
-  let connectAccountId: string | null = null;
-  if (tenantId) {
-    const account = await getPosDriver().getConnectAccount(tenantId);
-    connectAccountId =
-      effectiveConnectAccount(account)?.account_id ?? null;
-  }
-
   try {
+    // Real mode: refuse unless the tenant has a charges-enabled connected
+    // account (never mint a token on the platform account).
+    const connectAccountId = await resolveCardConnectAccountId(body.tenantId);
     const token = await stripeRequest<{ secret: string }>(
       "/terminal/connection_tokens",
       {},
@@ -47,6 +44,9 @@ export async function POST(request: Request) {
     );
     return NextResponse.json({ secret: token.secret, simulated: false });
   } catch (err) {
+    if (err instanceof CardPaymentsNotReadyError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Token mint failed." },
       { status: 502 },
