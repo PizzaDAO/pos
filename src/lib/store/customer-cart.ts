@@ -29,6 +29,8 @@ export interface CustomerCartState {
   updateLine: (id: string, line: OrderItem) => void;
   setQuantity: (id: string, quantity: number) => void;
   removeLine: (id: string) => void;
+  /** Replace every line (e.g. with the server's repriced lines). */
+  replaceItems: (items: OrderItem[]) => void;
   subtotalCents: () => number;
   itemCount: () => number;
   clear: () => void;
@@ -68,6 +70,9 @@ export const useCustomerCart = create<CustomerCartState>()(
 
       removeLine: (id) =>
         set((state) => ({ items: state.items.filter((i) => i.id !== id) })),
+
+      replaceItems: (items) =>
+        set({ items: items.filter((i) => !i.voided).map(withLinePricing) }),
 
       subtotalCents: () => computeSubtotalCents(get().items),
 

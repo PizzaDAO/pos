@@ -35,7 +35,12 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentSettings,
+  RefundReservation,
+} from "./payment-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -915,6 +920,12 @@ export const mockDriver: PosDriver = {
       const merged: Payment = {
         ...existing,
         ...payment,
+        // Refund bookkeeping is owned by reservePaymentRefund; a stale snapshot
+        // passed to upsert must never roll it back.
+        refunded_cents: existing.refunded_cents,
+        refund_ids: existing.refund_ids,
+        status:
+          existing.status === "refunded" ? "refunded" : payment.status,
         created_at: existing.created_at,
         updated_at: nowIso(),
       };
@@ -929,6 +940,56 @@ export const mockDriver: PosDriver = {
     };
     payments.set(created.id, created);
     return created;
+  },
+
+  // Single synchronous block (no awaits): atomic in the single-threaded mock.
+  async reservePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string | null,
+  ): Promise<RefundReservation> {
+    const p = payments.get(paymentId);
+    if (!p) return { ok: false, reason: "not_found", payment: null };
+    const ids = p.refund_ids ?? [];
+    if (refundId && ids.includes(refundId)) {
+      return { ok: false, reason: "duplicate", payment: p };
+    }
+    const total = p.amount_cents + p.tip_cents;
+    if (
+      amountCents <= 0 ||
+      (p.status !== "captured" && p.status !== "authorized") ||
+      p.refunded_cents + amountCents > total
+    ) {
+      return { ok: false, reason: "exceeds", payment: p };
+    }
+    const refunded = p.refunded_cents + amountCents;
+    const updated: Payment = {
+      ...p,
+      refunded_cents: refunded,
+      refund_ids: refundId ? [...ids, refundId] : ids,
+      status: refunded >= total ? "refunded" : p.status,
+      updated_at: nowIso(),
+    };
+    payments.set(paymentId, updated);
+    return { ok: true, payment: updated };
+  },
+
+  async releasePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string | null,
+  ): Promise<void> {
+    const p = payments.get(paymentId);
+    if (!p) return;
+    payments.set(paymentId, {
+      ...p,
+      refunded_cents: Math.max(0, p.refunded_cents - amountCents),
+      refund_ids: refundId
+        ? (p.refund_ids ?? []).filter((x) => x !== refundId)
+        : p.refund_ids,
+      status: p.status === "refunded" ? "captured" : p.status,
+      updated_at: nowIso(),
+    });
   },
 
   async getPayment(id: string): Promise<Payment | null> {

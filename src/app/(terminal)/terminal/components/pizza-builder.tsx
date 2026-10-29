@@ -129,9 +129,15 @@ export function PizzaBuilder({
   const pickedIn = (g: (typeof halfGroups)[number]) =>
     g.modifiers.filter((m) => toppings[m.id]).length;
   const overMax = halfGroups.filter((g) => pickedIn(g) > g.max_select);
-  const missingRequired = singleGroups
-    .filter((g) => g.min_select >= 1 && !single[g.id])
-    .map((g) => g.name);
+  // min_select applies to multi-select (topping) groups too, as on the server.
+  const missingRequired = [
+    ...singleGroups
+      .filter((g) => g.min_select >= 1 && !single[g.id])
+      .map((g) => g.name),
+    ...halfGroups
+      .filter((g) => pickedIn(g) < g.min_select)
+      .map((g) => `${g.name} (at least ${g.min_select})`),
+  ];
   const needsSize = item.sizes.length > 0 && !sizeId;
   const valid =
     missingRequired.length === 0 && !needsSize && overMax.length === 0;

@@ -28,6 +28,7 @@ import {
   isConnectedForHealth,
 } from "@/lib/payments/connect-status";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { captureError } from "@/lib/observability";
 import type { PosDriver } from "./driver";
 import type {
   ItemSize,
@@ -228,6 +229,7 @@ function mapPayment(r: Row): Payment {
     cash_tendered_cents: (r.cash_tendered_cents as number | null) ?? null,
     cash_change_cents: (r.cash_change_cents as number | null) ?? null,
     refunded_cents: r.refunded_cents as number,
+    refund_ids: (r.refund_ids as string[] | null) ?? [],
     simulated: r.simulated as boolean,
     raw: (r.raw as Record<string, unknown> | null) ?? null,
     created_at: r.created_at as string,
@@ -1359,7 +1361,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       try {
         await writeOrderItems(input.id, input.items);
       } catch (err) {
-        await sb.from("orders").delete().eq("id", input.id);
+        const { error: delErr } = await sb
+          .from("orders")
+          .delete()
+          .eq("id", input.id);
+        if (delErr) {
+          // The rollback itself failed: an item-less order may remain. Log it
+          // loudly (and to the error sink) so it can be cleaned up.
+          captureError(new Error(`createOrder rollback failed: ${delErr.message}`), {
+            scope: "createOrder",
+            orderId: input.id,
+          });
+          console.error(
+            `[createOrder] rollback delete failed for order ${input.id}: ${delErr.message}`,
+          );
+        }
         throw err;
       }
       const order = await readOrderRow(orderRow);
@@ -1428,12 +1444,22 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .maybeSingle(),
       ) as Row | null;
       const now = nowIso();
+      // Refund bookkeeping (refunded_cents, refund_ids, a `refunded` status) is
+      // owned by the atomic reserve/release RPCs. A whole-row upsert from a stale
+      // snapshot must never overwrite it on an existing tender.
+      const {
+        refunded_cents: _rc,
+        refund_ids: _ri,
+        ...writable
+      } = payment;
+      void _rc;
+      void _ri;
       const row = mapPayment(
         unwrap(
           await sb
             .from("payments")
             .upsert({
-              ...payment,
+              ...(existing ? writable : payment),
               created_at:
                 (existing?.created_at as string) ?? payment.created_at ?? now,
               updated_at: now,
@@ -1443,6 +1469,33 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         ) as Row,
       );
       return row;
+    },
+
+    async reservePaymentRefund(paymentId, amountCents, refundId) {
+      const out = unwrap(
+        await sb.rpc("reserve_payment_refund", {
+          p_payment_id: paymentId,
+          p_amount: amountCents,
+          p_refund_id: refundId,
+        }),
+      ) as { outcome: string; payment?: Row };
+      const payment = out.payment ? mapPayment(out.payment) : null;
+      if (out.outcome === "ok" && payment) return { ok: true, payment };
+      const reason =
+        out.outcome === "duplicate" || out.outcome === "not_found"
+          ? out.outcome
+          : "exceeds";
+      return { ok: false, reason, payment };
+    },
+
+    async releasePaymentRefund(paymentId, amountCents, refundId) {
+      unwrap(
+        await sb.rpc("release_payment_refund", {
+          p_payment_id: paymentId,
+          p_amount: amountCents,
+          p_refund_id: refundId,
+        }),
+      );
     },
 
     async getPayment(id) {

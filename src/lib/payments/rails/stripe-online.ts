@@ -22,7 +22,11 @@ import type {
   RefundRequest,
   RefundResult,
 } from "../PaymentRail";
-import { cardRailsSimulated, getDefaultPlatformFee } from "../env";
+import {
+  assertLiveKeyAllowed,
+  cardRailsSimulated,
+  getDefaultPlatformFee,
+} from "../env";
 import { computeApplicationFeeCents, stripeRefundParams } from "../fees";
 import {
   mapIntentStatus,
@@ -74,6 +78,7 @@ export const stripeOnlineRail: PaymentRail = {
       };
     }
 
+    assertLiveKeyAllowed();
     const intent = await stripeRequest<{
       id: string;
       status: string;

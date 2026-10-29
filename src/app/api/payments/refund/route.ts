@@ -7,7 +7,7 @@
  * via a derived key. Simulated rails always "succeed".
  */
 import { NextResponse } from "next/server";
-import { refundPayment } from "@/lib/payments/service";
+import { RefundExceedsError, refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantRole } from "@/lib/auth/api";
@@ -89,29 +89,34 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.res;
 
   try {
-    const payment = await refundPayment({
+    const result = await refundPayment({
       paymentId: b.paymentId,
       amountCents: b.amountCents,
       reason: b.reason,
       refundId: b.refundId,
     });
-    if (!payment) {
+    if (!result) {
       return NextResponse.json(
         { error: "Payment not found." },
         { status: 404 },
       );
     }
+    const { replayed, refundedNowCents, ...payment } = result;
     const order = await driver.getOrder(payment.order_id);
     const balance = order ? await getOrderBalance(order) : 0;
 
-    // Audit the refund (tenant-scoped). Fully-refunded ⇒ a void of the tender.
-    const fullyRefunded = payment.refunded_cents >= payment.amount_cents;
-    await recordAudit({
-      actor: { id: auth.user.id, label: auth.user.email },
-      action: fullyRefunded ? "payment_void" : "payment_refund",
-      tenantId: payment.tenant_id,
-      detail: `Refunded ${b.amountCents ?? payment.amount_cents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
-    });
+    // Audit the refund (tenant-scoped) with the amount ACTUALLY refunded now.
+    // An idempotent replay did nothing, so it writes no second entry.
+    if (!replayed) {
+      const fullyRefunded =
+        payment.refunded_cents >= payment.amount_cents + payment.tip_cents;
+      await recordAudit({
+        actor: { id: auth.user.id, label: auth.user.email },
+        action: fullyRefunded ? "payment_void" : "payment_refund",
+        tenantId: payment.tenant_id,
+        detail: `Refunded ${refundedNowCents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
+      });
+    }
 
     return NextResponse.json({
       payment: publicTender(payment),
@@ -119,6 +124,9 @@ export async function POST(request: Request) {
       orderStatus: order?.status,
     });
   } catch (err) {
+    if (err instanceof RefundExceedsError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Refund failed." },
       { status: 502 },

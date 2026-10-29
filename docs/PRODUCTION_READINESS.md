@@ -584,3 +584,24 @@ domain-level validation (scheduling, zone gates, idempotency) is unchanged.
   `requires_action` are canceled on the connected account.
 - **Order lines** get server-minted ids; the Supabase `createOrder` deletes the
   order row if writing its lines fails (no item-less `placed` order).
+- **Known gap: concurrent intent creation.** Two simultaneous `POST /api/payments`
+  calls for the same online order with DIFFERENT `paymentId`s can each create a
+  `stripe_online` intent (the cancel-earlier-intents step runs before creation,
+  not under a lock). It is latent today because no client confirms a
+  `stripe_online` intent yet (the shop only records the tender; Stripe.js
+  confirmation lands with the checkout redesign), so an extra open intent can
+  never be paid. The redesign closes it with a partial unique index (one open
+  `stripe_online` tender per order).
+- **Unpaid-order cancel.** If the customer declines a repriced total, the shop
+  calls `POST /api/shop/orders/cancel`, which only voids an ONLINE, still
+  `placed` order with no pending/authorized/captured tender, within 10 minutes of
+  creation (and cancels its open card intent and delivery). Inventory depleted at
+  placement is not restocked by the void (no existing restock path).
+- **Refund bookkeeping is atomic** (`reserve_payment_refund` /
+  `release_payment_refund`, migration `20261030000100_payment_refund_atomic.sql`,
+  new `payments.refund_ids` column): cash/crypto reserve before calling the rail
+  (released on failure); cards call Stripe first (it caps the money and dedupes on
+  the key) and then record atomically. `upsertPayment` never touches
+  `refunded_cents`/`refund_ids` on an existing tender.
+- **Live key guard.** With `sk_live_`/`rk_live_` and `VERCEL_ENV` not
+  `production`, Connect account creation and card charges are refused.

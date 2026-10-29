@@ -43,6 +43,33 @@ export function isStripeTestKey(): boolean {
   return key.startsWith("sk_test_") || key.startsWith("rk_test_");
 }
 
+/** True for a LIVE-mode key (`sk_live_...` or restricted `rk_live_...`). */
+export function isStripeLiveKey(): boolean {
+  const key = process.env.STRIPE_SECRET_KEY ?? "";
+  return key.startsWith("sk_live_") || key.startsWith("rk_live_");
+}
+
+export class LiveKeyOutsideProductionError extends Error {
+  constructor() {
+    super(
+      "A live Stripe key is configured outside production (VERCEL_ENV is not 'production'); refusing to create real Connect accounts or charges from a preview/dev deployment.",
+    );
+    this.name = "LiveKeyOutsideProductionError";
+  }
+}
+
+/**
+ * Guard for REAL money-moving Stripe operations (Connect account creation, card
+ * charges): a live key must only ever be used by the production deployment, so a
+ * preview or local run that inherited the production env can't create real
+ * accounts or charge real cards.
+ */
+export function assertLiveKeyAllowed(): void {
+  if (isStripeLiveKey() && process.env.VERCEL_ENV !== "production") {
+    throw new LiveKeyOutsideProductionError();
+  }
+}
+
 /** True when `TRAINING_MODE` is explicitly enabled via env. */
 export function isTrainingFlagSet(): boolean {
   const v = (process.env.TRAINING_MODE ?? "").toLowerCase();

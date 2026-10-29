@@ -183,5 +183,37 @@ export function useShopCheckout() {
     [],
   );
 
-  return { loading, error, setError, quoteDelivery, placeOrder, pay, newUuid };
+  /** Void a just-placed, unpaid order (customer declined a changed total). */
+  const cancelOrder = useCallback(async (orderId: string): Promise<boolean> => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/shop/orders/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? `HTTP ${res.status}`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not cancel the order.");
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return {
+    loading,
+    error,
+    setError,
+    quoteDelivery,
+    placeOrder,
+    pay,
+    cancelOrder,
+    newUuid,
+  };
 }

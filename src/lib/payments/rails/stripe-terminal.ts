@@ -34,7 +34,11 @@ import type {
   RefundRequest,
   RefundResult,
 } from "../PaymentRail";
-import { cardRailsSimulated, getDefaultPlatformFee } from "../env";
+import {
+  assertLiveKeyAllowed,
+  cardRailsSimulated,
+  getDefaultPlatformFee,
+} from "../env";
 import { computeApplicationFeeCents, stripeRefundParams } from "../fees";
 import {
   mapIntentStatus,
@@ -91,6 +95,7 @@ export const stripeTerminalRail: PaymentRail = {
     }
 
     // Real Connect charge on the tenant's connected account.
+    assertLiveKeyAllowed();
     const intent = await stripeRequest<{ id: string; status: string }>(
       "/payment_intents",
       {

@@ -15,7 +15,12 @@
  */
 import type { ConnectAccount, ConnectStatus } from "@/lib/db/payment-types";
 import { getPosDriver } from "@/lib/db";
-import { cardRailsSimulated, getStripeConfig, isStripeConfigured } from "./env";
+import {
+  assertLiveKeyAllowed,
+  cardRailsSimulated,
+  getStripeConfig,
+  isStripeConfigured,
+} from "./env";
 import {
   effectiveConnectAccount,
   isSimulated,
@@ -63,6 +68,7 @@ export async function createConnectAccount(
   if (!isStripeConfigured()) {
     return { ...simulatedConnectAccount(tenantId), status: "pending", charges_enabled: false, payouts_enabled: false, details_submitted: false };
   }
+  assertLiveKeyAllowed();
   const acct = await stripeRequest<{
     id: string;
     charges_enabled?: boolean;

@@ -22,6 +22,7 @@
 import "./rails";
 import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
+import type { RefundReservation } from "@/lib/db/payment-types";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
@@ -340,13 +341,16 @@ function isRealIntentTender(p: Payment): boolean {
   );
 }
 
+const NON_CANCELABLE_INTENT_STATUSES = ["succeeded", "processing", "canceled"];
+
 /**
  * Before a NEW stripe_online intent is created for an order, cancel any earlier
  * stripe_online tenders still in `requires_action`: cancel the PaymentIntent on
  * the connected account and mark the tender canceled, so two open intents can
  * never both be confirmed. If Stripe refuses to cancel (e.g. it already
- * succeeded), the tender is re-synced from Stripe instead; any other failure
- * propagates and blocks creating another intent.
+ * succeeded / processing / already canceled), the tender is re-synced from
+ * Stripe instead; any other failure propagates and blocks creating another
+ * intent.
  */
 export async function cancelOpenOnlineIntents(
   orderId: string,
@@ -367,12 +371,18 @@ export async function cancelOpenOnlineIntents(
           { stripeAccount: p.connect_account_id },
         );
       } catch (err) {
-        // Not cancelable: find out what it became (e.g. succeeded) and sync.
+        // The cancel failed. Only carry on if Stripe says the intent is in a
+        // state that can no longer be confirmed by the customer in a way we
+        // don't already track (succeeded / processing / canceled): sync it.
+        // Anything else (a transient error, a still-cancelable intent) means
+        // the old intent may yet be confirmed, so rethrow and create no new one.
         const intent = await stripeGet<{ status: string }>(
           `/payment_intents/${p.charge_id}`,
           { stripeAccount: p.connect_account_id },
         ).catch(() => null);
-        if (!intent) throw err;
+        if (!intent || !NON_CANCELABLE_INTENT_STATUSES.includes(intent.status)) {
+          throw err;
+        }
         await applyRailStatus(p.id, mapIntentStatus(intent.status));
         continue;
       }
@@ -408,7 +418,32 @@ export async function freshClientSecret(
   }
 }
 
-/** Refund a captured tender (full or partial) and persist the refunded amount. */
+/** A refund would exceed what is left on the tender (maps to HTTP 409). */
+export class RefundExceedsError extends Error {
+  constructor() {
+    super("Refund amount exceeds what is left on this payment.");
+    this.name = "RefundExceedsError";
+  }
+}
+
+/** True for the card rails, where Stripe itself caps the refunded money. */
+function isCardRail(rail: Payment["rail"]): boolean {
+  return rail === "stripe_terminal" || rail === "stripe_online";
+}
+
+/**
+ * Refund a tender (full or partial). The local bookkeeping (refunded_cents,
+ * refund-id append, over-refund cap) is ATOMIC in the driver
+ * (`reservePaymentRefund`), so concurrent refunds never lose an update.
+ *
+ *  - cash / crypto: nothing external caps the money, so RESERVE first, then call
+ *    the rail; if the rail fails the reservation is released.
+ *  - card: Stripe caps the money (and dedupes on the idempotency key), so call
+ *    the rail first, then record atomically. (Reserving first would turn a crash
+ *    between reserve and the Stripe call into a refund recorded but never made.)
+ *
+ * Returns `replayed: true` (and writes nothing) for a repeated `refundId`.
+ */
 export async function refundPayment(input: {
   paymentId: string;
   amountCents?: number;
@@ -419,51 +454,65 @@ export async function refundPayment(input: {
    * new id is a new refund, so repeated partial refunds work.
    */
   refundId?: string;
-}): Promise<Payment | null> {
+}): Promise<(Payment & { replayed?: boolean; refundedNowCents?: number }) | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(input.paymentId);
   if (!payment) return null;
 
   const total = payment.amount_cents + payment.tip_cents;
-  const done = Array.isArray(payment.raw?.refund_ids)
-    ? (payment.raw?.refund_ids as string[])
-    : [];
-  if (input.refundId && done.includes(input.refundId)) return payment;
+  const refundId = input.refundId ?? null;
+  if (refundId && (payment.refund_ids ?? []).includes(refundId)) {
+    return { ...payment, replayed: true, refundedNowCents: 0 };
+  }
 
   const rail = requirePaymentRail(payment.rail);
   const refundAmount = input.amountCents ?? total - payment.refunded_cents;
   if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
-    throw new Error("Refund amount exceeds what is left on this payment.");
+    throw new RefundExceedsError();
   }
 
-  const result = await rail.refund({
-    context: {
-      tenantId: payment.tenant_id,
-      locationId: payment.location_id,
-      connectAccountId: payment.connect_account_id,
-      // Unique per refund request. Without a client refundId fall back to a
-      // counter of what was already refunded + the amount (lost-response retry
-      // before the refund persisted still dedupes; clients should send refundId).
-      idempotencyKey: input.refundId
-        ? `refund_${payment.id}_${input.refundId}`
-        : `refund_${payment.id}_${payment.refunded_cents}_${refundAmount}`,
-    },
-    chargeId: payment.charge_id ?? payment.id,
-    amount: { amount: refundAmount, currency: payment.currency },
-    reason: input.reason,
-  });
+  const callRail = () =>
+    rail.refund({
+      context: {
+        tenantId: payment.tenant_id,
+        locationId: payment.location_id,
+        connectAccountId: payment.connect_account_id,
+        // Unique per refund request. Without a client refundId fall back to a
+        // counter of what was already refunded + the amount (clients should
+        // send refundId).
+        idempotencyKey: refundId
+          ? `refund_${payment.id}_${refundId}`
+          : `refund_${payment.id}_${payment.refunded_cents}_${refundAmount}`,
+      },
+      chargeId: payment.charge_id ?? payment.id,
+      amount: { amount: refundAmount, currency: payment.currency },
+      reason: input.reason,
+    });
 
-  const refundedTotal = payment.refunded_cents + result.amount.amount;
-  const fullyRefunded = refundedTotal >= total;
+  let recorded: RefundReservation;
+  if (isCardRail(payment.rail)) {
+    await callRail();
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId);
+  } else {
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId);
+    if (recorded.ok) {
+      try {
+        await callRail();
+      } catch (err) {
+        await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
+        throw err;
+      }
+    }
+  }
 
-  const updated = await driver.upsertPayment({
-    ...payment,
-    status: fullyRefunded ? "refunded" : payment.status,
-    refunded_cents: refundedTotal,
-    raw: input.refundId
-      ? { ...(payment.raw ?? {}), refund_ids: [...done, input.refundId] }
-      : payment.raw,
-  });
+  if (!recorded.ok) {
+    if (recorded.reason === "duplicate" && recorded.payment) {
+      return { ...recorded.payment, replayed: true, refundedNowCents: 0 };
+    }
+    if (recorded.reason === "not_found") return null;
+    throw new RefundExceedsError();
+  }
+  const updated = recorded.payment;
 
   // If all tenders on the order are fully refunded, mark the order refunded.
   const all = await driver.listPaymentsForOrder(payment.order_id);
@@ -471,7 +520,7 @@ export async function refundPayment(input: {
     all.length > 0 && all.every((p) => p.status === "refunded");
   if (allRefunded) await driver.updateOrderStatus(payment.order_id, "refunded");
 
-  return updated;
+  return { ...updated, refundedNowCents: refundAmount };
 }
 
 /**

@@ -190,6 +190,33 @@ export async function dispatchDelivery(
 }
 
 /**
+ * Cancel the delivery attached to an order (e.g. the order was voided before
+ * payment). Cancels with the provider when it owns the delivery, then marks the
+ * record `canceled`. No-op when there is no (live) delivery.
+ */
+export async function cancelDeliveryForOrder(
+  orderId: string,
+): Promise<DeliveryRecord | null> {
+  const driver = getPosDriver();
+  const record = await driver.getDeliveryForOrder(orderId);
+  if (!record || record.status === "canceled" || record.status === "delivered") {
+    return record;
+  }
+  const provider = getDeliveryProvider(record.provider as DeliveryProviderKey);
+  if (provider && record.provider_delivery_id) {
+    await provider.cancel(
+      {
+        tenantId: record.tenant_id,
+        locationId: record.location_id,
+        idempotencyKey: record.order_id,
+      },
+      record.provider_delivery_id,
+    );
+  }
+  return driver.upsertDelivery({ ...record, status: "canceled" });
+}
+
+/**
  * Refresh a delivery's live state from its provider and persist it. For an
  * in-house delivery still `pending_assignment`, we DON'T overwrite with the
  * provider's simulated "assigned" state — assignment is a manual /admin action.

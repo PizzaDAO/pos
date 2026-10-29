@@ -50,6 +50,7 @@ export function CheckoutFlow({
   const items = useCustomerCart((s) => s.items);
   const subtotalCents = useCustomerCart((s) => s.subtotalCents());
   const clearCart = useCustomerCart((s) => s.clear);
+  const replaceCartItems = useCustomerCart((s) => s.replaceItems);
 
   const { settings, paymentSettings, location } = shop;
   const currency = settings.currency;
@@ -163,6 +164,21 @@ export function CheckoutFlow({
       return;
     }
     await payPlacedOrder(placed.order);
+  }
+
+  /**
+   * The customer declined the changed total: void the placed order (so it does
+   * not sit on the KDS / get dispatched), then adopt the server's repriced lines
+   * and delivery fee so the next attempt matches and the prompt can't loop.
+   */
+  async function declinePriceChange(order: Order) {
+    if (!(await checkout.cancelOrder(order.id))) return;
+    replaceCartItems(order.items);
+    if (order.fulfillment?.type === "delivery") {
+      const fee = order.fulfillment.delivery_fee_cents ?? 0;
+      setQuote((q) => (q ? { ...q, feeCents: fee } : q));
+    }
+    setPriceChange(null);
   }
 
   async function payPlacedOrder(order: Order) {
@@ -529,7 +545,7 @@ export function CheckoutFlow({
                       variant="outline"
                       className="flex-1"
                       disabled={checkout.loading}
-                      onClick={() => setPriceChange(null)}
+                      onClick={() => void declinePriceChange(priceChange)}
                     >
                       Cancel
                     </Button>

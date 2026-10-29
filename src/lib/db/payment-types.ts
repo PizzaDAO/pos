@@ -59,9 +59,24 @@ export interface Payment {
   simulated: boolean;
   /** Free-form rail data persisted alongside the payment row. */
   raw: Record<string, unknown> | null;
+  /**
+   * Client refund-request ids already applied to this tender (idempotency).
+   * Written ONLY by `reservePaymentRefund`, never by `upsertPayment`.
+   */
+  refund_ids?: string[];
   created_at: string;
   updated_at: string;
 }
+
+/** Result of an atomic refund reservation (see `PosDriver.reservePaymentRefund`). */
+export type RefundReservation =
+  | { ok: true; payment: Payment }
+  | {
+      ok: false;
+      /** duplicate: refundId already applied; exceeds: over-refund / not refundable. */
+      reason: "not_found" | "duplicate" | "exceeds";
+      payment: Payment | null;
+    };
 
 /** Per-tenant Stripe Connect onboarding status. */
 export type ConnectStatus = "not_started" | "pending" | "connected" | "rejected";
