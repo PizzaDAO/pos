@@ -495,6 +495,58 @@ begin
 end $$;
 reset role;
 
+-- 19) Online checkout lifecycle (20261101000000/100): the new statuses are valid,
+--     and a second LIVE card tender on one order is refused by the partial unique
+--     index while a canceled one frees the slot. (No new tables, so no new RLS.)
+do $$
+declare blocked boolean := false; n int;
+begin
+  insert into public.orders
+    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+  values
+    ('0ada0002-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+     'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'awaiting_payment', 'online_pickup', 'USD', 0,
+     '{"total_cents":1099}'::jsonb, 'A-0002');
+  update public.orders set status = 'abandoned' where id = '0ada0002-0000-0000-0000-000000000001';
+  update public.orders set status = 'awaiting_payment' where id = '0ada0002-0000-0000-0000-000000000001';
+
+  insert into public.payments
+    (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+  values
+    ('0aea0002-0000-0000-0000-000000000001', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'stripe_online', 'requires_action', 1099, 'USD');
+  begin
+    insert into public.payments
+      (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+    values
+      ('0aea0002-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
+       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+       'stripe_online', 'requires_action', 1099, 'USD');
+  exception when unique_violation then blocked := true; end;
+  assert blocked, 'a second live stripe_online tender on one order must be refused';
+
+  -- A different rail on the same order is fine.
+  insert into public.payments
+    (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+  values
+    ('0aea0002-0000-0000-0000-000000000003', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'crypto_onchain_usdc', 'pending', 1099, 'USD');
+
+  -- Canceling the first frees the slot for a new one.
+  update public.payments set status = 'canceled' where id = '0aea0002-0000-0000-0000-000000000001';
+  insert into public.payments
+    (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+  values
+    ('0aea0002-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'stripe_online', 'requires_action', 1099, 'USD');
+  select count(*) into n from public.payments
+    where order_id = '0ada0002-0000-0000-0000-000000000001' and rail = 'stripe_online';
+  assert n = 2, 'one canceled + one live stripe_online tender expected';
+end $$;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;

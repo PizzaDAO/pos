@@ -187,6 +187,10 @@ export interface StoreSettings {
 
 export type OrderStatus =
   | "draft"
+  // Online checkout lifecycle: created `awaiting_payment`, becomes `paid` once
+  // tenders settle (finalizeOnlinePayment) or `abandoned` if it expires/cancels.
+  | "awaiting_payment"
+  | "abandoned"
   | "placed"
   | "paid"
   | "in_kitchen"
@@ -218,6 +222,20 @@ export const KDS_ACTIVE_STATUSES: readonly OrderStatus[] = [
   "out_for_delivery",
 ] as const;
 
+/**
+ * Pre-payment online-checkout states. Such an order is invisible to the KDS,
+ * inventory, delivery dispatch, reports, EOD and tenant health: it only becomes
+ * real once it is `paid`.
+ */
+export const UNPAID_ONLINE_STATUSES: readonly OrderStatus[] = [
+  "awaiting_payment",
+  "abandoned",
+] as const;
+
+export function isUnpaidOnlineStatus(status: OrderStatus): boolean {
+  return (UNPAID_ONLINE_STATUSES as readonly string[]).includes(status);
+}
+
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
 
 /** How an online order is fulfilled (Phase 4). */
@@ -237,8 +255,15 @@ export interface OrderFulfillment {
   promised_at: string;
   /** Delivery address (delivery only). */
   address?: DeliveryAddress;
-  /** Resolved delivery zone id (delivery only). */
+  /** Resolved delivery zone / quote id (delivery only). Also the quote id. */
   zone_id?: string;
+  /**
+   * Delivery provider + ETA from the quote taken at order creation (delivery
+   * only). Persisted so `finalizeOnlinePayment` can dispatch the delivery AFTER
+   * payment without re-quoting.
+   */
+  delivery_provider?: string;
+  eta_minutes?: number | null;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */
