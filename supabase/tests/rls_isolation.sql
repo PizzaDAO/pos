@@ -337,6 +337,20 @@ begin
 end $$;
 reset role;
 
+-- 15) Every public table with RLS enabled must also have it FORCED (incl.
+--     users + platform_admins, forced by 20260607000000).
+do $$
+declare unforced text;
+begin
+  select string_agg(c.relname, ', ') into unforced
+  from pg_class c
+  join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname = 'public' and c.relkind = 'r'
+    and c.relrowsecurity and not c.relforcerowsecurity;
+  assert unforced is null,
+    format('RLS enabled but not FORCED on: %s', unforced);
+end $$;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;

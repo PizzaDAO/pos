@@ -91,7 +91,7 @@ export function TerminalClient({
   if (isLoading) {
     return (
       <div
-        className="grid h-screen grid-cols-1 lg:grid-cols-[1fr_400px]"
+        className="grid h-full grid-cols-1 lg:grid-cols-[1fr_400px]"
         aria-busy="true"
         aria-label="Loading terminal"
       >
@@ -116,7 +116,7 @@ export function TerminalClient({
 
   if (isError || !data) {
     return (
-      <div className="flex h-screen flex-col items-center justify-center">
+      <div className="flex h-full flex-col items-center justify-center">
         <EmptyState
           icon={AlertTriangle}
           title="Could not load the menu"
@@ -223,7 +223,7 @@ export function TerminalClient({
   }
 
   return (
-    <div id="main-content" className="flex h-screen flex-col">
+    <div id="main-content" className="flex h-full flex-col">
       <StatusBar
         locationName={"Tony's Downtown"}
         online={sync.online}

@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { RegisterServiceWorker } from "./register-sw";
 import { InstallPrompt } from "./install-prompt";
+import { TrainingBanner } from "@/components/training-banner";
 
 export const metadata: Metadata = {
   appleWebApp: {
@@ -27,7 +28,12 @@ export default function TerminalLayout({
   return (
     <>
       <RegisterServiceWorker />
-      {children}
+      {/* Column shell: the in-flow banner takes its height, the terminal (h-full)
+          fills the rest, so the full-height POS grid never overflows. */}
+      <div className="flex h-screen flex-col">
+        <TrainingBanner />
+        <div className="min-h-0 flex-1">{children}</div>
+      </div>
       <InstallPrompt />
     </>
   );

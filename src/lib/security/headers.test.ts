@@ -3,6 +3,8 @@ import {
   CONTENT_SECURITY_POLICY,
   CSP_DIRECTIVES,
   SECURITY_HEADERS,
+  buildContentSecurityPolicy,
+  sentryIngestOrigin,
 } from "./headers";
 
 describe("CSP", () => {
@@ -47,5 +49,24 @@ describe("SECURITY_HEADERS", () => {
   it("has no duplicate header keys", () => {
     const keys = SECURITY_HEADERS.map((h) => h.key);
     expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe("Sentry CSP origin", () => {
+  const dsn = "https://abc123@o42.ingest.us.sentry.io/99";
+
+  it("parses the ingest origin and rejects junk / non-https", () => {
+    expect(sentryIngestOrigin(dsn)).toBe("https://o42.ingest.us.sentry.io");
+    expect(sentryIngestOrigin(undefined)).toBeNull();
+    expect(sentryIngestOrigin("not a url")).toBeNull();
+    expect(sentryIngestOrigin("http://k@host/1")).toBeNull();
+  });
+
+  it("is unchanged without a DSN and widens connect-src only with one", () => {
+    expect(buildContentSecurityPolicy()).toBe(CONTENT_SECURITY_POLICY);
+    expect(CONTENT_SECURITY_POLICY).not.toContain("sentry");
+    const csp = buildContentSecurityPolicy(dsn);
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).toContain("https://o42.ingest.us.sentry.io");
   });
 });
