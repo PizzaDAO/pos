@@ -110,6 +110,7 @@ import {
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { isStaleUnsettled } from "@/lib/payments/balance";
 
 // ---------------------------------------------------------------------------
 // MUTABLE menu state (Phase 5). Cloned from the seed so admin CRUD can mutate
@@ -976,6 +977,38 @@ export const mockDriver: PosDriver = {
       return { ok: false, reason: "conflict", order: current } as const;
     }
     const order = (await this.updateOrderStatus(id, to)) as Order;
+    return { ok: true, order } as const;
+  },
+
+  async cancelOrder(id, tenantId, opts) {
+    ensureKitchenSeed();
+    const current = orders.get(id);
+    if (!current || current.tenant_id !== tenantId) return { ok: false, reason: "not_found" } as const;
+    if (current.status === "voided") return { ok: true, order: current } as const;
+    if (!["draft", "placed", "paid"].includes(current.status)) {
+      return { ok: false, reason: "not_cancelable", order: current } as const;
+    }
+    const nowMs = opts?.nowMs ?? Date.now();
+    const mine = [...payments.values()].filter((p) => p.order_id === id);
+    // Same rules as public.core_cancel_order(): stale unsettled tenders (no rail
+    // charge) are voided; any other in-flight tender blocks the cancel.
+    const inFlight = mine.filter((p) =>
+      ["pending", "authorized", "requires_action"].includes(p.status),
+    );
+    for (const p of inFlight) {
+      if (!isStaleUnsettled(p, nowMs)) {
+        return { ok: false, reason: "in_flight", order: current } as const;
+      }
+    }
+    if (
+      mine.some(
+        (p) => p.status === "captured" && p.amount_cents + p.tip_cents > p.refunded_cents,
+      )
+    ) {
+      return { ok: false, reason: "captured", order: current } as const;
+    }
+    for (const p of inFlight) await this.voidTender(p.id);
+    const order = (await this.updateOrderStatus(id, "voided")) as Order;
     return { ok: true, order } as const;
   },
 

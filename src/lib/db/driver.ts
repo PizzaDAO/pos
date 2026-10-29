@@ -313,6 +313,21 @@ export interface PosDriver {
     | { ok: false; reason: "conflict"; order: Order }
   >;
 
+  /**
+   * Atomically cancel an order: lock the order row, refuse while a tender is in
+   * flight (abandoned unsettled tenders past the stale TTL are voided) or money
+   * is still captured, then transition to `voided`. Idempotent for voided.
+   */
+  cancelOrder(
+    id: string,
+    tenantId: string,
+    opts?: { nowMs?: number },
+  ): Promise<
+    | { ok: true; order: Order }
+    | { ok: false; reason: "not_found" }
+    | { ok: false; reason: "not_cancelable" | "in_flight" | "captured"; order: Order }
+  >;
+
   /** Batch read: tenders for several orders (one query), grouped by order id. */
   listPaymentsForOrders(orderIds: string[]): Promise<Map<string, Payment[]>>;
 

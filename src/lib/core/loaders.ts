@@ -146,6 +146,26 @@ export interface OrdersPageQuery {
   driver?: PosDriver;
 }
 
+export interface OrdersPage {
+  /** Up to `limit + 1` matching rows, oldest first. */
+  rows: CoreOrder[];
+  /**
+   * Set when the bounded scan stopped EARLY somewhere: rows after this position
+   * have not been examined, so the caller must resume from it (never report
+   * "no more pages" for a cut-short scan).
+   */
+  resume: { created_at: string; id: string } | null;
+}
+
+const after = (r: { created_at: string; id: string }) => ({
+  created_at: r.created_at,
+  id: r.id,
+});
+const cmp = (
+  a: { created_at: string; id: string },
+  b: { created_at: string; id: string },
+) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id);
+
 /**
  * Oldest-first page of mapped orders across locations. Paging is keyset in SQL
  * (bounded scan: at most MAX_SCAN_PAGES pages of SCAN_PAGE rows per location),
@@ -154,7 +174,7 @@ export interface OrdersPageQuery {
 export async function loadOrdersPage(
   tenantId: string,
   q: OrdersPageQuery,
-): Promise<CoreOrder[]> {
+): Promise<OrdersPage> {
   const d = driverOf(q.driver);
   const bundles = (await loadLocations(tenantId, d)).filter(
     (b) => !q.locationIds || q.locationIds.includes(b.location.id),
@@ -162,18 +182,25 @@ export async function loadOrdersPage(
   const tz = new Map(bundles.map((b) => [b.location.id, b.location.timezone]));
   const want = q.limit + 1;
   const merged: CoreOrder[] = [];
+  // Smallest position at which a location's scan was cut short by the page cap.
+  let bound: { created_at: string; id: string } | null = null;
   for (const b of bundles) {
-    let after = q.after;
+    let pos = q.after;
     let got = 0;
-    for (let page = 0; page < MAX_SCAN_PAGES && got < want; page++) {
+    let exhausted = false;
+    let page = 0;
+    for (; page < MAX_SCAN_PAGES && got < want; page++) {
       const rows = await d.listOrdersPage(tenantId, b.location.id, {
-        after,
+        after: pos,
         limit: SCAN_PAGE,
         createdFrom: q.createdFrom,
         createdTo: q.createdTo,
         updatedSince: q.updatedSince,
       });
-      if (rows.length === 0) break;
+      if (rows.length === 0) {
+        exhausted = true;
+        break;
+      }
       const mapped = await mapOrders(rows, (l) => tz.get(l) ?? "UTC", d);
       for (const m of mapped) {
         if (!q.filter || q.filter(m)) {
@@ -181,15 +208,23 @@ export async function loadOrdersPage(
           got += 1;
         }
       }
-      const last = rows[rows.length - 1]!;
-      after = { created_at: last.created_at, id: last.id };
-      if (rows.length < SCAN_PAGE) break;
+      pos = after(rows[rows.length - 1]!);
+      if (rows.length < SCAN_PAGE) {
+        exhausted = true;
+        break;
+      }
+    }
+    // Stopped because of the scan cap (not because we have enough matches and
+    // not because the location ran out): unexamined rows remain after `pos`.
+    if (!exhausted && got < want && pos) {
+      if (!bound || cmp(pos, bound) < 0) bound = pos;
     }
   }
-  merged.sort(
-    (a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
-  );
-  return merged.slice(0, want);
+  merged.sort(cmp);
+  // Never return rows past the earliest cut-short scan: another location may
+  // still hold unexamined rows before them.
+  const rows = (bound ? merged.filter((m) => cmp(m, bound!) <= 0) : merged).slice(0, want);
+  return { rows, resume: bound };
 }
 
 /**
@@ -207,22 +242,28 @@ export async function loadTenantOrders(
   } = {},
 ): Promise<CoreOrder[]> {
   const out: CoreOrder[] = [];
-  let after: { created_at: string; id: string } | undefined;
+  let cursor: { created_at: string; id: string } | undefined;
   const max = opts.maxRows ?? 20_000;
+  const size = SCAN_PAGE * 5;
   for (;;) {
-    const page = await loadOrdersPage(tenantId, {
+    const { rows, resume } = await loadOrdersPage(tenantId, {
       locationIds: opts.locationIds,
-      limit: SCAN_PAGE * 5,
-      after,
+      limit: size,
+      after: cursor,
       createdFrom: opts.createdFrom,
       createdTo: opts.createdTo,
       driver: opts.driver,
     });
-    const take = page.slice(0, SCAN_PAGE * 5);
+    const take = rows.slice(0, size);
     out.push(...take);
-    if (page.length <= SCAN_PAGE * 5 || out.length >= max) break;
-    const last = take[take.length - 1]!;
-    after = { created_at: last.created_at, id: last.id };
+    if (out.length >= max) break;
+    if (rows.length > size) {
+      cursor = after(take[take.length - 1]!);
+    } else if (resume) {
+      cursor = resume;
+    } else {
+      break;
+    }
   }
   return out;
 }

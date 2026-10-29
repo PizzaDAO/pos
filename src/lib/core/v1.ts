@@ -26,7 +26,6 @@ import {
   QuoteRequestSchema,
   SalesSummaryQuerySchema,
   V1_ROUTES,
-  hasScopes,
   isProblemError,
   priceCart,
   problem,
@@ -47,8 +46,8 @@ import {
   type PosDriver,
   type OrderFulfillment,
 } from "@/lib/db";
+import { isGuid, isIsoTimestamp } from "@/lib/db/paging";
 import { priceOrder } from "@/lib/order-pricing";
-import { isStaleUnsettled } from "@/lib/payments/balance";
 import { RepriceError, maxTipCents } from "@/lib/reprice";
 import { getPlan } from "@/lib/saas/plans";
 import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlements";
@@ -167,7 +166,7 @@ function encodeCursor(ts: string, id: string): string {
 function decodeCursor(c: string): [string, string] {
   try {
     const v = JSON.parse(Buffer.from(c, "base64url").toString("utf8"));
-    if (Array.isArray(v) && typeof v[0] === "string" && typeof v[1] === "string") {
+    if (Array.isArray(v) && isIsoTimestamp(v[0]) && isGuid(v[1])) {
       return [v[0], v[1]];
     }
   } catch {
@@ -237,7 +236,22 @@ async function requireActiveTenant(ctx: Ctx): Promise<void> {
  * and is subject to plan gating and store hours.
  */
 function isTerminal(p: Principal): boolean {
-  return hasScopes(p.scopes, "orders:place_direct");
+  return hasLiteralScope(p, "orders:place_direct");
+}
+
+/**
+ * Powerful, order-money scopes (`orders:discount`, `orders:place_direct`,
+ * `orders:release_unpaid`) must be granted by NAME: `*`, `orders:*` and
+ * `*:write` do not imply them.
+ */
+export const LITERAL_SCOPES = [
+  "orders:discount",
+  "orders:place_direct",
+  "orders:release_unpaid",
+] as const;
+
+function hasLiteralScope(p: Pick<Principal, "scopes">, scope: (typeof LITERAL_SCOPES)[number]): boolean {
+  return p.scopes.includes(scope);
 }
 
 async function ownedLocation(ctx: Ctx, locationId: string): Promise<LocationBundle> {
@@ -434,7 +448,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     // business_date is location-local: pad the UTC created_at range by a day.
     const padDay = (d: string, days: number) =>
       new Date(new Date(`${d}T00:00:00Z`).getTime() + days * 86_400_000).toISOString();
-    const rows = await loadOrdersPage(ctx.principal.tenant_id, {
+    const { rows, resume } = await loadOrdersPage(ctx.principal.tenant_id, {
       locationIds: ids,
       limit,
       after: cursor ? { created_at: cursor[0], id: cursor[1] } : undefined,
@@ -452,12 +466,16 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     });
     const data = rows.slice(0, limit);
     const last = data[data.length - 1];
-    return {
-      body: {
-        data,
-        next_cursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
-      },
-    };
+    // More rows than a page => resume after the last returned row. Otherwise, if the
+    // bounded scan stopped early, resume from where it stopped (never report "done"
+    // for a scan that was merely cut short).
+    const next_cursor =
+      rows.length > limit && last
+        ? encodeCursor(last.created_at, last.id)
+        : resume
+          ? encodeCursor(resume.created_at, resume.id)
+          : null;
+    return { body: { data, next_cursor } };
   },
 
   "orders.get": async (ctx) => {
@@ -481,35 +499,21 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         detail: `Order is ${order.status}; it can no longer be canceled here.`,
       });
     }
-    const payments = await ctx.driver.listPaymentsForOrder(order.id);
-    // In-flight money can still capture after we void. Use the POS tender
-    // settlement semantics: an abandoned attempt (unsettled, never reached a
-    // rail, past the stale TTL) is voided here (same row-locked voidTender the
-    // terminal uses); anything else in flight must settle or be voided first.
-    const inFlight = payments.filter((p) =>
-      ["pending", "authorized", "requires_action"].includes(p.status),
-    );
-    for (const p of inFlight) {
-      if (isStaleUnsettled(p, ctx.now().getTime())) {
-        const v = await ctx.driver.voidTender(p.id);
-        if (v.ok) continue;
-      }
+    // Tender check + status transition happen atomically under a row lock
+    // (core_cancel_order): a payment cannot slip in between the two.
+    const res = await ctx.driver.cancelOrder(order.id, ctx.principal.tenant_id, {
+      nowMs: ctx.now().getTime(),
+    });
+    if (!res.ok) {
+      if (res.reason === "not_found") throw notFound("Order");
       throw ProblemError.of("CANCEL_NOT_ALLOWED", {
-        detail: "Order has payments in flight; wait for them to settle or void them first.",
+        detail:
+          res.reason === "in_flight"
+            ? "Order has payments in flight; wait for them to settle or void them first."
+            : res.reason === "captured"
+              ? "Order has captured payments; refund them first."
+              : `Order is ${res.order.status}; it can no longer be canceled here.`,
       });
-    }
-    const live = payments.filter(
-      (p) => p.status === "captured" && p.amount_cents + p.tip_cents > p.refunded_cents,
-    );
-    if (live.length > 0) {
-      throw ProblemError.of("CANCEL_NOT_ALLOWED", {
-        detail: "Order has captured payments; refund them first.",
-      });
-    }
-    // Compare-and-set: a concurrent release/payment wins and we report it.
-    const res = await ctx.driver.transitionOrderStatus(order.id, [order.status], "voided");
-    if (!res.ok && res.reason === "conflict" && res.order.status !== "voided") {
-      throw ProblemError.of("CONFLICT", { detail: "Order changed while canceling; reload and retry." });
     }
     return { body: await mapOrderFor(ctx, order.id) };
   },
@@ -531,12 +535,9 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         detail: "The hold expired and the order was canceled.",
       });
     }
-    // An awaiting_payment hold is only released once fully paid, unless the
-    // caller holds the explicit scope (e.g. a terminal taking cash).
-    if (
-      order.hold?.reason === "awaiting_payment" &&
-      !hasScopes(ctx.principal.scopes, "orders:release_unpaid")
-    ) {
+    // Any hold (whatever its reason) is only released once fully paid, unless
+    // the caller holds the explicit scope (e.g. a terminal taking cash).
+    if (!hasLiteralScope(ctx.principal, "orders:release_unpaid")) {
       const payments = await ctx.driver.listPaymentsForOrder(order.id);
       const covered = payments
         .filter((p) => p.status === "captured")
@@ -600,10 +601,15 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     const tenantId = ctx.principal.tenant_id;
     let found = email ? await ctx.driver.getCustomerByEmail(tenantId, email) : null;
     if (!found && phone) {
-      found =
-        (await ctx.driver.listCustomers(tenantId, { limit: 1000 })).find(
-          (c) => c.phone?.replace(/[\s().-]/g, "") === phone,
-        ) ?? null;
+      // Keyset-page through ALL customers (no silent 1000-row truncation).
+      let after: { created_at: string; id: string } | undefined;
+      for (let guard = 0; guard < 400 && !found; guard++) {
+        const batch = await ctx.driver.listCustomers(tenantId, { after, limit: 500 });
+        found = batch.find((c) => c.phone?.replace(/[\s().-]/g, "") === phone) ?? null;
+        if (batch.length < 500) break;
+        const lastRow = batch[batch.length - 1]!;
+        after = { created_at: lastRow.created_at, id: lastRow.id };
+      }
     }
     if (!found) throw notFound("Customer");
     return { body: await loadCustomer(tenantId, found.id, ctx.driver) };
@@ -828,7 +834,12 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
 
   // Discounts/comps are an owner/manager power in POS: callers need an explicit scope.
   if ((input.adjustments?.length ?? 0) > 0) {
-    requireScopes(ctx.principal, ["orders:discount"]);
+    if (!hasLiteralScope(ctx.principal, "orders:discount")) {
+      throw ProblemError.of("INSUFFICIENT_SCOPE", {
+        detail: "missing scope(s): orders:discount (must be granted explicitly)",
+        details: { missing: ["orders:discount"], granted: ctx.principal.scopes },
+      });
+    }
   }
   // Plan gate: anything but a counter order is "online ordering".
   if (!(terminal && input.channel === "in_store")) {
@@ -1001,9 +1012,15 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   // Held unless the caller will take payment at the counter.
   const now = ctx.now();
   // Held unless a terminal takes the order at the counter (or invoices it).
-  const holdReason =
-    input.hold?.reason ??
-    (input.payment_intent === "prepaid" || !terminal ? "awaiting_payment" : null);
+  // Only a terminal may choose the reason. For everyone else the reason is
+  // forced to awaiting_payment: a caller-chosen reason (e.g. "manual") must
+  // never dodge the unpaid-release check.
+  const wantsHold = Boolean(input.hold) || input.payment_intent === "prepaid" || !terminal;
+  const holdReason = !wantsHold
+    ? null
+    : terminal
+      ? (input.hold?.reason ?? "awaiting_payment")
+      : "awaiting_payment";
   const ttl = input.hold?.ttl_seconds ?? 900;
   const hold = holdReason
     ? { reason: holdReason, expires_at: new Date(now.getTime() + ttl * 1000).toISOString() }

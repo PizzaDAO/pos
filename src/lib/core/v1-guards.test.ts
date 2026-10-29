@@ -111,7 +111,7 @@ describe("write guards", () => {
     expect(held.status).toBe(201);
     expect(held.json.fulfillment_status).toBe("held");
 
-    const terminal = principal(["orders:*", "quotes:write", "menu:read"]);
+    const terminal = principal(["orders:*", "orders:place_direct", "quotes:write", "menu:read"]);
     const placed = await call("POST", "/orders", {
       p: terminal,
       body: {
@@ -238,6 +238,45 @@ describe("tender settlement + active staff", () => {
       body: await orderBody({ staff_id: gone.id }, "b8000000-0000-4000-8000-000000000001"),
     });
     expect(r.status).toBe(404);
+  });
+});
+
+describe("literal order-money scopes + hold reason", () => {
+  it("a caller-chosen hold reason cannot dodge the unpaid-release check", async () => {
+    const b = await orderBody(
+      { hold: { reason: "manual" }, payment_intent: "prepaid" },
+      "b9000000-0000-4000-8000-000000000001",
+    );
+    const created = await call("POST", "/orders", { p: agent(), body: b });
+    expect(created.status).toBe(201);
+    expect(created.json.hold.reason).toBe("awaiting_payment");
+    const denied = await call("POST", `/orders/${created.json.id}/release`, { p: agent(), body: {} });
+    expect(denied.status).toBe(402);
+  });
+
+  it("release checks payment for ANY hold reason (a terminal-made manual hold too)", async () => {
+    const terminal = principal(["orders:place_direct", "orders:write", "quotes:write", "menu:read"]);
+    const b = await orderBody(
+      { hold: { reason: "manual" }, channel: "in_store", source: { type: "pos_terminal" } },
+      "b9000000-0000-4000-8000-000000000002",
+    );
+    const created = await call("POST", "/orders", { p: terminal, body: b });
+    expect(created.json.hold.reason).toBe("manual");
+    const denied = await call("POST", `/orders/${created.json.id}/release`, { p: terminal, body: {} });
+    expect(denied.status).toBe(402);
+  });
+
+  it("*, orders:* and *:write do not grant discount / place_direct / release_unpaid", async () => {
+    for (const scopes of [["*"], ["orders:*", "quotes:write"], ["*:write", "orders:write", "quotes:write"]]) {
+      const p = principal(scopes);
+      const disc = await call("POST", "/orders", {
+        p,
+        body: await orderBody({ adjustments: [{ type: "discount", source: "x", label: "y", amount_cents: 100 }] }),
+      });
+      expect(disc.status, scopes.join()).toBe(403);
+      const placed = await call("POST", "/orders", { p, body: await orderBody({ channel: "in_store" }) });
+      expect(placed.json.fulfillment_status, scopes.join()).toBe("held");
+    }
   });
 });
 

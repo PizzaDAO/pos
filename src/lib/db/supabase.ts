@@ -89,6 +89,7 @@ import type {
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { fetchAllPages, safeKeyset } from "./paging";
 
 // ---------------------------------------------------------------------------
 // Config + client construction (lazy; never at module load).
@@ -598,23 +599,31 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     return (await readOrderRows([orderRow]))[0] as Order;
   }
 
-  /** Chunked `in` query (keeps PostgREST URLs short). */
+  /**
+   * Chunked `in` query that PAGES each chunk with `.range()` over a stable total
+   * order (parent column, then id), so nothing past PostgREST's row cap is lost.
+   * Callers re-sort in memory when they need a business order (sort_order, ...).
+   */
   async function selectIn(
     table: string,
     column: string,
     ids: string[],
-    orderBy: string,
   ): Promise<Row[]> {
     const out: Row[] = [];
     for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
       out.push(
-        ...(unwrap(
-          await sb
-            .from(table)
-            .select("*")
-            .in(column, ids.slice(i, i + 100))
-            .order(orderBy),
-        ) as Row[]),
+        ...(await fetchAllPages<Row>(async (from, to) =>
+          unwrap(
+            await sb
+              .from(table)
+              .select("*")
+              .in(column, chunk)
+              .order(column)
+              .order("id")
+              .range(from, to),
+          ) as Row[],
+        )),
       );
     }
     return out;
@@ -627,14 +636,14 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       "order_items",
       "order_id",
       orderRows.map((r) => r.id as string),
-      "sort_order",
     );
+    itemRows.sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
     const modRows = await selectIn(
       "order_item_modifiers",
       "order_item_id",
       itemRows.map((r) => r.id as string),
-      "sort_order",
     );
+    modRows.sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
     const modsByItem = new Map<string, Row[]>();
     for (const m of modRows) {
       const k = m.order_item_id as string;
@@ -1519,7 +1528,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       if (opts.createdTo) q = q.lte("created_at", opts.createdTo);
       if (opts.updatedSince) q = q.gte("updated_at", opts.updatedSince);
       if (opts.after) {
-        const { created_at: c, id } = opts.after;
+        const { created_at: c, id } = safeKeyset(opts.after);
         q = q.or(`created_at.gt.${c},and(created_at.eq.${c},id.gt.${id})`);
       }
       const rows = unwrap(
@@ -1565,9 +1574,30 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       } as const;
     },
 
+    async cancelOrder(id, tenantId) {
+      // One SQL function: lock the order row, check in-flight/captured tenders,
+      // void abandoned ones, transition to voided. All or nothing.
+      const res = unwrap(
+        await sb.rpc("core_cancel_order", { p_order_id: id, p_tenant_id: tenantId }),
+      ) as { ok: boolean; reason?: string } | null;
+      const row = unwrap(
+        await sb.from("orders").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      if (!row || row.tenant_id !== tenantId) return { ok: false, reason: "not_found" } as const;
+      const order = await readOrderRow(row);
+      if (res?.ok) return { ok: true, order } as const;
+      return {
+        ok: false,
+        reason: (res?.reason ?? "not_cancelable") as "not_cancelable" | "in_flight" | "captured",
+        order,
+      } as const;
+    },
+
     async listPaymentsForOrders(orderIds) {
       const out = new Map<string, Payment[]>();
-      for (const r of await selectIn("payments", "order_id", orderIds, "created_at")) {
+      const payRows = await selectIn("payments", "order_id", orderIds);
+      payRows.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+      for (const r of payRows) {
         const p = mapPayment(r);
         const list = out.get(p.order_id) ?? [];
         list.push(p);
@@ -1577,7 +1607,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async getCustomers(ids) {
-      return (await selectIn("customers", "id", ids, "created_at")).map(mapCustomer);
+      return (await selectIn("customers", "id", ids)).map(mapCustomer);
     },
 
     async customerOrderStats(tenantId, customerIds) {
@@ -1586,15 +1616,20 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
       >();
       for (let i = 0; i < customerIds.length; i += 100) {
-        const rows = unwrap(
-          await sb
-            .from("orders")
-            .select("customer_id,totals,created_at,status")
-            .eq("tenant_id", tenantId)
-            .in("customer_id", customerIds.slice(i, i + 100))
-            .not("status", "in", "(voided,draft)")
-            .limit(5000),
-        ) as Row[];
+        const chunk = customerIds.slice(i, i + 100);
+        const rows = await fetchAllPages<Row>(async (from, to) =>
+          unwrap(
+            await sb
+              .from("orders")
+              .select("id,customer_id,totals,created_at,status")
+              .eq("tenant_id", tenantId)
+              .in("customer_id", chunk)
+              .not("status", "in", "(voided,draft)")
+              .order("customer_id")
+              .order("id")
+              .range(from, to),
+          ) as Row[],
+        );
         for (const r of rows) {
           const id = r.customer_id as string;
           const st = out.get(id) ?? { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 };
@@ -1888,7 +1923,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     async listCustomers(tenantId, opts) {
       let q = sb.from("customers").select("*").eq("tenant_id", tenantId);
       if (opts?.after) {
-        const { created_at: c, id } = opts.after;
+        const { created_at: c, id } = safeKeyset(opts.after);
         q = q.or(`created_at.gt.${c},and(created_at.eq.${c},id.gt.${id})`);
       }
       return (

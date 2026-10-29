@@ -60,6 +60,14 @@ is set** (otherwise every request is rejected).
 
 ### Write guards
 
+**Literal scopes.** `orders:discount`, `orders:place_direct` and `orders:release_unpaid` must be
+granted BY NAME: `*`, `orders:*` and `*:write` do not imply them (the dev principal lists them
+explicitly). Only a principal with `orders:place_direct` may choose a hold reason; for everyone
+else any caller-supplied `hold.reason` is ignored and forced to `awaiting_payment`. `release`
+requires full payment coverage for ANY hold reason unless the caller has `orders:release_unpaid`.
+`cancel` runs in one SQL function (`core_cancel_order`) that locks the order row, checks in-flight
+tenders, voids abandoned ones and transitions to voided atomically (mirrored in the mock driver).
+
 Parity with the security-branch routes: tenant must be `active` (else 403 on every write);
 `adjustments` need the `orders:discount` scope; tips are capped (`maxTipCents`); anything
 but a counter order is plan-gated (`canUseOnlineOrdering`); pickup/delivery enabled,
@@ -119,6 +127,13 @@ cron  GET|POST /api/core/outbox  -> claim (SKIP LOCKED) -> hydrate contract payl
 * The per-tenant `sequence` upsert holds a row lock until the transaction ends; triggers emit
   last in their statement, and writers should keep transactions short.
 * The mock store is never signed or sent (`deliverOutbox` returns `skipped: "mock_store"`).
+* **A cron is REQUIRED.** Nothing is delivered, pruned, or even enqueued until `/api/core/outbox`
+  runs. The `outbox_enabled` flag lives in the database, which previews/branches may share with
+  production, so only the production deployment (`VERCEL_ENV=production`) or an explicit
+  `OUTBOX_OWNER=1` acts; every other deployment answers `{skipped:"not_outbox_owner"}`.
+  `OUTBOX_PENDING_EXPIRY_DAYS` (default 7) controls when undelivered pending rows expire.
+* Run budget: rows may START only within 25 s (hydrate 15 s + fetch 10 s on top, under
+  `maxDuration=60`); claimed-but-unattempted rows are released without counting an attempt.
 * Schedule `/api/core/outbox` every minute (Vercel Cron on Pro, or an external
   scheduler) with `Authorization: Bearer $CRON_SECRET`. Not in `vercel.json` because
   Hobby only allows daily crons. With the hub env unset it is a no-op.

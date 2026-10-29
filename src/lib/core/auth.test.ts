@@ -18,7 +18,8 @@ describe("authenticateV1 (zero-env simulated mode)", () => {
   it("accepts the dev token as the demo tenant with all scopes", async () => {
     const p = await authenticateV1(req(DEV_TOKEN), { env: {} });
     expect(p.tenant_id).toBe(DEMO_TENANT_ID);
-    expect(p.scopes).toEqual(["*"]);
+    expect(p.scopes).toContain("*");
+    expect(p.scopes).toContain("orders:place_direct");
   });
 
   it("rejects a missing or wrong token", async () => {

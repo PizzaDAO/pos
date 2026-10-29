@@ -269,7 +269,13 @@ export async function authenticateV1(
         id: "dev",
         tenant_id: DEMO_TENANT_ID,
         location_ids: null,
-        scopes: ["*"],
+        // `*` does not imply the order-money scopes: list them explicitly.
+        scopes: [
+          "*",
+          "orders:discount",
+          "orders:place_direct",
+          "orders:release_unpaid",
+        ],
         module: null,
       };
     }

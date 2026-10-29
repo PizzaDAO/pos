@@ -87,7 +87,7 @@ export interface OutboxStore {
    */
   claim(limit: number, now: Date): Promise<OutboxRow[]>;
   /** Delete delivered/dead rows past retention; expire stale pending rows. */
-  prune?(): Promise<void>;
+  prune?(pendingExpiryDays?: number): Promise<void>;
   /** Tell the database whether triggers should enqueue at all. */
   setEnabled?(enabled: boolean): Promise<void>;
   markDelivered(id: string, at: Date): Promise<void>;
@@ -194,8 +194,10 @@ export function createSupabaseOutbox(config: { url: string; key: string }): Outb
       if (error) throw new Error(`core_outbox_claim failed: ${error.message}`);
       return (data ?? []) as OutboxRow[];
     },
-    async prune() {
-      const { error } = await sb.rpc("core_outbox_prune");
+    async prune(pendingExpiryDays = 7) {
+      const { error } = await sb.rpc("core_outbox_prune", {
+        p_pending_expiry: `${Math.max(1, Math.floor(pendingExpiryDays))} days`,
+      });
       if (error) throw new Error(`core_outbox_prune failed: ${error.message}`);
     },
     async setEnabled(enabled) {
@@ -395,7 +397,7 @@ export interface DeliverOptions {
   timeoutMs?: number;
   /** Max time to build one event payload (default 15s). */
   hydrateTimeoutMs?: number;
-  /** Wall-clock budget per run (default 45s); unprocessed rows are released. */
+  /** Wall-clock budget for STARTING rows (default 25s); unattempted rows are released. */
   deadlineMs?: number;
   random?: () => number;
   /** Tests only: allow signing/sending rows from the in-memory mock store. */
@@ -405,6 +407,8 @@ export interface DeliverOptions {
 export interface DeliverResult {
   /** Set when nothing was attempted (e.g. "mock_store"). */
   skipped?: string;
+  /** Claimed but not attempted (deadline); released without counting an attempt. */
+  released?: number;
   claimed: number;
   delivered: number;
   retried: number;
@@ -424,11 +428,14 @@ export async function deliverOutbox(opts: DeliverOptions): Promise<DeliverResult
   const rows = await store.claim(opts.limit ?? 50, now());
   result.claimed = rows.length;
 
-  const deadline = now().getTime() + (opts.deadlineMs ?? 45_000);
+  // A row may START only before the deadline; one attempt can then take up to
+  // hydrate (15s) + fetch (10s), so 25s + 25s stays well under maxDuration=60.
+  const deadline = Date.now() + (opts.deadlineMs ?? 25_000);
   for (const row of rows) {
-    if (Date.now() > deadline && !opts.unsafeAllowMockStore) {
-      // Out of time: hand the row back un-counted for the next run.
+    if (Date.now() > deadline) {
+      // Never attempted: give the claim back WITHOUT counting an attempt.
       await store.markRetry(row.id, row.attempts - 1, now(), row.last_error ?? "");
+      result.released = (result.released ?? 0) + 1;
       continue;
     }
     // `claim` already counted this attempt.
@@ -508,4 +515,11 @@ export function readHubEnv(
       .map((s) => s.trim())
       .filter(Boolean),
   };
+}
+
+/** Production deployment, or an explicit opt-in (self-hosted / local). */
+export function isOutboxOwner(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.VERCEL_ENV === "production" || env.OUTBOX_OWNER === "1";
 }
