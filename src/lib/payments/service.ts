@@ -143,6 +143,33 @@ export function isDefinitiveRailFailure(err: unknown): boolean {
   return false;
 }
 
+/**
+ * Statuses a provider signal (status poll / webhook) may move a tender FROM.
+ * Failed / canceled (voided) / captured / refunded tenders never change.
+ */
+export const PROVIDER_UPDATABLE: PaymentStatus[] = [
+  "pending",
+  "requires_action",
+  "authorized",
+];
+
+/**
+ * The rail charged, but the tender had been voided/canceled in the meantime.
+ * The tender is NOT revived; the charge must be reconciled (refunded at the
+ * provider). → HTTP 409.
+ */
+export class TenderVoidedDuringChargeError extends Error {
+  constructor(
+    readonly paymentId: string,
+    readonly chargeId: string,
+  ) {
+    super(
+      `Tender ${paymentId} was voided while the charge (${chargeId}) completed; refund it at the provider.`,
+    );
+    this.name = "TenderVoidedDuringChargeError";
+  }
+}
+
 /** A refund doesn't fit / conflicts (→ HTTP 409/422). */
 export class RefundRejectedError extends Error {
   constructor(
@@ -272,7 +299,9 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
     if (isDefinitiveRailFailure(err)) {
       // Definitive decline: no money moved — release the reservation.
       await driver
-        .updatePaymentStatusFromProvider(reserved.id, "failed")
+        .updatePaymentStatusFromProvider(reserved.id, "failed", {
+          from: ["pending", "requires_action"],
+        })
         .catch(() => null);
       throw err;
     }
@@ -290,7 +319,11 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
 
   const cashTendered =
     input.rail === "cash"
-      ? Number(result.raw?.cashTenderedCents ?? input.cashTenderedCents ?? input.amountCents + input.tipCents)
+      ? Number(
+          result.raw?.cashTenderedCents ??
+            input.cashTenderedCents ??
+            input.amountCents + input.tipCents,
+        )
       : null;
   const cashChange =
     input.rail === "cash" ? Number(result.raw?.cashChangeCents ?? 0) : null;
@@ -319,7 +352,28 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
     updated_at: nowIso(),
   };
 
-  const saved = await driver.upsertPayment(payment);
+  // Conditional final write: only while the reservation is still unsettled.
+  // A tender voided / canceled while the rail call was in flight is NEVER
+  // brought back.
+  const saved = await driver.completeTender(payment);
+  if (
+    !saved ||
+    saved.status !== payment.status ||
+    saved.charge_id !== payment.charge_id
+  ) {
+    const current = saved ?? (await driver.getPayment(payment.id));
+    if (
+      current &&
+      (current.status === "canceled" || current.status === "failed") &&
+      (payment.status === "captured" || payment.status === "authorized")
+    ) {
+      // Money moved at the rail but the tender was voided meanwhile — surface
+      // it for reconciliation (refund at the provider) instead of reviving it.
+      throw new TenderVoidedDuringChargeError(payment.id, result.chargeId);
+    }
+    if (current) return current;
+    throw new Error(`Tender ${payment.id} disappeared during the charge.`);
+  }
   await maybeMarkOrderPaid(input.orderId);
   return saved;
 }
@@ -354,6 +408,7 @@ export async function refreshPaymentStatus(
   const updated = await driver.updatePaymentStatusFromProvider(
     payment.id,
     status,
+    { from: PROVIDER_UPDATABLE },
   );
   await maybeMarkOrderPaid(payment.order_id);
   return updated;
@@ -457,7 +512,10 @@ export async function refundPayment(input: {
 }
 
 /** Rail idempotency key for one refund request of one payment. */
-export function refundIdempotencyKey(paymentId: string, refundId: string): string {
+export function refundIdempotencyKey(
+  paymentId: string,
+  refundId: string,
+): string {
   return `refund_${paymentId}_${refundId}`;
 }
 

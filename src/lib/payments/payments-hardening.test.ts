@@ -27,6 +27,9 @@ import {
   PaymentOutcomeUnknownError,
   RefundRejectedError,
   refundPayment,
+  refreshPaymentStatus,
+  PROVIDER_UPDATABLE,
+  TenderVoidedDuringChargeError,
   takePayment,
 } from "./service";
 import { POST as voidPOST } from "@/app/api/payments/void/route";
@@ -293,6 +296,42 @@ describe("active-staff gating (real mode)", () => {
       (await staffCookieValue(cashier.id)),
     )}`;
     expect((await r(cookie)).status).toBe(200);
+  });
+});
+
+describe("voided tenders never come back", () => {
+  it("a void during the in-flight rail call wins over the final write", async () => {
+    const orderId = await seedOrder(650);
+    const id = uid("race-void");
+    const rail = requirePaymentRail("stripe_terminal");
+    const real = rail.createCharge.bind(rail);
+    vi.spyOn(rail, "createCharge").mockImplementationOnce(async (req) => {
+      // Staff voids the (still pending, no charge id yet) tender meanwhile.
+      await getPosDriver().voidTender(id);
+      return real(req);
+    });
+    await expect(takePayment(tender(orderId, id, 650))).rejects.toBeInstanceOf(
+      TenderVoidedDuringChargeError,
+    );
+    expect((await getPosDriver().getPayment(id))?.status).toBe("canceled");
+  });
+
+  it("status refresh / provider signals don't revive a canceled tender", async () => {
+    const orderId = await seedOrder(300);
+    const id = uid("canceled");
+    const rail = requirePaymentRail("crypto_coinbase");
+    vi.spyOn(rail, "createCharge").mockRejectedValueOnce(new TypeError("timeout"));
+    await expect(
+      takePayment({ ...tender(orderId, id, 300), rail: "crypto_coinbase" }),
+    ).rejects.toBeInstanceOf(PaymentOutcomeUnknownError);
+    await getPosDriver().voidTender(id);
+    vi.spyOn(rail, "status").mockResolvedValue("captured");
+    await refreshPaymentStatus(id);
+    expect((await getPosDriver().getPayment(id))?.status).toBe("canceled");
+    const p = await getPosDriver().updatePaymentStatusFromProvider(id, "captured", {
+      from: PROVIDER_UPDATABLE,
+    });
+    expect(p?.status).toBe("canceled");
   });
 });
 

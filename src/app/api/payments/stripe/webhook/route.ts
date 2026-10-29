@@ -13,7 +13,10 @@ import { getPosDriver } from "@/lib/db";
 import type { PaymentStatus } from "@/lib/db";
 import { verifyStripeWebhook, mapIntentStatus } from "@/lib/payments/providers/stripe-client";
 import { isStripeConfigured } from "@/lib/payments/env";
-import { refreshPaymentStatus } from "@/lib/payments/service";
+import {
+  PROVIDER_UPDATABLE,
+  refreshPaymentStatus,
+} from "@/lib/payments/service";
 
 export const runtime = "nodejs";
 
@@ -53,7 +56,9 @@ export async function POST(request: Request) {
   if (matched) {
     // Targeted status-only update; never moves a refunded / partially
     // refunded tender back (e.g. a late payment_intent.succeeded).
-    await driver.updatePaymentStatusFromProvider(matched.id, mapped);
+    await driver.updatePaymentStatusFromProvider(matched.id, mapped, {
+      from: PROVIDER_UPDATABLE,
+    });
     await refreshPaymentStatus(matched.id);
   }
 

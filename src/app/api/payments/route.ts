@@ -35,6 +35,7 @@ import {
   isDefinitiveRailFailure,
   PaymentOutcomeUnknownError,
   railIsSimulated,
+  TenderVoidedDuringChargeError,
   takePayment,
 } from "@/lib/payments/service";
 import { simulatedRailsAllowed } from "@/lib/payments/simulation";
@@ -276,6 +277,9 @@ export async function POST(request: Request) {
         { error: err.message, retry: true, paymentId: err.id },
         { status: 503 },
       );
+    }
+    if (err instanceof TenderVoidedDuringChargeError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
     }
     if (err instanceof BalanceExceededError) {
       return NextResponse.json(
