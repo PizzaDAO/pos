@@ -1357,14 +1357,21 @@ export const mockDriver: PosDriver = {
           (c) => c.tenant_id === customer.tenant_id && c.email === email,
         );
     const base = existingById ?? existingByEmail;
+    // Matched only by EMAIL (guest checkout with a new id): anyone can type an
+    // email, so never overwrite the stored name/phone — only fill blanks.
+    const fillBlanksOnly = !existingById && Boolean(existingByEmail);
     const now = nowIso();
     const merged: Customer = {
       ...customer,
       id: base?.id ?? customer.id,
       email,
       verified: customer.verified || base?.verified || false,
-      name: customer.name ?? base?.name ?? null,
-      phone: customer.phone ?? base?.phone ?? null,
+      name: fillBlanksOnly
+        ? (base?.name ?? customer.name ?? null)
+        : (customer.name ?? base?.name ?? null),
+      phone: fillBlanksOnly
+        ? (base?.phone ?? customer.phone ?? null)
+        : (customer.phone ?? base?.phone ?? null),
       created_at: base?.created_at ?? now,
       updated_at: now,
     };

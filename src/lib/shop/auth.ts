@@ -22,7 +22,11 @@ function newId(): string {
 
 const TOKEN_TTL_MS = 30 * 60_000; // 30 minutes
 
-/** Upsert a (guest) customer for the tenant by email. Idempotent on email. */
+/**
+ * Upsert a (guest) customer for the tenant by email. Idempotent on email. An
+ * existing customer's name/phone are never overwritten here (only blanks are
+ * filled) — the details typed for one order are stored on that order.
+ */
 export async function ensureCustomer(input: {
   tenantId: string;
   email: string;

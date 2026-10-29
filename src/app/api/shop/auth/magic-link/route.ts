@@ -101,7 +101,11 @@ export async function POST(request: Request) {
           { status: 502 },
         );
       }
-      return NextResponse.json({ customer, simulated: false, sent: true });
+      return NextResponse.json({
+        customer: { id: customer.id, email: customer.email },
+        simulated: false,
+        sent: true,
+      });
     }
   }
 
@@ -114,7 +118,7 @@ export async function POST(request: Request) {
   });
 
   return NextResponse.json({
-    customer: result.customer,
+    customer: { id: result.customer.id, email: result.customer.email },
     simulated: true,
     magicLinkUrl: result.magicLinkUrl,
   });

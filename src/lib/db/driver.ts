@@ -463,7 +463,9 @@ export interface PosDriver {
   /**
    * Upsert a customer. Re-using an id merges mutable fields; a new id with an
    * email that already exists for the tenant returns the existing row (so guest
-   * checkout is idempotent on email).
+   * checkout is idempotent on email) and only FILLS BLANK name/phone — an
+   * email match never overwrites stored contact details (anyone can type an
+   * email at checkout). Per-order contact lives on the order's fulfillment.
    */
   upsertCustomer(customer: Customer): Promise<Customer>;
 

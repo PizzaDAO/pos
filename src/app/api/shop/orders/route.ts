@@ -78,6 +78,11 @@ function isValid(body: unknown): body is ShopOrderBody {
   );
 }
 
+/** A trimmed, length-bounded optional string from client input, else null. */
+function cleanText(v: unknown, max: number): string | null {
+  return typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null;
+}
+
 export async function POST(request: Request) {
   // Unauthenticated intake: rate-limit per IP to blunt order-spam.
   const limited = enforceRateLimit(request, "orders");
@@ -225,11 +230,13 @@ export async function POST(request: Request) {
   }
 
   // ---- Customer (guest upsert) ---------------------------------------------
+  const contactName = cleanText(body.customer.name, 120);
+  const contactPhone = cleanText(body.customer.phone, 40);
   const customer = await ensureCustomer({
     tenantId,
     email: body.customer.email,
-    name: body.customer.name ?? null,
-    phone: body.customer.phone ?? null,
+    name: contactName,
+    phone: contactPhone,
   });
 
   // ---- Subtotal (pre-delivery) so zone minimums are checked correctly -------
@@ -308,6 +315,9 @@ export async function POST(request: Request) {
     promised_at: promisedAt,
     // Which deployment kind owns this order's sweeping (prod vs staging).
     checkout_mode: deploymentCheckoutMode(),
+    // Per-order contact (what the customer typed now), independent of the
+    // stored customer record.
+    contact: { name: contactName, phone: contactPhone },
     ...(body.fulfillmentType === "delivery"
       ? {
           address: body.address,
@@ -342,5 +352,10 @@ export async function POST(request: Request) {
 
   // Delivery is dispatched by finalizeOnlinePayment once the order is paid.
   const delivery = null;
-  return NextResponse.json({ order, customer, delivery }, { status: 201 });
+  // Don't echo the stored customer record (name/phone/verified) back to
+  // whoever typed this email — only the id the client needs.
+  return NextResponse.json(
+    { order, customer: { id: customer.id }, delivery },
+    { status: 201 },
+  );
 }
