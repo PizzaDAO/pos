@@ -32,9 +32,12 @@ import type {
   OrderStatus,
 } from "@/lib/db";
 import type { DeliveryProviderKey } from "@/lib/delivery";
-import { dispatchDelivery } from "@/lib/delivery/service";
+import { dispatchDelivery, quoteDelivery } from "@/lib/delivery/service";
 import { captureError } from "@/lib/observability";
 import { asapPromisedAt } from "./scheduling";
+
+/** A quote with no stated expiry is trusted for this long after checkout. */
+const QUOTE_FALLBACK_TTL_MS = 15 * 60_000;
 
 export interface FinalizeResult {
   /** The order after the call (null if it does not exist). */
@@ -141,6 +144,33 @@ export async function runPostPaymentSteps(paid: Order): Promise<boolean> {
       country: "US",
     };
     try {
+      let quoteId = f.zone_id;
+      let etaMinutes = f.eta_minutes ?? null;
+      // The quote was taken at checkout. A LATE payment (admin Accept, a slow
+      // crypto confirmation) may outlive it: re-quote with the same provider and
+      // dispatch on the fresh quote. The customer's fee stays what they paid.
+      const expiresAt = f.quote_expires_at
+        ? new Date(f.quote_expires_at).getTime()
+        : new Date(paid.created_at).getTime() + QUOTE_FALLBACK_TTL_MS;
+      if (Date.now() > expiresAt) {
+        const fresh = await quoteDelivery({
+          tenantId: paid.tenant_id,
+          locationId: paid.location_id,
+          dropoff: f.address,
+          pickup,
+          subtotalCents: paid.totals.subtotal_cents,
+          currency: paid.currency,
+          scheduledFor: f.scheduled_for === "asap" ? undefined : f.scheduled_for,
+          provider: f.delivery_provider as DeliveryProviderKey,
+        });
+        quoteId = fresh.quote.quoteId ?? quoteId;
+        etaMinutes = fresh.quote.etaMinutes ?? etaMinutes;
+        await driver.mergeOrderFulfillment(orderId, {
+          zone_id: quoteId,
+          eta_minutes: etaMinutes,
+          quote_expires_at: fresh.quote.expiresAt,
+        });
+      }
       await dispatchDelivery({
         orderId,
         tenantId: paid.tenant_id,
@@ -149,9 +179,10 @@ export async function runPostPaymentSteps(paid: Order): Promise<boolean> {
         pickup,
         dropoff: f.address,
         zoneId: f.zone_id ?? null,
+        quoteId,
         feeCents: f.delivery_fee_cents ?? 0,
         currency: paid.currency,
-        etaMinutes: f.eta_minutes ?? null,
+        etaMinutes,
         scheduledFor: f.scheduled_for === "asap" ? undefined : f.scheduled_for,
       });
     } catch (err) {

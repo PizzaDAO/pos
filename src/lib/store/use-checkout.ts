@@ -28,6 +28,8 @@ export interface CheckoutState {
   balanceCents: number;
   loading: boolean;
   error: string | null;
+  /** Non-error information to show (e.g. a crypto refund that must be sent by hand). */
+  notice: string | null;
   /** Take one tender. Resolves when the tender is recorded (may be pending). */
   takeTender: (input: TakeTenderInput) => Promise<Payment | null>;
   /** Refund/void a tender (full unless amountCents given). */
@@ -60,6 +62,8 @@ export function useCheckout(
   const [balanceCents, setBalanceCents] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Non-error information the cashier must read (e.g. a manual crypto refund). */
+  const [notice, setNotice] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const pendingIds = useRef(createPendingTenderIds(newUuid));
   const pendingRefundIds = useRef(createPendingTenderIds(newUuid));
@@ -205,8 +209,13 @@ export function useCheckout(
             ),
           }),
         });
-        const data = (await res.json()) as { error?: string };
+        const data = (await res.json()) as {
+          error?: string;
+          manualRefund?: boolean;
+          note?: string;
+        };
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        setNotice(data.manualRefund ? (data.note ?? "Manual refund required.") : null);
         pendingRefundIds.current.clear();
         await refresh();
       } catch (e) {
@@ -224,6 +233,7 @@ export function useCheckout(
     balanceCents,
     loading,
     error,
+    notice,
     takeTender,
     refund,
     refresh,

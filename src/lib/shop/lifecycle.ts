@@ -19,7 +19,7 @@ import { tenderFreesSlot } from "@/lib/db/payment-types";
 import { captureError } from "@/lib/observability";
 import {
   cancelOpenOnlineIntents,
-  cancelPendingTender,
+  cancelOpenTender,
   refreshPaymentStatus,
 } from "@/lib/payments/service";
 import { runPostPaymentSteps } from "./finalize";
@@ -134,9 +134,17 @@ export async function closeOpenTenders(
     if (p.status !== "pending") continue;
     if (p.rail === "stripe_online" && !p.simulated) return "in_flight";
     if (!p.simulated && !opts.cancelPendingCrypto) return "in_flight";
-    // Coinbase: cancel the charge with the provider (best effort, logged), then
-    // the local row. USDC has nothing held at a provider: local only.
-    await cancelPendingTender(p);
+    // STRICT: Coinbase is asked to cancel the charge; if it refuses (a payment
+    // was detected) the charge is re-synced and, if still pending, the order is
+    // NOT abandoned -- it stays awaiting_payment until the payment settles or
+    // fails. USDC has nothing held at a provider: local cancel only.
+    const outcome = await cancelOpenTender(p);
+    if (outcome === "in_flight") return "in_flight";
+    if (outcome === "settled") {
+      return (await driver.getOrder(orderId))?.status === "awaiting_payment"
+        ? "in_flight"
+        : "paid";
+    }
   }
   return (await driver.getOrder(orderId))?.status === "awaiting_payment"
     ? "closed"
@@ -190,6 +198,10 @@ export interface ExpireSummary {
   errors: number;
   /** Paid orders whose post-payment steps were re-run (crash recovery). */
   recovered: number;
+  /** Orders of another deployment mode swept after the long grace (no real tender). */
+  foreignSwept: number;
+  /** Orders of another deployment mode holding real tenders (alerted once, not swept). */
+  foreignAlerted: number;
 }
 
 /**
@@ -213,14 +225,54 @@ function foreignMode(payments: Payment[]): boolean {
 const PAGE_SIZE = 100;
 /** Hard cap per run (PAGE_SIZE x MAX_PAGES orders); the next run continues. */
 const MAX_PAGES = 20;
-/** A paid order is only recovered once this old, so a live finalize is not raced. */
-const RECOVERY_GRACE_MS = 2 * 60_000;
+/**
+ * A paid order is only recovered once this old. It must comfortably exceed the
+ * cron route's `maxDuration` (60 s): a finalize that is still legitimately
+ * running when the next sweep starts must not be raced.
+ */
+export const RECOVERY_GRACE_MS = 6 * 60_000;
+/**
+ * Orders stamped with ANOTHER deployment mode are left to that mode's sweeper for
+ * this long; after it they are swept here if they carry no real tender (so a mode
+ * flip cannot strand them) and alerted once if they do.
+ */
+export const FOREIGN_MODE_GRACE_MS = 24 * 60 * 60_000;
+/** Recovery backoff: 5 min doubling per failed attempt, capped at 6 h. */
+const RECOVERY_BACKOFF_BASE_MS = 5 * 60_000;
+const RECOVERY_BACKOFF_MAX_MS = 6 * 60 * 60_000;
+
+/** A tender that moved (or may move) real money on a provider. */
+function hasRealTender(payments: Payment[]): boolean {
+  return payments.some(
+    (p) =>
+      !p.simulated &&
+      p.rail !== "cash" &&
+      (p.status === "requires_action" ||
+        p.status === "pending" ||
+        p.status === "authorized" ||
+        p.status === "captured"),
+  );
+}
+
+async function backOffRecovery(order: Order, now: Date, delayMs?: number) {
+  const attempts = (order.fulfillment?.recovery_attempts ?? 0) + 1;
+  const delay =
+    delayMs ??
+    Math.min(RECOVERY_BACKOFF_BASE_MS * 2 ** attempts, RECOVERY_BACKOFF_MAX_MS);
+  await getPosDriver().mergeOrderFulfillment(order.id, {
+    recovery_attempts: attempts,
+    recovery_next_at: new Date(now.getTime() + delay).toISOString(),
+  });
+}
 
 /**
  * Crash recovery: paid online orders whose post-payment steps (inventory,
  * dispatch) never completed -- the process died after the `awaiting_payment ->
- * paid` compare-and-set -- re-run them. The steps are idempotent. Only orders of
- * this deployment's mode are touched.
+ * paid` compare-and-set -- re-run them. The steps are idempotent per item / per
+ * order. A failing order backs off exponentially (so it cannot starve the rest of
+ * the oldest-first batch). Orders of another deployment mode are left alone for
+ * `FOREIGN_MODE_GRACE_MS`; after that they are recovered if they hold no real
+ * tender and otherwise alerted and parked.
  */
 export async function recoverUnfinalizedOrders(
   now: Date = new Date(),
@@ -230,15 +282,33 @@ export async function recoverUnfinalizedOrders(
   const stuck = await driver.listUnfinalizedPaidOrders(
     new Date(now.getTime() - RECOVERY_GRACE_MS).toISOString(),
     PAGE_SIZE,
+    now.toISOString(),
   );
   let recovered = 0;
   for (const order of stuck) {
-    const m = order.fulfillment?.checkout_mode;
-    if (m !== undefined && m !== mode) continue;
     try {
+      const m = order.fulfillment?.checkout_mode;
+      if (m !== undefined && m !== mode) {
+        const paidAt = new Date(order.fulfillment?.paid_at ?? now).getTime();
+        const payments = await driver.listPaymentsForOrder(order.id);
+        const young = now.getTime() - paidAt < FOREIGN_MODE_GRACE_MS;
+        if (young || hasRealTender(payments)) {
+          if (!young) {
+            captureError(new Error("paid order of another deployment mode never finalized"), {
+              scope: "recoverUnfinalizedOrders.foreign",
+              orderId: order.id,
+              mode: m,
+            });
+          }
+          await backOffRecovery(order, now, FOREIGN_MODE_GRACE_MS);
+          continue;
+        }
+      }
       if (await runPostPaymentSteps(order)) recovered += 1;
+      else await backOffRecovery(order, now);
     } catch (err) {
       captureError(err, { scope: "recoverUnfinalizedOrders", orderId: order.id });
+      await backOffRecovery(order, now).catch(() => undefined);
     }
   }
   return recovered;
@@ -263,6 +333,8 @@ export async function expireOnlineOrders(
     skipped: 0,
     errors: 0,
     recovered: 0,
+    foreignSwept: 0,
+    foreignAlerted: 0,
   };
   const shortest = Math.min(
     onlineCheckoutWindowMs("card"),
@@ -284,8 +356,61 @@ export async function expireOnlineOrders(
     after = { created_at: last.created_at, id: last.id };
     if (batch.length < PAGE_SIZE) break;
   }
+  await sweepForeignModeOrders(now, mode, summary);
   summary.recovered = await recoverUnfinalizedOrders(now);
   return summary;
+}
+
+/**
+ * Orders stamped with a DIFFERENT deployment mode (e.g. test-mode orders seen by
+ * the live sweeper, or after the deployment flipped mode) are normally left to
+ * that mode's sweeper. Once they are far past any window, sweep those with no
+ * real tender here, so a mode change cannot strand them forever; alert (once, via
+ * `foreign_alerted_at`) on the ones that hold real tenders instead of silently
+ * skipping them on every run.
+ */
+async function sweepForeignModeOrders(
+  now: Date,
+  mode: "live" | "test" | "sim",
+  summary: ExpireSummary,
+): Promise<void> {
+  const driver = getPosDriver();
+  const cutoff = new Date(now.getTime() - FOREIGN_MODE_GRACE_MS).toISOString();
+  let after: { created_at: string; id: string } | undefined;
+  for (let page = 0; page < 5; page += 1) {
+    const batch = await driver.listAwaitingPaymentOrders(cutoff, {
+      limit: PAGE_SIZE,
+      after,
+      foreignOf: mode,
+    });
+    if (batch.length === 0) break;
+    for (const order of batch) {
+      try {
+        const payments = await driver.listPaymentsForOrder(order.id);
+        if (hasRealTender(payments)) {
+          captureError(new Error("unpaid order of another deployment mode holds a real tender"), {
+            scope: "expireOnlineOrders.foreign",
+            orderId: order.id,
+            mode: order.fulfillment?.checkout_mode,
+          });
+          await driver.mergeOrderFulfillment(order.id, {
+            foreign_alerted_at: now.toISOString(),
+          });
+          summary.foreignAlerted += 1;
+        } else {
+          const before = summary.abandoned;
+          await sweepOne(order, now, summary);
+          if (summary.abandoned > before) summary.foreignSwept += 1;
+        }
+      } catch (err) {
+        summary.errors += 1;
+        captureError(err, { scope: "sweepForeignModeOrders", orderId: order.id });
+      }
+    }
+    const last = batch[batch.length - 1]!;
+    after = { created_at: last.created_at, id: last.id };
+    if (batch.length < PAGE_SIZE) break;
+  }
 }
 
 async function sweepOne(

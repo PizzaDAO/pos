@@ -135,6 +135,11 @@ export function TrackClient({
                   This order was not paid in time, so it was never sent to the
                   kitchen. Nothing was charged.
                 </p>
+              ) : order.late_payment === "refund_owed_manual" ? (
+                <p className="text-sm text-muted-foreground" data-testid="late-refund-processing">
+                  This order was not paid in time, so it was never sent to the
+                  kitchen. Your refund is being processed.
+                </p>
               ) : order.late_payment === "refunded" ? (
                 <p className="text-sm text-muted-foreground" data-testid="late-refunded">
                   This order was not paid in time, so it was never sent to the

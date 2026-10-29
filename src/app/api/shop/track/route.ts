@@ -56,9 +56,12 @@ export async function GET(request: Request) {
           : null,
         // Money settled after the checkout expired: "unresolved" until the
         // restaurant accepts or refunds it, then "accepted"/"refunded".
-        late_payment: order.fulfillment?.late_payment
-          ? (order.fulfillment.late_payment.resolved ?? "unresolved")
-          : null,
+        // ("refund_owed_manual" = a refund is on its way but is sent by hand.)
+        late_payment:
+          order.fulfillment?.late_payment &&
+          order.fulfillment.late_payment.kind !== "duplicate"
+            ? (order.fulfillment.late_payment.resolved ?? "unresolved")
+            : null,
         created_at: order.created_at,
         updated_at: order.updated_at,
       },

@@ -16,7 +16,7 @@ import { formatMoney } from "@/lib/pricing";
 
 interface Row {
   order: Order;
-  payments: Payment[];
+  payments: (Payment & { return_address: string | null; manual_refund: boolean })[];
 }
 
 export function LatePayments({
@@ -46,7 +46,10 @@ export function LatePayments({
     void load();
   }, [load]);
 
-  async function resolve(orderId: string, action: "accept" | "refund") {
+  async function resolve(
+    orderId: string,
+    action: "accept" | "refund" | "mark_refunded",
+  ) {
     setBusy(orderId);
     setError(null);
     try {
@@ -55,10 +58,12 @@ export function LatePayments({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ orderId, action }),
       });
-      if (!res.ok) {
-        const d = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(d.error ?? `HTTP ${res.status}`);
-      }
+      const d = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        note?: string;
+      };
+      if (!res.ok) setError(d.error ?? `HTTP ${res.status}`);
+      else if (d.note) setError(d.note);
       await load();
     } finally {
       setBusy(null);
@@ -88,49 +93,106 @@ export function LatePayments({
         </p>
       ) : (
         <ul className="space-y-3">
-          {rows.map(({ order, payments }) => (
-            <li
-              key={order.id}
-              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"
-              data-testid="late-payment-row"
-            >
-              <div className="text-sm">
-                <div className="font-semibold">
-                  Order {order.order_number} ·{" "}
-                  {formatMoney(
-                    order.fulfillment?.late_payment?.amount_cents ?? 0,
-                    order.currency,
-                  )}
+          {rows.map(({ order, payments }) => {
+            const m = order.fulfillment?.late_payment;
+            const owed = m?.resolved === "refund_owed_manual";
+            const duplicate = m?.kind === "duplicate";
+            const manual = payments.filter((p) => p.manual_refund);
+            return (
+              <li
+                key={order.id}
+                className="space-y-2 rounded-lg border p-3"
+                data-testid="late-payment-row"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-sm">
+                    <div className="font-semibold">
+                      {duplicate ? "Duplicate payment, refund one" : "Late payment"} ·
+                      Order {order.order_number} ·{" "}
+                      {formatMoney(m?.amount_cents ?? 0, order.currency)}
+                    </div>
+                    <div className="text-muted-foreground">
+                      {order.status} · {payments.length} payment
+                      {payments.length === 1 ? "" : "s"} · flagged{" "}
+                      {m ? new Date(m.flagged_at).toLocaleString() : ""}
+                      {m?.claim ? ` · ${m.claim}…` : ""}
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    {owed ? (
+                      <Button
+                        size="sm"
+                        disabled={busy === order.id}
+                        onClick={() => void resolve(order.id, "mark_refunded")}
+                      >
+                        Mark refunded
+                      </Button>
+                    ) : (
+                      <>
+                        {!duplicate && (
+                          <Button
+                            size="sm"
+                            disabled={busy === order.id || order.status !== "abandoned"}
+                            onClick={() => void resolve(order.id, "accept")}
+                          >
+                            Accept
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy === order.id}
+                          onClick={() => void resolve(order.id, "refund")}
+                        >
+                          Refund
+                        </Button>
+                      </>
+                    )}
+                  </div>
                 </div>
-                <div className="text-muted-foreground">
-                  {order.status} · {payments.length} payment
-                  {payments.length === 1 ? "" : "s"} · flagged{" "}
-                  {order.fulfillment?.late_payment
-                    ? new Date(
-                        order.fulfillment.late_payment.flagged_at,
-                      ).toLocaleString()
-                    : ""}
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  size="sm"
-                  disabled={busy === order.id || order.status !== "abandoned"}
-                  onClick={() => void resolve(order.id, "accept")}
-                >
-                  Accept
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={busy === order.id}
-                  onClick={() => void resolve(order.id, "refund")}
-                >
-                  Refund
-                </Button>
-              </div>
-            </li>
-          ))}
+                {owed && (
+                  <div
+                    className="rounded-md border border-amber-500/60 bg-amber-500/10 p-2 text-sm"
+                    data-testid="manual-refund-instructions"
+                  >
+                    <p className="font-medium">
+                      Refund owed by hand: no money has been sent.
+                    </p>
+                    <ul className="mt-1 list-disc pl-5">
+                      {(m?.manual_refunds ?? []).map((r) => {
+                        const p = manual.find((x) => x.id === r.payment_id);
+                        return (
+                          <li key={r.payment_id}>
+                            Send {formatMoney(r.amount_cents, order.currency)} back
+                            {p?.return_address
+                              ? ` to ${p.return_address}`
+                              : " (no return address on file: ask the customer)"}
+                            {p?.crypto_tx_hash ? ` · tx ${p.crypto_tx_hash}` : ""}
+                            {p?.rail === "crypto_coinbase" && (
+                              <>
+                                {" · "}
+                                <a
+                                  className="underline"
+                                  href="https://commerce.coinbase.com/dashboard/payments"
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  open Coinbase
+                                </a>
+                              </>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    <p className="mt-1 text-muted-foreground">
+                      Press Mark refunded after you have sent it.
+                    </p>
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>

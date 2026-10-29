@@ -264,6 +264,8 @@ export interface OrderFulfillment {
    */
   delivery_provider?: string;
   eta_minutes?: number | null;
+  /** When the delivery quote (`zone_id` is its handle) stops being valid, if the provider says. */
+  quote_expires_at?: string;
   /**
    * Online-checkout lifecycle markers (server-owned; written by the lifecycle
    * code, never the client):
@@ -282,20 +284,42 @@ export interface OrderFulfillment {
   paid_at?: string;
   finalized_at?: string;
   late_payment?: LatePaymentMarker;
+  /** Crash-recovery backoff (see `recoverUnfinalizedOrders`). */
+  recovery_attempts?: number;
+  recovery_next_at?: string;
+  /** Set once an order of another deployment mode was alerted on (not swept again). */
+  foreign_alerted_at?: string;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */
   delivery_notes?: string;
 }
 
-/** See `OrderFulfillment.late_payment`. */
+/**
+ * See `OrderFulfillment.late_payment`. One marker type serves two admin items:
+ *  - `late` (default): money settled on an order that was already abandoned/voided.
+ *  - `duplicate`: more money settled on an order than it is worth (two tenders
+ *    both settled); one of them must be refunded.
+ */
 export interface LatePaymentMarker {
+  kind?: "late" | "duplicate";
   payment_id: string;
-  /** Settled amount (base + tip) at the time of flagging, in cents. */
+  /** Late: settled amount (base + tip). Duplicate: the EXCESS, in cents. */
   amount_cents: number;
   flagged_at: string;
-  resolved?: "accepted" | "refunded";
+  /**
+   * `accepted` (promoted to paid) and `refunded` (money returned) are final.
+   * `refund_owed_manual`: a refund is owed but could not be sent by the system
+   * (crypto rails): the tender stays captured and staff return the money
+   * themselves, then "Mark refunded". Still listed until then.
+   */
+  resolved?: "accepted" | "refunded" | "refund_owed_manual";
   resolved_at?: string;
+  /** Transient exclusive claim so concurrent Accept/Refund cannot both act. */
+  claim?: "accepting" | "refunding" | "marking_refunded";
+  claim_at?: string;
+  /** Crypto money owed back by hand (`refund_owed_manual`): per tender, in cents. */
+  manual_refunds?: { payment_id: string; amount_cents: number }[];
 }
 
 /** A structured delivery address (Phase 4). */

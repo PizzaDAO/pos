@@ -627,6 +627,35 @@ in-store: unchanged (placed -> paid)
     locally, pending Coinbase with the provider; a USDC tender with a reported tx
     hash and a processing card are never canceled). Several cash tenders (client
     ids) may split an online bill. `/pay/sync` has its own `paySync` rate bucket.
+  - *Second review round.*
+    - Crypto refunds never claim to move money: `refundPayment` only records the
+      intent for USDC/Coinbase, so the refund API returns `manualRefund` + a note,
+      the terminal shows it, and the admin late-payment Refund leaves crypto
+      tenders `captured` with the item `refund_owed_manual` (listed with amounts,
+      return address if known and a Coinbase link) until staff press Mark refunded
+      (audited). The tracking page says "Your refund is being processed" until then.
+    - Accept/Refund/Mark refunded first CLAIM the marker with an atomic
+      compare-and-set (`claim_late_payment`), so concurrent actions cannot both
+      act; marker updates are atomic RPCs (`update_late_payment`,
+      `merge_order_fulfillment`), not read-modify-write.
+    - The one-open-tender index now covers only `requires_action`/`pending`, so a
+      settlement can always be recorded (never captured money stored as canceled).
+      When an online order ends up with more settled money than it is worth, a
+      `duplicate` marker ("Duplicate payment, refund one") appears in the same tab.
+      Cancels are STRICT: a provider that refuses (Coinbase payment detected, card
+      confirming) is re-synced, never marked canceled; the sweeper leaves such an
+      order `awaiting_payment`.
+    - Cash on an online order: till-role check first; partial cash carries no tip
+      (the final covering tender does); a racing overpaying cash tender is voided
+      deterministically. A REAL pending USDC tender is never auto-canceled (TODO
+      slice 3).
+    - Recovery: grace 6 min (> the cron's 60 s maxDuration), per-item idempotent
+      depletion, one delivery per order (`deliveries_order_id_uidx`), exponential
+      backoff on failing orders, oldest-`paid_at` first, expired delivery quotes
+      re-quoted. Orders stamped with another deployment mode are swept/recovered
+      after 24 h if they hold no real tender, otherwise alerted once.
+    - Late payments come from a dedicated capped query (`listOpenLatePayments`).
+    - Migration `20261101000300_late_payment_and_idempotency.sql`.
   - Migration `20261101000200_audit_action_values.sql` adds the late-payment audit
     actions and the Phase 7 actions (`payment_refund`, `payment_void`, ...) that
     were never in the DB enum, so those audit rows had been silently dropped.

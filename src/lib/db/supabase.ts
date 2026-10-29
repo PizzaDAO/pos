@@ -40,7 +40,6 @@ import type {
   Modifier,
   ModifierGroup,
   Order,
-  OrderFulfillment,
   OrderItem,
   OrderItemModifier,
   OrderStatus,
@@ -776,8 +775,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       }
     }
 
+    // Per-item idempotent: skip inventory rows this order already depleted.
+    const already = new Set(
+      (
+        unwrap(
+          await sb
+            .from("inventory_movements")
+            .select("inventory_item_id")
+            .eq("order_id", order.id)
+            .eq("reason", "depletion"),
+        ) as Row[]
+      ).map((r) => r.inventory_item_id as string),
+    );
     for (const [invId, qty] of consumption) {
       if (qty <= 0) continue;
+      if (already.has(invId)) continue;
       await applyMovementInternal({
         inventoryItemId: invId,
         reason: "depletion",
@@ -1445,20 +1457,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         await sb.from("orders").select("*").eq("id", orderId).maybeSingle(),
       ) as Row | null;
       if (!r) return;
-      // Idempotent for crash recovery: never deplete an order twice.
-      const prior = unwrap(
-        await sb
-          .from("inventory_movements")
-          .select("id")
-          .eq("order_id", orderId)
-          .eq("reason", "depletion")
-          .limit(1),
-      ) as Row[];
-      if (prior.length > 0) return;
-      await depleteForOrder(await readOrderRow(r));
+      await depleteForOrder(await readOrderRow(r)); // per-item idempotent
     },
 
     async listAwaitingPaymentOrders(createdBefore, opts) {
+
       let q = sb
         .from("orders")
         .select("*")
@@ -1475,6 +1478,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           `fulfillment->>checkout_mode.eq.${opts.checkoutMode},fulfillment->>checkout_mode.is.null`,
         );
       }
+      if (opts?.foreignOf) {
+        q = q
+          .not("fulfillment->>checkout_mode", "is", null)
+          .neq("fulfillment->>checkout_mode", opts.foreignOf)
+          .is("fulfillment->>foreign_alerted_at", null);
+      }
       const rows = unwrap(
         await q
           .order("created_at", { ascending: true })
@@ -1484,7 +1493,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
-    async listUnfinalizedPaidOrders(paidBefore, limit = 100) {
+    async listUnfinalizedPaidOrders(paidBefore, limit = 100, asOf = nowIso()) {
       const rows = unwrap(
         await sb
           .from("orders")
@@ -1493,26 +1502,63 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .not("fulfillment->>paid_at", "is", null)
           .lt("fulfillment->>paid_at", paidBefore)
           .is("fulfillment->>finalized_at", null)
+          .or(`fulfillment->>recovery_next_at.is.null,fulfillment->>recovery_next_at.lte.${asOf}`)
+          .order("fulfillment->>paid_at", { ascending: true })
           .limit(limit),
       ) as Row[];
       return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
+    // Atomic (one UPDATE inside the RPC): no read-modify-write window.
     async mergeOrderFulfillment(id, patch) {
-      const cur = unwrap(
-        await sb.from("orders").select("fulfillment").eq("id", id).maybeSingle(),
-      ) as Row | null;
-      const f = cur?.fulfillment as OrderFulfillment | null | undefined;
-      if (!f) return null;
-      const r = unwrap(
+      const rows = unwrap(
+        await sb.rpc("merge_order_fulfillment", {
+          p_order_id: id,
+          p_patch: patch,
+        }),
+      ) as Row[] | null;
+      const r = rows?.[0];
+      return r ? readOrderRow(r) : null;
+    },
+
+    async claimLatePayment(orderId, claim, staleBeforeIso) {
+      const rows = unwrap(
+        await sb.rpc("claim_late_payment", {
+          p_order_id: orderId,
+          p_claim: claim,
+          p_stale_before: staleBeforeIso,
+        }),
+      ) as Row[] | null;
+      const r = rows?.[0];
+      return r ? readOrderRow(r) : null;
+    },
+
+    async updateLatePayment(orderId, patch) {
+      const rows = unwrap(
+        await sb.rpc("update_late_payment", {
+          p_order_id: orderId,
+          p_patch: patch,
+        }),
+      ) as Row[] | null;
+      const r = rows?.[0];
+      return r ? readOrderRow(r) : null;
+    },
+
+    async listOpenLatePayments(tenantId, locationId, limit = 100) {
+      const rows = unwrap(
         await sb
           .from("orders")
-          .update({ fulfillment: { ...f, ...patch }, updated_at: nowIso() })
-          .eq("id", id)
-          .select()
-          .maybeSingle(),
-      ) as Row | null;
-      return r ? readOrderRow(r) : null;
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .not("fulfillment->late_payment", "is", null)
+          .or(
+            "fulfillment->late_payment->>resolved.is.null,fulfillment->late_payment->>resolved.eq.refund_owed_manual",
+          )
+          .order("updated_at", { ascending: false })
+          .limit(limit),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
     // -- Payments ----------------------------------------------------------

@@ -52,6 +52,13 @@ import {
   POST as latePOST,
 } from "@/app/api/admin/late-payments/route";
 import { RATE_LIMIT_RULES } from "@/lib/security";
+import { POST as refundPOST } from "@/app/api/payments/refund/route";
+import { dispatchDelivery } from "@/lib/delivery/service";
+import {
+  FOREIGN_MODE_GRACE_MS,
+  RECOVERY_GRACE_MS,
+  recoverUnfinalizedOrders,
+} from "./lifecycle";
 import { buildSalesReport } from "@/lib/reports";
 
 const TENANT = DEMO_TENANT_ID;
@@ -83,6 +90,9 @@ async function seedOnline(
     status?: OrderStatus;
     delivery?: boolean;
     mode?: "live" | "test" | "sim";
+    tip?: number;
+    quoteExpiresAt?: string;
+    postal?: string;
   } = {},
 ): Promise<string> {
   seq += 1;
@@ -116,8 +126,8 @@ async function seedOnline(
       discount_cents: 0,
       taxable_cents: 3600,
       tax_cents: 0,
-      tip_cents: 0,
-      total_cents: 3600,
+      tip_cents: opts.tip ?? 0,
+      total_cents: 3600 + (opts.tip ?? 0),
     },
     notes: null,
     status: opts.status ?? "awaiting_payment",
@@ -133,9 +143,10 @@ async function seedOnline(
               line1: "1 Main",
               city: "NYC",
               region: "NY",
-              postal_code: "10001",
+              postal_code: opts.postal ?? "10001",
               country: "US",
             },
+            ...(opts.quoteExpiresAt ? { quote_expires_at: opts.quoteExpiresAt } : {}),
             zone_id: "zone-near",
             delivery_provider: "in_house_manual",
             eta_minutes: 30,
@@ -306,7 +317,7 @@ describe("2a: closing a pending Coinbase tender cancels the charge at Coinbase",
     expect((await getPosDriver().getPayment(t.id))?.status).toBe("canceled");
   });
 
-  it("a refused provider cancel is logged but the order is still given up", async () => {
+  it("a refused cancel (payment detected) re-syncs: still pending => in flight, NOT abandoned", async () => {
     coinbaseFetch(false);
     const id = await seedOnline();
     const t = await seedTender(id, {
@@ -316,19 +327,50 @@ describe("2a: closing a pending Coinbase tender cancels the charge at Coinbase",
       connect_account_id: null,
       raw: null,
     });
-    await expireOnlineOrders(later(61));
-    expect((await getPosDriver().getPayment(t.id))?.status).toBe("canceled");
-    expect(captureSpy.mock.calls.some((c) => (c[1] as { scope?: string }).scope === "cancel-tender-provider")).toBe(true);
+    const summary = await expireOnlineOrders(later(61));
+    expect(summary.skipped).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    expect((await getPosDriver().getPayment(t.id))?.status).toBe("pending"); // NOT marked canceled
+    expect((await getPosDriver().getOrder(id))?.status).toBe("awaiting_payment");
+    expect(captureSpy.mock.calls.some((c) => (c[1] as { scope?: string }).scope === "cancel-open-tender")).toBe(true);
+  });
+
+  it("a refused cancel where Coinbase says the payment landed finalizes the order", async () => {
+    const f = vi.fn(async (url: string) => {
+      if (String(url).endsWith("/cancel")) {
+        return new Response(JSON.stringify({ error: { message: "paid" } }), { status: 400 });
+      }
+      return new Response(
+        JSON.stringify({
+          data: { id: "cb_1", code: "C", hosted_url: "u", timeline: [{ status: "NEW" }, { status: "COMPLETED" }] },
+        }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", f);
+    const id = await seedOnline();
+    await seedTender(id, {
+      rail: "crypto_coinbase",
+      status: "pending",
+      charge_id: "cb_1",
+      connect_account_id: null,
+      raw: null,
+    });
+    // refreshPaymentStatus in closeOpenTenders already sees COMPLETED first.
+    const summary = await expireOnlineOrders(later(61));
+    expect(summary.finalized).toBe(1);
+    expect((await getPosDriver().getOrder(id))?.status).toBe("paid");
   });
 });
 
 describe("2b/2d: a payment settling on an abandoned order", () => {
-  async function lateOrder() {
+  async function lateOrder(rail: Payment["rail"] = "crypto_onchain_usdc", amount = 3600) {
     const id = await seedOnline({ status: "abandoned" });
     const t = await seedTender(id, {
       simulated: true,
       status: "pending",
-      rail: "crypto_onchain_usdc",
+      rail,
+      amount_cents: amount,
       connect_account_id: null,
     });
     await applyRailStatus(t.id, "captured");
@@ -398,25 +440,123 @@ describe("2b/2d: a payment settling on an abandoned order", () => {
     expect((await after.json()).latePayments).toHaveLength(0);
   });
 
-  it("admin Refund refunds every settled tender and leaves the order abandoned", async () => {
-    const { id, t } = await lateOrder();
-    const res = await latePOST(
+  const refundReq = (id: string, action = "refund") =>
+    latePOST(
       new Request("http://x/api/admin/late-payments", {
         method: "POST",
-        body: JSON.stringify({ orderId: id, action: "refund" }),
+        body: JSON.stringify({ orderId: id, action }),
       }),
     );
+
+  it("admin Refund of a CARD payment refunds it and leaves the order abandoned", async () => {
+    const { id, t } = await lateOrder("stripe_online");
+    const res = await refundReq(id);
     expect(res.status).toBe(200);
+    expect((await res.json()).refundOwedManually).toBe(false);
     const order = (await getPosDriver().getOrder(id))!;
     expect(order.status).toBe("abandoned"); // NOT overwritten with refunded
     expect(order.fulfillment?.late_payment?.resolved).toBe("refunded");
     expect((await getPosDriver().getPayment(t.id))?.refunded_cents).toBe(3600);
-    expect(
-      (await getPosDriver().listAuditLog(TENANT)).some((a) => a.action === "late_payment_refunded"),
-    ).toBe(true);
-    // The tracking feed now says refunded.
     const track = await trackGET(new Request(`http://x/api/shop/track?orderId=${id}`));
     expect((await track.json()).order.late_payment).toBe("refunded");
+  });
+
+  it("admin Refund of a CRYPTO payment moves no money: refund_owed_manual until staff mark it", async () => {
+    const auditsBefore = (await getPosDriver().listAuditLog(TENANT)).filter(
+      (a) => a.action === "late_payment_refunded",
+    ).length;
+    const { id, t } = await lateOrder("crypto_coinbase");
+    const res = await refundReq(id);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.refundOwedManually).toBe(true);
+    expect(body.note).toMatch(/no money|cannot be sent/i);
+    // The tender stays captured; nothing was recorded as refunded.
+    const tender = (await getPosDriver().getPayment(t.id))!;
+    expect(tender.status).toBe("captured");
+    expect(tender.refunded_cents).toBe(0);
+    let order = (await getPosDriver().getOrder(id))!;
+    expect(order.status).toBe("abandoned");
+    expect(order.fulfillment?.late_payment).toMatchObject({
+      resolved: "refund_owed_manual",
+      manual_refunds: [{ payment_id: t.id, amount_cents: 3600 }],
+    });
+    // The customer is told it is being processed, never "refunded".
+    const track = await trackGET(new Request(`http://x/api/shop/track?orderId=${id}`));
+    expect((await track.json()).order.late_payment).toBe("refund_owed_manual");
+    // Still listed (with the owed amounts) so staff cannot lose it.
+    const list = await lateGET(
+      new Request(`http://x/api/admin/late-payments?tenantId=${TENANT}&locationId=${LOCATION}`),
+    );
+    const rows = (await list.json()).latePayments;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].payments[0].manual_refund).toBe(true);
+    // Refund cannot be pressed again; Accept is gone.
+    expect((await refundReq(id)).status).toBe(409);
+    expect((await refundReq(id, "accept")).status).toBe(409);
+    // Staff send the money, then confirm.
+    expect((await refundReq(id, "mark_refunded")).status).toBe(200);
+    order = (await getPosDriver().getOrder(id))!;
+    expect(order.fulfillment?.late_payment?.resolved).toBe("refunded");
+    expect((await getPosDriver().getPayment(t.id))?.status).toBe("refunded");
+    const audits = (await getPosDriver().listAuditLog(TENANT)).filter(
+      (a) => a.action === "late_payment_refunded",
+    );
+    expect(audits.length - auditsBefore).toBe(2); // the owed refund + staff's confirmation
+    expect(audits.some((a) => /BY HAND|OWED/i.test(a.detail ?? ""))).toBe(true);
+    expect(audits.some((a) => /confirmed/i.test(a.detail ?? ""))).toBe(true);
+    expect((await refundReq(id, "mark_refunded")).status).toBe(409);
+  });
+
+  it("an UNDERPAID late payment is flagged too, and Accept counts refunds", async () => {
+    const { id } = await lateOrder("stripe_online", 1000);
+    expect((await getPosDriver().getOrder(id))?.fulfillment?.late_payment?.amount_cents).toBe(1000);
+    expect((await refundReq(id, "accept")).status).toBe(409); // 1000 < 3600
+    // Fully paid then partially refunded: net below the order total.
+    const full = await lateOrder("stripe_online", 3600);
+    await refundPayment({ paymentId: full.t.id, amountCents: 1000, refundId: "part" });
+    const r = await refundReq(full.id, "accept");
+    expect(r.status).toBe(409);
+    expect((await getPosDriver().getOrder(full.id))?.status).toBe("abandoned");
+  });
+
+  it("Accept and Refund racing: exactly one wins, in either order", async () => {
+    for (const order of [["accept", "refund"], ["refund", "accept"]] as const) {
+      resetMockOrders();
+      resetMockPayments();
+      const { id } = await lateOrder("stripe_online");
+      const results = await Promise.all(order.map((a) => refundReq(id, a)));
+      const codes = results.map((r) => r.status).sort();
+      expect(codes).toEqual([200, 409]);
+      const o = (await getPosDriver().getOrder(id))!;
+      // Coherent end state: either promoted to paid (accepted) or refunded and abandoned.
+      if (o.fulfillment?.late_payment?.resolved === "accepted") {
+        expect(o.status).toBe("paid");
+        expect((await getPosDriver().listPaymentsForOrder(id))[0]!.refunded_cents).toBe(0);
+      } else {
+        expect(o.status).toBe("abandoned");
+        expect(o.fulfillment?.late_payment?.resolved).toBe("refunded");
+      }
+    }
+  });
+
+  it("two concurrent Accepts act once; a failed action releases its claim", async () => {
+    const { id } = await lateOrder("stripe_online");
+    const [a, b] = await Promise.all([refundReq(id, "accept"), refundReq(id, "accept")]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    // A refund that throws releases the claim so the item is not stuck.
+    resetMockOrders();
+    resetMockPayments();
+    const again = await lateOrder("stripe_online");
+    const spy = vi
+      .spyOn(getPosDriver(), "updateLatePayment")
+      .mockRejectedValueOnce(new Error("boom"));
+    const failed = await refundReq(again.id);
+    spy.mockRestore();
+    expect(failed.status).toBe(502);
+    expect(
+      (await getPosDriver().getOrder(again.id))?.fulfillment?.late_payment?.claim,
+    ).toBeUndefined();
   });
 
   it("admin endpoints are owner/manager only", async () => {
@@ -496,17 +636,49 @@ describe("2c: a settling webhook that hits the one-live-tender index", () => {
     expect((await getPosDriver().getOrder(id))?.status).toBe("paid");
   });
 
-  it("a genuine double settlement answers 200 and is flagged, never a 500", async () => {
+  it("a genuine double settlement: BOTH stay captured, 200, flagged as a duplicate for the admin", async () => {
     const id = await seedOnline();
     const old = await seedTender(id, { status: "canceled" });
     const newer = await seedTender(id, { status: "captured" });
     const res = await webhookPOST(hook(old));
     expect(res.status).toBe(200);
-    expect((await getPosDriver().getPayment(old.id))?.status).toBe("canceled");
+    // Never leave captured money recorded as canceled.
+    expect((await getPosDriver().getPayment(old.id))?.status).toBe("captured");
     expect((await getPosDriver().getPayment(newer.id))?.status).toBe("captured");
+    const marker = (await getPosDriver().getOrder(id))?.fulfillment?.late_payment;
+    expect(marker).toMatchObject({ kind: "duplicate", amount_cents: 3600 });
     expect(
       captureSpy.mock.calls.some((c) => String((c[0] as Error).message).includes("DOUBLE SETTLEMENT")),
     ).toBe(true);
+    const list = await lateGET(
+      new Request(`http://x/api/admin/late-payments?tenantId=${TENANT}&locationId=${LOCATION}`),
+    );
+    expect((await list.json()).latePayments).toHaveLength(1);
+    // The tracking page does not show duplicates as a late payment.
+    const track = await trackGET(new Request(`http://x/api/shop/track?orderId=${id}`));
+    expect((await track.json()).order.late_payment).toBeNull();
+  });
+
+  it("an older tender's open-state flip is ignored (stays canceled), never a 500", async () => {
+    const id = await seedOnline();
+    const old = await seedTender(id, { status: "canceled" });
+    const newer = await seedTender(id, { status: "requires_action" });
+    const res = await webhookPOST(hook(old, "payment_intent.payment_failed"));
+    expect(res.status).toBe(200);
+    expect((await getPosDriver().getPayment(old.id))?.status).toBe("canceled");
+    expect((await getPosDriver().getPayment(newer.id))?.status).toBe("requires_action");
+  });
+
+  it("when the provider refuses to cancel the newer tender it is re-synced, never marked canceled", async () => {
+    const id = await seedOnline();
+    const old = await seedTender(id, { status: "canceled" });
+    const newer = await seedTender(id, { status: "requires_action" });
+    stripeRequest.mockRejectedValue(new Error("cannot cancel: confirming"));
+    stripeGet.mockResolvedValue({ status: "processing" });
+    const res = await webhookPOST(hook(old));
+    expect(res.status).toBe(200);
+    expect((await getPosDriver().getPayment(old.id))?.status).toBe("captured");
+    expect((await getPosDriver().getPayment(newer.id))?.status).toBe("pending"); // re-synced, not canceled
   });
 });
 
@@ -533,9 +705,9 @@ describe("3: crash recovery of paid-but-unfinalized orders", () => {
     expect(o.fulfillment?.finalized_at).toBeTruthy();
   });
 
-  it("re-runs depletion and dispatch for an order paid >2 min ago, then stops", async () => {
+  it("re-runs depletion and dispatch for an order paid >6 min ago, then stops", async () => {
     const dough = await onHand("Pizza dough ball");
-    const id = await crashedAfterCas(3);
+    const id = await crashedAfterCas(7);
     expect(await getPosDriver().getDeliveryForOrder(id)).toBeNull();
     const first = await expireOnlineOrders();
     expect(first.recovered).toBe(1);
@@ -548,16 +720,16 @@ describe("3: crash recovery of paid-but-unfinalized orders", () => {
 
   it("does not deplete twice when the crash came after depletion", async () => {
     const dough = await onHand("Pizza dough ball");
-    const id = await crashedAfterCas(3, { depleted: true });
+    const id = await crashedAfterCas(7, { depleted: true });
     expect(await onHand("Pizza dough ball")).toBe(dough - 2);
     await expireOnlineOrders();
     expect(await onHand("Pizza dough ball")).toBe(dough - 2);
     expect(await getPosDriver().getDeliveryForOrder(id)).not.toBeNull();
   });
 
-  it("leaves a fresh (<2 min) order to the live finalize", async () => {
+  it("leaves a fresh (<6 min) order to the live finalize", async () => {
     const dough = await onHand("Pizza dough ball");
-    await crashedAfterCas(0.5);
+    await crashedAfterCas(5);
     expect((await expireOnlineOrders()).recovered).toBe(0);
     expect(await onHand("Pizza dough ball")).toBe(dough);
   });
@@ -566,7 +738,7 @@ describe("3: crash recovery of paid-but-unfinalized orders", () => {
     const id = await seedOnline({ mode: "live" });
     const order = (await getPosDriver().getOrder(id))!;
     await getPosDriver().transitionOrderStatus(id, ["awaiting_payment"], "paid", {
-      fulfillment: { ...order.fulfillment!, paid_at: new Date(Date.now() - 5 * MIN).toISOString() },
+      fulfillment: { ...order.fulfillment!, paid_at: new Date(Date.now() - 7 * MIN).toISOString() },
     });
     expect((await expireOnlineOrders()).recovered).toBe(0); // zero-env deployment is "sim"
   });
@@ -821,5 +993,273 @@ describe("11: split cash on an online order", () => {
     });
     const id = await seedOnline();
     expect((await cashReq(id, "cash-x", 1000)).status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Re-review round
+// ---------------------------------------------------------------------------
+
+describe("R1: refunds of crypto tenders only record an intent -- say so", () => {
+  const refundReq = (paymentId: string) =>
+    refundPOST(
+      new Request("http://x/api/payments/refund", {
+        method: "POST",
+        body: JSON.stringify({ paymentId, refundId: `rr-${paymentId}` }),
+      }),
+    );
+
+  it("the refund API flags a crypto refund as manual (no money sent), a card refund is not", async () => {
+    const id = await seedOnline({ status: "paid" });
+    const crypto = await seedTender(id, {
+      id: deriveTenderId(id, "crypto_coinbase"),
+      rail: "crypto_coinbase",
+      status: "captured",
+      simulated: true,
+      connect_account_id: null,
+    });
+    const card = await seedTender(id, {
+      id: deriveTenderId(id, "stripe_online"),
+      rail: "stripe_online",
+      status: "captured",
+      simulated: true,
+    });
+    const c = await (await refundReq(crypto.id)).json();
+    expect(c.manualRefund).toBe(true);
+    expect(c.note).toMatch(/no money was sent/i);
+    const k = await (await refundReq(card.id)).json();
+    expect(k.manualRefund).toBe(false);
+    expect(k.note).toBeUndefined();
+  });
+});
+
+describe("R3: settled tenders no longer hold the one-open-tender slot", () => {
+  it("captured + a new open tender is recordable; two OPEN tenders are still refused", async () => {
+    const id = await seedOnline();
+    await seedTender(id, { status: "captured" });
+    await seedTender(id, { status: "requires_action" }); // allowed now
+    await expect(seedTender(id, { status: "pending" })).rejects.toThrow(/in progress/);
+  });
+});
+
+describe("R5: split cash", () => {
+  const cashReq = (id: string, paymentId: string, amountCents: number) =>
+    paymentsPOST(payReq(id, { rail: "cash", paymentId, amountCents }));
+
+  it("the till-role check runs BEFORE the existing-tender lookup", async () => {
+    const id = await seedOnline();
+    expect((await cashReq(id, "cash-known", 1000)).status).toBe(201);
+    requireTenantRole.mockResolvedValue({ ok: false, res: new Response("{}", { status: 403 }) });
+    const probe = await cashReq(id, "cash-known", 1000);
+    expect(probe.status).toBe(403); // not the stored tender
+  });
+
+  it("the tip rides on the final covering tender only", async () => {
+    const id = await seedOnline({ tip: 500 });
+    const a = await (await cashReq(id, "cash-t1", 1000)).json();
+    expect(a.payment.tip_cents).toBe(0);
+    const b = await (await cashReq(id, "cash-t2", 999_999)).json();
+    expect(b.payment.tip_cents).toBe(500);
+    expect(b.payment.amount_cents + a.payment.amount_cents).toBe(3600);
+    expect(b.orderStatus).toBe("paid");
+  });
+
+  it("two concurrent full cash tenders: exactly one survives, the other is voided", async () => {
+    const id = await seedOnline();
+    const [a, b] = await Promise.all([cashReq(id, "cash-r1", 999_999), cashReq(id, "cash-r2", 999_999)]);
+    expect([a.status, b.status].sort()).toEqual([201, 409]);
+    const live = (await getPosDriver().listPaymentsForOrder(id)).filter(
+      (p) => p.rail === "cash" && p.status === "captured",
+    );
+    expect(live).toHaveLength(1);
+    expect(live[0]!.amount_cents).toBe(3600);
+    expect((await getPosDriver().getOrder(id))?.status).toBe("paid");
+  });
+});
+
+describe("R6: a REAL pending USDC tender is never auto-canceled on a rail switch", () => {
+  it("real stays pending (blocks card)", async () => {
+    const id = await seedOnline();
+    const real = await seedTender(id, {
+      rail: "crypto_onchain_usdc",
+      status: "pending",
+      simulated: false,
+      connect_account_id: null,
+    });
+    const res = await paymentsPOST(payReq(id, { rail: "stripe_online" }));
+    expect(res.status).toBe(409);
+    expect((await getPosDriver().getPayment(real.id))?.status).toBe("pending");
+  });
+});
+
+describe("R7: crash recovery details", () => {
+  const crashed = async (paidMinAgo: number, over: Parameters<typeof seedOnline>[0] = {}) => {
+    const id = await seedOnline({ delivery: true, ...over });
+    const order = (await getPosDriver().getOrder(id))!;
+    await getPosDriver().transitionOrderStatus(id, ["awaiting_payment"], "paid", {
+      fulfillment: {
+        ...order.fulfillment!,
+        paid_at: new Date(Date.now() - paidMinAgo * MIN).toISOString(),
+      },
+    });
+    return id;
+  };
+
+  it("the grace period is well above the cron route's 60 s maxDuration", () => {
+    expect(RECOVERY_GRACE_MS).toBeGreaterThanOrEqual(5 * maxDuration * 1000);
+  });
+
+  it("a concurrent double dispatch yields exactly one delivery", async () => {
+    const id = await seedOnline({ delivery: true });
+    const input = {
+      orderId: id,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      provider: "in_house_manual" as const,
+      pickup: { line1: "p", city: "", region: "", postal_code: "", country: "US" },
+      dropoff: { line1: "1 Main", city: "NYC", region: "NY", postal_code: "10001", country: "US" },
+      zoneId: "zone-near",
+      feeCents: 399,
+      currency: "USD",
+      etaMinutes: 30,
+    };
+    const [a, b] = await Promise.all([dispatchDelivery(input), dispatchDelivery(input)]);
+    expect(a.id).toBe(b.id);
+    expect(await getPosDriver().getDeliveryForOrder(id)).toMatchObject({ id: a.id });
+  });
+
+  it("lists the oldest paid_at first", async () => {
+    const newer = await crashed(7);
+    const older = await crashed(30);
+    const list = await getPosDriver().listUnfinalizedPaidOrders(new Date().toISOString(), 10);
+    expect(list.map((o) => o.id)).toEqual([older, newer]);
+  });
+
+  it("a persistently failing order backs off and cannot starve the rest", async () => {
+    const bad = await crashed(30);
+    const good = await crashed(7);
+    const driver = getPosDriver();
+    const real = driver.depleteInventoryForOrder.bind(driver);
+    const spy = vi
+      .spyOn(driver, "depleteInventoryForOrder")
+      .mockImplementation(async (oid: string) => {
+        if (oid === bad) throw new Error("db down");
+        return real(oid);
+      });
+    try {
+      expect(await recoverUnfinalizedOrders()).toBe(1); // `good` recovered, `bad` failed
+      const f = (await driver.getOrder(bad))!.fulfillment!;
+      expect(f.recovery_attempts).toBe(1);
+      expect(new Date(f.recovery_next_at!).getTime()).toBeGreaterThan(Date.now());
+      // Backing off: not retried on the next run...
+      spy.mockClear();
+      await recoverUnfinalizedOrders();
+      expect(spy).not.toHaveBeenCalledWith(bad);
+      // ...but retried once the backoff has passed.
+      await recoverUnfinalizedOrders(new Date(Date.now() + 24 * 60 * MIN));
+      expect(spy).toHaveBeenCalledWith(bad);
+      expect((await driver.getOrder(bad))!.fulfillment!.recovery_attempts).toBe(2);
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await driver.getOrder(good))!.fulfillment!.finalized_at).toBeTruthy();
+  });
+
+  it("an expired delivery quote is re-quoted before dispatch (out of zone => failed record)", async () => {
+    const stale = new Date(Date.now() - 60 * MIN).toISOString();
+    // In-zone: re-quote succeeds and the delivery is dispatched.
+    const ok = await seedOnline({ delivery: true, quoteExpiresAt: stale });
+    await finalizeOnlinePayment(ok);
+    expect((await getPosDriver().getDeliveryForOrder(ok))?.status).not.toBe("failed");
+    // Out of zone now: the re-quote is refused, so no dispatch on a dead quote.
+    const bad = await seedOnline({ delivery: true, quoteExpiresAt: stale, postal: "99999" });
+    await finalizeOnlinePayment(bad);
+    expect((await getPosDriver().getDeliveryForOrder(bad))?.status).toBe("failed");
+    // A fresh quote is used as-is (even out of zone, nothing is re-quoted).
+    const fresh = await seedOnline({
+      delivery: true,
+      quoteExpiresAt: new Date(Date.now() + 10 * MIN).toISOString(),
+      postal: "99999",
+    });
+    await finalizeOnlinePayment(fresh);
+    expect((await getPosDriver().getDeliveryForOrder(fresh))?.status).not.toBe("failed");
+  });
+});
+
+describe("R8: a mode flip cannot strand orders", () => {
+  beforeEach(() => {
+    goLive(); // this deployment is mode "test"
+  });
+  const farFuture = () => new Date(Date.now() + FOREIGN_MODE_GRACE_MS + 60 * MIN);
+
+  it("sweeps another mode's unpaid order once far past its window, if it holds no real tender", async () => {
+    const live = await seedOnline({ mode: "live" });
+    // Within the normal pass it is invisible...
+    expect((await expireOnlineOrders(later(31))).abandoned).toBe(0);
+    // ...but after the long grace it is swept.
+    const summary = await expireOnlineOrders(farFuture());
+    expect(summary.foreignSwept).toBe(1);
+    expect((await getPosDriver().getOrder(live))?.status).toBe("abandoned");
+  });
+
+  it("alerts ONCE (and stops rescanning) on another mode's order that holds a real tender", async () => {
+    const live = await seedOnline({ mode: "live" });
+    await seedTender(live, { raw: { livemode: true } });
+    const first = await expireOnlineOrders(farFuture());
+    expect(first.foreignAlerted).toBe(1);
+    expect(first.foreignSwept).toBe(0);
+    expect(
+      captureSpy.mock.calls.some((c) => (c[1] as { scope?: string }).scope === "expireOnlineOrders.foreign"),
+    ).toBe(true);
+    expect((await getPosDriver().getOrder(live))?.status).toBe("awaiting_payment");
+    expect((await expireOnlineOrders(farFuture())).foreignAlerted).toBe(0);
+  });
+
+  it("recovery: another mode's paid order is recovered after the grace if no real tender, else alerted and parked", async () => {
+    const mk = async (withReal: boolean) => {
+      const id = await seedOnline({ mode: "live" });
+      if (withReal) await seedTender(id, { status: "captured", raw: { livemode: true } });
+      const o = (await getPosDriver().getOrder(id))!;
+      await getPosDriver().transitionOrderStatus(id, ["awaiting_payment"], "paid", {
+        fulfillment: { ...o.fulfillment!, paid_at: new Date(Date.now() - 2 * MIN).toISOString() },
+      });
+      return id;
+    };
+    const plain = await mk(false);
+    const real = await mk(true);
+    const now = farFuture();
+    expect(await recoverUnfinalizedOrders(now)).toBe(1);
+    expect((await getPosDriver().getOrder(plain))!.fulfillment!.finalized_at).toBeTruthy();
+    const r = (await getPosDriver().getOrder(real))!.fulfillment!;
+    expect(r.finalized_at).toBeUndefined();
+    expect(r.recovery_next_at).toBeTruthy(); // parked
+    expect(
+      captureSpy.mock.calls.some((c) => (c[1] as { scope?: string }).scope === "recoverUnfinalizedOrders.foreign"),
+    ).toBe(true);
+  });
+});
+
+describe("R10: late payments come from a dedicated, ordered, capped query", () => {
+  it("returns only open items, newest first, honouring the limit", async () => {
+    const driver = getPosDriver();
+    const mk = async (marker: Record<string, unknown> | null) => {
+      const id = await seedOnline({ status: "abandoned" });
+      if (marker) {
+        await driver.mergeOrderFulfillment(id, {
+          late_payment: { payment_id: "p", amount_cents: 1, flagged_at: "x", ...marker },
+        } as never);
+      }
+      return id;
+    };
+    await mk(null); // no marker
+    const resolved = await mk({ resolved: "refunded" });
+    const a = await mk({});
+    const owed = await mk({ resolved: "refund_owed_manual" });
+    const b = await mk({});
+    const all = (await driver.listOpenLatePayments(TENANT, LOCATION)).map((o) => o.id);
+    expect(all).not.toContain(resolved);
+    expect(new Set(all)).toEqual(new Set([a, owed, b]));
+    expect(await driver.listOpenLatePayments(TENANT, LOCATION, 2)).toHaveLength(2);
+    expect(await driver.listOpenLatePayments(TENANT, "other-location")).toHaveLength(0);
   });
 });

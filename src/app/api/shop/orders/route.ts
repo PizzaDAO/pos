@@ -234,6 +234,7 @@ export async function POST(request: Request) {
   let quotedProvider: import("@/lib/delivery").DeliveryProviderKey | null = null;
   let zoneId: string | null = null;
   let etaMinutes: number | null = null;
+  let quoteExpiresAt: string | undefined;
   const pickupAddress: DeliveryAddress = {
     line1: fulfillment.pickup_address ?? "Pickup",
     city: "",
@@ -264,6 +265,7 @@ export async function POST(request: Request) {
       deliveryFeeCents = quote.fee.amount;
       zoneId = quote.quoteId ?? null;
       etaMinutes = quote.etaMinutes ?? null;
+      quoteExpiresAt = quote.expiresAt;
     } catch (err) {
       if (err instanceof DeliveryUnavailableError) {
         return NextResponse.json(
@@ -301,6 +303,7 @@ export async function POST(request: Request) {
           zone_id: zoneId ?? undefined,
           delivery_provider: quotedProvider ?? undefined,
           eta_minutes: etaMinutes,
+          ...(quoteExpiresAt ? { quote_expires_at: quoteExpiresAt } : {}),
           delivery_fee_cents: deliveryFeeCents,
           delivery_notes: body.deliveryNotes,
         }

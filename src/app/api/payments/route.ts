@@ -35,6 +35,7 @@ import {
   deriveOnlineTender,
   cancelPendingTender,
   cancelSupersededTenders,
+  voidIfOverpaying,
   freshClientSecret,
   getOrderBalance,
   nextOnlineTenderId,
@@ -139,6 +140,14 @@ export async function POST(request: Request) {
       "manager",
       "cashier",
     ]);
+    if (!auth.ok) return auth.res;
+  }
+
+  // Cash on an ONLINE order takes a till role, exactly like an in-store tender.
+  // Checked BEFORE any tender lookup, so an anonymous caller cannot probe (or be
+  // handed back) an existing cash tender by guessing a payment id.
+  if (order.channel !== "in_store" && body.rail === "cash") {
+    const auth = await requireTenantRole(tenantId, ["owner", "manager", "cashier"]);
     if (!auth.ok) return auth.res;
   }
 
@@ -255,16 +264,8 @@ export async function POST(request: Request) {
         }
       }
     }
-    // An anonymous caller can never settle an online order with cash: it takes
-    // a till role, exactly like an in-store tender.
-    if (body.rail === "cash") {
-      const auth = await requireTenantRole(tenantId, [
-        "owner",
-        "manager",
-        "cashier",
-      ]);
-      if (!auth.ok) return auth.res;
-    } else if (!onlineRailAvailable(body.rail)) {
+    // (Cash was authorized above.)
+    if (body.rail !== "cash" && !onlineRailAvailable(body.rail)) {
       // An unconfigured crypto rail would simulate and auto-confirm: no money.
       return NextResponse.json(
         { error: "That payment method is not available right now." },
@@ -287,6 +288,8 @@ export async function POST(request: Request) {
     // Split cash: a till role may take part of the bill (never more than is owed).
     if (body.rail === "cash" && body.amountCents > 0 && body.amountCents < amountCents) {
       amountCents = body.amountCents;
+      // The tip rides on the FINAL covering tender only, never on a partial one.
+      tipCents = 0;
     }
     if (amountCents <= 0) {
       return NextResponse.json(
@@ -316,6 +319,20 @@ export async function POST(request: Request) {
       cashTenderedCents: body.cashTenderedCents,
       metadata: body.metadata,
     });
+
+    // Concurrent split cash: two tills may both have derived the same remaining
+    // balance. After the insert, a tender that is covered by EARLIER settled
+    // tenders is voided (deterministic by created_at, id: exactly one survives).
+    if (isOnline && body.rail === "cash" && (await voidIfOverpaying(payment))) {
+      return NextResponse.json(
+        {
+          error:
+            "This order was already paid in full by another payment. This cash tender was voided; do not keep the cash.",
+          code: "already_paid",
+        },
+        { status: 409 },
+      );
+    }
 
     const refreshed = await driver.getOrder(body.orderId);
     // The sweeper / a cancel may have abandoned the order between the gate above

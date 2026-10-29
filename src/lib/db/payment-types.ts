@@ -133,6 +133,15 @@ export const ONE_LIVE_TENDER_RAILS: readonly string[] = [
   "crypto_coinbase",
 ];
 
+/**
+ * Tender statuses that HOLD the one-open-tender slot (the DB index
+ * `payments_one_live_card_or_cb` covers only these). Settled tenders do not, so
+ * a settlement can always be recorded.
+ */
+export function tenderHoldsOpenSlot(status: PaymentStatus): boolean {
+  return status === "requires_action" || status === "pending";
+}
+
 /** Tender statuses that free the one-live-tender slot. */
 export function tenderFreesSlot(status: PaymentStatus): boolean {
   return status === "canceled" || status === "failed";

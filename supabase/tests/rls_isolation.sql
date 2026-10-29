@@ -556,6 +556,74 @@ insert into public.audit_log (actor_user_id, actor_label, action, tenant_id, det
   ('00000000-0000-0000-0000-000000000000', 'system', 'payment_refund', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't'),
   ('00000000-0000-0000-0000-000000000000', 'system', 'payment_void', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 't');
 
+-- 21) Late-payment / idempotency migration (20261101000300): settled tenders do not
+--     hold the open-tender slot, one delivery per order, and the atomic
+--     fulfillment RPCs (claim is exclusive).
+do $$
+declare blocked boolean := false; n int; claimed int;
+begin
+  -- captured + a new open card tender is allowed; two OPEN ones are not.
+  insert into public.payments
+    (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+  values
+    ('0aea0003-0000-0000-0000-000000000001', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'crypto_coinbase', 'captured', 1099, 'USD'),
+    ('0aea0003-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'crypto_coinbase', 'pending', 1099, 'USD');
+  begin
+    insert into public.payments
+      (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+    values
+      ('0aea0003-0000-0000-0000-000000000003', '0ada0002-0000-0000-0000-000000000001',
+       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+       'crypto_coinbase', 'pending', 1099, 'USD');
+  exception when unique_violation then blocked := true; end;
+  assert blocked, 'two OPEN coinbase tenders on one order must be refused';
+
+  select count(*) into n from pg_indexes
+   where indexname = 'deliveries_order_id_uidx';
+  assert n = 1, 'one delivery per order index must exist';
+
+  -- Atomic fulfillment helpers.
+  update public.orders
+     set fulfillment = '{"type":"pickup","late_payment":{"payment_id":"p","amount_cents":5,"flagged_at":"x"}}'::jsonb
+   where id = '0ada0002-0000-0000-0000-000000000001';
+  select count(*) into claimed from public.claim_late_payment(
+    '0ada0002-0000-0000-0000-000000000001', 'refunding', now() - interval '10 minutes');
+  assert claimed = 1, 'first claim must win';
+  select count(*) into claimed from public.claim_late_payment(
+    '0ada0002-0000-0000-0000-000000000001', 'accepting', now() - interval '10 minutes');
+  assert claimed = 0, 'a second concurrent claim must lose';
+  perform public.update_late_payment('0ada0002-0000-0000-0000-000000000001',
+    '{"resolved":"refund_owed_manual","claim":null,"claim_at":null}'::jsonb);
+  assert (select fulfillment -> 'late_payment' ->> 'claim' from public.orders
+           where id = '0ada0002-0000-0000-0000-000000000001') is null,
+    'releasing the claim removes it';
+  select count(*) into claimed from public.claim_late_payment(
+    '0ada0002-0000-0000-0000-000000000001', 'marking_refunded', now() - interval '10 minutes');
+  assert claimed = 1, 'a refund-owed item can be claimed again (mark refunded)';
+  perform public.merge_order_fulfillment('0ada0002-0000-0000-0000-000000000001',
+    '{"finalized_at":"t"}'::jsonb);
+  assert (select fulfillment ->> 'finalized_at' from public.orders
+           where id = '0ada0002-0000-0000-0000-000000000001') = 't', 'merge sets a key';
+  assert (select fulfillment -> 'late_payment' ->> 'amount_cents' from public.orders
+           where id = '0ada0002-0000-0000-0000-000000000001') = '5', 'merge keeps other keys';
+end $$;
+
+-- ...and they are server-only.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare blocked boolean := false;
+begin
+  begin
+    perform public.claim_late_payment('0ada0002-0000-0000-0000-000000000001', 'accepting', now());
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT be able to call claim_late_payment';
+end $$;
+reset role;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;

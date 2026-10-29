@@ -9,6 +9,7 @@
 import type {
   CreateOrderInput,
   Menu,
+  LatePaymentMarker,
   Order,
   OrderFulfillment,
   OrderStatus,
@@ -268,6 +269,12 @@ export interface PosDriver {
       limit?: number;
       after?: { created_at: string; id: string };
       checkoutMode?: "live" | "test" | "sim";
+      /**
+       * Instead: orders stamped with a mode OTHER than this one that have not been
+       * alerted on yet (`foreign_alerted_at` unset). For the long-grace pass that
+       * keeps a mode flip from stranding orders.
+       */
+      foreignOf?: "live" | "test" | "sim";
     },
   ): Promise<Order[]>;
 
@@ -278,6 +285,40 @@ export interface PosDriver {
    */
   listUnfinalizedPaidOrders(
     paidBefore: string,
+    limit?: number,
+    /** Orders whose `recovery_next_at` is later than this are backing off and skipped. */
+    nowIso?: string,
+  ): Promise<Order[]>;
+
+  /**
+   * Atomically claim an unresolved (or refund-owed) late-payment marker for one
+   * actor: sets `late_payment.claim` only if no live claim exists (a claim older
+   * than `staleBeforeIso` is treated as abandoned). Returns the order, or null if
+   * someone else holds it / there is nothing to claim.
+   */
+  claimLatePayment(
+    orderId: string,
+    claim: "accepting" | "refunding" | "marking_refunded",
+    staleBeforeIso: string,
+  ): Promise<Order | null>;
+
+  /**
+   * Atomic nested merge into `fulfillment.late_payment` (null removes a key).
+   * Returns null when the order has no marker.
+   */
+  updateLatePayment(
+    orderId: string,
+    patch: Partial<Record<keyof LatePaymentMarker, unknown>>,
+  ): Promise<Order | null>;
+
+  /**
+   * Orders at a location whose late-payment marker is still open (unresolved or
+   * refund owed), newest first, capped by `limit`. A dedicated query, not a scan
+   * of every order.
+   */
+  listOpenLatePayments(
+    tenantId: string,
+    locationId: string,
     limit?: number,
   ): Promise<Order[]>;
 

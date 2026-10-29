@@ -101,7 +101,7 @@ export async function POST(request: Request) {
         { status: 404 },
       );
     }
-    const { replayed, refundedNowCents, ...payment } = result;
+    const { replayed, refundedNowCents, manualRefund, ...payment } = result;
     const order = await driver.getOrder(payment.order_id);
     const balance = order ? await getOrderBalance(order) : 0;
 
@@ -114,7 +114,7 @@ export async function POST(request: Request) {
         actor: { id: auth.user.id, label: auth.user.email },
         action: fullyRefunded ? "payment_void" : "payment_refund",
         tenantId: payment.tenant_id,
-        detail: `Refunded ${refundedNowCents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
+        detail: `${manualRefund ? "Recorded a MANUAL refund of" : "Refunded"} ${refundedNowCents}¢ on payment ${payment.id} (order ${payment.order_id})${manualRefund ? " -- no money was sent; return it by hand" : ""}${b.reason ? ` — ${b.reason}` : ""}.`,
       });
     }
 
@@ -122,6 +122,12 @@ export async function POST(request: Request) {
       payment: publicTender(payment),
       balanceCents: balance,
       orderStatus: order?.status,
+      // Crypto refunds only record the intent: the money was NOT sent.
+      manualRefund: manualRefund === true,
+      note:
+        manualRefund === true
+          ? "Refund recorded, but no money was sent. Return the funds to the customer manually from your wallet / Coinbase account."
+          : undefined,
     });
   } catch (err) {
     if (err instanceof RefundExceedsError) {
