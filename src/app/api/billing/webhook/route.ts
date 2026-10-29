@@ -42,8 +42,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid payload." }, { status: 400 });
   }
 
-  // The ONLY place a real subscription's tier/status is written.
-  await applyBillingEvent(event);
+  // The ONLY place a real subscription's tier/status is written. It re-fetches
+  // the subscription from Stripe; on failure answer 5xx so Stripe retries.
+  try {
+    await applyBillingEvent(event);
+  } catch {
+    return NextResponse.json({ error: "Could not apply event." }, { status: 500 });
+  }
 
   return NextResponse.json({ received: true });
 }
