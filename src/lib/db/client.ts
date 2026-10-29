@@ -14,6 +14,7 @@
 import type { PosDriver } from "./driver";
 import { mockDriver } from "./mock";
 import { createSupabaseDriver, readSupabaseConfig } from "./supabase";
+import { withOutbox } from "@/lib/core/mock-events";
 
 export interface DbClientConfig {
   url: string;
@@ -72,11 +73,18 @@ let cachedDriver: PosDriver | null = null;
 export function getPosDriver(): PosDriver {
   if (cachedDriver) return cachedDriver;
   const config = readSupabaseConfig();
-  cachedDriver = config ? createSupabaseDriver(config) : mockDriver;
+  // Mock: wrap with the in-memory outbox emitter (Postgres uses triggers).
+  cachedDriver = config ? createSupabaseDriver(config) : mockOutboxDriver();
   return cachedDriver;
 }
 
 /** Test/HMR helper to clear the memoized driver. */
 export function resetPosDriver(): void {
   cachedDriver = null;
+}
+
+let mockWrapped: PosDriver | null = null;
+function mockOutboxDriver(): PosDriver {
+  mockWrapped ??= withOutbox(mockDriver);
+  return mockWrapped;
 }

@@ -159,7 +159,7 @@ export function AdminShell({
       { id: "menu", label: "Menu", icon: LayoutGrid },
       { id: "inventory", label: "Inventory", icon: Boxes },
       { id: "reports", label: "Reports", icon: BarChart3 },
-      { id: "staff", label: "Staff & shifts", icon: Users },
+      { id: "staff", label: "Staff & drawer", icon: Users },
       { id: "eod", label: "End of day", icon: Receipt },
       { id: "locations", label: "Locations", icon: MapPin },
       { id: "plan", label: "Plan", icon: Wallet },

@@ -1,5 +1,5 @@
 /**
- * Staff & shifts — /api/admin/staff (Phase 5).
+ * Staff & cash drawer — /api/admin/staff (Phase 5).
  *
  * GET  ?tenantId=&locationId=  → staff list + each member's open shift (if any)
  *      + recent shifts for the location.
@@ -86,7 +86,7 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
-  // Any operational member of the tenant may clock in/out + record drawer events.
+  // Any operational member of the tenant may open/close a drawer + record drawer events.
   if (!body.tenantId) {
     return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
   }

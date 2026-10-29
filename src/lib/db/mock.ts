@@ -71,6 +71,7 @@ import type {
   Membership,
   PlatformAdmin,
   Tenant,
+  TenantSettings,
   User,
 } from "./types";
 import type {
@@ -206,6 +207,9 @@ const businessDayCloses = new Map<string, BusinessDayClose>();
 
 /** Process-lifetime order store, keyed by client UUID for idempotent upsert. */
 const orders = new Map<string, Order>();
+
+/** Per-tenant POS settings (core v1). Absent = defaults. */
+const tenantSettings = new Map<string, TenantSettings>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
 /** Refund requests keyed by client refund id (idempotency key). */
@@ -219,16 +223,18 @@ const magicLinks = new Map<string, MagicLinkToken>();
 /** Deliveries keyed by id. */
 const deliveries = new Map<string, DeliveryRecord>();
 let orderSeq = 0;
-let idSeq = 0;
 
 function nowIso(): string {
   return new Date().toISOString();
 }
 
-/** Deterministic-enough unique id for mock-created rows. */
-function genId(prefix: string): string {
-  idSeq += 1;
-  return `${prefix}-${Date.now().toString(36)}-${idSeq}`;
+/**
+ * Unique id for mock-created rows. A real UUID (like the Supabase driver's
+ * `genUuid`) so mock data also satisfies the core contract's id format; the
+ * prefix is kept only as a readability hint in the signature.
+ */
+function genId(_prefix: string): string {
+  return globalThis.crypto.randomUUID();
 }
 
 /** Slugify a name into a URL-safe slug, made unique against `existing`. */
@@ -405,6 +411,10 @@ function resolveLocationInventory(
 }
 
 function depleteForOrder(order: Order): void {
+  // Back-of-house owns inventory for this tenant: POS must not deplete.
+  if (tenantSettings.get(order.tenant_id)?.inventory_owner === "backofhouse") {
+    return;
+  }
   // Aggregate consumption per resolved inventory row id.
   const consumption = new Map<string, number>();
 
@@ -891,13 +901,19 @@ export const mockDriver: PosDriver = {
       customer_id: input.customer_id ?? null,
       staff_id: input.staff_id ?? null,
       fulfillment: input.fulfillment,
+      source: input.source,
+      hold: input.hold ?? null,
+      version: 1,
       created_at: now,
       updated_at: now,
     };
     orders.set(order.id, order);
     // Phase 5: deplete linked inventory on the single order funnel (terminal +
-    // shop both land here), unless the order was created already voided.
-    if (order.status !== "voided") depleteForOrder(order);
+    // shop both land here), unless the order was created already voided. Held
+    // (draft) orders deplete when they are released.
+    if (order.status !== "voided" && order.status !== "draft") {
+      depleteForOrder(order);
+    }
     return order;
   },
 
@@ -920,8 +936,16 @@ export const mockDriver: PosDriver = {
     ensureKitchenSeed();
     const order = orders.get(id);
     if (!order) return null;
-    const updated: Order = { ...order, status, updated_at: nowIso() };
+    const leavingHold = order.status === "draft" && status !== "draft";
+    const updated: Order = {
+      ...order,
+      status,
+      hold: leavingHold ? null : (order.hold ?? null),
+      version: (order.version ?? 1) + 1,
+      updated_at: nowIso(),
+    };
     orders.set(id, updated);
+    if (leavingHold && status !== "voided") depleteForOrder(updated);
     return updated;
   },
 
@@ -1133,6 +1157,36 @@ export const mockDriver: PosDriver = {
 
   async getCustomer(id: string): Promise<Customer | null> {
     return customers.get(id) ?? null;
+  },
+
+  async listCustomers(tenantId: string): Promise<Customer[]> {
+    return [...customers.values()]
+      .filter((c) => c.tenant_id === tenantId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .map((c) => ({ ...c }));
+  },
+
+  async getTenantSettings(tenantId: string): Promise<TenantSettings> {
+    return (
+      tenantSettings.get(tenantId) ?? {
+        tenant_id: tenantId,
+        inventory_owner: "pos_basic",
+        updated_at: new Date(0).toISOString(),
+      }
+    );
+  },
+
+  async setTenantSettings(tenantId, patch): Promise<TenantSettings> {
+    const current = await this.getTenantSettings(tenantId);
+    const next: TenantSettings = {
+      ...current,
+      ...(patch.inventory_owner
+        ? { inventory_owner: patch.inventory_owner }
+        : {}),
+      updated_at: nowIso(),
+    };
+    tenantSettings.set(tenantId, next);
+    return next;
   },
 
   async upsertCustomer(customer: Customer): Promise<Customer> {

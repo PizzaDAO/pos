@@ -58,6 +58,7 @@ import type {
   Membership,
   PlatformAdmin,
   Tenant,
+  TenantSettings,
   User,
 } from "./types";
 import type {
@@ -335,6 +336,20 @@ export interface PosDriver {
   /** Fetch a single customer by id, or null. */
   getCustomer(id: string): Promise<Customer | null>;
 
+  /** All of a tenant's customers (newest first) — the core `/v1/customers` feed. */
+  listCustomers(tenantId: string): Promise<Customer[]>;
+
+  // -- Per-tenant POS settings (core v1) ---------------------------------------
+
+  /** Tenant POS settings (defaults when no row: inventory_owner = pos_basic). */
+  getTenantSettings(tenantId: string): Promise<TenantSettings>;
+
+  /** Upsert tenant POS settings (e.g. hand inventory to backofhouse). */
+  setTenantSettings(
+    tenantId: string,
+    patch: Partial<Pick<TenantSettings, "inventory_owner">>,
+  ): Promise<TenantSettings>;
+
   /**
    * Upsert a customer. Re-using an id merges mutable fields; a new id with an
    * email that already exists for the tenant returns the existing row (so guest
@@ -492,7 +507,8 @@ export interface PosDriver {
   ): Promise<BusinessDayClose>;
 
   // --------------------------------------------------------------------------
-  // Staff & shifts (clock in/out + drawer reconciliation).
+  // Staff & cash-drawer sessions (open/close drawer + reconciliation; the
+  // time clock belongs to workforce).
   // --------------------------------------------------------------------------
 
   listStaff(tenantId: string): Promise<Staff[]>;
@@ -518,7 +534,7 @@ export interface PosDriver {
     staffId: string,
   ): Promise<Shift | null>;
 
-  /** Clock in: open a shift with an opening float. */
+  /** Open a drawer: start a cash session with an opening float. */
   openShift(input: {
     tenantId: string;
     locationId: string;
@@ -536,7 +552,7 @@ export interface PosDriver {
   getDrawerReconciliation(shiftId: string): Promise<DrawerReconciliation>;
 
   /**
-   * Clock out + reconcile: closes the shift, records the counted drawer, and
+   * Close the drawer + reconcile: closes the session, records the counted drawer, and
    * computes over/short. Returns the closed shift.
    */
   closeShift(input: {

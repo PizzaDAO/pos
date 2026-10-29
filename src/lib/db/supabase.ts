@@ -69,7 +69,14 @@ import type {
   SizeInput,
   Staff,
 } from "./backoffice-types";
-import type { Location, Membership, Tenant, User } from "./types";
+import type {
+  InventoryOwner,
+  Location,
+  Membership,
+  Tenant,
+  TenantSettings,
+  User,
+} from "./types";
 import type {
   AuditLogEntry,
   OnboardingStep,
@@ -153,7 +160,23 @@ function mapLocation(r: Row): Location {
     slug: r.slug as string,
     timezone: r.timezone as string,
     address: (r.address as string | null) ?? null,
+    address_line1: (r.address_line1 as string | null) ?? null,
+    address_line2: (r.address_line2 as string | null) ?? null,
+    city: (r.city as string | null) ?? null,
+    region: (r.region as string | null) ?? null,
+    postal_code: (r.postal_code as string | null) ?? null,
+    country: (r.country as string | null) ?? null,
+    lat: (r.lat as number | null) ?? null,
+    lng: (r.lng as number | null) ?? null,
     created_at: r.created_at as string,
+  };
+}
+
+function mapTenantSettings(r: Row): TenantSettings {
+  return {
+    tenant_id: r.tenant_id as string,
+    inventory_owner: (r.inventory_owner as InventoryOwner) ?? "pos_basic",
+    updated_at: r.updated_at as string,
   };
 }
 
@@ -205,6 +228,9 @@ function mapOrder(r: Row, items: OrderItem[]): Order {
     customer_id: (r.customer_id as string | null) ?? null,
     staff_id: (r.staff_id as string | null) ?? null,
     fulfillment: (r.fulfillment as Order["fulfillment"]) ?? undefined,
+    source: (r.source as Order["source"] | null) ?? undefined,
+    hold: (r.hold as Order["hold"] | null) ?? null,
+    version: (r.version as number | null) ?? 1,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -290,6 +316,8 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
     pin_hash: opts?.includePin
       ? ((r.pin_hash as string | null) ?? null)
       : undefined,
+    user_id: (r.user_id as string | null) ?? null,
+    location_ids: (r.location_ids as string[] | null) ?? [],
     created_at: r.created_at as string,
   };
 }
@@ -736,6 +764,15 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
   }
 
   async function depleteForOrder(order: Order): Promise<void> {
+    // Back-of-house owns inventory for this tenant: POS must not deplete.
+    const settingsRow = unwrap(
+      await sb
+        .from("tenant_settings")
+        .select("*")
+        .eq("tenant_id", order.tenant_id)
+        .maybeSingle(),
+    ) as Row | null;
+    if (settingsRow && settingsRow.inventory_owner === "backofhouse") return;
     const links = (
       unwrap(
         await sb
@@ -1390,6 +1427,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             customer_id: input.customer_id ?? null,
             staff_id: input.staff_id ?? null,
             fulfillment: input.fulfillment ?? null,
+            source: input.source ?? null,
+            hold: input.hold ?? null,
             created_at: now,
             updated_at: now,
           })
@@ -1398,7 +1437,10 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       ) as Row;
       await writeOrderItems(input.id, input.items);
       const order = await readOrderRow(orderRow);
-      if (order.status !== "voided") await depleteForOrder(order);
+      // Held (draft) orders deplete when released (updateOrderStatus).
+      if (order.status !== "voided" && order.status !== "draft") {
+        await depleteForOrder(order);
+      }
       return order;
     },
 
@@ -1422,15 +1464,26 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async updateOrderStatus(id, status) {
+      const before = unwrap(
+        await sb.from("orders").select("status").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      const leavingHold = before?.status === "draft" && status !== "draft";
       const r = unwrap(
         await sb
           .from("orders")
-          .update({ status, updated_at: nowIso() })
+          .update({
+            status,
+            updated_at: nowIso(),
+            ...(leavingHold ? { hold: null } : {}),
+          })
           .eq("id", id)
           .select()
           .maybeSingle(),
       ) as Row | null;
-      return r ? readOrderRow(r) : null;
+      if (!r) return null;
+      const order = await readOrderRow(r);
+      if (leavingHold && status !== "voided") await depleteForOrder(order);
+      return order;
     },
 
     // -- Payments ----------------------------------------------------------
@@ -1636,6 +1689,51 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         await sb.from("customers").select("*").eq("id", id).maybeSingle(),
       ) as Row | null;
       return r ? mapCustomer(r) : null;
+    },
+
+    async listCustomers(tenantId) {
+      return (
+        unwrap(
+          await sb
+            .from("customers")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .order("created_at", { ascending: false }),
+        ) as Row[]
+      ).map(mapCustomer);
+    },
+
+    async getTenantSettings(tenantId) {
+      const r = unwrap(
+        await sb
+          .from("tenant_settings")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      if (r) return mapTenantSettings(r);
+      return {
+        tenant_id: tenantId,
+        inventory_owner: "pos_basic",
+        updated_at: new Date(0).toISOString(),
+      };
+    },
+
+    async setTenantSettings(tenantId, patch) {
+      const current = await this.getTenantSettings(tenantId);
+      return mapTenantSettings(
+        unwrap(
+          await sb
+            .from("tenant_settings")
+            .upsert({
+              tenant_id: tenantId,
+              inventory_owner: patch.inventory_owner ?? current.inventory_owner,
+              updated_at: nowIso(),
+            })
+            .select()
+            .single(),
+        ) as Row,
+      );
     },
 
     async upsertCustomer(customer) {
