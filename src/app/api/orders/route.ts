@@ -12,7 +12,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
 import {
   captureError,
@@ -66,7 +66,12 @@ export async function POST(request: Request) {
   // In-store terminal orders are placed by a signed-in device user who must be a
   // member of the order's tenant. (Customer/online orders go through the public
   // /api/shop/orders route instead.)
-  const auth = await requireTenantMember(body.tenant_id);
+  // Only till roles create orders (the kitchen display never does).
+  const auth = await requireTenantRole(body.tenant_id, [
+    "owner",
+    "manager",
+    "cashier",
+  ]);
   if (!auth.ok) return auth.res;
 
   try {
@@ -104,6 +109,9 @@ export async function GET(request: Request) {
       { status: 400 },
     );
   }
+  // Order lists carry customer details: tenant members only.
+  const auth = await requireTenantMember(tenantId);
+  if (!auth.ok) return auth.res;
   const driver = getPosDriver();
   const orders = await driver.listOrders(tenantId, locationId);
   return NextResponse.json({ orders });

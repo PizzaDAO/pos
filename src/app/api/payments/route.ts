@@ -6,14 +6,19 @@
  * than charging again. Resolves the tenant's Connect account for card rails,
  * computes the platform application fee, calls the rail (real when keys are
  * present, simulated otherwise), persists the payment, and marks the order
- * `paid` once the balance reaches zero.
+ * `paid` once the balance reaches zero. For ONLINE orders (`online_*` channel)
+ * the amount and tip are derived from the order, never the client body, and the
+ * Stripe `clientSecret` is returned in this response only (not stored).
  *
  * GET /api/payments?orderId= — list tenders + remaining balance for an order.
+ * Tenant members only; tenders are returned without rail internals.
  *
  * No env vars are required; with none, rails settle via the simulated path.
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
+import { publicTender } from "@/lib/payments/public";
 import {
   CardPaymentsNotReadyError,
   resolveCardConnectAccountId,
@@ -21,9 +26,16 @@ import {
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
   PaymentConflictError,
-  takePayment,
+  takePaymentDetailed,
+  deriveOnlineTender,
+  cancelOpenOnlineIntents,
+  freshClientSecret,
   getOrderBalance,
 } from "@/lib/payments/service";
+import {
+  isOnlineOrderRail,
+  onlineRailAvailable,
+} from "@/lib/payments/online-rails";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -96,8 +108,29 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
+  // The ORDER decides the currency, never the client: a body naming another
+  // currency is rejected (a $25 USD order must not be payable as 2,500 KRW).
+  if (body.currency.toUpperCase() !== order.currency.toUpperCase()) {
+    return NextResponse.json(
+      { error: "currency does not match the order." },
+      { status: 400 },
+    );
+  }
   const tenantId = order.tenant_id;
   const locationId = order.location_id;
+
+  // IN-STORE orders are taken at the till: every rail (cash, card, crypto) needs
+  // a signed-in owner/manager/cashier of the order's tenant. The terminal's
+  // Supabase session carries the device user's membership role (the staff PIN
+  // switch does not change it). Online orders stay anonymous for card/crypto.
+  if (order.channel === "in_store") {
+    const auth = await requireTenantRole(tenantId, [
+      "owner",
+      "manager",
+      "cashier",
+    ]);
+    if (!auth.ok) return auth.res;
+  }
 
   // Idempotent retry: return the existing tender BEFORE the card gate, so a
   // retry after a successful charge is never turned into a refusal.
@@ -111,9 +144,15 @@ export async function POST(request: Request) {
         );
       }
       const current = await driver.getOrder(order.id);
+      // A stripe_online tender still awaiting the customer gets a fresh secret
+      // from Stripe (this response only; never stored).
+      const clientSecret = await freshClientSecret(existing);
       return NextResponse.json(
         {
-          payment: existing,
+          payment: publicTender(
+            (await driver.getPayment(existing.id)) ?? existing,
+          ),
+          clientSecret,
           balanceCents: current ? await getOrderBalance(current) : 0,
           orderStatus: current?.status,
         },
@@ -124,6 +163,55 @@ export async function POST(request: Request) {
     // Fall through: takePayment repeats the idempotency check.
   }
 
+  // ONLINE orders: the server decides what is owed. The client's amountCents /
+  // tipCents are ignored (the order total already includes the customer's tip,
+  // which rides on the tender's tip, so trusting the body double-charges it).
+  let amountCents = body.amountCents;
+  let tipCents = body.tipCents ?? 0;
+  const isOnline = order.channel !== "in_store";
+  if (isOnline) {
+    if (!isOnlineOrderRail(body.rail)) {
+      return NextResponse.json(
+        { error: "That payment method is not available for online orders." },
+        { status: 422 },
+      );
+    }
+    // An anonymous caller can never settle an online order with cash: it takes
+    // a till role, exactly like an in-store tender.
+    if (body.rail === "cash") {
+      const auth = await requireTenantRole(tenantId, [
+        "owner",
+        "manager",
+        "cashier",
+      ]);
+      if (!auth.ok) return auth.res;
+    } else if (!onlineRailAvailable(body.rail)) {
+      // An unconfigured crypto rail would simulate and auto-confirm: no money.
+      return NextResponse.json(
+        { error: "That payment method is not available right now." },
+        { status: 409 },
+      );
+    }
+    // Never leave two live intents open for one order.
+    if (body.rail === "stripe_online") {
+      try {
+        await cancelOpenOnlineIntents(order.id, body.paymentId);
+      } catch (err) {
+        return NextResponse.json(
+          { error: err instanceof Error ? err.message : "Payment failed." },
+          { status: 502 },
+        );
+      }
+    }
+    ({ amountCents, tipCents } = await deriveOnlineTender(order));
+    if (amountCents <= 0) {
+      return NextResponse.json(
+        { error: "This order has nothing left to pay." },
+        { status: 409 },
+      );
+    }
+  }
+
   // Resolve the connected account for card rails (simulated when no Stripe key).
   // In real mode a tenant without a charges-enabled account is refused (409).
   try {
@@ -131,15 +219,15 @@ export async function POST(request: Request) {
     if (body.rail === "stripe_terminal" || body.rail === "stripe_online") {
       connectAccountId = await resolveCardConnectAccountId(tenantId);
     }
-    const payment = await takePayment({
+    const { payment, clientSecret } = await takePaymentDetailed({
       paymentId: body.paymentId,
       orderId: body.orderId,
       tenantId,
       locationId,
       rail: body.rail,
-      amountCents: body.amountCents,
-      tipCents: body.tipCents ?? 0,
-      currency: body.currency,
+      amountCents,
+      tipCents,
+      currency: order.currency,
       connectAccountId,
       cashTenderedCents: body.cashTenderedCents,
       metadata: body.metadata,
@@ -148,7 +236,12 @@ export async function POST(request: Request) {
     const refreshed = await driver.getOrder(body.orderId);
     const balance = refreshed ? await getOrderBalance(refreshed) : 0;
     return NextResponse.json(
-      { payment, balanceCents: balance, orderStatus: refreshed?.status },
+      {
+        payment: publicTender(payment),
+        clientSecret,
+        balanceCents: balance,
+        orderStatus: refreshed?.status,
+      },
       { status: 201 },
     );
   } catch (err) {
@@ -179,11 +272,14 @@ export async function GET(request: Request) {
   if (!order) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
+  // Tenders + totals are staff-only: authorize against the ORDER's tenant.
+  const auth = await requireTenantMember(order.tenant_id);
+  if (!auth.ok) return auth.res;
   const payments = await driver.listPaymentsForOrder(orderId);
   const balance = await getOrderBalance(order);
   return NextResponse.json({
     order,
-    payments,
+    payments: payments.map(publicTender),
     balanceCents: balance,
     orderStatus: order.status,
   });

@@ -13,13 +13,23 @@
  *    unset — the same `isStripeConfigured()` check every rail uses to decide to
  *    simulate), even on the live Supabase driver, so a half-wired production never
  *    looks like it is taking real money.
- *  - In training mode, payment rails run simulated and orders are seed/disposable
- *    — exactly the current zero-env behaviour, now nameable + assertable.
+ *  - When training is on because of the `TRAINING_MODE` flag or the mock driver,
+ *    CARD rails run simulated WHATEVER Stripe key is set (see
+ *    `cardRailsSimulated()` in payments/env), so the banner never lies about
+ *    real money. Orders are seed/disposable.
+ *  - Exception, `stripe-test`: a `sk_test_` key on a live driver with no flag is
+ *    shown as "Stripe test mode, no real money" and card rails DO call Stripe's
+ *    test mode (so test-mode Stripe is exercised for real).
  *
  * Lazy env read, no throw on unset, safe to import anywhere.
  */
 import { getPosDriver } from "@/lib/db";
-import { isStripeConfigured } from "@/lib/payments/env";
+import {
+  cardRailsSimulated,
+  isStripeConfigured,
+  isStripeTestKey,
+  isTrainingFlagSet,
+} from "@/lib/payments/env";
 
 /** Banner copy: mock driver or explicit `TRAINING_MODE` (nothing is real). */
 export const TRAINING_BANNER =
@@ -32,28 +42,33 @@ export const TRAINING_BANNER =
 export const TRAINING_BANNER_STRIPE =
   "TRAINING MODE — card payments are simulated (Stripe not configured)";
 
-/** Why training mode is on (null when off). */
-export type TrainingReason = "flag" | "mock" | "stripe-unset" | null;
+/**
+ * Banner copy when Stripe is in TEST mode (a `sk_test_` key, no flag, live
+ * driver): card payments are real Stripe test-mode calls, but no real money moves.
+ */
+export const TRAINING_BANNER_STRIPE_TEST =
+  "TRAINING \u2014 Stripe test mode, no real money";
+
+/** Why training mode is on (null when off). Precedence: flag > mock > stripe-unset > stripe-test. */
+export type TrainingReason =
+  | "flag"
+  | "mock"
+  | "stripe-unset"
+  | "stripe-test"
+  | null;
 
 /** True when `TRAINING_MODE` is explicitly enabled via env. */
 export function isTrainingModeEnv(): boolean {
-  const v = (process.env.TRAINING_MODE ?? "").toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return isTrainingFlagSet();
 }
 
 /**
- * Whether the running environment is in training/demo mode. True when either the
- * `TRAINING_MODE` env flag is set, the active data driver is the mock/seed
- * driver (no live DB), OR payments would be simulated (no Stripe secret key).
+ * Whether the running environment is in training/demo mode: the `TRAINING_MODE`
+ * flag, the mock/seed driver (no live DB), no Stripe secret key, or a Stripe
+ * TEST-mode key.
  */
 export function isTrainingMode(): boolean {
-  if (isTrainingModeEnv()) return true;
-  if (!isStripeConfigured()) return true;
-  try {
-    return getPosDriver().name === "mock";
-  } catch {
-    return false;
-  }
+  return demoModeInfo().trainingMode;
 }
 
 export interface DemoModeInfo {
@@ -75,14 +90,16 @@ export function demoModeInfo(): DemoModeInfo {
   } catch {
     driver = "mock";
   }
-  const paymentsSimulated = !isStripeConfigured();
+  const paymentsSimulated = cardRailsSimulated();
   const reason: TrainingReason = isTrainingModeEnv()
     ? "flag"
     : driver === "mock"
       ? "mock"
-      : paymentsSimulated
+      : !isStripeConfigured()
         ? "stripe-unset"
-        : null;
+        : isStripeTestKey()
+          ? "stripe-test"
+          : null;
   return {
     trainingMode: reason !== null,
     driver,
@@ -93,6 +110,8 @@ export function demoModeInfo(): DemoModeInfo {
         ? null
         : reason === "stripe-unset"
           ? TRAINING_BANNER_STRIPE
-          : TRAINING_BANNER,
+          : reason === "stripe-test"
+            ? TRAINING_BANNER_STRIPE_TEST
+            : TRAINING_BANNER,
   };
 }

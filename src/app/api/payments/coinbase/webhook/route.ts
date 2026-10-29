@@ -16,7 +16,7 @@ import {
   verifyCoinbaseWebhook,
 } from "@/lib/payments/providers/coinbase-client";
 import { isCoinbaseConfigured } from "@/lib/payments/env";
-import { refreshPaymentStatus } from "@/lib/payments/service";
+import { applyRailStatus } from "@/lib/payments/service";
 
 export const runtime = "nodejs";
 
@@ -50,8 +50,8 @@ export async function POST(request: Request) {
   const driver = getPosDriver();
   const matched = await driver.getPaymentByChargeId(chargeId);
   if (matched) {
-    await driver.upsertPayment({ ...matched, status: mapped });
-    await refreshPaymentStatus(matched.id);
+    // Persist (never downgrading a captured tender) and re-evaluate the order.
+    await applyRailStatus(matched.id, mapped);
   }
 
   return NextResponse.json({ received: true });

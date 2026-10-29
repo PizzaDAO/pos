@@ -14,6 +14,33 @@ export function roundHalfUp(value: number): number {
   return Math.floor(value + 0.5);
 }
 
+/**
+ * Whether the platform returns its application fee on refunds (Stripe
+ * `refund_application_fee`). Default true on EVERY refund: Stripe returns the
+ * fee in proportion to the amount refunded (all of it on a full refund), so
+ * repeated partial refunds add up to the whole fee. Flip this single constant to
+ * keep the fee.
+ */
+export const REFUND_APPLICATION_FEE = true;
+
+/**
+ * Params for a Stripe refund on a DIRECT charge (the PaymentIntent lives on the
+ * connected account, so the refund is made with `Stripe-Account`). Note: no
+ * `reverse_transfer` -- that is only valid for destination charges.
+ */
+export function stripeRefundParams(req: {
+  chargeId: string;
+  amountCents?: number;
+  reason?: string;
+}): Record<string, unknown> {
+  return {
+    payment_intent: req.chargeId,
+    amount: req.amountCents,
+    reason: req.reason,
+    refund_application_fee: REFUND_APPLICATION_FEE ? true : undefined,
+  };
+}
+
 /** Card rails carry a per-order platform fee; cash + crypto do not (v1). */
 export function railChargesApplicationFee(
   rail: PaymentRailKey | "cash",

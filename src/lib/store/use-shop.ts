@@ -20,6 +20,8 @@ export interface ShopResponse {
   paymentSettings: PaymentSettings;
   /** False when card tender would be refused (tenant not Stripe-onboarded). */
   cardReady?: boolean;
+  /** Per-rail availability of crypto tender (false when not configured). */
+  cryptoReady?: Partial<Record<"crypto_onchain_usdc" | "crypto_coinbase", boolean>>;
   driver: string;
 }
 

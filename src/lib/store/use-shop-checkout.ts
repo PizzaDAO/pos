@@ -12,7 +12,7 @@
  */
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type {
   DeliveryAddress,
   Order,
@@ -20,6 +20,7 @@ import type {
   Payment,
 } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
+import { createPendingTenderIds, tenderSignature } from "./pending-tender";
 
 function newUuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -52,6 +53,7 @@ export interface PlaceOrderInput {
 export function useShopCheckout() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const pendingIds = useRef(createPendingTenderIds(newUuid));
 
   /** Price + gate a delivery address. Returns null + sets `error` on rejection. */
   const quoteDelivery = useCallback(
@@ -144,7 +146,15 @@ export function useShopCheckout() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            paymentId: newUuid(),
+            // Same id on retry of the same tender (lost response / double-tap).
+            paymentId: pendingIds.current.get(
+              tenderSignature({
+                orderId: input.order.id,
+                rail: input.rail,
+                amountCents: input.amountCents,
+                tipCents: input.tipCents,
+              }),
+            ),
             orderId: input.order.id,
             tenantId: input.order.tenant_id,
             locationId: input.order.location_id,
@@ -161,6 +171,7 @@ export function useShopCheckout() {
         if (!res.ok || !data.payment) {
           throw new Error(data.error ?? `HTTP ${res.status}`);
         }
+        pendingIds.current.clear();
         return data.payment;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Payment failed.");
@@ -172,5 +183,37 @@ export function useShopCheckout() {
     [],
   );
 
-  return { loading, error, setError, quoteDelivery, placeOrder, pay, newUuid };
+  /** Void a just-placed, unpaid order (customer declined a changed total). */
+  const cancelOrder = useCallback(async (orderId: string): Promise<boolean> => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/shop/orders/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(data.error ?? `HTTP ${res.status}`);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not cancel the order.");
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return {
+    loading,
+    error,
+    setError,
+    quoteDelivery,
+    placeOrder,
+    pay,
+    cancelOrder,
+    newUuid,
+  };
 }

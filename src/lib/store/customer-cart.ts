@@ -12,6 +12,7 @@
  */
 "use client";
 
+import { MAX_LINE_QUANTITY } from "@/lib/shop/reprice";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { OrderItem } from "@/lib/db";
@@ -28,6 +29,8 @@ export interface CustomerCartState {
   updateLine: (id: string, line: OrderItem) => void;
   setQuantity: (id: string, quantity: number) => void;
   removeLine: (id: string) => void;
+  /** Replace every line (e.g. with the server's repriced lines). */
+  replaceItems: (items: OrderItem[]) => void;
   subtotalCents: () => number;
   itemCount: () => number;
   clear: () => void;
@@ -60,13 +63,16 @@ export const useCustomerCart = create<CustomerCartState>()(
         set((state) => ({
           items: state.items.map((i) =>
             i.id === id
-              ? withLinePricing({ ...i, quantity: Math.max(1, quantity) })
+              ? withLinePricing({ ...i, quantity: Math.min(MAX_LINE_QUANTITY, Math.max(1, quantity)) })
               : i,
           ),
         })),
 
       removeLine: (id) =>
         set((state) => ({ items: state.items.filter((i) => i.id !== id) })),
+
+      replaceItems: (items) =>
+        set({ items: items.filter((i) => !i.voided).map(withLinePricing) }),
 
       subtotalCents: () => computeSubtotalCents(get().items),
 

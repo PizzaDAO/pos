@@ -9,6 +9,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isCardReady } from "@/lib/payments/connect";
+import { onlineRailAvailable } from "@/lib/payments/online-rails";
 
 export const runtime = "nodejs";
 
@@ -41,6 +42,12 @@ export async function GET(request: Request) {
       settings,
       paymentSettings,
       cardReady,
+      // Unconfigured crypto rails are hidden (they would simulate; the payments
+      // route refuses them unless the whole environment is a simulation).
+      cryptoReady: {
+        crypto_onchain_usdc: onlineRailAvailable("crypto_onchain_usdc"),
+        crypto_coinbase: onlineRailAvailable("crypto_coinbase"),
+      },
       driver: driver.name,
     },
     { headers: { "Cache-Control": "no-store" } },

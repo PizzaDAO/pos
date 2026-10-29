@@ -54,6 +54,7 @@ export async function GET(request: Request) {
       status: ready ? "ready" : "not_ready",
       checks,
       trainingMode: demo.trainingMode,
+      trainingReason: demo.reason,
       driver: demo.driver,
       paymentsSimulated: demo.paymentsSimulated,
       time: new Date().toISOString(),

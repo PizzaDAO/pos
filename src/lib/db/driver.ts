@@ -13,7 +13,12 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentSettings,
+  RefundReservation,
+} from "./payment-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -239,6 +244,27 @@ export interface PosDriver {
    * double-charge. Updating an existing tender (status/refund) merges fields.
    */
   upsertPayment(payment: Payment): Promise<Payment>;
+
+  /**
+   * ATOMICALLY reserve a refund on a tender: increment `refunded_cents`, append
+   * `refundId` to `refund_ids`, and flip status to `refunded` when fully refunded
+   * -- all in one step, refused when it would exceed amount + tip, the tender
+   * isn't refundable (captured/authorized only), or `refundId` was already
+   * applied (`duplicate`). `upsertPayment` never touches these fields on an
+   * existing tender, so concurrent refunds can't lose each other's updates.
+   */
+  reservePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string | null,
+  ): Promise<RefundReservation>;
+
+  /** Undo a reservation whose rail call failed. */
+  releasePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string | null,
+  ): Promise<void>;
 
   /** Fetch a single payment tender by id, or null. */
   getPayment(id: string): Promise<Payment | null>;

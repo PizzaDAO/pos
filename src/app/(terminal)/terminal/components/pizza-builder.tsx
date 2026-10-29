@@ -5,6 +5,7 @@
  */
 "use client";
 
+import { MAX_LINE_QUANTITY } from "@/lib/shop/reprice";
 import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import type { HalfPlacement, MenuItemDetail, OrderItem } from "@/lib/db";
@@ -119,17 +120,44 @@ export function PizzaBuilder({
   const preview = withLinePricing(previewLine);
 
   // ---- Validation: required single-select groups must be chosen -------------
-  const missingRequired = singleGroups
-    .filter((g) => g.min_select >= 1 && !single[g.id])
-    .map((g) => g.name);
+  // Server rules (see lib/shop/reprice.ts) the builder must never violate:
+  // half placements only on half-and-half-capable items, max_select per group.
+  const halfAllowed = item.is_half_and_half_capable;
+  const placementOptions = halfAllowed
+    ? PLACEMENTS
+    : PLACEMENTS.filter((p) => p.value === "whole");
+  const pickedIn = (g: (typeof halfGroups)[number]) =>
+    g.modifiers.filter((m) => toppings[m.id]).length;
+  const overMax = halfGroups.filter((g) => pickedIn(g) > g.max_select);
+  // min_select applies to multi-select (topping) groups too, as on the server.
+  const missingRequired = [
+    ...singleGroups
+      .filter((g) => g.min_select >= 1 && !single[g.id])
+      .map((g) => g.name),
+    ...halfGroups
+      .filter((g) => pickedIn(g) < g.min_select)
+      .map((g) => `${g.name} (at least ${g.min_select})`),
+  ];
   const needsSize = item.sizes.length > 0 && !sizeId;
-  const valid = missingRequired.length === 0 && !needsSize;
+  const valid =
+    missingRequired.length === 0 && !needsSize && overMax.length === 0;
 
-  function setToppingPlacement(modId: string, placement: HalfPlacement) {
+  function setToppingPlacement(
+    modId: string,
+    placement: HalfPlacement,
+    maxSelect: number,
+    groupModIds: string[],
+  ) {
     setToppings((prev) => {
       const next = { ...prev };
-      if (next[modId] === placement) delete next[modId];
-      else next[modId] = placement;
+      if (next[modId] === placement) {
+        delete next[modId];
+      } else {
+        // Adding a NEW topping beyond the group's max_select is refused.
+        const picked = groupModIds.filter((id) => next[id]).length;
+        if (!next[modId] && picked >= maxSelect) return prev;
+        next[modId] = placement;
+      }
       return next;
     });
   }
@@ -235,12 +263,15 @@ export function PizzaBuilder({
                 {g.name}
               </h3>
               <p className="mb-2 text-xs text-muted-foreground">
-                Place each topping on the Left half, Right half, or the Whole
-                pizza. Half placements are charged at half price.
+                {halfAllowed
+                  ? "Place each topping on the Left half, Right half, or the Whole pizza. Half placements are charged at half price."
+                  : "Choose the toppings for the whole pizza."}{" "}
+                {`Up to ${g.max_select}.`}
               </p>
               <div className="space-y-2">
                 {g.modifiers.map((m) => {
                   const placement = toppings[m.id];
+                  const atMax = !placement && pickedIn(g) >= g.max_select;
                   return (
                     <div
                       key={m.id}
@@ -259,14 +290,22 @@ export function PizzaBuilder({
                         </div>
                       </div>
                       <div className="flex shrink-0 overflow-hidden rounded-md border">
-                        {PLACEMENTS.map((p) => (
+                        {placementOptions.map((p) => (
                           <button
                             key={p.value}
                             type="button"
                             aria-pressed={placement === p.value}
-                            onClick={() => setToppingPlacement(m.id, p.value)}
+                            disabled={atMax}
+                            onClick={() =>
+                              setToppingPlacement(
+                                m.id,
+                                p.value,
+                                g.max_select,
+                                g.modifiers.map((x) => x.id),
+                              )
+                            }
                             className={cn(
-                              "min-w-[44px] px-2 py-2 text-xs font-medium transition-colors",
+                              "min-w-[44px] px-2 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
                               placement === p.value
                                 ? "bg-primary text-primary-foreground"
                                 : "bg-background hover:bg-accent",
@@ -303,7 +342,8 @@ export function PizzaBuilder({
               <Button
                 variant="outline"
                 size="icon"
-                onClick={() => setQty((q) => q + 1)}
+                onClick={() => setQty((q) => Math.min(MAX_LINE_QUANTITY, q + 1))}
+                disabled={qty >= MAX_LINE_QUANTITY}
                 aria-label="Increase quantity"
               >
                 +

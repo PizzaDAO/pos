@@ -417,6 +417,84 @@ begin
   assert dup, 'connect_accounts.account_id must be unique';
 end $$;
 
+-- 17) A signed-in CUSTOMER cannot insert an order (even their own, in a tenant
+--     where they are a customer): online orders are written server-side after
+--     repricing. A tenant member still can.
+select pg_temp.act_as('c0a00001-0000-0000-0000-000000000001');
+do $$
+declare blocked boolean := false;
+begin
+  begin
+    insert into public.orders
+      (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number, customer_id)
+    values
+      ('0ada7777-0000-0000-0000-000000000077', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+       'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'placed', 'online_pickup', 'USD', 0,
+       '{"total_cents":1}'::jsonb, 'CUSTHACK', 'c0a00001-0000-0000-0000-000000000001');
+  exception when others then
+    blocked := true;
+  end;
+  assert blocked, 'a signed-in customer must NOT be able to insert an order';
+end $$;
+reset role;
+
+do $$
+declare n int;
+begin
+  select count(*) into n from public.orders where order_number = 'CUSTHACK';
+  assert n = 0, format('Blocked customer order insert must leave no row, found %s', n);
+end $$;
+
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int;
+begin
+  insert into public.orders
+    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+  values
+    ('0ada7777-0000-0000-0000-000000000078', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+     'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'placed', 'in_store', 'USD', 0,
+     '{"total_cents":1}'::jsonb, 'MEMBEROK');
+  select count(*) into n from public.orders where order_number = 'MEMBEROK';
+  assert n = 1, 'a tenant member must still be able to insert an order';
+end $$;
+reset role;
+
+-- 18) Atomic refund RPCs (20261030000100): increment + id append + cap in one
+--     UPDATE. Fixture payment 0aea0001 is captured, 1099 cents.
+do $$
+declare out jsonb; pay public.payments;
+begin
+  out := public.reserve_payment_refund('0aea0001-0000-0000-0000-000000000001', 500, 'r1');
+  assert out->>'outcome' = 'ok', 'first refund must reserve';
+  out := public.reserve_payment_refund('0aea0001-0000-0000-0000-000000000001', 500, 'r1');
+  assert out->>'outcome' = 'duplicate', 'a replayed refund id must be a duplicate, not applied twice';
+  out := public.reserve_payment_refund('0aea0001-0000-0000-0000-000000000001', 600, 'r2');
+  assert out->>'outcome' = 'exceeds', 'an over-refund must be refused';
+  out := public.reserve_payment_refund('0aea0001-0000-0000-0000-000000000001', 599, 'r3');
+  assert out->>'outcome' = 'ok', 'the exact remainder must reserve';
+  select * into pay from public.payments where id = '0aea0001-0000-0000-0000-000000000001';
+  assert pay.refunded_cents = 1099, format('refunded_cents should be 1099, saw %s', pay.refunded_cents);
+  assert pay.status = 'refunded', 'a fully refunded tender must flip to refunded';
+  assert pay.refund_ids = array['r1', 'r3'], 'both applied refund ids are kept';
+  perform public.release_payment_refund('0aea0001-0000-0000-0000-000000000001', 599, 'r3');
+  select * into pay from public.payments where id = '0aea0001-0000-0000-0000-000000000001';
+  assert pay.refunded_cents = 500 and pay.status = 'captured' and pay.refund_ids = array['r1'],
+    'release must undo the reservation';
+end $$;
+
+-- ...and the RPCs are server-only: neither anon nor a signed-in user may call them.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare blocked boolean := false;
+begin
+  begin
+    perform public.reserve_payment_refund('0aea0001-0000-0000-0000-000000000001', 1, 'hack');
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT be able to call reserve_payment_refund';
+end $$;
+reset role;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;

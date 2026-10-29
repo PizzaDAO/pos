@@ -15,7 +15,12 @@
  */
 import type { ConnectAccount, ConnectStatus } from "@/lib/db/payment-types";
 import { getPosDriver } from "@/lib/db";
-import { getStripeConfig, isStripeConfigured } from "./env";
+import {
+  assertLiveKeyAllowed,
+  cardRailsSimulated,
+  getStripeConfig,
+  isStripeConfigured,
+} from "./env";
 import {
   effectiveConnectAccount,
   isSimulated,
@@ -63,6 +68,7 @@ export async function createConnectAccount(
   if (!isStripeConfigured()) {
     return { ...simulatedConnectAccount(tenantId), status: "pending", charges_enabled: false, payouts_enabled: false, details_submitted: false };
   }
+  assertLiveKeyAllowed();
   const acct = await stripeRequest<{
     id: string;
     charges_enabled?: boolean;
@@ -165,7 +171,11 @@ async function evaluateCardGate(
 ): Promise<CardGate> {
   const driver = getPosDriver();
   const stored = tenantId ? await driver.getConnectAccount(tenantId) : null;
-  if (isSimulated()) return { ok: true, accountId: stored?.account_id ?? null };
+  // Card CHARGE rails simulated (no key, or training mode): no gate, and never
+  // touch Stripe. A real stored account id is still returned as-is.
+  if (cardRailsSimulated()) {
+    return { ok: true, accountId: stored?.account_id ?? null };
+  }
   let account = effectiveConnectAccount(stored);
   if (!account) return { ok: false };
   // "throttled": refresh at most once per STALE_REFRESH_MS per tenant (the

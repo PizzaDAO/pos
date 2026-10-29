@@ -13,7 +13,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, Loader2, X } from "lucide-react";
-import type { DeliveryAddress } from "@/lib/db";
+import type { DeliveryAddress, Order } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -50,6 +50,7 @@ export function CheckoutFlow({
   const items = useCustomerCart((s) => s.items);
   const subtotalCents = useCustomerCart((s) => s.subtotalCents());
   const clearCart = useCustomerCart((s) => s.clear);
+  const replaceCartItems = useCustomerCart((s) => s.replaceItems);
 
   const { settings, paymentSettings, location } = shop;
   const currency = settings.currency;
@@ -85,12 +86,19 @@ export function CheckoutFlow({
   // after the order is already placed); default to the first available rail.
   const cardReady = shop.cardReady !== false;
   const availableRails = ONLINE_RAILS.filter(
-    (r) => cardReady || r.key !== "stripe_online",
+    (r) =>
+      (cardReady || r.key !== "stripe_online") &&
+      // Hide crypto rails the server reports as not configured.
+      (r.key !== "crypto_onchain_usdc" && r.key !== "crypto_coinbase"
+        ? true
+        : shop.cryptoReady?.[r.key] !== false),
   );
   const [rail, setRail] = useState<PaymentRailKey>(
     availableRails[0]?.key ?? "stripe_online",
   );
   const [tipCents, setTipCents] = useState(0);
+  // Set when the server's repriced total differs from the displayed total.
+  const [priceChange, setPriceChange] = useState<Order | null>(null);
   const [placedOrderId, setPlacedOrderId] = useState<string | null>(null);
   const [placedOrderNumber, setPlacedOrderNumber] = useState<string | null>(
     null,
@@ -149,15 +157,45 @@ export function CheckoutFlow({
       tipCents,
     });
     if (!placed) return;
+    // The server reprices from the menu. If its total differs from what the
+    // customer saw, STOP and let them confirm the new total before any charge.
+    if (placed.order.totals.total_cents !== grandTotal) {
+      setPriceChange(placed.order);
+      return;
+    }
+    await payPlacedOrder(placed.order);
+  }
+
+  /**
+   * The customer declined the changed total: void the placed order (so it does
+   * not sit on the KDS / get dispatched), then adopt the server's repriced lines
+   * and delivery fee so the next attempt matches and the prompt can't loop.
+   */
+  async function declinePriceChange(order: Order) {
+    if (!(await checkout.cancelOrder(order.id))) return;
+    replaceCartItems(order.items);
+    if (order.fulfillment?.type === "delivery") {
+      const fee = order.fulfillment.delivery_fee_cents ?? 0;
+      setQuote((q) => (q ? { ...q, feeCents: fee } : q));
+    }
+    setPriceChange(null);
+  }
+
+  async function payPlacedOrder(order: Order) {
+    // The order total already INCLUDES the tip, and the tender carries the tip
+    // separately, so base = total - tip (charging total + tip would double-count
+    // it). The server re-derives both from the order anyway.
+    const orderTip = order.totals.tip_cents;
     const pay = await checkout.pay({
-      order: placed.order,
+      order,
       rail,
-      amountCents: placed.order.totals.total_cents,
-      tipCents,
+      amountCents: order.totals.total_cents - orderTip,
+      tipCents: orderTip,
     });
     if (!pay) return;
-    setPlacedOrderId(placed.order.id);
-    setPlacedOrderNumber(placed.order.order_number);
+    setPlacedOrderId(order.id);
+    setPlacedOrderNumber(order.order_number);
+    setPriceChange(null);
     clearCart();
     setStep("done");
   }
@@ -488,6 +526,40 @@ export function CheckoutFlow({
                 </div>
               </section>
 
+              {priceChange && (
+                <div
+                  role="alert"
+                  data-testid="price-change"
+                  className="space-y-2 rounded-md border border-amber-500/60 bg-amber-500/10 p-3 text-sm"
+                >
+                  <p>
+                    Prices have changed since you built your cart. The new total
+                    is{" "}
+                    <strong>
+                      {formatMoney(priceChange.totals.total_cents, currency)}
+                    </strong>{" "}
+                    (was {formatMoney(grandTotal, currency)}).
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      className="flex-1"
+                      disabled={checkout.loading}
+                      onClick={() => void declinePriceChange(priceChange)}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      className="flex-1"
+                      disabled={checkout.loading}
+                      onClick={() => void payPlacedOrder(priceChange)}
+                    >
+                      {`Pay ${formatMoney(priceChange.totals.total_cents, currency)}`}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               <div className="flex gap-2">
                 <Button
                   variant="outline"
@@ -498,7 +570,7 @@ export function CheckoutFlow({
                 </Button>
                 <Button
                   className="flex-1"
-                  disabled={checkout.loading}
+                  disabled={checkout.loading || priceChange !== null}
                   onClick={handlePlaceAndPay}
                 >
                   {checkout.loading ? (

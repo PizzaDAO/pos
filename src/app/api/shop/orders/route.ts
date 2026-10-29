@@ -24,6 +24,8 @@ import {
   type OrderItem,
 } from "@/lib/db";
 import { computeOrderTotals } from "@/lib/pricing";
+import { RepriceError, repriceItems } from "@/lib/shop/reprice";
+import { enforceRateLimit, isMoneyCents } from "@/lib/security";
 import { ensureCustomer } from "@/lib/shop/auth";
 import {
   asapAvailability,
@@ -67,6 +69,10 @@ function isValid(body: unknown): body is ShopOrderBody {
 }
 
 export async function POST(request: Request) {
+  // Unauthenticated intake: rate-limit per IP to blunt order-spam.
+  const limited = enforceRateLimit(request, "orders");
+  if (limited) return limited;
+
   let body: unknown;
   try {
     body = await request.json();
@@ -118,9 +124,34 @@ export async function POST(request: Request) {
     );
   }
 
-  const activeItems = body.items.filter((i) => !i.voided);
+  // NEVER trust client prices: rebuild every line from the location's menu
+  // (86'd items excluded, per-location overrides applied).
+  let activeItems: OrderItem[];
+  try {
+    const menu = await driver.getMenu(tenantId, locationId);
+    activeItems = repriceItems(menu, body.items);
+  } catch (err) {
+    if (err instanceof RepriceError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
+    }
+    throw err;
+  }
   if (activeItems.length === 0) {
     return NextResponse.json({ error: "Cart is empty." }, { status: 422 });
+  }
+
+  // Tip: a non-negative integer, capped at 100% of the (repriced) subtotal.
+  const tipCents = body.tipCents ?? 0;
+  const itemsSubtotal = computeOrderTotals({
+    items: activeItems,
+    discountCents: 0,
+    taxRateBps: 0,
+  }).subtotal_cents;
+  if (!isMoneyCents(tipCents) || tipCents > itemsSubtotal) {
+    return NextResponse.json(
+      { error: "Invalid tip amount." },
+      { status: 422 },
+    );
   }
 
   // ---- Fulfillment-type gate ------------------------------------------------
@@ -236,7 +267,7 @@ export async function POST(request: Request) {
     items: activeItems,
     discountCents: 0,
     taxRateBps: settings.tax_rate_bps,
-    tipCents: body.tipCents ?? 0,
+    tipCents,
   });
   totals.total_cents += deliveryFeeCents;
 
@@ -261,7 +292,7 @@ export async function POST(request: Request) {
     channel:
       body.fulfillmentType === "delivery" ? "online_delivery" : "online_pickup",
     currency: settings.currency,
-    items: body.items,
+    items: activeItems,
     discount_cents: 0,
     totals,
     notes: body.notes?.trim() ? body.notes.trim() : null,

@@ -10,6 +10,7 @@ import { NextResponse } from "next/server";
 import { refreshPaymentStatus } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { getOrderBalance } from "@/lib/payments/service";
+import { publicTender } from "@/lib/payments/public";
 
 export const runtime = "nodejs";
 
@@ -30,7 +31,7 @@ export async function GET(request: Request) {
   const order = await driver.getOrder(payment.order_id);
   const balance = order ? await getOrderBalance(order) : 0;
   return NextResponse.json({
-    payment,
+    payment: publicTender(payment),
     balanceCents: balance,
     orderStatus: order?.status,
   });

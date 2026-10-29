@@ -11,21 +11,27 @@
  * double-tap, lost response) never creates a second charge.
  *
  * SPLIT PAYMENT: an order may have several tenders across rails. The order is
- * marked `paid` once the sum of captured (or pending-crypto) base amounts covers
- * the order total. `getOrderBalance` returns the remaining balance the UI drives
- * to zero.
+ * marked `paid` once SETTLED (authorized/captured) base amounts cover the amount
+ * due (`orderDueCents`). `getOrderBalance` returns the remaining balance the UI
+ * drives to zero; tenders still awaiting customer action don't reduce it.
+ *
+ * SETTLEMENT: every status change from a rail (takePayment, polling, webhooks)
+ * funnels through `applyRailStatus`, which never downgrades a captured/refunded
+ * tender and ALWAYS re-evaluates whether the order is now paid.
  */
 import "./rails";
 import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
+import type { RefundReservation } from "@/lib/db/payment-types";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
+import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
 import { railChargesApplicationFee } from "./fees";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
+  cardRailsSimulated,
   isCoinbaseConfigured,
   isOnchainConfigured,
-  isStripeConfigured,
 } from "./env";
 
 function nowIso(): string {
@@ -39,7 +45,7 @@ export function railIsSimulated(rail: PaymentRailKey | "cash"): boolean {
       return false; // cash is always real
     case "stripe_terminal":
     case "stripe_online":
-      return !isStripeConfigured();
+      return cardRailsSimulated();
     case "crypto_onchain_usdc":
       return !isOnchainConfigured();
     case "crypto_coinbase":
@@ -77,15 +83,33 @@ export interface TakePaymentInput {
 }
 
 /**
- * Sum of base amounts covered by non-failed tenders, INCLUDING pending crypto.
- * Drives the UI balance so the cashier isn't asked to collect twice while a
- * crypto tender confirms. (Order is only marked `paid` once tenders SETTLE — see
- * `settledCents`.)
+ * Amount due on an order, in cents: the order total minus any tip carried on the
+ * ORDER (online orders fold the customer's tip into `total_cents`; the tip rides
+ * on the tender's `tip_cents`, not its base `amount_cents`). Terminal orders have
+ * an order tip of 0 (the tip is added per tender), so their due == total.
  */
+export function orderDueCents(order: Order): number {
+  return Math.max(0, order.totals.total_cents - (order.totals.tip_cents ?? 0));
+}
+
+/**
+ * Tenders that cover the balance: pending, authorized or captured — INCLUDING
+ * pending crypto, so the cashier isn't asked to collect twice while it confirms.
+ * `requires_action` (an intent nobody has paid yet), failed, canceled and
+ * refunded tenders do NOT cover. (The order is only marked `paid` once tenders
+ * SETTLE — see `settledCents`.)
+ */
+function coveredTenders(payments: Payment[]): Payment[] {
+  return payments.filter(
+    (p) =>
+      p.status === "pending" ||
+      p.status === "authorized" ||
+      p.status === "captured",
+  );
+}
+
 function coveredCents(payments: Payment[]): number {
-  return payments
-    .filter((p) => p.status !== "failed" && p.status !== "canceled")
-    .reduce((sum, p) => sum + p.amount_cents, 0);
+  return coveredTenders(payments).reduce((sum, p) => sum + p.amount_cents, 0);
 }
 
 /** Sum of base amounts covered by SETTLED tenders (captured/authorized). */
@@ -95,12 +119,40 @@ function settledCents(payments: Payment[]): number {
     .reduce((sum, p) => sum + p.amount_cents, 0);
 }
 
+/**
+ * Tenders for an order that are in the ORDER's currency. A tender recorded in
+ * another currency can never cover or settle the order's amount due.
+ */
+async function listOrderCurrencyPayments(order: Order): Promise<Payment[]> {
+  const all = await getPosDriver().listPaymentsForOrder(order.id);
+  const cur = order.currency.toUpperCase();
+  return all.filter((p) => p.currency.toUpperCase() === cur);
+}
+
 /** Remaining unpaid balance on an order, in cents (never negative). */
 export async function getOrderBalance(order: Order): Promise<number> {
-  const driver = getPosDriver();
-  const payments = await driver.listPaymentsForOrder(order.id);
-  const balance = order.totals.total_cents - coveredCents(payments);
+  const payments = await listOrderCurrencyPayments(order);
+  const balance = orderDueCents(order) - coveredCents(payments);
   return Math.max(0, balance);
+}
+
+/**
+ * Amount + tip to charge for an ONLINE order, derived from the order itself
+ * (never the client): base = remaining due, tip = the order's tip not already
+ * carried by a covering tender. `amountCents` is 0 when nothing is left to pay.
+ */
+export async function deriveOnlineTender(
+  order: Order,
+): Promise<{ amountCents: number; tipCents: number }> {
+  const payments = await listOrderCurrencyPayments(order);
+  const covering = coveredTenders(payments);
+  const amountCents = Math.max(
+    0,
+    orderDueCents(order) - covering.reduce((n, p) => n + p.amount_cents, 0),
+  );
+  const tipCovered = covering.reduce((n, p) => n + p.tip_cents, 0);
+  const tipCents = Math.max(0, (order.totals.tip_cents ?? 0) - tipCovered);
+  return { amountCents, tipCents };
 }
 
 /**
@@ -109,20 +161,31 @@ export async function getOrderBalance(order: Order): Promise<number> {
  * and marks the order `paid` once the balance reaches zero.
  */
 export async function takePayment(input: TakePaymentInput): Promise<Payment> {
+  return (await takePaymentDetailed(input)).payment;
+}
+
+/**
+ * `takePayment` plus the one-time card-form secret (Stripe `client_secret`),
+ * which is returned to the caller but deliberately NEVER persisted on the
+ * tender row.
+ */
+export async function takePaymentDetailed(
+  input: TakePaymentInput,
+): Promise<{ payment: Payment; clientSecret?: string }> {
   const driver = getPosDriver();
 
   // Idempotency guard: a tender with this id already exists → return it.
   const existing = await driver.getPayment(input.paymentId);
   if (existing) {
     if (existing.order_id !== input.orderId) throw new PaymentConflictError();
-    return existing;
+    return { payment: existing };
   }
 
   // Defense in depth: in real mode a card rail must always be scoped to a real
   // connected account — never fall back to the platform account.
   if (
     railChargesApplicationFee(input.rail) &&
-    isStripeConfigured() &&
+    !cardRailsSimulated() &&
     (!input.connectAccountId || input.connectAccountId.startsWith("acct_sim_"))
   ) {
     throw new CardPaymentsNotReadyError();
@@ -136,7 +199,13 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
       : undefined;
 
   // Pass the cash-tendered amount to the cash rail (for change calculation).
-  const metadata: Record<string, string> = { ...input.metadata };
+  const metadata: Record<string, string> = {
+    ...input.metadata,
+    // Server-owned correlation ids (override anything client-supplied).
+    order_id: input.orderId,
+    payment_id: input.paymentId,
+    tenant_id: input.tenantId,
+  };
   if (input.rail === "cash" && input.cashTenderedCents !== undefined) {
     metadata.cashTenderedCents = String(input.cashTenderedCents);
   }
@@ -192,6 +261,41 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
 
   const saved = await driver.upsertPayment(payment);
   await maybeMarkOrderPaid(input.orderId);
+  return { payment: saved, clientSecret: result.clientSecret };
+}
+
+/**
+ * Persist a rail-reported status for a tender and ALWAYS re-evaluate the order.
+ * Used by takePayment, polling and the provider webhooks.
+ *
+ * Precedence: a `refunded` tender never changes, and a `captured` tender is never
+ * downgraded (a late `failed`/`canceled`/`pending` event or a replayed older
+ * webhook must not un-settle money). Everything else takes the new status. The
+ * order check runs even when the tender status is unchanged, so an order whose
+ * tender settled before the order was evaluated still becomes `paid`.
+ */
+export async function applyRailStatus(
+  paymentId: string,
+  status: PaymentStatus,
+  opts: { raw?: Record<string, unknown> } = {},
+): Promise<Payment | null> {
+  const driver = getPosDriver();
+  const payment = await driver.getPayment(paymentId);
+  if (!payment) return null;
+
+  let saved = payment;
+  const locked =
+    payment.status === "refunded" ||
+    (payment.status === "captured" && status !== "refunded");
+  if (!locked && (status !== payment.status || opts.raw)) {
+    saved = await driver.upsertPayment({
+      ...payment,
+      status,
+      raw: opts.raw ? { ...(payment.raw ?? {}), ...opts.raw } : payment.raw,
+      updated_at: nowIso(),
+    });
+  }
+  await maybeMarkOrderPaid(payment.order_id);
   return saved;
 }
 
@@ -206,6 +310,8 @@ export async function refreshPaymentStatus(
   const payment = await driver.getPayment(paymentId);
   if (!payment) return null;
   if (payment.status === "captured" || payment.status === "refunded") {
+    // Nothing to ask the rail, but make sure the order caught up.
+    await maybeMarkOrderPaid(payment.order_id);
     return payment;
   }
 
@@ -220,45 +326,193 @@ export async function refreshPaymentStatus(
     payment.charge_id ?? payment.id,
   );
 
-  if (status === payment.status) return payment;
-  const updated = await driver.upsertPayment({ ...payment, status });
-  await maybeMarkOrderPaid(payment.order_id);
-  return updated;
+  return applyRailStatus(payment.id, status);
 }
 
-/** Refund a captured tender (full or partial) and persist the refunded amount. */
+/** True for a real (non-simulated) Stripe PaymentIntent tender. */
+function isRealIntentTender(p: Payment): boolean {
+  return (
+    p.rail === "stripe_online" &&
+    !p.simulated &&
+    !!p.charge_id &&
+    !p.charge_id.startsWith("sim_") &&
+    !!p.connect_account_id &&
+    !cardRailsSimulated()
+  );
+}
+
+const NON_CANCELABLE_INTENT_STATUSES = ["succeeded", "processing", "canceled"];
+
+/**
+ * Before a NEW stripe_online intent is created for an order, cancel any earlier
+ * stripe_online tenders still in `requires_action`: cancel the PaymentIntent on
+ * the connected account and mark the tender canceled, so two open intents can
+ * never both be confirmed. If Stripe refuses to cancel (e.g. it already
+ * succeeded / processing / already canceled), the tender is re-synced from
+ * Stripe instead; any other failure propagates and blocks creating another
+ * intent.
+ */
+export async function cancelOpenOnlineIntents(
+  orderId: string,
+  exceptPaymentId?: string,
+): Promise<void> {
+  const open = (await getPosDriver().listPaymentsForOrder(orderId)).filter(
+    (p) =>
+      p.rail === "stripe_online" &&
+      p.status === "requires_action" &&
+      p.id !== exceptPaymentId,
+  );
+  for (const p of open) {
+    if (isRealIntentTender(p)) {
+      try {
+        await stripeRequest(
+          `/payment_intents/${p.charge_id}/cancel`,
+          {},
+          { stripeAccount: p.connect_account_id },
+        );
+      } catch (err) {
+        // The cancel failed. Only carry on if Stripe says the intent is in a
+        // state that can no longer be confirmed by the customer in a way we
+        // don't already track (succeeded / processing / canceled): sync it.
+        // Anything else (a transient error, a still-cancelable intent) means
+        // the old intent may yet be confirmed, so rethrow and create no new one.
+        const intent = await stripeGet<{ status: string }>(
+          `/payment_intents/${p.charge_id}`,
+          { stripeAccount: p.connect_account_id },
+        ).catch(() => null);
+        if (!intent || !NON_CANCELABLE_INTENT_STATUSES.includes(intent.status)) {
+          throw err;
+        }
+        await applyRailStatus(p.id, mapIntentStatus(intent.status));
+        continue;
+      }
+    }
+    await applyRailStatus(p.id, "canceled");
+  }
+}
+
+/**
+ * For the idempotent-retry path: a fresh `client_secret` for a stripe_online
+ * tender still awaiting the customer, retrieved from Stripe on the connected
+ * account (never stored). Also re-syncs the tender if Stripe moved on.
+ */
+export async function freshClientSecret(
+  payment: Payment,
+): Promise<string | undefined> {
+  if (payment.status !== "requires_action" || !isRealIntentTender(payment)) {
+    return undefined;
+  }
+  try {
+    const intent = await stripeGet<{ status: string; client_secret?: string }>(
+      `/payment_intents/${payment.charge_id}`,
+      { stripeAccount: payment.connect_account_id },
+    );
+    const mapped = mapIntentStatus(intent.status);
+    if (mapped !== "requires_action") {
+      await applyRailStatus(payment.id, mapped);
+      return undefined;
+    }
+    return intent.client_secret;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A refund would exceed what is left on the tender (maps to HTTP 409). */
+export class RefundExceedsError extends Error {
+  constructor() {
+    super("Refund amount exceeds what is left on this payment.");
+    this.name = "RefundExceedsError";
+  }
+}
+
+/** True for the card rails, where Stripe itself caps the refunded money. */
+function isCardRail(rail: Payment["rail"]): boolean {
+  return rail === "stripe_terminal" || rail === "stripe_online";
+}
+
+/**
+ * Refund a tender (full or partial). The local bookkeeping (refunded_cents,
+ * refund-id append, over-refund cap) is ATOMIC in the driver
+ * (`reservePaymentRefund`), so concurrent refunds never lose an update.
+ *
+ *  - cash / crypto: nothing external caps the money, so RESERVE first, then call
+ *    the rail; if the rail fails the reservation is released.
+ *  - card: Stripe caps the money (and dedupes on the idempotency key), so call
+ *    the rail first, then record atomically. (Reserving first would turn a crash
+ *    between reserve and the Stripe call into a refund recorded but never made.)
+ *
+ * Returns `replayed: true` (and writes nothing) for a repeated `refundId`.
+ */
 export async function refundPayment(input: {
   paymentId: string;
   amountCents?: number;
   reason?: string;
-}): Promise<Payment | null> {
+  /**
+   * Client-minted id for THIS refund request. A retry with the same id is
+   * idempotent (same Stripe key, and never applied to the tender twice), while a
+   * new id is a new refund, so repeated partial refunds work.
+   */
+  refundId?: string;
+}): Promise<(Payment & { replayed?: boolean; refundedNowCents?: number }) | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(input.paymentId);
   if (!payment) return null;
 
+  const total = payment.amount_cents + payment.tip_cents;
+  const refundId = input.refundId ?? null;
+  if (refundId && (payment.refund_ids ?? []).includes(refundId)) {
+    return { ...payment, replayed: true, refundedNowCents: 0 };
+  }
+
   const rail = requirePaymentRail(payment.rail);
-  const refundAmount = input.amountCents ?? payment.amount_cents + payment.tip_cents;
+  const refundAmount = input.amountCents ?? total - payment.refunded_cents;
+  if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
+    throw new RefundExceedsError();
+  }
 
-  const result = await rail.refund({
-    context: {
-      tenantId: payment.tenant_id,
-      locationId: payment.location_id,
-      connectAccountId: payment.connect_account_id,
-      idempotencyKey: `refund_${payment.id}`,
-    },
-    chargeId: payment.charge_id ?? payment.id,
-    amount: { amount: refundAmount, currency: payment.currency },
-    reason: input.reason,
-  });
+  const callRail = () =>
+    rail.refund({
+      context: {
+        tenantId: payment.tenant_id,
+        locationId: payment.location_id,
+        connectAccountId: payment.connect_account_id,
+        // Unique per refund request. Without a client refundId fall back to a
+        // counter of what was already refunded + the amount (clients should
+        // send refundId).
+        idempotencyKey: refundId
+          ? `refund_${payment.id}_${refundId}`
+          : `refund_${payment.id}_${payment.refunded_cents}_${refundAmount}`,
+      },
+      chargeId: payment.charge_id ?? payment.id,
+      amount: { amount: refundAmount, currency: payment.currency },
+      reason: input.reason,
+    });
 
-  const refundedTotal = payment.refunded_cents + result.amount.amount;
-  const fullyRefunded = refundedTotal >= payment.amount_cents + payment.tip_cents;
+  let recorded: RefundReservation;
+  if (isCardRail(payment.rail)) {
+    await callRail();
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId);
+  } else {
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId);
+    if (recorded.ok) {
+      try {
+        await callRail();
+      } catch (err) {
+        await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
+        throw err;
+      }
+    }
+  }
 
-  const updated = await driver.upsertPayment({
-    ...payment,
-    status: fullyRefunded ? "refunded" : payment.status,
-    refunded_cents: refundedTotal,
-  });
+  if (!recorded.ok) {
+    if (recorded.reason === "duplicate" && recorded.payment) {
+      return { ...recorded.payment, replayed: true, refundedNowCents: 0 };
+    }
+    if (recorded.reason === "not_found") return null;
+    throw new RefundExceedsError();
+  }
+  const updated = recorded.payment;
 
   // If all tenders on the order are fully refunded, mark the order refunded.
   const all = await driver.listPaymentsForOrder(payment.order_id);
@@ -266,23 +520,28 @@ export async function refundPayment(input: {
     all.length > 0 && all.every((p) => p.status === "refunded");
   if (allRefunded) await driver.updateOrderStatus(payment.order_id, "refunded");
 
-  return updated;
+  return { ...updated, refundedNowCents: refundAmount };
 }
 
 /**
- * Mark the order `paid` once captured/pending tenders cover the total. Pending
- * crypto tenders count toward coverage so the cashier isn't blocked; the
- * watcher/webhook later flips them to captured. Never downgrades a paid order.
+ * Mark the order `paid` once SETTLED (authorized/captured) tenders cover the
+ * amount due. Only a `draft` or `placed` order moves to `paid`: a late
+ * settlement (webhook, slow crypto) must never regress an order that has already
+ * progressed (`in_kitchen`, `ready`, `completed`, ...). Never downgrades.
  */
 async function maybeMarkOrderPaid(orderId: string): Promise<void> {
   const driver = getPosDriver();
   const order = await driver.getOrder(orderId);
   if (!order) return;
-  if (order.status === "refunded" || order.status === "voided") return;
 
-  const payments = await driver.listPaymentsForOrder(orderId);
-  const settled = settledCents(payments);
-  if (settled >= order.totals.total_cents && order.status !== "paid") {
+  const payments = await listOrderCurrencyPayments(order);
+  if (settledCents(payments) < orderDueCents(order)) return;
+
+  if (order.status === "draft" || order.status === "placed") {
     await driver.updateOrderStatus(orderId, "paid");
+  } else if (order.status !== "paid") {
+    console.info(
+      `[payments] order ${orderId} settled while ${order.status}; status left unchanged`,
+    );
   }
 }

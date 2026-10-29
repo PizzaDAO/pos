@@ -7,12 +7,14 @@
  * via a derived key. Simulated rails always "succeed".
  */
 import { NextResponse } from "next/server";
-import { refundPayment } from "@/lib/payments/service";
+import { RefundExceedsError, refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantRole } from "@/lib/auth/api";
+import { publicTender } from "@/lib/payments/public";
 import {
   enforceRateLimit,
+  isClientId,
   isMoneyCents,
   isUuid,
   readJsonBody,
@@ -25,6 +27,8 @@ interface RefundBody {
   paymentId: string;
   amountCents?: number;
   reason?: string;
+  /** Client-minted id for this refund request (idempotency across retries). */
+  refundId?: string;
 }
 
 export async function POST(request: Request) {
@@ -55,6 +59,13 @@ export async function POST(request: Request) {
     );
   }
 
+  if (b.refundId !== undefined && !isClientId(b.refundId)) {
+    return NextResponse.json(
+      { error: "refundId is invalid." },
+      { status: 422 },
+    );
+  }
+
   const driver = getPosDriver();
 
   // The refund targets a specific payment; resolve it first so we can authorize
@@ -70,39 +81,52 @@ export async function POST(request: Request) {
   if (!existingPayment) {
     return NextResponse.json({ error: "Payment not found." }, { status: 404 });
   }
-  const auth = await requireTenantMember(existingPayment.tenant_id);
+  // Refunds move money out: owner or manager only (not cashier / kitchen).
+  const auth = await requireTenantRole(existingPayment.tenant_id, [
+    "owner",
+    "manager",
+  ]);
   if (!auth.ok) return auth.res;
 
   try {
-    const payment = await refundPayment({
+    const result = await refundPayment({
       paymentId: b.paymentId,
       amountCents: b.amountCents,
       reason: b.reason,
+      refundId: b.refundId,
     });
-    if (!payment) {
+    if (!result) {
       return NextResponse.json(
         { error: "Payment not found." },
         { status: 404 },
       );
     }
+    const { replayed, refundedNowCents, ...payment } = result;
     const order = await driver.getOrder(payment.order_id);
     const balance = order ? await getOrderBalance(order) : 0;
 
-    // Audit the refund (tenant-scoped). Fully-refunded ⇒ a void of the tender.
-    const fullyRefunded = payment.refunded_cents >= payment.amount_cents;
-    await recordAudit({
-      actor: { id: auth.user.id, label: auth.user.email },
-      action: fullyRefunded ? "payment_void" : "payment_refund",
-      tenantId: payment.tenant_id,
-      detail: `Refunded ${b.amountCents ?? payment.amount_cents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
-    });
+    // Audit the refund (tenant-scoped) with the amount ACTUALLY refunded now.
+    // An idempotent replay did nothing, so it writes no second entry.
+    if (!replayed) {
+      const fullyRefunded =
+        payment.refunded_cents >= payment.amount_cents + payment.tip_cents;
+      await recordAudit({
+        actor: { id: auth.user.id, label: auth.user.email },
+        action: fullyRefunded ? "payment_void" : "payment_refund",
+        tenantId: payment.tenant_id,
+        detail: `Refunded ${refundedNowCents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
+      });
+    }
 
     return NextResponse.json({
-      payment,
+      payment: publicTender(payment),
       balanceCents: balance,
       orderStatus: order?.status,
     });
   } catch (err) {
+    if (err instanceof RefundExceedsError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Refund failed." },
       { status: 502 },

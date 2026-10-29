@@ -92,6 +92,11 @@ export interface ChargeResult {
   /** Crypto tx hash / chain when applicable. */
   cryptoTxHash?: string;
   cryptoChain?: string;
+  /**
+   * One-time card-form secret (Stripe `client_secret`) for card-not-present
+   * rails. Returned to the caller ONLY; never persisted in `raw`.
+   */
+  clientSecret?: string;
   /** Free-form rail data persisted alongside the payment row. */
   raw?: Record<string, unknown>;
 }
