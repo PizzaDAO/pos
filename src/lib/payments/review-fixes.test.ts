@@ -1,3 +1,4 @@
+import { deriveTenderId } from "./ids";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createHmac } from "node:crypto";
 import {
@@ -167,7 +168,10 @@ describe("1: currency comes from the order, never the client", () => {
       payReq(orderId, { paymentId: "cur-2", rail: "stripe_online", currency: "usd" }),
     );
     expect(res.status).toBe(201);
-    expect((await getPosDriver().getPayment("cur-2"))?.currency).toBe("USD");
+    expect(
+      (await getPosDriver().getPayment(deriveTenderId(orderId, "stripe_online")))
+        ?.currency,
+    ).toBe("USD");
   });
 
   it("a tender in another currency never covers or settles the order", async () => {
@@ -366,7 +370,11 @@ describe("4: a second live PaymentIntent is never left open", () => {
 
   it("an idempotent retry returns a FRESH client_secret (response only, never stored)", async () => {
     const orderId = await seedOrder();
-    const t = await seedTender(orderId, { charge_id: "pi_open" });
+    // Online tender ids are derived from the order, so a retry finds this one.
+    const t = await seedTender(orderId, {
+      id: deriveTenderId(orderId, "stripe_online"),
+      charge_id: "pi_open",
+    });
     stripeGet.mockResolvedValue({ status: "requires_payment_method", client_secret: "cs_fresh" });
     const res = await paymentsPOST(
       payReq(orderId, { paymentId: t.id, rail: "stripe_online" }),

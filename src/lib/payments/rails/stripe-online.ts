@@ -26,6 +26,7 @@ import {
   assertLiveKeyAllowed,
   cardRailsSimulated,
   getDefaultPlatformFee,
+  isStripeLiveKey,
 } from "../env";
 import { computeApplicationFeeCents, stripeRefundParams } from "../fees";
 import {
@@ -115,6 +116,8 @@ export const stripeOnlineRail: PaymentRail = {
         applicationFeeCents: fee,
         tipCents: tip,
         stripeStatus: intent.status,
+        // Test vs live: the sweeper only touches tenders of its own mode.
+        livemode: isStripeLiveKey(),
       },
     };
   },

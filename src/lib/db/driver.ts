@@ -10,6 +10,7 @@ import type {
   CreateOrderInput,
   Menu,
   Order,
+  OrderFulfillment,
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
@@ -227,6 +228,34 @@ export interface PosDriver {
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
+
+  /**
+   * [SHARED: online checkout + terminal card reader] Compare-and-set status
+   * transition: `UPDATE ... WHERE id = ? AND status IN (from) RETURNING`. Returns
+   * the updated order, or null when the order is missing or no longer in one of
+   * the `from` statuses (someone else won the race). Only the winner of a
+   * transition may run its side effects. An optional `patch.fulfillment`
+   * replaces the order's fulfillment in the SAME atomic update.
+   */
+  transitionOrderStatus(
+    id: string,
+    from: OrderStatus[],
+    to: OrderStatus,
+    patch?: { fulfillment?: OrderFulfillment },
+  ): Promise<Order | null>;
+
+  /**
+   * Deplete linked inventory for an order. `createOrder` calls this itself for
+   * orders created live; an `awaiting_payment` online order skips it and the
+   * finalize step (`finalizeOnlinePayment`) calls it once payment settles.
+   */
+  depleteInventoryForOrder(orderId: string): Promise<void>;
+
+  /**
+   * `awaiting_payment` orders created before `createdBefore` (ISO), oldest first
+   * (all tenants). Input to the abandonment sweeper.
+   */
+  listAwaitingPaymentOrders(createdBefore: string): Promise<Order[]>;
 
   // --------------------------------------------------------------------------
   // Payments (Phase 2)

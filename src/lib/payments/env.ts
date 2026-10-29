@@ -163,3 +163,24 @@ export function getDefaultPlatformFee(): {
     flatCents: Number.isFinite(flat) && flat >= 0 ? flat : 10,
   };
 }
+
+/**
+ * How long an unpaid ONLINE order may sit in `awaiting_payment` before the
+ * sweeper abandons it, by the rail of its live tender. Overridable via env
+ * (minutes): card/wallets 30 (covers 3DS), Coinbase 60, onchain USDC 60 (a manual
+ * exchange withdrawal commonly takes 10-30 min).
+ */
+export type CheckoutWindowKind = "card" | "coinbase" | "usdc";
+
+const DEFAULT_WINDOW_MIN: Record<CheckoutWindowKind, number> = {
+  card: 30,
+  coinbase: 60,
+  usdc: 60,
+};
+
+export function onlineCheckoutWindowMs(kind: CheckoutWindowKind): number {
+  const envName = `ONLINE_CHECKOUT_WINDOW_${kind.toUpperCase()}_MIN`;
+  const v = Number.parseInt(process.env[envName] ?? "", 10);
+  const minutes = Number.isFinite(v) && v > 0 ? v : DEFAULT_WINDOW_MIN[kind];
+  return minutes * 60_000;
+}

@@ -46,6 +46,8 @@ import type {
   StoreSettings,
 } from "./menu-types";
 import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import { LiveTenderConflictError } from "./payment-types";
+import { isUnpaidOnlineStatus } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
   BusinessDayClose,
@@ -1229,7 +1231,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .from("orders")
             .select("totals,status")
             .eq("tenant_id", t.id)
-            .neq("status", "voided")
+            .not("status", "in", "(voided,awaiting_payment,abandoned)")
             .gte("created_at", since),
         ) as Row[];
         const connect = await this.getConnectAccount(t.id);
@@ -1379,7 +1381,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         throw err;
       }
       const order = await readOrderRow(orderRow);
-      if (order.status !== "voided") await depleteForOrder(order);
+      // An online order awaiting payment (or abandoned) consumes nothing: it is
+      // depleted by `depleteInventoryForOrder` once payment finalizes.
+      if (order.status !== "voided" && !isUnpaidOnlineStatus(order.status)) {
+        await depleteForOrder(order);
+      }
       return order;
     },
 
@@ -1412,6 +1418,44 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .maybeSingle(),
       ) as Row | null;
       return r ? readOrderRow(r) : null;
+    },
+
+    async transitionOrderStatus(id, from, to, patch) {
+      // Compare-and-set: the WHERE clause is the lock. Zero rows back means
+      // another caller already moved the order out of `from`.
+      const r = unwrap(
+        await sb
+          .from("orders")
+          .update({
+            status: to,
+            ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+            updated_at: nowIso(),
+          })
+          .eq("id", id)
+          .in("status", from)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? readOrderRow(r) : null;
+    },
+
+    async depleteInventoryForOrder(orderId) {
+      const r = unwrap(
+        await sb.from("orders").select("*").eq("id", orderId).maybeSingle(),
+      ) as Row | null;
+      if (r) await depleteForOrder(await readOrderRow(r));
+    },
+
+    async listAwaitingPaymentOrders(createdBefore) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .eq("status", "awaiting_payment")
+          .lt("created_at", createdBefore)
+          .order("created_at", { ascending: true }),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
     // -- Payments ----------------------------------------------------------
@@ -1454,21 +1498,22 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       } = payment;
       void _rc;
       void _ri;
-      const row = mapPayment(
-        unwrap(
-          await sb
-            .from("payments")
-            .upsert({
-              ...(existing ? writable : payment),
-              created_at:
-                (existing?.created_at as string) ?? payment.created_at ?? now,
-              updated_at: now,
-            })
-            .select()
-            .single(),
-        ) as Row,
-      );
-      return row;
+      const res = await sb
+        .from("payments")
+        .upsert({
+          ...(existing ? writable : payment),
+          created_at:
+            (existing?.created_at as string) ?? payment.created_at ?? now,
+          updated_at: now,
+        })
+        .select()
+        .single();
+      // A second live card/Coinbase tender for one order trips the partial
+      // unique index payments_one_live_card_or_cb.
+      if (res.error?.message.includes("payments_one_live_card_or_cb")) {
+        throw new LiveTenderConflictError();
+      }
+      return mapPayment(unwrap(res) as Row);
     },
 
     async reservePaymentRefund(paymentId, amountCents, refundId) {

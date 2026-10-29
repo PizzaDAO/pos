@@ -23,6 +23,9 @@ import "./rails";
 import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
 import type { RefundReservation } from "@/lib/db/payment-types";
+import { LiveTenderConflictError } from "@/lib/db/payment-types";
+import { finalizeOnlinePayment } from "@/lib/shop/finalize";
+import { deriveTenderId } from "./ids";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
@@ -156,6 +159,29 @@ export async function deriveOnlineTender(
 }
 
 /**
+ * The tender id for an ONLINE order's next attempt on `rail`: derived from the
+ * order id (never client-minted), so retries, reloads and double-taps all land
+ * on the same tender. Sequence 0 is used until that tender is `canceled`/`failed`
+ * (a rail switch away and back, or a declined card), then the next sequence
+ * number starts a fresh attempt.
+ */
+export async function nextOnlineTenderId(
+  orderId: string,
+  rail: string,
+): Promise<string> {
+  const driver = getPosDriver();
+  for (let seq = 0; seq < 50; seq += 1) {
+    const id = deriveTenderId(orderId, rail, seq);
+    const existing = await driver.getPayment(id);
+    if (!existing) return id;
+    if (existing.status !== "canceled" && existing.status !== "failed") {
+      return id;
+    }
+  }
+  throw new Error("Too many payment attempts for this order.");
+}
+
+/**
  * Take one tender against an order. Idempotent on `paymentId`. Computes the
  * platform application fee for card rails, calls the rail, persists the tender,
  * and marks the order `paid` once the balance reaches zero.
@@ -259,7 +285,22 @@ export async function takePaymentDetailed(
     updated_at: nowIso(),
   };
 
-  const saved = await driver.upsertPayment(payment);
+  let saved: Payment;
+  try {
+    saved = await driver.upsertPayment(payment);
+  } catch (err) {
+    // A different live card/Coinbase tender already holds this order's slot
+    // (payments_one_live_card_or_cb). The intent we just created is an orphan:
+    // cancel it so it can never be confirmed.
+    if (err instanceof LiveTenderConflictError && isRealIntentTender(payment)) {
+      await stripeRequest(
+        `/payment_intents/${payment.charge_id}/cancel`,
+        {},
+        { stripeAccount: payment.connect_account_id },
+      ).catch(() => undefined);
+    }
+    throw err;
+  }
   await maybeMarkOrderPaid(input.orderId);
   return { payment: saved, clientSecret: result.clientSecret };
 }
@@ -330,7 +371,7 @@ export async function refreshPaymentStatus(
 }
 
 /** True for a real (non-simulated) Stripe PaymentIntent tender. */
-function isRealIntentTender(p: Payment): boolean {
+export function isRealIntentTender(p: Payment): boolean {
   return (
     p.rail === "stripe_online" &&
     !p.simulated &&
@@ -525,9 +566,18 @@ export async function refundPayment(input: {
 
 /**
  * Mark the order `paid` once SETTLED (authorized/captured) tenders cover the
- * amount due. Only a `draft` or `placed` order moves to `paid`: a late
- * settlement (webhook, slow crypto) must never regress an order that has already
- * progressed (`in_kitchen`, `ready`, `completed`, ...). Never downgrades.
+ * amount due. Only a `draft`, `placed` or `awaiting_payment` order moves to
+ * `paid`: a late settlement (webhook, slow crypto) must never regress an order
+ * that has already progressed (`in_kitchen`, `ready`, `completed`, ...). Never
+ * downgrades. Every move is a compare-and-set, so concurrent settlements (webhook
+ * + client sync + sweeper) cannot double-apply.
+ *
+ *  - `draft`/`placed` (in-store, and legacy online orders placed before the
+ *    lifecycle shipped): plain move to `paid`.
+ *  - `awaiting_payment` (online): `finalizeOnlinePayment` -- the single place that
+ *    promotes the order onto the KDS, depletes inventory and dispatches delivery.
+ *  - `abandoned`/`voided`: money arrived for an order we already gave up on. It is
+ *    NOT promoted; flagged loudly for a manual accept-or-refund.
  */
 async function maybeMarkOrderPaid(orderId: string): Promise<void> {
   const driver = getPosDriver();
@@ -538,7 +588,13 @@ async function maybeMarkOrderPaid(orderId: string): Promise<void> {
   if (settledCents(payments) < orderDueCents(order)) return;
 
   if (order.status === "draft" || order.status === "placed") {
-    await driver.updateOrderStatus(orderId, "paid");
+    await driver.transitionOrderStatus(orderId, ["draft", "placed"], "paid");
+  } else if (order.status === "awaiting_payment") {
+    await finalizeOnlinePayment(orderId);
+  } else if (order.status === "abandoned" || order.status === "voided") {
+    console.warn(
+      `[payments] order ${orderId} settled while ${order.status}; NOT promoted -- needs a manual accept-or-refund`,
+    );
   } else if (order.status !== "paid") {
     console.info(
       `[payments] order ${orderId} settled while ${order.status}; status left unchanged`,

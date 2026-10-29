@@ -32,6 +32,7 @@ import type {
   Modifier,
   ModifierGroup,
   Order,
+  OrderFulfillment,
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
@@ -41,6 +42,12 @@ import type {
   PaymentSettings,
   RefundReservation,
 } from "./payment-types";
+import {
+  LiveTenderConflictError,
+  ONE_LIVE_TENDER_RAILS,
+  tenderFreesSlot,
+} from "./payment-types";
+import { isUnpaidOnlineStatus } from "./menu-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -773,6 +780,7 @@ export const mockDriver: PosDriver = {
         (o) =>
           o.tenant_id === t.id &&
           o.status !== "voided" &&
+          !isUnpaidOnlineStatus(o.status) &&
           new Date(o.created_at).getTime() >= since,
       );
       const connect = connectAccounts.get(t.id);
@@ -869,7 +877,11 @@ export const mockDriver: PosDriver = {
     orders.set(order.id, order);
     // Phase 5: deplete linked inventory on the single order funnel (terminal +
     // shop both land here), unless the order was created already voided.
-    if (order.status !== "voided") depleteForOrder(order);
+    // An online order awaiting payment (or abandoned) consumes nothing: it is
+    // depleted by `depleteInventoryForOrder` once payment finalizes.
+    if (order.status !== "voided" && !isUnpaidOnlineStatus(order.status)) {
+      depleteForOrder(order);
+    }
     return order;
   },
 
@@ -897,6 +909,40 @@ export const mockDriver: PosDriver = {
     return updated;
   },
 
+  // Single synchronous block (no awaits): an atomic compare-and-set in the mock.
+  async transitionOrderStatus(
+    id: string,
+    from: OrderStatus[],
+    to: OrderStatus,
+    patch?: { fulfillment?: OrderFulfillment },
+  ): Promise<Order | null> {
+    ensureKitchenSeed();
+    const order = orders.get(id);
+    if (!order || !from.includes(order.status)) return null;
+    const updated: Order = {
+      ...order,
+      status: to,
+      ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+      updated_at: nowIso(),
+    };
+    orders.set(id, updated);
+    return updated;
+  },
+
+  async depleteInventoryForOrder(orderId: string): Promise<void> {
+    const order = orders.get(orderId);
+    if (order) depleteForOrder(order);
+  },
+
+  async listAwaitingPaymentOrders(createdBefore: string): Promise<Order[]> {
+    ensureKitchenSeed();
+    return [...orders.values()]
+      .filter(
+        (o) => o.status === "awaiting_payment" && o.created_at < createdBefore,
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  },
+
   // -- Payments --------------------------------------------------------------
 
   async getPaymentSettings(tenantId, locationId): Promise<PaymentSettings> {
@@ -916,6 +962,21 @@ export const mockDriver: PosDriver = {
 
   async upsertPayment(payment: Payment): Promise<Payment> {
     const existing = payments.get(payment.id);
+    // Mirror payments_one_live_card_or_cb: one live card/Coinbase tender per
+    // order (a canceled/failed one frees the slot).
+    if (
+      ONE_LIVE_TENDER_RAILS.includes(payment.rail) &&
+      !tenderFreesSlot(payment.status) &&
+      [...payments.values()].some(
+        (p) =>
+          p.id !== payment.id &&
+          p.order_id === payment.order_id &&
+          p.rail === payment.rail &&
+          !tenderFreesSlot(p.status),
+      )
+    ) {
+      throw new LiveTenderConflictError();
+    }
     if (existing) {
       const merged: Payment = {
         ...existing,
