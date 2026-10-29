@@ -11,6 +11,11 @@ const session = vi.hoisted(() => ({ user: null as SessionUser | null }));
 vi.mock("@/lib/auth/session", () => ({
   getCurrentUser: vi.fn(async () => session.user),
 }));
+// No request scope in tests: the sign-out route's Supabase client is stubbed.
+vi.mock("@/lib/auth/supabase-server", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/auth/supabase-server")>()),
+  getServerSupabase: async () => null,
+}));
 
 import {
   DEMO_LOCATION_DOWNTOWN_ID,
@@ -29,7 +34,7 @@ import { POST as refundPOST } from "@/app/api/payments/refund/route";
 import { POST as ordersPOST } from "@/app/api/orders/route";
 import {
   ACTIVE_STAFF_COOKIE,
-  signActiveStaff,
+  openStaffSession,
 } from "@/lib/auth/active-staff";
 
 // Seed staff (Tony = owner, Christopher = cashier) — resolved by name below.
@@ -56,6 +61,17 @@ function deviceOwner(): SessionUser {
     isPlatformAdmin: false,
     real: true,
   };
+}
+
+/** A real server-side staff session for the mocked device login. */
+async function staffCookieValue(staffId: string, userId = "device-owner") {
+  const v = await openStaffSession({
+    userId,
+    tenantId: DEMO_TENANT_ID,
+    staffId,
+  });
+  if (!v) throw new Error("no signing secret");
+  return v;
 }
 
 let seq = 0;
@@ -197,13 +213,13 @@ describe("void tender", () => {
     // A cashier switched in → refused.
     const cashier = await staffByRole("cashier");
     const cashierCookie = `${ACTIVE_STAFF_COOKIE}=${encodeURIComponent(
-      signActiveStaff(DEMO_TENANT_ID, cashier.id)!,
+      (await staffCookieValue(cashier.id)),
     )}`;
     expect((await voidPOST(post({ paymentId: stuck }, cashierCookie))).status).toBe(403);
     // The owner switched in → allowed.
     const owner = await staffByRole("owner");
     const ownerCookie = `${ACTIVE_STAFF_COOKIE}=${encodeURIComponent(
-      signActiveStaff(DEMO_TENANT_ID, owner.id)!,
+      (await staffCookieValue(owner.id)),
     )}`;
     expect((await voidPOST(post({ paymentId: stuck }, ownerCookie))).status).toBe(200);
   });
@@ -236,16 +252,31 @@ describe("active-staff gating (real mode)", () => {
       );
     const cashier = await staffByRole("cashier");
     const owner = await staffByRole("owner");
-    const cookieFor = (id: string) =>
-      `${ACTIVE_STAFF_COOKIE}=${encodeURIComponent(signActiveStaff(DEMO_TENANT_ID, id)!)}`;
+    const cookieFor = async (id: string, userId?: string) =>
+      `${ACTIVE_STAFF_COOKIE}=${encodeURIComponent(await staffCookieValue(id, userId))}`;
 
     expect((await order()).status).toBe(403); // no active staff
-    expect((await order(cookieFor(cashier.id))).status).toBe(403);
-    expect((await order(cookieFor(owner.id))).status).toBe(201);
+    expect((await order(await cookieFor(cashier.id))).status).toBe(403);
+    const ownerCookie = await cookieFor(owner.id);
+    expect((await order(ownerCookie)).status).toBe(201);
     // A forged cookie is ignored.
     expect(
-      (await order(`${ACTIVE_STAFF_COOKIE}=${DEMO_TENANT_ID}.${owner.id}.9999999999999.00`)).status,
+      (await order(`${ACTIVE_STAFF_COOKIE}=${DEMO_TENANT_ID}.${owner.id}.u.s.9999999999999.00`)).status,
     ).toBe(403);
+    // A cookie opened by ANOTHER device login is useless here.
+    expect(
+      (await order(await cookieFor(owner.id, "some-other-device-user"))).status,
+    ).toBe(403);
+    // Switch-out revokes it server-side: the same (copied) cookie dies.
+    const { DELETE: pinDELETE } = await import("@/app/api/terminal/pin/route");
+    await pinDELETE(post({}, ownerCookie));
+    expect((await order(ownerCookie)).status).toBe(403);
+    // Sign-out revokes every session of the device login.
+    const again = await cookieFor(owner.id);
+    expect((await order(again)).status).toBe(201);
+    const { POST: signoutPOST } = await import("@/app/auth/signout/route");
+    await signoutPOST(new Request("http://localhost/auth/signout", { method: "POST" }));
+    expect((await order(again)).status).toBe(403);
   });
 
   it("refunds need an active staff member who may refund", async () => {
@@ -259,7 +290,7 @@ describe("active-staff gating (real mode)", () => {
     expect((await r()).status).toBe(403);
     const cashier = await staffByRole("cashier");
     const cookie = `${ACTIVE_STAFF_COOKIE}=${encodeURIComponent(
-      signActiveStaff(DEMO_TENANT_ID, cashier.id)!,
+      (await staffCookieValue(cashier.id)),
     )}`;
     expect((await r(cookie)).status).toBe(200);
   });

@@ -51,7 +51,7 @@ export async function POST(request: Request) {
   }
   const auth = await requireTenantAccess(payment.tenant_id, "terminal");
   if (!auth.ok) return auth.res;
-  const active = await effectiveTerminalRole(request, auth.tenantId, auth.role);
+  const active = await effectiveTerminalRole(request, auth);
   if (active.role !== "owner" && active.role !== "manager") {
     return NextResponse.json(
       { error: "Only an owner or manager can void a tender." },

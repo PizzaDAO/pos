@@ -96,7 +96,7 @@ export async function POST(request: Request) {
   // judged on the ACTIVE (PIN-switched) staff member, not the device login.
   const auth = await requireTenantAccess(existingPayment.tenant_id, "terminal");
   if (!auth.ok) return auth.res;
-  const active = await effectiveTerminalRole(request, auth.tenantId, auth.role);
+  const active = await effectiveTerminalRole(request, auth);
   if (
     active.role !== "owner" &&
     active.role !== "manager" &&

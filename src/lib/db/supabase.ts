@@ -68,6 +68,7 @@ import type {
   ShiftCashEvent,
   SizeInput,
   Staff,
+  StaffSession,
 } from "./backoffice-types";
 import type { Location, Membership, Tenant, User } from "./types";
 import type {
@@ -141,6 +142,7 @@ function mapTenant(r: Row): Tenant {
     name: r.name as string,
     slug: r.slug as string,
     status: r.status as Tenant["status"],
+    suspended_by_platform: r.suspended_by_platform === true,
     created_at: r.created_at as string,
   };
 }
@@ -935,11 +937,14 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { tenant, owner };
     },
 
-    async setTenantStatus(tenantId, status) {
+    async setTenantStatus(tenantId, status, opts) {
+      // The platform flag is written in the SAME update as the status.
+      const patch: Row = { status };
+      if (opts?.byPlatform) patch.suspended_by_platform = status === "suspended";
       const r = unwrap(
         await sb
           .from("tenants")
-          .update({ status })
+          .update(patch)
           .eq("id", tenantId)
           .select()
           .maybeSingle(),
@@ -1535,16 +1540,30 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       };
     },
 
-    async updatePaymentStatusFromProvider(id, status) {
+    async updatePaymentStatusFromProvider(id, status, opts) {
       // Targeted update: status only, and never on a refunded / partially
       // refunded tender (the filters make it a no-op for those rows).
+      let q = sb
+        .from("payments")
+        .update({ status, updated_at: nowIso() })
+        .eq("id", id)
+        .neq("status", "refunded")
+        .eq("refunded_cents", 0);
+      if (opts?.from) q = q.in("status", opts.from);
+      const r = unwrap(await q.select().maybeSingle()) as Row | null;
+      return r ? mapPayment(r) : this.getPayment(id);
+    },
+
+    async completeTender(payment) {
+      // Conditional final write: only while still unsettled.
+      const { id, created_at: _created, ...fields } = payment;
+      void _created;
       const r = unwrap(
         await sb
           .from("payments")
-          .update({ status, updated_at: nowIso() })
+          .update({ ...fields, updated_at: nowIso() })
           .eq("id", id)
-          .neq("status", "refunded")
-          .eq("refunded_cents", 0)
+          .in("status", ["pending", "requires_action"])
           .select()
           .maybeSingle(),
       ) as Row | null;
@@ -2567,6 +2586,89 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       ) as Row | null;
       // includePin: this is the trusted server PIN-verification path only.
       return r ? mapStaff(r, { includePin: true }) : null;
+    },
+
+    async getPinLockState(tenantId, staffId) {
+      const r = unwrap(
+        await sb
+          .from("staff")
+          .select("pin_failed_attempts, pin_locked_until")
+          .eq("id", staffId)
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      const until = (r?.pin_locked_until as string | null) ?? null;
+      const locked = until !== null && new Date(until).getTime() > Date.now();
+      return {
+        attempts: locked || until === null ? Number(r?.pin_failed_attempts ?? 0) : 0,
+        lockedUntil: locked ? until : null,
+      };
+    },
+
+    async recordPinFailure(tenantId, staffId) {
+      const res = unwrap(
+        await sb.rpc("record_pin_failure", {
+          p_tenant_id: tenantId,
+          p_staff_id: staffId,
+        }),
+      ) as { attempts?: number; locked_until?: string | null };
+      return {
+        attempts: Number(res?.attempts ?? 0),
+        lockedUntil: res?.locked_until ?? null,
+      };
+    },
+
+    async clearPinFailures(tenantId, staffId) {
+      unwrap(
+        await sb
+          .from("staff")
+          .update({ pin_failed_attempts: 0, pin_locked_until: null })
+          .eq("id", staffId)
+          .eq("tenant_id", tenantId)
+          .select("id"),
+      );
+    },
+
+    async createStaffSession(session) {
+      return unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .insert(session)
+          .select()
+          .single(),
+      ) as StaffSession;
+    },
+
+    async getStaffSession(id) {
+      return (unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle(),
+      ) ?? null) as StaffSession | null;
+    },
+
+    async revokeStaffSession(id) {
+      unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .update({ revoked_at: nowIso() })
+          .eq("id", id)
+          .is("revoked_at", null)
+          .select("id"),
+      );
+    },
+
+    async revokeStaffSessionsForUser(userId) {
+      unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .update({ revoked_at: nowIso() })
+          .eq("user_id", userId)
+          .is("revoked_at", null)
+          .select("id"),
+      );
     },
 
     async upsertStaff(staff) {

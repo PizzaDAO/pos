@@ -104,7 +104,7 @@ export async function POST(request: Request) {
 
     // Staff discounts are an explicit field, gated by the ACTIVE (PIN-switched)
     // staff member's role — not the device login's role.
-    const active = await effectiveTerminalRole(request, auth.tenantId, auth.role);
+    const active = await effectiveTerminalRole(request, auth);
     const discountCents = body.discount_cents ?? 0;
     if (
       discountCents > 0 &&
