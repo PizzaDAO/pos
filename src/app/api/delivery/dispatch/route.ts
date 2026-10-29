@@ -9,24 +9,27 @@
  *   Assigns a driver to an in-house delivery (pending_assignment → assigned) and
  *   flips the order to `out_for_delivery` (surfaces on the KDS + customer tracker).
  *
+ * Auth: owner|manager (admin surface) of the tenant. Assignment resolves the
+ * delivery first and authorizes against ITS tenant.
+ *
  * No env vars required.
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { assignDriver } from "@/lib/delivery/service";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+  const locationId = auth.locationId as string;
   const driver = getPosDriver();
   const deliveries = await driver.listDeliveries(tenantId, locationId);
   // Enrich each with its order number for the dispatch board.
@@ -71,6 +74,16 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
+
+  // Authorize against the delivery's OWN tenant (not a client-supplied one).
+  const existing = await getPosDriver()
+    .getDelivery(body.deliveryId)
+    .catch(() => null);
+  if (!existing) {
+    return NextResponse.json({ error: "Delivery not found." }, { status: 404 });
+  }
+  const auth = await requireTenantAccess(existing.tenant_id, "admin");
+  if (!auth.ok) return auth.res;
 
   const updated = await assignDriver({
     deliveryId: body.deliveryId,

@@ -17,8 +17,12 @@ import { getBillingWebhookSecret } from "@/lib/billing/env";
 
 export const runtime = "nodejs";
 
-/** Map a Stripe subscription status to ours. */
-function mapStatus(stripeStatus: string): SubscriptionStatus {
+/**
+ * Map a Stripe subscription status to ours. Not-yet-paid statuses (e.g.
+ * `incomplete`) must NOT grant an active plan; unknown statuses return null
+ * (leave the stored status unchanged) instead of defaulting to active.
+ */
+function mapStatus(stripeStatus: string): SubscriptionStatus | null {
   switch (stripeStatus) {
     case "trialing":
       return "trialing";
@@ -26,12 +30,13 @@ function mapStatus(stripeStatus: string): SubscriptionStatus {
       return "active";
     case "past_due":
     case "unpaid":
+    case "incomplete":
       return "past_due";
     case "canceled":
     case "incomplete_expired":
       return "canceled";
     default:
-      return "active";
+      return null;
   }
 }
 
@@ -45,8 +50,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ received: true, simulated: true });
   }
 
+  // Verify against the BILLING endpoint's own signing secret (not the Connect
+  // payments secret), with Stripe's timestamp tolerance.
   const sig = request.headers.get("stripe-signature");
-  if (!verifyStripeWebhook(raw, sig)) {
+  if (!verifyStripeWebhook(raw, sig, secret)) {
     return NextResponse.json({ error: "Invalid signature." }, { status: 400 });
   }
 
@@ -66,13 +73,22 @@ export async function POST(request: Request) {
   if (tenantId) {
     const existing = await driver.getSubscription(tenantId);
     if (existing) {
-      const status =
-        event.type === "invoice.payment_failed"
-          ? "past_due"
-          : event.type === "customer.subscription.deleted"
-            ? "canceled"
-            : mapStatus(String(obj.status ?? "active"));
-      await driver.advanceSubscriptionStatus(tenantId, status);
+      let status: SubscriptionStatus | null;
+      switch (event.type) {
+        case "invoice.payment_failed":
+          status = "past_due";
+          break;
+        case "customer.subscription.deleted":
+          status = "canceled";
+          break;
+        case "checkout.session.completed":
+        case "invoice.paid":
+          status = "active";
+          break;
+        default:
+          status = mapStatus(String(obj.status ?? ""));
+      }
+      if (status) await driver.advanceSubscriptionStatus(tenantId, status);
     }
   }
 

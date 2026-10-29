@@ -9,6 +9,9 @@
  *
  * Sale-driven depletion happens automatically in `createOrder`; this endpoint
  * covers manual stock changes. No env vars; in-memory mock driver.
+ *
+ * Auth: owner|manager of the tenant. Items/locations referenced by id are
+ * verified to belong to that tenant before any write.
  */
 import { NextResponse } from "next/server";
 import {
@@ -16,20 +19,26 @@ import {
   type InventoryItem,
   type MovementReason,
 } from "@/lib/db";
-import { requireTenantRole } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+
+const MOVEMENT_REASONS: MovementReason[] = [
+  "restock",
+  "adjustment",
+  "waste",
+  "depletion",
+];
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+  const locationId = auth.locationId as string;
   const driver = getPosDriver();
   const [items, movements] = await Promise.all([
     driver.listInventory(tenantId, locationId),
@@ -61,10 +70,11 @@ export async function POST(request: Request) {
   if (!tenantId) {
     return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
   }
-  const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+  const auth = await requireTenantAccess(tenantId, "admin");
   if (!auth.ok) return auth.res;
 
   const driver = getPosDriver();
+  const locations = await driver.listLocations(auth.tenantId);
 
   try {
     if (body.action === "upsertItem") {
@@ -74,7 +84,27 @@ export async function POST(request: Request) {
           { status: 422 },
         );
       }
-      const item = await driver.upsertInventoryItem(body.item);
+      // The row must live at one of THIS tenant's locations, and an existing
+      // id must not belong to another tenant.
+      if (!locations.some((l) => l.id === body.item?.location_id)) {
+        return NextResponse.json(
+          { error: "location_id does not belong to this tenant." },
+          { status: 403 },
+        );
+      }
+      if (body.item.id) {
+        const current = await driver.getInventoryItem(body.item.id);
+        if (current && current.tenant_id !== auth.tenantId) {
+          return NextResponse.json(
+            { error: "Inventory item not found." },
+            { status: 404 },
+          );
+        }
+      }
+      const item = await driver.upsertInventoryItem({
+        ...body.item,
+        tenant_id: auth.tenantId,
+      });
       return NextResponse.json({ item }, { status: 201 });
     }
     if (body.action === "movement") {
@@ -86,6 +116,24 @@ export async function POST(request: Request) {
         return NextResponse.json(
           { error: "inventoryItemId, reason, delta are required." },
           { status: 422 },
+        );
+      }
+      if (
+        !MOVEMENT_REASONS.includes(body.reason) ||
+        !Number.isFinite(body.delta) ||
+        !Number.isInteger(body.delta) ||
+        Math.abs(body.delta) > 1_000_000
+      ) {
+        return NextResponse.json(
+          { error: "Invalid movement." },
+          { status: 422 },
+        );
+      }
+      const target = await driver.getInventoryItem(body.inventoryItemId);
+      if (!target || target.tenant_id !== auth.tenantId) {
+        return NextResponse.json(
+          { error: "Inventory item not found." },
+          { status: 404 },
         );
       }
       const result = await driver.applyInventoryMovement({

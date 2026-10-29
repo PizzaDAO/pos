@@ -7,30 +7,41 @@
  * fall back to their simulated paths.
  *
  * Actions (POST { action, ... }):
- *   create_business  { businessName, ownerEmail }  → new tenant + owner user
+ *   create_business  { businessName, ownerEmail }  → new tenant + owner user,
+ *                    plus an `onboardingToken` bound to the new tenant
  *   add_location     { tenantId, name, address? }  → first location (own slug)
  *   import_menu      { tenantId }                   → starter template menu
  *   go_live          { tenantId }                   → activate + mark live
  *
  * GET ?tenantId=  → onboarding state + tenant + locations (resume the wizard).
+ *
+ * Auth: `create_business` is PUBLIC (rate-limited). Every tenant-scoped action
+ * requires EITHER the `x-onboarding-token` minted for that tenant OR an
+ * owner|manager session of it — never a bare tenantId. The wizard steps only
+ * run while the tenant is still onboarding (409 after go-live), so they can't
+ * be used to bypass plan gating (extra locations) or to re-activate a tenant
+ * the platform suspended.
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { effectiveConnectAccount } from "@/lib/payments/connect";
-import { getCurrentUser } from "@/lib/auth/session";
-import { recordAudit } from "@/lib/security";
+import {
+  requireTenantAdminOrOnboarding,
+  signOnboardingToken,
+} from "@/lib/auth/onboarding-token";
+import { enforceRateLimit, isEmail, recordAudit } from "@/lib/security";
+import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  if (!tenantId) {
-    return NextResponse.json(
-      { error: "tenantId is required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAdminOrOnboarding(
+    request,
+    searchParams.get("tenantId"),
+  );
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
   const driver = getPosDriver();
   const [tenant, onboarding, locations, subscription, connect] =
     await Promise.all([
@@ -69,90 +80,142 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
+  if (!body || typeof body !== "object") {
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
   const driver = getPosDriver();
+
+  if (body.action === "create_business") {
+    // Public: creates a tenant row per call — rate-limit per IP.
+    const limited = enforceRateLimit(request, "auth");
+    if (limited) return limited;
+    const businessName = body.businessName?.trim();
+    const ownerEmail = body.ownerEmail?.trim();
+    if (!businessName || !ownerEmail || !isEmail(ownerEmail)) {
+      return NextResponse.json(
+        { error: "businessName and a valid ownerEmail are required." },
+        { status: 422 },
+      );
+    }
+    if (businessName.length > 120) {
+      return NextResponse.json(
+        { error: "businessName is too long." },
+        { status: 422 },
+      );
+    }
+    try {
+      const { tenant, owner } = await driver.createTenant({
+        businessName,
+        ownerEmail,
+      });
+      const onboarding = await driver.getOnboarding(tenant.id);
+      return NextResponse.json(
+        {
+          tenant,
+          owner,
+          onboarding,
+          onboardingToken: signOnboardingToken(tenant.id),
+        },
+        { status: 201 },
+      );
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "Signup failed." },
+        { status: 500 },
+      );
+    }
+  }
+
+  if (
+    body.action !== "add_location" &&
+    body.action !== "import_menu" &&
+    body.action !== "go_live"
+  ) {
+    return NextResponse.json({ error: "Unknown action." }, { status: 422 });
+  }
+  if (!body.tenantId) {
+    return NextResponse.json(
+      { error: "tenantId is required." },
+      { status: 422 },
+    );
+  }
+
+  // Tenant-scoped wizard step: onboarding token for THIS tenant, or an
+  // owner|manager session of it.
+  const auth = await requireTenantAdminOrOnboarding(request, body.tenantId);
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+
+  // Wizard steps only apply while onboarding (not after go-live).
+  const current = await driver.getOnboarding(tenantId);
+  if (!current) {
+    return NextResponse.json({ error: "Tenant not found." }, { status: 404 });
+  }
+  if (current.live) {
+    return NextResponse.json(
+      { error: "Onboarding is already complete for this tenant." },
+      { status: 409 },
+    );
+  }
 
   try {
     switch (body.action) {
-      case "create_business": {
-        const businessName = body.businessName?.trim();
-        const ownerEmail = body.ownerEmail?.trim();
-        if (!businessName || !ownerEmail) {
-          return NextResponse.json(
-            { error: "businessName and ownerEmail are required." },
-            { status: 422 },
-          );
-        }
-        const { tenant, owner } = await driver.createTenant({
-          businessName,
-          ownerEmail,
-        });
-        const onboarding = await driver.getOnboarding(tenant.id);
-        return NextResponse.json(
-          { tenant, owner, onboarding },
-          { status: 201 },
-        );
-      }
-
       case "add_location": {
-        if (!body.tenantId || !body.name?.trim()) {
+        if (!body.name?.trim()) {
           return NextResponse.json(
             { error: "tenantId and name are required." },
             { status: 422 },
           );
         }
+        // Same plan gate as /api/admin/locations (no cap bypass via signup).
+        const [existing, subscription] = await Promise.all([
+          driver.listLocations(tenantId),
+          driver.getSubscription(tenantId),
+        ]);
+        const entitlements = resolveEntitlements(subscription);
+        const gate = canAddLocation(entitlements, existing.length);
+        if (!gate.allowed) {
+          return NextResponse.json(
+            { error: gate.reason, code: "plan_limit", entitlements },
+            { status: 402 },
+          );
+        }
         const location = await driver.createLocation({
-          tenant_id: body.tenantId,
-          name: body.name.trim(),
+          tenant_id: tenantId,
+          name: body.name.trim().slice(0, 120),
           address: body.address ?? null,
           timezone: body.timezone,
         });
         const onboarding = await driver.completeOnboardingStep(
-          body.tenantId,
+          tenantId,
           "location",
         );
         return NextResponse.json({ location, onboarding }, { status: 201 });
       }
 
       case "import_menu": {
-        if (!body.tenantId) {
-          return NextResponse.json(
-            { error: "tenantId is required." },
-            { status: 422 },
-          );
-        }
-        await driver.importStarterMenu(body.tenantId);
+        await driver.importStarterMenu(tenantId);
         const onboarding = await driver.completeOnboardingStep(
-          body.tenantId,
+          tenantId,
           "menu",
         );
         return NextResponse.json({ ok: true, onboarding });
       }
 
       case "go_live": {
-        if (!body.tenantId) {
-          return NextResponse.json(
-            { error: "tenantId is required." },
-            { status: 422 },
-          );
-        }
-        const onboarding = await driver.goLive(body.tenantId);
-        const tenant = await driver.getTenant(body.tenantId);
-        // Audit tenant go-live (lifecycle) — best-effort actor from session.
-        const actor = await getCurrentUser();
+        const onboarding = await driver.goLive(tenantId);
+        const tenant = await driver.getTenant(tenantId);
         await recordAudit({
           actor: {
-            id: actor?.id ?? "system",
-            label: actor?.email ?? "self-serve onboarding",
+            id: auth.user?.id ?? "system",
+            label: auth.user?.email ?? "self-serve onboarding",
           },
           action: "tenant_go_live",
-          tenantId: body.tenantId,
-          detail: `Tenant "${tenant?.name ?? body.tenantId}" went live.`,
+          tenantId,
+          detail: `Tenant "${tenant?.name ?? tenantId}" went live.`,
         });
         return NextResponse.json({ ok: true, onboarding, tenant });
       }
-
-      default:
-        return NextResponse.json({ error: "Unknown action." }, { status: 422 });
     }
   } catch (err) {
     return NextResponse.json(

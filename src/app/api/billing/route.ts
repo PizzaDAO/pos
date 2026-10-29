@@ -11,20 +11,30 @@
  * POST { action, tenantId, tier?, status? }:
  *   subscribe → start/switch a subscription (returns checkoutUrl in real mode)
  *   set_status → advance a SIMULATED subscription's lifecycle (demo dunning)
+ *
+ * Auth: the plan catalogue (GET without tenantId) is public. Anything
+ * tenant-scoped requires an owner|manager session of the tenant, or the signup
+ * wizard's onboarding token while the tenant is still onboarding. `set_status`
+ * is session-only and only allowed while billing is simulated (real
+ * subscription state comes from the signed Stripe webhook).
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type PlanTier, type SubscriptionStatus } from "@/lib/db";
 import { getPlans } from "@/lib/saas/plans";
 import { resolveEntitlements } from "@/lib/saas/entitlements";
 import { subscribeTenant, isBillingSimulated } from "@/lib/billing/service";
-import { getCurrentUser } from "@/lib/auth/session";
+import { requireTenantAdminOrOnboarding } from "@/lib/auth/onboarding-token";
 import { recordAudit } from "@/lib/security";
+import type { SessionUser } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 
 /** Best-effort tenant-scoped audit of a subscription/billing change. */
-async function auditBilling(tenantId: string, detail: string): Promise<void> {
-  const actor = await getCurrentUser();
+async function auditBilling(
+  actor: SessionUser | null,
+  tenantId: string,
+  detail: string,
+): Promise<void> {
   await recordAudit({
     actor: {
       id: actor?.id ?? "system",
@@ -38,10 +48,15 @@ async function auditBilling(tenantId: string, detail: string): Promise<void> {
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
+  const requested = searchParams.get("tenantId");
   const driver = getPosDriver();
   const plans = getPlans();
-  const subscription = tenantId ? await driver.getSubscription(tenantId) : null;
+  let subscription = null;
+  if (requested) {
+    const auth = await requireTenantAdminOrOnboarding(request, requested);
+    if (!auth.ok) return auth.res;
+    subscription = await driver.getSubscription(auth.tenantId);
+  }
   const entitlements = resolveEntitlements(subscription);
   return NextResponse.json({
     plans,
@@ -65,16 +80,26 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
-  if (!body.tenantId) {
+  if (!body || !body.tenantId) {
     return NextResponse.json(
       { error: "tenantId is required." },
       { status: 422 },
     );
   }
+  const auth = await requireTenantAdminOrOnboarding(request, body.tenantId);
+  if (!auth.ok) return auth.res;
+  const actor = auth.user;
   const driver = getPosDriver();
 
   try {
     if (body.action === "set_status") {
+      // Demo dunning only: real subscription status comes from Stripe.
+      if (auth.via !== "session" || !isBillingSimulated()) {
+        return NextResponse.json(
+          { error: "Subscription status is managed by billing." },
+          { status: 403 },
+        );
+      }
       if (!body.status) {
         return NextResponse.json(
           { error: "status is required." },
@@ -92,12 +117,16 @@ export async function POST(request: Request) {
         );
       }
       await auditBilling(
+        actor,
         body.tenantId,
         `Subscription status advanced to ${body.status}.`,
       );
       return NextResponse.json({ subscription: updated });
     }
 
+    if (body.action !== "subscribe") {
+      return NextResponse.json({ error: "Unknown action." }, { status: 422 });
+    }
     // subscribe
     if (!body.tier) {
       return NextResponse.json({ error: "tier is required." }, { status: 422 });
@@ -117,6 +146,7 @@ export async function POST(request: Request) {
       // Mark the plan step complete on the wizard if mid-onboarding.
       await driver.completeOnboardingStep(body.tenantId, "plan");
       await auditBilling(
+        actor,
         body.tenantId,
         `Subscription tier changed ${existing.tier} → ${body.tier}.`,
       );
@@ -149,6 +179,7 @@ export async function POST(request: Request) {
     const subscription = await driver.upsertSubscription(result.subscription);
     await driver.completeOnboardingStep(body.tenantId, "plan");
     await auditBilling(
+      actor,
       body.tenantId,
       `Subscribed to ${body.tier} plan${result.simulated ? " (simulated)" : ""}.`,
     );

@@ -12,7 +12,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
-import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
 import {
   captureError,
@@ -66,12 +66,14 @@ export async function POST(request: Request) {
   // In-store terminal orders are placed by a signed-in device user who must be a
   // member of the order's tenant. (Customer/online orders go through the public
   // /api/shop/orders route instead.)
-  // Only till roles create orders (the kitchen display never does).
-  const auth = await requireTenantRole(body.tenant_id, [
-    "owner",
-    "manager",
-    "cashier",
-  ]);
+  // Only till roles create orders (the kitchen display never does), and the
+  // location must belong to that tenant (no writing into another tenant's
+  // location under your own tenant id).
+  const auth = await requireTenantAccess(
+    body.tenant_id,
+    ["owner", "manager", "cashier"],
+    { locationId: body.location_id, requireLocation: true },
+  );
   if (!auth.ok) return auth.res;
 
   try {
@@ -109,10 +111,14 @@ export async function GET(request: Request) {
       { status: 400 },
     );
   }
-  // Order lists carry customer details: tenant members only.
-  const auth = await requireTenantMember(tenantId);
+  // Order lists carry customer details: tenant members only, and the location
+  // must belong to that tenant.
+  const auth = await requireTenantAccess(tenantId, "terminal", { locationId });
   if (!auth.ok) return auth.res;
   const driver = getPosDriver();
-  const orders = await driver.listOrders(tenantId, locationId);
+  const orders = await driver.listOrders(
+    auth.tenantId,
+    auth.locationId as string,
+  );
   return NextResponse.json({ orders });
 }
