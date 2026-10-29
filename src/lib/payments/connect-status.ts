@@ -3,11 +3,14 @@
  * `connect.ts` so the DB drivers can use them without an import cycle.
  */
 import type { ConnectAccount } from "@/lib/db/payment-types";
-import { isStripeConfigured } from "./env";
+import { cardRailsSimulated } from "./env";
 
-/** Whether the platform is using simulated rails (no Stripe key). */
+/**
+ * Whether card rails are simulated: no Stripe key, or training mode (flag / mock
+ * driver) is forcing the simulated path whatever key is set.
+ */
 export function isSimulated(): boolean {
-  return !isStripeConfigured();
+  return cardRailsSimulated();
 }
 
 /** True for a stored account that was simulated (never a real Stripe account). */

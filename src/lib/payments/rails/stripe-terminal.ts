@@ -34,7 +34,7 @@ import type {
   RefundRequest,
   RefundResult,
 } from "../PaymentRail";
-import { getDefaultPlatformFee, isStripeConfigured } from "../env";
+import { cardRailsSimulated, getDefaultPlatformFee } from "../env";
 import { computeApplicationFeeCents, stripeRefundParams } from "../fees";
 import {
   mapIntentStatus,
@@ -79,7 +79,7 @@ export const stripeTerminalRail: PaymentRail = {
     };
     const fee = feeForTender(req.amount.amount, tip);
 
-    if (!isStripeConfigured()) {
+    if (cardRailsSimulated()) {
       // Simulated approval — reader present, instant capture.
       return {
         rail: KEY,
@@ -123,7 +123,7 @@ export const stripeTerminalRail: PaymentRail = {
 
   async capture(req: CaptureRequest): Promise<ChargeResult> {
     const amount = req.amount ?? { amount: 0, currency: "USD" };
-    if (!isStripeConfigured()) {
+    if (cardRailsSimulated()) {
       return { rail: KEY, chargeId: req.chargeId, status: "captured", amount };
     }
     const intent = await stripeRequest<{ id: string; status: string }>(
@@ -141,7 +141,7 @@ export const stripeTerminalRail: PaymentRail = {
 
   async refund(req: RefundRequest): Promise<RefundResult> {
     const amount = req.amount ?? { amount: 0, currency: "USD" };
-    if (!isStripeConfigured()) {
+    if (cardRailsSimulated()) {
       return { refundId: simId("re_terminal"), status: "refunded", amount };
     }
     const refund = await stripeRequest<{ id: string; status: string }>(
@@ -162,7 +162,7 @@ export const stripeTerminalRail: PaymentRail = {
   },
 
   async status(context: PaymentContext, chargeId: string) {
-    if (!isStripeConfigured()) return "captured" as const;
+    if (cardRailsSimulated()) return "captured" as const;
     const intent = await stripeGet<{ status: string }>(
       `/payment_intents/${chargeId}`,
       { stripeAccount: context.connectAccountId ?? undefined },

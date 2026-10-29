@@ -37,6 +37,42 @@ export function isStripeConfigured(): boolean {
   return getStripeConfig() !== null;
 }
 
+/** True when the Stripe secret key is a TEST-mode key (`sk_test_...`). */
+export function isStripeTestKey(): boolean {
+  return (process.env.STRIPE_SECRET_KEY ?? "").startsWith("sk_test_");
+}
+
+/** True when `TRAINING_MODE` is explicitly enabled via env. */
+export function isTrainingFlagSet(): boolean {
+  const v = (process.env.TRAINING_MODE ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "on" || v === "yes";
+}
+
+/**
+ * True when the app is on the in-memory mock driver. Mirrors `getPosDriver()`'s
+ * env-driven selection (kept here, not imported, because the DB drivers import
+ * payments code and this module must stay a dependency-free leaf).
+ */
+export function usingMockDriver(): boolean {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  return !url || !key;
+}
+
+/**
+ * Whether CARD rails (Stripe Terminal / online, and Connect) take the SIMULATED
+ * path. They simulate when there is no Stripe key, OR whenever training mode is
+ * on because of the `TRAINING_MODE` flag or the mock driver -- whatever key is
+ * set -- so a training environment can never create a real charge, even with a
+ * live key. A `sk_test_` key with no flag on a live driver is the one case that
+ * calls Stripe (test mode), so test-mode Stripe is exercised for real.
+ */
+export function cardRailsSimulated(): boolean {
+  return !isStripeConfigured() || isTrainingFlagSet() || usingMockDriver();
+}
+
 /** Coinbase Commerce is "configured" once an API key is present. */
 export function getCoinbaseConfig(): {
   apiKey: string;

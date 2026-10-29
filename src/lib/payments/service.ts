@@ -27,9 +27,9 @@ import { requirePaymentRail } from "./registry";
 import { railChargesApplicationFee } from "./fees";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
+  cardRailsSimulated,
   isCoinbaseConfigured,
   isOnchainConfigured,
-  isStripeConfigured,
 } from "./env";
 
 function nowIso(): string {
@@ -43,7 +43,7 @@ export function railIsSimulated(rail: PaymentRailKey | "cash"): boolean {
       return false; // cash is always real
     case "stripe_terminal":
     case "stripe_online":
-      return !isStripeConfigured();
+      return cardRailsSimulated();
     case "crypto_onchain_usdc":
       return !isOnchainConfigured();
     case "crypto_coinbase":
@@ -174,7 +174,7 @@ export async function takePaymentDetailed(
   // connected account — never fall back to the platform account.
   if (
     railChargesApplicationFee(input.rail) &&
-    isStripeConfigured() &&
+    !cardRailsSimulated() &&
     (!input.connectAccountId || input.connectAccountId.startsWith("acct_sim_"))
   ) {
     throw new CardPaymentsNotReadyError();

@@ -135,6 +135,12 @@ beforeEach(() => {
   requireTenantRole.mockResolvedValue({ ok: true, user: { id: "u1", email: "s@x" } });
   vi.unstubAllEnvs();
   vi.stubEnv("STRIPE_SECRET_KEY", "");
+  getPosDriver(); // memoize the mock before pretending to be a live driver
+  // Behave like a LIVE driver (Supabase env present). The in-memory mock is
+  // already memoized by the call above, so storage still works; this only stops
+  // card rails from taking the mock-driver training-mode simulated path.
+  vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "http://localhost:54321");
+  vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "test-service-key");
 });
 
 afterEach(() => {

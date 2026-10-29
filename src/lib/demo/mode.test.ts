@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import * as db from "@/lib/db";
 import {
+  TRAINING_BANNER_STRIPE_TEST,
   demoModeInfo,
   isTrainingMode,
   isTrainingModeEnv,
@@ -66,7 +67,7 @@ describe("training / demo mode", () => {
     vi.spyOn(db, "getPosDriver").mockReturnValue({
       name: "supabase",
     } as unknown as ReturnType<typeof db.getPosDriver>);
-    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_live_x");
     expect(isTrainingMode()).toBe(false);
     const info = demoModeInfo();
     expect(info.trainingMode).toBe(false);
@@ -81,5 +82,38 @@ describe("training / demo mode", () => {
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
     vi.stubEnv("TRAINING_MODE", "1");
     expect(demoModeInfo().trainingMode).toBe(true);
+  });
+});
+
+describe("stripe-test reason + precedence (S10)", () => {
+  function liveDriver() {
+    vi.spyOn(db, "getPosDriver").mockReturnValue({
+      name: "supabase",
+    } as unknown as ReturnType<typeof db.getPosDriver>);
+  }
+
+  it("shows the Stripe test mode banner for a sk_test_ key with no flag", () => {
+    liveDriver();
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const info = demoModeInfo();
+    expect(info.reason).toBe("stripe-test");
+    expect(info.trainingMode).toBe(true);
+    expect(info.banner).toBe(TRAINING_BANNER_STRIPE_TEST);
+    expect(info.banner).toBe("TRAINING \u2014 Stripe test mode, no real money");
+    expect(isTrainingMode()).toBe(true);
+  });
+
+  it("precedence: flag > mock > stripe-unset > stripe-test", () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    // mock driver (the real one in tests) beats stripe-test
+    expect(demoModeInfo().reason).toBe("mock");
+    vi.stubEnv("TRAINING_MODE", "1");
+    expect(demoModeInfo().reason).toBe("flag");
+    vi.unstubAllEnvs();
+    liveDriver();
+    vi.stubEnv("STRIPE_SECRET_KEY", "");
+    expect(demoModeInfo().reason).toBe("stripe-unset");
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    expect(demoModeInfo().reason).toBe("stripe-test");
   });
 });

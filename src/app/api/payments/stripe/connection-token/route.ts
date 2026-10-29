@@ -16,7 +16,7 @@ import {
   resolveCardConnectAccountId,
 } from "@/lib/payments/connect";
 import { requireTenantRole } from "@/lib/auth/api";
-import { isStripeConfigured } from "@/lib/payments/env";
+import { cardRailsSimulated } from "@/lib/payments/env";
 import { stripeRequest } from "@/lib/payments/providers/stripe-client";
 
 export const runtime = "nodejs";
@@ -39,7 +39,7 @@ export async function POST(request: Request) {
   ]);
   if (!auth.ok) return auth.res;
 
-  if (!isStripeConfigured()) {
+  if (cardRailsSimulated()) {
     return NextResponse.json({
       secret: `sim_terminal_connection_token_${Date.now()}`,
       simulated: true,

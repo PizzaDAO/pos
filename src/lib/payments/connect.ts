@@ -15,7 +15,7 @@
  */
 import type { ConnectAccount, ConnectStatus } from "@/lib/db/payment-types";
 import { getPosDriver } from "@/lib/db";
-import { getStripeConfig, isStripeConfigured } from "./env";
+import { cardRailsSimulated, getStripeConfig } from "./env";
 import {
   effectiveConnectAccount,
   isSimulated,
@@ -60,7 +60,7 @@ export function deriveStatus(acct: {
 export async function createConnectAccount(
   tenantId: string,
 ): Promise<ConnectAccount> {
-  if (!isStripeConfigured()) {
+  if (cardRailsSimulated()) {
     return { ...simulatedConnectAccount(tenantId), status: "pending", charges_enabled: false, payouts_enabled: false, details_submitted: false };
   }
   const acct = await stripeRequest<{
@@ -95,7 +95,7 @@ export async function createAccountLink(
   returnUrl: string,
   refreshUrl: string,
 ): Promise<string> {
-  if (!isStripeConfigured()) {
+  if (cardRailsSimulated()) {
     return `${returnUrl}?simulated=1`;
   }
   const link = await stripeRequest<{ url: string }>("/account_links", {
@@ -112,7 +112,7 @@ export async function fetchConnectStatus(
   tenantId: string,
   accountId: string,
 ): Promise<ConnectAccount> {
-  if (!isStripeConfigured() || accountId.startsWith("acct_sim_")) {
+  if (cardRailsSimulated() || accountId.startsWith("acct_sim_")) {
     return simulatedConnectAccount(tenantId);
   }
   const acct = await stripeGet<{
