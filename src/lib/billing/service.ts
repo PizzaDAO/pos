@@ -17,8 +17,11 @@
  * module only builds subscription rows / talks to Stripe.
  */
 import type { PlanTier, Subscription } from "@/lib/db/saas-types";
-import { getPlan } from "@/lib/saas/plans";
-import { stripeRequest } from "@/lib/payments/providers/stripe-client";
+import { getPlan, getPlans } from "@/lib/saas/plans";
+import {
+  stripeGet,
+  stripeRequest,
+} from "@/lib/payments/providers/stripe-client";
 import { isBillingConfigured, isBillingSimulated } from "./env";
 
 function nowIso(): string {
@@ -60,9 +63,51 @@ export function simulatedSubscription(
   };
 }
 
+/** The plan tier whose Stripe Price id is `priceId`, or null if unknown. */
+export function tierForPriceId(priceId: unknown): PlanTier | null {
+  if (typeof priceId !== "string" || !priceId) return null;
+  return getPlans().find((p) => p.stripe_price_id === priceId)?.tier ?? null;
+}
+
+/**
+ * REAL mode: ask Stripe to move an existing subscription to another tier's
+ * Price. The local tier is NOT changed here — it is applied only when the
+ * signed `customer.subscription.updated` webhook arrives (see
+ * `applyBillingEvent`), so a tenant can never upgrade without Stripe billing it.
+ */
+export async function requestStripeTierChange(input: {
+  tenantId: string;
+  stripeSubscriptionId: string;
+  tier: PlanTier;
+}): Promise<void> {
+  const plan = getPlan(input.tier);
+  if (!plan.stripe_price_id) {
+    throw new Error(`No Stripe Price configured for the ${plan.name} plan.`);
+  }
+  const sub = await stripeGet<{ items?: { data?: { id: string }[] } }>(
+    `/subscriptions/${encodeURIComponent(input.stripeSubscriptionId)}`,
+  );
+  const itemId = sub.items?.data?.[0]?.id;
+  if (!itemId) throw new Error("Stripe subscription has no items.");
+  await stripeRequest(
+    `/subscriptions/${encodeURIComponent(input.stripeSubscriptionId)}`,
+    {
+      "items[0][id]": itemId,
+      "items[0][price]": plan.stripe_price_id,
+      proration_behavior: "create_prorations",
+      "metadata[tenant_id]": input.tenantId,
+      "metadata[tier]": input.tier,
+    },
+  );
+}
+
 /** Result of starting a subscription. */
 export interface SubscribeResult {
-  subscription: Subscription;
+  /**
+   * Simulated: the ready subscription to persist. REAL: null — nothing that
+   * grants a tier is persisted until the verified billing webhook confirms it.
+   */
+  subscription: Subscription | null;
   /** Hosted Stripe Checkout URL in REAL mode; null when simulated. */
   checkoutUrl: string | null;
   simulated: boolean;
@@ -70,8 +115,9 @@ export interface SubscribeResult {
 
 /**
  * Subscribe a tenant to a tier. In simulated mode returns a ready subscription;
- * in real mode creates a Stripe Customer + Checkout Session and returns its URL
- * (the subscription is provisional `trialing`/`active` and confirmed by webhook).
+ * in real mode creates a Stripe Customer + Checkout Session and returns its URL.
+ * Real mode persists NOTHING locally: the subscription row (tier + status) is
+ * created by the signed billing webhook once Stripe confirms checkout.
  */
 export async function subscribeTenant(input: {
   tenantId: string;
@@ -115,26 +161,13 @@ export async function subscribeTenant(input: {
       "line_items[0][quantity]": 1,
       "subscription_data[trial_period_days]": plan.trial_days,
       "subscription_data[metadata][tenant_id]": input.tenantId,
+      "subscription_data[metadata][tier]": input.tier,
       "metadata[tenant_id]": input.tenantId,
+      "metadata[tier]": input.tier,
     },
   );
 
-  const subscription: Subscription = {
-    id: `sub_${input.tenantId}`,
-    tenant_id: input.tenantId,
-    tier: input.tier,
-    status: plan.trial_days > 0 ? "trialing" : "active",
-    current_period_end: addDays(plan.trial_days > 0 ? plan.trial_days : 30),
-    trial_end: plan.trial_days > 0 ? addDays(plan.trial_days) : null,
-    cancel_at_period_end: false,
-    simulated: false,
-    stripe_customer_id: customerId,
-    stripe_subscription_id: null, // filled in by the webhook on completion
-    created_at: nowIso(),
-    updated_at: nowIso(),
-  };
-
-  return { subscription, checkoutUrl: session.url, simulated: false };
+  return { subscription: null, checkoutUrl: session.url, simulated: false };
 }
 
 export { isBillingConfigured, isBillingSimulated };

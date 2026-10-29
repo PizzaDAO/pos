@@ -9,7 +9,11 @@
  * GET  ?tenantId=  → plans catalogue + the tenant's current subscription +
  *      resolved entitlements + simulated flag.
  * POST { action, tenantId, tier?, status? }:
- *   subscribe → start/switch a subscription (returns checkoutUrl in real mode)
+ *   subscribe → start/switch a subscription (returns checkoutUrl in real mode).
+ *     REAL billing never changes the tier locally: a new subscription goes
+ *     through Stripe Checkout and a switch is a Stripe subscription update;
+ *     the tier is applied only by the signed billing webhook. SIMULATED mode
+ *     applies the tier directly (no Stripe).
  *   set_status → advance a SIMULATED subscription's lifecycle (demo dunning)
  *
  * Auth: the plan catalogue (GET without tenantId) is public. Anything
@@ -22,7 +26,11 @@ import { NextResponse } from "next/server";
 import { getPosDriver, type PlanTier, type SubscriptionStatus } from "@/lib/db";
 import { getPlans } from "@/lib/saas/plans";
 import { resolveEntitlements } from "@/lib/saas/entitlements";
-import { subscribeTenant, isBillingSimulated } from "@/lib/billing/service";
+import {
+  isBillingSimulated,
+  requestStripeTierChange,
+  subscribeTenant,
+} from "@/lib/billing/service";
 import { requireTenantAdminOrOnboarding } from "@/lib/auth/onboarding-token";
 import { recordAudit } from "@/lib/security";
 import type { SessionUser } from "@/lib/auth/session";
@@ -137,8 +145,37 @@ export async function POST(request: Request) {
     }
     const existing = await driver.getSubscription(body.tenantId);
 
-    // Already subscribed? Switching tier is a tier change, not a new checkout.
-    if (existing && existing.tier !== body.tier) {
+    const simulated = isBillingSimulated();
+
+    // REAL billing: an existing Stripe subscription switches tier THROUGH
+    // Stripe; the local tier only changes when the verified webhook arrives.
+    if (
+      !simulated &&
+      existing &&
+      !existing.simulated &&
+      existing.stripe_subscription_id &&
+      existing.tier !== body.tier
+    ) {
+      await requestStripeTierChange({
+        tenantId: body.tenantId,
+        stripeSubscriptionId: existing.stripe_subscription_id,
+        tier: body.tier,
+      });
+      await auditBilling(
+        actor,
+        body.tenantId,
+        `Requested tier change ${existing.tier} → ${body.tier} (pending Stripe confirmation).`,
+      );
+      return NextResponse.json({
+        subscription: existing,
+        checkoutUrl: null,
+        pending: true,
+        simulated: false,
+      });
+    }
+
+    // SIMULATED: switching tier is a direct tier change, not a new checkout.
+    if (simulated && existing && existing.tier !== body.tier) {
       const switched = await driver.changeSubscriptionTier(
         body.tenantId,
         body.tier,
@@ -176,8 +213,14 @@ export async function POST(request: Request) {
       successUrl: `${origin}/signup?tenant=${body.tenantId}&billing=success`,
       cancelUrl: `${origin}/signup?tenant=${body.tenantId}&billing=cancel`,
     });
-    const subscription = await driver.upsertSubscription(result.subscription);
-    await driver.completeOnboardingStep(body.tenantId, "plan");
+    // Simulated: persist the ready subscription. REAL: nothing is persisted —
+    // the billing webhook creates the row (tier + status) after checkout.
+    const subscription = result.subscription
+      ? await driver.upsertSubscription(result.subscription)
+      : existing;
+    if (result.simulated) {
+      await driver.completeOnboardingStep(body.tenantId, "plan");
+    }
     await auditBilling(
       actor,
       body.tenantId,
