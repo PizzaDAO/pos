@@ -20,6 +20,7 @@ import type {
   PaymentSettings,
   ReserveRefundResult,
   ReserveTenderResult,
+  VoidTenderResult,
 } from "./payment-types";
 import type {
   Customer,
@@ -41,9 +42,11 @@ import type {
   MovementReason,
   OverrideInput,
   SalesReport,
+  PinLockState,
   Shift,
   ShiftCashEvent,
   Staff,
+  StaffSession,
   SizeInput,
 } from "./backoffice-types";
 import type {
@@ -129,10 +132,15 @@ export interface PosDriver {
     input: CreateTenantInput,
   ): Promise<{ tenant: Tenant; owner: User }>;
 
-  /** Update a tenant's lifecycle status (active/suspended/cancelled). */
+  /**
+   * Update a tenant's lifecycle status (active/suspended/cancelled). With
+   * `byPlatform: true` the platform-suspension flag is written in the SAME
+   * update (true when suspending, false otherwise).
+   */
   setTenantStatus(
     tenantId: string,
     status: Tenant["status"],
+    opts?: { byPlatform?: boolean },
   ): Promise<Tenant | null>;
 
   /** Add a location to a tenant during/after onboarding (own slug + settings). */
@@ -356,6 +364,30 @@ export interface PosDriver {
    * the last of the balance. Idempotent on `payment.id`.
    */
   reserveTender(payment: Payment): Promise<ReserveTenderResult>;
+
+  /**
+   * Cancel an UNSETTLED tender (pending / requires_action) under a row lock so
+   * it stops holding the order balance. Settled tenders are refunded instead.
+   */
+  voidTender(id: string): Promise<VoidTenderResult>;
+
+  /**
+   * Targeted status update from a provider signal (webhook / status poll):
+   * changes ONLY `status`, and never moves a refunded or partially refunded
+   * tender (refunded_cents > 0) back to another status. Returns the row.
+   */
+  updatePaymentStatusFromProvider(
+    id: string,
+    status: Payment["status"],
+    opts?: { from?: Payment["status"][] },
+  ): Promise<Payment | null>;
+
+  /**
+   * Final write of a tender after its rail call — applied ONLY while the row
+   * is still unsettled (pending / requires_action), so a tender voided or
+   * canceled meanwhile can never come back. Returns the current row.
+   */
+  completeTender(payment: Payment): Promise<Payment | null>;
 
   /** Fetch a refund request by its id, or null. */
   getRefund(id: string): Promise<PaymentRefund | null>;
@@ -595,6 +627,19 @@ export interface PosDriver {
    * PIN route — the hash never leaves the server. Returns null if unknown.
    */
   getStaffById(tenantId: string, staffId: string): Promise<Staff | null>;
+
+  // -- PIN lockout (per staff member, persisted) -----------------------------
+  getPinLockState(tenantId: string, staffId: string): Promise<PinLockState>;
+  /** Atomically count a failed PIN; locks after 5 failures for 15 minutes. */
+  recordPinFailure(tenantId: string, staffId: string): Promise<PinLockState>;
+  clearPinFailures(tenantId: string, staffId: string): Promise<void>;
+
+  // -- Terminal staff sessions (server-side revocation of PIN switch-ins) ----
+  createStaffSession(session: StaffSession): Promise<StaffSession>;
+  getStaffSession(id: string): Promise<StaffSession | null>;
+  revokeStaffSession(id: string): Promise<void>;
+  /** Revoke every live staff session opened by this device user. */
+  revokeStaffSessionsForUser(userId: string): Promise<void>;
 
   /** Fetch a single shift by id (any tenant), or null. */
   getShift(id: string): Promise<Shift | null>;

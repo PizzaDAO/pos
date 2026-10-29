@@ -14,6 +14,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { demoModeInfo } from "@/lib/demo/mode";
+import { simulatedPaymentsPolicy } from "@/lib/payments/availability";
 import {
   captureError,
   resolveRequestId,
@@ -56,6 +57,8 @@ export async function GET(request: Request) {
       trainingMode: demo.trainingMode,
       driver: demo.driver,
       paymentsSimulated: demo.paymentsSimulated,
+      // Whether unkeyed (simulated) rails are accepted, and for whom.
+      simulatedPayments: simulatedPaymentsPolicy(),
       time: new Date().toISOString(),
       requestId,
     },

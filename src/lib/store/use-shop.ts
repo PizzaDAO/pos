@@ -19,6 +19,8 @@ export interface ShopResponse {
   menu: Menu;
   settings: StoreSettings;
   paymentSettings: PaymentSettings;
+  /** Online rails the customer can pay with right now (server-decided). */
+  onlineRails?: string[];
   driver: string;
 }
 

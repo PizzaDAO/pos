@@ -30,6 +30,19 @@ import {
 } from "@/lib/auth/onboarding-token";
 import { enforceRateLimit, isEmail, recordAudit } from "@/lib/security";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
+import { signingSecret } from "@/lib/auth/signing-secret";
+
+/**
+ * Whether the platform suspended (or cancelled) this tenant — read from the
+ * explicit `suspended_by_platform` flag written in the same update as the
+ * platform's status change (never inferred from the audit log).
+ */
+async function isPlatformSuspended(tenantId: string): Promise<boolean> {
+  const tenant = await getPosDriver().getTenant(tenantId);
+  if (!tenant) return true;
+  if (tenant.status === "cancelled") return true;
+  return tenant.status === "suspended" && tenant.suspended_by_platform === true;
+}
 
 export const runtime = "nodejs";
 
@@ -100,6 +113,14 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { error: "businessName is too long." },
         { status: 422 },
+      );
+    }
+    // Fail closed BEFORE creating anything if tokens can't be signed (real
+    // mode without ONBOARDING_TOKEN_SECRET / service key).
+    if (!signingSecret()) {
+      return NextResponse.json(
+        { error: "Signup is temporarily unavailable." },
+        { status: 503 },
       );
     }
     try {
@@ -202,6 +223,15 @@ export async function POST(request: Request) {
       }
 
       case "go_live": {
+        // New tenants start `suspended` until go-live — but a tenant the
+        // PLATFORM suspended (audited tenant_suspend not followed by a
+        // reactivate) must not self-activate through the wizard.
+        if (await isPlatformSuspended(tenantId)) {
+          return NextResponse.json(
+            { error: "This account is suspended. Contact support." },
+            { status: 403 },
+          );
+        }
         const onboarding = await driver.goLive(tenantId);
         const tenant = await driver.getTenant(tenantId);
         await recordAudit({

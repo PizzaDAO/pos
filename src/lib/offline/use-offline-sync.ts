@@ -13,13 +13,17 @@
 import { useCallback, useEffect, useState } from "react";
 import type { CreateOrderInput } from "@/lib/db";
 import { enqueueOrder, getPendingCount, pruneSynced } from "./queue";
-import { flushQueue } from "./sync";
+import { flushQueue, syncEntry, type SyncOutcome } from "./sync";
 
 export interface OfflineSyncState {
   online: boolean;
   pendingCount: number;
-  /** Enqueue + attempt flush. Returns once durably queued (not necessarily synced). */
-  placeOrderOffline: (payload: CreateOrderInput) => Promise<void>;
+  /**
+   * Enqueue durably, then (when online) push THIS order immediately and report
+   * the server's verdict: synced, rejected (non-retryable 4xx — show it, don't
+   * take payment), or error (stays queued, retried later).
+   */
+  placeOrderOffline: (payload: CreateOrderInput) => Promise<SyncOutcome>;
   /** Manually trigger a flush (e.g. a "retry sync" button). */
   flushNow: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -45,13 +49,24 @@ export function useOfflineSync(): OfflineSyncState {
   }, [refresh]);
 
   const placeOrderOffline = useCallback(
-    async (payload: CreateOrderInput) => {
+    async (payload: CreateOrderInput): Promise<SyncOutcome> => {
       await enqueueOrder(payload);
       await refresh();
-      // Fire-and-forget flush; failures stay queued for the next trigger.
-      void flushNow();
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        return { status: "error", error: "offline" };
+      }
+      const outcome = await syncEntry({
+        id: payload.id,
+        payload,
+        status: "pending",
+        attempts: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      await refresh();
+      return outcome;
     },
-    [flushNow, refresh],
+    [refresh],
   );
 
   useEffect(() => {

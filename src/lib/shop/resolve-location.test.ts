@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { DEMO_LOCATION_DOWNTOWN_ID, DEMO_TENANT_ID, getPosDriver } from "@/lib/db";
-import { resolveStorefrontLocation } from "./resolve-location";
+import {
+  resolveLegacyShopSlug,
+  resolveStorefrontLocation,
+} from "./resolve-location";
 import { storefrontPath } from "./storefront";
 
 /**
@@ -77,6 +80,53 @@ describe("storefront slug resolution across tenants (mock driver)", () => {
       name: "Track",
     });
     expect(loc.slug).not.toBe("track");
+  });
+
+  it("legacy /shop/{slug}: tenant slug wins; tenant+location collision → chooser", async () => {
+    // Tenant slug with ONE location → redirect to it.
+    const { tenant: solo } = await driver.createTenant({
+      businessName: "Solo Slice",
+      ownerEmail: "solo@example.com",
+    });
+    const soloLoc = await driver.createLocation({
+      tenant_id: solo.id,
+      name: "Main Street",
+    });
+    expect(await resolveLegacyShopSlug(solo.slug)).toEqual({
+      kind: "redirect",
+      path: storefrontPath({ tenantSlug: solo.slug, locationSlug: soloLoc.slug }),
+    });
+
+    // A tenant whose slug equals ANOTHER tenant's location slug → chooser
+    // with both, never a guess.
+    const { tenant: clash } = await driver.createTenant({
+      businessName: "Tonys Uptown",
+      ownerEmail: "clash@example.com",
+    });
+    expect(clash.slug).toBe("tonys-uptown");
+    await driver.createLocation({ tenant_id: clash.id, name: "Only Store" });
+    const res = await resolveLegacyShopSlug("tonys-uptown");
+    expect(res.kind).toBe("choose");
+    if (res.kind === "choose") {
+      expect(new Set(res.choices.map((c) => c.tenant.id))).toEqual(
+        new Set([clash.id, DEMO_TENANT_ID]),
+      );
+    }
+
+    // A bare, unique legacy location slug still redirects.
+    const { tenant: other } = await driver.createTenant({
+      businessName: "Legacy Only",
+      ownerEmail: "legacy@example.com",
+    });
+    const legacy = await driver.createLocation({
+      tenant_id: other.id,
+      name: "Very Unique Store Name",
+    });
+    expect(await resolveLegacyShopSlug(legacy.slug)).toEqual({
+      kind: "redirect",
+      path: storefrontPath({ tenantSlug: other.slug, locationSlug: legacy.slug }),
+    });
+    expect((await resolveLegacyShopSlug("nothing-here")).kind).toBe("none");
   });
 
   it("builds canonical storefront paths", () => {

@@ -16,7 +16,10 @@ import {
   verifyCoinbaseWebhook,
 } from "@/lib/payments/providers/coinbase-client";
 import { isCoinbaseConfigured } from "@/lib/payments/env";
-import { refreshPaymentStatus } from "@/lib/payments/service";
+import {
+  PROVIDER_UPDATABLE,
+  refreshPaymentStatus,
+} from "@/lib/payments/service";
 
 export const runtime = "nodejs";
 
@@ -50,7 +53,11 @@ export async function POST(request: Request) {
   const driver = getPosDriver();
   const matched = await driver.getPaymentByChargeId(chargeId);
   if (matched) {
-    await driver.upsertPayment({ ...matched, status: mapped });
+    // Targeted status-only update; never moves a refunded / partially
+    // refunded tender back (e.g. a late payment_intent.succeeded).
+    await driver.updatePaymentStatusFromProvider(matched.id, mapped, {
+      from: PROVIDER_UPDATABLE,
+    });
     await refreshPaymentStatus(matched.id);
   }
 

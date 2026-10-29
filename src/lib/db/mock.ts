@@ -38,7 +38,9 @@ import type {
   PaymentSettings,
   ReserveRefundResult,
   ReserveTenderResult,
+  VoidTenderResult,
 } from "./payment-types";
+import { countsTowardBalance } from "@/lib/payments/balance";
 import type {
   Customer,
   DeliveryRecord,
@@ -65,6 +67,8 @@ import type {
   ShiftCashEvent,
   SizeInput,
   Staff,
+  PinLockState,
+  StaffSession,
 } from "./backoffice-types";
 import type {
   Location,
@@ -214,6 +218,12 @@ const tenantSettings = new Map<string, TenantSettings>();
 const payments = new Map<string, Payment>();
 /** Refund requests keyed by client refund id (idempotency key). */
 const refunds = new Map<string, PaymentRefund>();
+/** Terminal PIN switch-in sessions keyed by id (server-side revocation). */
+const staffSessions = new Map<string, StaffSession>();
+/** Per-staff PIN failure counters / locks (mirrors staff.pin_* columns). */
+const pinLocks = new Map<string, { attempts: number; lockedUntil: number | null }>();
+const PIN_MAX_FAILURES = 5;
+const PIN_LOCK_MS = 15 * 60_000;
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 /** Online-ordering customers keyed by id. */
@@ -577,10 +587,12 @@ export const mockDriver: PosDriver = {
   async setTenantStatus(
     tenantId: string,
     status: Tenant["status"],
+    opts?: { byPlatform?: boolean },
   ): Promise<Tenant | null> {
     const t = tenants.find((x) => x.id === tenantId);
     if (!t) return null;
     t.status = status;
+    if (opts?.byPlatform) t.suspended_by_platform = status === "suspended";
     return { ...t };
   },
 
@@ -1111,11 +1123,7 @@ export const mockDriver: PosDriver = {
     }
     let covered = 0;
     for (const p of payments.values()) {
-      if (
-        p.order_id === order.id &&
-        p.status !== "failed" &&
-        p.status !== "canceled"
-      ) {
+      if (p.order_id === order.id && countsTowardBalance(p)) {
         covered += p.amount_cents;
       }
     }
@@ -1130,11 +1138,52 @@ export const mockDriver: PosDriver = {
     const now = nowIso();
     const created: Payment = {
       ...payment,
-      created_at: payment.created_at || now,
+      // Server time, like reserve_payment() (drives the stale-tender TTL).
+      created_at: now,
       updated_at: now,
     };
     payments.set(created.id, created);
     return { ok: true, created: true, payment: { ...created } };
+  },
+
+  async voidTender(id: string): Promise<VoidTenderResult> {
+    const p = payments.get(id);
+    if (!p) return { ok: false, reason: "not_found" };
+    if (p.status === "canceled") return { ok: true, payment: { ...p } };
+    if (p.status !== "pending" && p.status !== "requires_action") {
+      return { ok: false, reason: "not_voidable", payment: { ...p } };
+    }
+    const updated: Payment = { ...p, status: "canceled", updated_at: nowIso() };
+    payments.set(id, updated);
+    return { ok: true, payment: { ...updated } };
+  },
+
+  async updatePaymentStatusFromProvider(id, status, opts): Promise<Payment | null> {
+    const p = payments.get(id);
+    if (!p) return null;
+    // Never resurrect a refunded / partially refunded tender.
+    if (p.status === "refunded" || p.refunded_cents > 0) return { ...p };
+    if (opts?.from && !opts.from.includes(p.status)) return { ...p };
+    const updated: Payment = { ...p, status, updated_at: nowIso() };
+    payments.set(id, updated);
+    return { ...updated };
+  },
+
+  async completeTender(payment: Payment): Promise<Payment | null> {
+    const current = payments.get(payment.id);
+    if (!current) return null;
+    // Only an unsettled reservation may be finalized (a voided / canceled /
+    // already-final tender is never overwritten).
+    if (current.status !== "pending" && current.status !== "requires_action") {
+      return { ...current };
+    }
+    const updated: Payment = {
+      ...payment,
+      created_at: current.created_at,
+      updated_at: nowIso(),
+    };
+    payments.set(updated.id, updated);
+    return { ...updated };
   },
 
   async getRefund(id: string): Promise<PaymentRefund | null> {
@@ -1153,6 +1202,10 @@ export const mockDriver: PosDriver = {
     const payment = payments.get(input.paymentId);
     if (!payment) {
       return { ok: false, reason: "payment_not_found", refundableCents: 0 };
+    }
+    // Only settled money can be refunded (mirrors reserve_refund()).
+    if (payment.status !== "captured" && payment.status !== "authorized") {
+      return { ok: false, reason: "not_settled", refundableCents: 0 };
     }
     let pending = 0;
     for (const r of refunds.values()) {
@@ -1813,6 +1866,68 @@ export const mockDriver: PosDriver = {
     const s = staffById.get(staffId);
     if (!s || s.tenant_id !== tenantId) return null;
     return { ...s };
+  },
+
+  async getPinLockState(tenantId, staffId): Promise<PinLockState> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return { attempts: 0, lockedUntil: null };
+    const l = pinLocks.get(staffId);
+    if (!l) return { attempts: 0, lockedUntil: null };
+    const locked = l.lockedUntil !== null && l.lockedUntil > Date.now();
+    return {
+      attempts: locked ? l.attempts : l.lockedUntil !== null ? 0 : l.attempts,
+      lockedUntil: locked ? new Date(l.lockedUntil as number).toISOString() : null,
+    };
+  },
+
+  async recordPinFailure(tenantId, staffId): Promise<PinLockState> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return { attempts: 0, lockedUntil: null };
+    const now = Date.now();
+    const l = pinLocks.get(staffId) ?? { attempts: 0, lockedUntil: null };
+    if (l.lockedUntil !== null && l.lockedUntil > now) {
+      return { attempts: l.attempts, lockedUntil: new Date(l.lockedUntil).toISOString() };
+    }
+    let attempts = (l.lockedUntil !== null ? 0 : l.attempts) + 1;
+    let lockedUntil: number | null = null;
+    if (attempts >= PIN_MAX_FAILURES) {
+      lockedUntil = now + PIN_LOCK_MS;
+      attempts = 0;
+    }
+    pinLocks.set(staffId, { attempts, lockedUntil });
+    return {
+      attempts,
+      lockedUntil: lockedUntil ? new Date(lockedUntil).toISOString() : null,
+    };
+  },
+
+  async clearPinFailures(tenantId, staffId): Promise<void> {
+    const s = staffById.get(staffId);
+    if (s && s.tenant_id === tenantId) pinLocks.delete(staffId);
+  },
+
+  async createStaffSession(session: StaffSession): Promise<StaffSession> {
+    staffSessions.set(session.id, { ...session });
+    return { ...session };
+  },
+
+  async getStaffSession(id: string): Promise<StaffSession | null> {
+    const s = staffSessions.get(id);
+    return s ? { ...s } : null;
+  },
+
+  async revokeStaffSession(id: string): Promise<void> {
+    const s = staffSessions.get(id);
+    if (s && !s.revoked_at) staffSessions.set(id, { ...s, revoked_at: nowIso() });
+  },
+
+  async revokeStaffSessionsForUser(userId: string): Promise<void> {
+    const now = nowIso();
+    for (const [id, s] of staffSessions) {
+      if (s.user_id === userId && !s.revoked_at) {
+        staffSessions.set(id, { ...s, revoked_at: now });
+      }
+    }
   },
 
   async upsertStaff(staff: Staff): Promise<Staff> {

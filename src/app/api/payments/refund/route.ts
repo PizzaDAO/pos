@@ -13,10 +13,15 @@
  */
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { RefundRejectedError, refundPayment } from "@/lib/payments/service";
+import {
+  PaymentOutcomeUnknownError,
+  RefundRejectedError,
+  refundPayment,
+} from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { effectiveTerminalRole } from "@/lib/auth/active-staff";
 import {
   enforceRateLimit,
   isMoneyCents,
@@ -87,13 +92,21 @@ export async function POST(request: Request) {
   if (!existingPayment) {
     return NextResponse.json({ error: "Payment not found." }, { status: 404 });
   }
-  // Money leaves the business: owner|manager|cashier only (not kitchen).
-  const auth = await requireTenantAccess(existingPayment.tenant_id, [
-    "owner",
-    "manager",
-    "cashier",
-  ]);
+  // Money leaves the business: owner|manager|cashier only (not kitchen) —
+  // judged on the ACTIVE (PIN-switched) staff member, not the device login.
+  const auth = await requireTenantAccess(existingPayment.tenant_id, "terminal");
   if (!auth.ok) return auth.res;
+  const active = await effectiveTerminalRole(request, auth);
+  if (
+    active.role !== "owner" &&
+    active.role !== "manager" &&
+    active.role !== "cashier"
+  ) {
+    return NextResponse.json(
+      { error: "Switch in a staff member who may issue refunds." },
+      { status: 403 },
+    );
+  }
 
   const refundId = b.refundId ?? randomUUID();
   // A retry of an already-recorded refund skips the pre-checks: the service
@@ -144,7 +157,12 @@ export async function POST(request: Request) {
     // Audit the refund (tenant-scoped). Fully-refunded ⇒ a void of the tender.
     const fullyRefunded = payment.refunded_cents >= payment.amount_cents;
     await recordAudit({
-      actor: { id: auth.user.id, label: auth.user.email },
+      actor: {
+        id: auth.user.id,
+        label: active.staff
+          ? `${active.staff.name} (via ${auth.user.email})`
+          : auth.user.email,
+      },
       action: fullyRefunded ? "payment_void" : "payment_refund",
       tenantId: payment.tenant_id,
       detail: `Refunded ${b.amountCents ?? payment.amount_cents}¢ on payment ${payment.id} (order ${payment.order_id})${b.reason ? ` — ${b.reason}` : ""}.`,
@@ -157,6 +175,14 @@ export async function POST(request: Request) {
       orderStatus: order?.status,
     });
   } catch (err) {
+    // Provider outcome unknown: the refund stays pending. Retry with the SAME
+    // refundId (the rail dedupes on it) — never a new id.
+    if (err instanceof PaymentOutcomeUnknownError) {
+      return NextResponse.json(
+        { error: err.message, retry: true, refundId: err.id },
+        { status: 503 },
+      );
+    }
     if (err instanceof RefundRejectedError) {
       return NextResponse.json({ error: err.message }, { status: err.status });
     }

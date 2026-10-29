@@ -28,6 +28,8 @@ import type { Order, Payment, PaymentStatus } from "@/lib/db";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { railChargesApplicationFee } from "./fees";
+import { countsTowardBalance, isStaleUnsettled } from "./balance";
+import { StripeError } from "./providers/stripe-client";
 import {
   isCoinbaseConfigured,
   isOnchainConfigured,
@@ -82,7 +84,7 @@ export interface TakePaymentInput {
  */
 function coveredCents(payments: Payment[]): number {
   return payments
-    .filter((p) => p.status !== "failed" && p.status !== "canceled")
+    .filter((p) => countsTowardBalance(p))
     .reduce((sum, p) => sum + p.amount_cents, 0);
 }
 
@@ -101,6 +103,70 @@ export class BalanceExceededError extends Error {
   ) {
     super(message);
     this.name = "BalanceExceededError";
+  }
+}
+
+/**
+ * The rail call's outcome is UNKNOWN (timeout, network error, 5xx, rate limit):
+ * the money may or may not have moved. The record is left `pending` and the
+ * client must retry with the SAME id (the rail dedupes on it) → HTTP 503.
+ */
+export class PaymentOutcomeUnknownError extends Error {
+  constructor(
+    message: string,
+    readonly id: string,
+  ) {
+    super(message);
+    this.name = "PaymentOutcomeUnknownError";
+  }
+}
+
+/**
+ * Did the rail DEFINITIVELY refuse (no money moved)? Only then may a tender /
+ * refund be finalized as failed. Stripe 4xx (decline / invalid request / auth)
+ * are definitive, except idempotency conflicts (409, idempotency_error) and
+ * rate limits (429); "not configured" errors never reached Stripe. Anything
+ * else — network errors, timeouts, 5xx, unknown errors — is ambiguous.
+ */
+export function isDefinitiveRailFailure(err: unknown): boolean {
+  if (err instanceof StripeError) {
+    if (err.raw === null) return true; // never sent (not configured)
+    const type = (err.raw as { error?: { type?: string } } | null)?.error?.type;
+    if (type === "idempotency_error") return false;
+    return (
+      err.status >= 400 &&
+      err.status < 500 &&
+      err.status !== 409 &&
+      err.status !== 429
+    );
+  }
+  return false;
+}
+
+/**
+ * Statuses a provider signal (status poll / webhook) may move a tender FROM.
+ * Failed / canceled (voided) / captured / refunded tenders never change.
+ */
+export const PROVIDER_UPDATABLE: PaymentStatus[] = [
+  "pending",
+  "requires_action",
+  "authorized",
+];
+
+/**
+ * The rail charged, but the tender had been voided/canceled in the meantime.
+ * The tender is NOT revived; the charge must be reconciled (refunded at the
+ * provider). → HTTP 409.
+ */
+export class TenderVoidedDuringChargeError extends Error {
+  constructor(
+    readonly paymentId: string,
+    readonly chargeId: string,
+  ) {
+    super(
+      `Tender ${paymentId} was voided while the charge (${chargeId}) completed; refund it at the provider.`,
+    );
+    this.name = "TenderVoidedDuringChargeError";
   }
 }
 
@@ -131,47 +197,78 @@ export async function getOrderBalance(order: Order): Promise<number> {
 export async function takePayment(input: TakePaymentInput): Promise<Payment> {
   const driver = getPosDriver();
 
-  // Idempotency guard: a tender with this id already exists → return it.
-  const existing = await driver.getPayment(input.paymentId);
-  if (existing) return existing;
-
   const rail = requirePaymentRail(input.rail);
 
-  // ATOMIC reservation against the remaining balance BEFORE charging.
-  const reservedAt = nowIso();
-  const reservation = await driver.reserveTender({
-    id: input.paymentId,
-    order_id: input.orderId,
-    tenant_id: input.tenantId,
-    location_id: input.locationId,
-    rail: input.rail,
-    status: "pending",
-    amount_cents: input.amountCents,
-    tip_cents: input.tipCents,
-    application_fee_cents: 0,
-    currency: input.currency,
-    charge_id: null,
-    connect_account_id: input.connectAccountId ?? null,
-    crypto_tx_hash: null,
-    crypto_chain: null,
-    cash_tendered_cents: null,
-    cash_change_cents: null,
-    refunded_cents: 0,
-    simulated: railIsSimulated(input.rail),
-    raw: null,
-    created_at: reservedAt,
-    updated_at: reservedAt,
-  });
-  if (!reservation.ok) {
-    throw new BalanceExceededError(
-      reservation.reason === "exceeds_balance"
-        ? `Amount exceeds the remaining balance (${reservation.balanceCents}).`
-        : "This order can no longer be paid.",
-      reservation.balanceCents,
-    );
+  // Idempotency guard: a tender with this id already exists.
+  const existing = await driver.getPayment(input.paymentId);
+  let reserved: Payment;
+  if (existing) {
+    if (existing.order_id !== input.orderId) {
+      throw new BalanceExceededError("Payment id already used.", 0);
+    }
+    // A reservation whose rail outcome was never recorded (an earlier attempt
+    // timed out / errored ambiguously): RESUME it with the SAME idempotency key
+    // and the ORIGINAL amounts — the rail returns the original charge if it
+    // happened, so this can't double-charge. Anything else is final → replay.
+    const unfinished =
+      existing.status === "pending" && !existing.charge_id && !existing.raw;
+    if (!unfinished) return existing;
+    if (isStaleUnsettled(existing)) {
+      // It no longer holds the balance; don't charge against it blindly.
+      throw new BalanceExceededError(
+        "This payment attempt expired. Void it and start a new payment.",
+        0,
+      );
+    }
+    reserved = existing;
+  } else {
+    // ATOMIC reservation against the remaining balance BEFORE charging.
+    const reservedAt = nowIso();
+    const reservation = await driver.reserveTender({
+      id: input.paymentId,
+      order_id: input.orderId,
+      tenant_id: input.tenantId,
+      location_id: input.locationId,
+      rail: input.rail,
+      status: "pending",
+      amount_cents: input.amountCents,
+      tip_cents: input.tipCents,
+      application_fee_cents: 0,
+      currency: input.currency,
+      charge_id: null,
+      connect_account_id: input.connectAccountId ?? null,
+      crypto_tx_hash: null,
+      crypto_chain: null,
+      cash_tendered_cents: null,
+      cash_change_cents: null,
+      refunded_cents: 0,
+      simulated: railIsSimulated(input.rail),
+      raw: null,
+      created_at: reservedAt,
+      updated_at: reservedAt,
+    });
+    if (!reservation.ok) {
+      throw new BalanceExceededError(
+        reservation.reason === "exceeds_balance"
+          ? `Amount exceeds the remaining balance (${reservation.balanceCents}).`
+          : "This order can no longer be paid.",
+        reservation.balanceCents,
+      );
+    }
+    // A concurrent request with the same id won the race → idempotent replay.
+    if (!reservation.created) return reservation.payment;
+    reserved = reservation.payment;
   }
-  // A concurrent request with the same id won the race → idempotent replay.
-  if (!reservation.created) return reservation.payment;
+  if (reserved.rail !== input.rail) {
+    throw new BalanceExceededError("Payment id already used.", 0);
+  }
+  // Always charge the RESERVED amounts (a resume must match the original).
+  input = {
+    ...input,
+    amountCents: reserved.amount_cents,
+    tipCents: reserved.tip_cents,
+    currency: reserved.currency,
+  };
   const amount = { amount: input.amountCents, currency: input.currency };
   const tip =
     input.tipCents > 0
@@ -199,11 +296,20 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
       metadata,
     });
   } catch (err) {
-    // Release the reservation so the balance is available again.
-    await driver
-      .upsertPayment({ ...reservation.payment, status: "failed" })
-      .catch(() => null);
-    throw err;
+    if (isDefinitiveRailFailure(err)) {
+      // Definitive decline: no money moved — release the reservation.
+      await driver
+        .updatePaymentStatusFromProvider(reserved.id, "failed", {
+          from: ["pending", "requires_action"],
+        })
+        .catch(() => null);
+      throw err;
+    }
+    // Ambiguous: leave it pending; the client retries with the SAME id.
+    throw new PaymentOutcomeUnknownError(
+      "The payment provider did not confirm the charge. Retry the same payment.",
+      reserved.id,
+    );
   }
 
   // Pull the application fee the rail computed (card rails only).
@@ -213,7 +319,11 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
 
   const cashTendered =
     input.rail === "cash"
-      ? Number(result.raw?.cashTenderedCents ?? input.cashTenderedCents ?? input.amountCents + input.tipCents)
+      ? Number(
+          result.raw?.cashTenderedCents ??
+            input.cashTenderedCents ??
+            input.amountCents + input.tipCents,
+        )
       : null;
   const cashChange =
     input.rail === "cash" ? Number(result.raw?.cashChangeCents ?? 0) : null;
@@ -238,11 +348,32 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
     refunded_cents: 0,
     simulated: railIsSimulated(input.rail),
     raw: result.raw ?? null,
-    created_at: reservation.payment.created_at,
+    created_at: reserved.created_at,
     updated_at: nowIso(),
   };
 
-  const saved = await driver.upsertPayment(payment);
+  // Conditional final write: only while the reservation is still unsettled.
+  // A tender voided / canceled while the rail call was in flight is NEVER
+  // brought back.
+  const saved = await driver.completeTender(payment);
+  if (
+    !saved ||
+    saved.status !== payment.status ||
+    saved.charge_id !== payment.charge_id
+  ) {
+    const current = saved ?? (await driver.getPayment(payment.id));
+    if (
+      current &&
+      (current.status === "canceled" || current.status === "failed") &&
+      (payment.status === "captured" || payment.status === "authorized")
+    ) {
+      // Money moved at the rail but the tender was voided meanwhile — surface
+      // it for reconciliation (refund at the provider) instead of reviving it.
+      throw new TenderVoidedDuringChargeError(payment.id, result.chargeId);
+    }
+    if (current) return current;
+    throw new Error(`Tender ${payment.id} disappeared during the charge.`);
+  }
   await maybeMarkOrderPaid(input.orderId);
   return saved;
 }
@@ -273,7 +404,12 @@ export async function refreshPaymentStatus(
   );
 
   if (status === payment.status) return payment;
-  const updated = await driver.upsertPayment({ ...payment, status });
+  // Targeted status-only update (never resurrects a refunded tender).
+  const updated = await driver.updatePaymentStatusFromProvider(
+    payment.id,
+    status,
+    { from: PROVIDER_UPDATABLE },
+  );
   await maybeMarkOrderPaid(payment.order_id);
   return updated;
 }
@@ -329,7 +465,9 @@ export async function refundPayment(input: {
         ? `Refund exceeds the refundable amount (${reservation.refundableCents}).`
         : reservation.reason === "refund_mismatch"
           ? "Refund id already used for another payment."
-          : "Payment not found.",
+          : reservation.reason === "not_settled"
+            ? "Only a settled (captured) payment can be refunded."
+            : "Payment not found.",
       reservation.reason === "exceeds_refundable" ? 422 : 409,
     );
   }
@@ -350,8 +488,16 @@ export async function refundPayment(input: {
       reason: input.reason,
     });
   } catch (err) {
-    await driver.finalizeRefund(refund.id, "failed").catch(() => null);
-    throw err;
+    if (isDefinitiveRailFailure(err)) {
+      await driver.finalizeRefund(refund.id, "failed").catch(() => null);
+      throw err;
+    }
+    // Ambiguous: keep the refund pending (its amount stays reserved); the
+    // client retries with the SAME refundId and the rail dedupes on it.
+    throw new PaymentOutcomeUnknownError(
+      "The payment provider did not confirm the refund. Retry the same refund.",
+      refund.id,
+    );
   }
 
   const updated = await driver.finalizeRefund(refund.id, "succeeded");
@@ -366,7 +512,10 @@ export async function refundPayment(input: {
 }
 
 /** Rail idempotency key for one refund request of one payment. */
-export function refundIdempotencyKey(paymentId: string, refundId: string): string {
+export function refundIdempotencyKey(
+  paymentId: string,
+  refundId: string,
+): string {
   return `refund_${paymentId}_${refundId}`;
 }
 

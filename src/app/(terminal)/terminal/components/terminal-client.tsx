@@ -12,7 +12,7 @@
  */
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import type { CreateOrderInput, MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
@@ -61,9 +61,18 @@ function clientOrderNumber(): string {
 export function TerminalClient({
   initialTenantId,
   initialLocationId,
+  deviceRole,
+  requireActiveStaff = false,
 }: {
   initialTenantId?: string;
   initialLocationId?: string;
+  /** The device login's role in this tenant (server-resolved). */
+  deviceRole?: string;
+  /**
+   * Real mode: money-sensitive actions are authorized by the PIN-switched
+   * active staff member only (the server enforces this; the UI mirrors it).
+   */
+  requireActiveStaff?: boolean;
 } = {}) {
   const { data, isLoading, isError, refetch } = useMenu(
     initialTenantId,
@@ -76,10 +85,20 @@ export function TerminalClient({
 
   const items = useCartStore((s) => s.items);
   const discountCents = useCartStore((s) => s.discountCents);
+  const setDiscount = useCartStore((s) => s.setDiscount);
   const notes = useCartStore((s) => s.notes);
   const addLine = useCartStore((s) => s.addLine);
   const updateLine = useCartStore((s) => s.updateLine);
   const clear = useCartStore((s) => s.clear);
+
+  // Who may discount: the active staff member's role (or, in the zero-env demo
+  // only, the device login's role) must be owner|manager.
+  const effectiveRole =
+    activeStaff?.role ?? (requireActiveStaff ? null : (deviceRole ?? null));
+  const canDiscount = effectiveRole === "owner" || effectiveRole === "manager";
+  useEffect(() => {
+    if (!canDiscount && discountCents > 0) setDiscount(0);
+  }, [canDiscount, discountCents, setDiscount]);
 
   const [builderItem, setBuilderItem] = useState<MenuItemDetail | null>(null);
   const [editingLine, setEditingLine] = useState<OrderItem | null>(null);
@@ -187,12 +206,22 @@ export function TerminalClient({
         staff_id: activeStaff?.id ?? null,
       };
 
-      // Snapshot online state before the async enqueue/flush.
-      const wasOnline = sync.online;
-      await sync.placeOrderOffline(payload);
+      const outcome = await sync.placeOrderOffline(payload);
+
+      if (outcome.status === "rejected") {
+        // The server REFUSED the order (e.g. forbidden discount, 86'd item):
+        // it was not placed. Keep the cart so the cashier can fix it, and
+        // never open payment.
+        toast({
+          title: "Order not placed",
+          description: outcome.error,
+          variant: "error",
+        });
+        return;
+      }
 
       clear();
-      if (wasOnline) {
+      if (outcome.status === "synced") {
         // Order reached the server → go straight to taking payment.
         toast({ title: `Order ${orderNumber} placed`, variant: "success" });
         setPayOrderId(orderId);
@@ -251,6 +280,7 @@ export function TerminalClient({
             onEditLine={openBuilderForLine}
             onPlaceOrder={handlePlaceOrder}
             placing={placing}
+            canDiscount={canDiscount}
           />
         </div>
       </div>
@@ -285,6 +315,7 @@ export function TerminalClient({
 
       {showStaffSwitch && (
         <StaffSwitch
+          tenantId={menu.tenantId}
           current={activeStaff}
           onVerify={verifyPin}
           onSignOut={signOutStaff}

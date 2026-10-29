@@ -5,8 +5,11 @@ import {
   getPosDriver,
 } from "@/lib/db";
 import { requirePaymentRail } from "./registry";
+import { StripeError } from "./providers/stripe-client";
+import { STALE_TENDER_TTL_MS } from "./balance";
 import {
   BalanceExceededError,
+  PaymentOutcomeUnknownError,
   getOrderBalance,
   refundIdempotencyKey,
   refundPayment,
@@ -91,21 +94,74 @@ describe("atomic tender reservation", () => {
     expect(payments).toHaveLength(2); // 400 + 400; a third 400 would overpay
   });
 
-  it("releases the reservation when the rail fails", async () => {
+  it("releases the reservation only on a DEFINITIVE decline", async () => {
     const orderId = await seedOrder(900);
     const rail = requirePaymentRail("stripe_terminal");
     const spy = vi
       .spyOn(rail, "createCharge")
-      .mockRejectedValueOnce(new Error("card declined"));
+      .mockRejectedValueOnce(
+        new StripeError("Your card was declined.", 402, {
+          error: { type: "card_error" },
+        }),
+      );
+    const declinedId = uid("declined");
     await expect(
-      takePayment(tender(orderId, uid("declined"), 900)),
-    ).rejects.toThrow("card declined");
+      takePayment(tender(orderId, declinedId, 900)),
+    ).rejects.toThrow("declined");
     spy.mockRestore();
+    expect((await getPosDriver().getPayment(declinedId))?.status).toBe("failed");
     const order = await getPosDriver().getOrder(orderId);
     expect(await getOrderBalance(order!)).toBe(900);
     await expect(
       takePayment(tender(orderId, uid("retry"), 900)),
     ).resolves.toMatchObject({ amount_cents: 900 });
+  });
+
+  it("keeps an AMBIGUOUS attempt pending and resumes it with the same id", async () => {
+    const orderId = await seedOrder(800);
+    const rail = requirePaymentRail("stripe_terminal");
+    const spy = vi
+      .spyOn(rail, "createCharge")
+      .mockRejectedValueOnce(new TypeError("fetch failed")); // timeout/network
+    const id = uid("ambiguous");
+    await expect(takePayment(tender(orderId, id, 800))).rejects.toBeInstanceOf(
+      PaymentOutcomeUnknownError,
+    );
+    const held = await getPosDriver().getPayment(id);
+    expect(held?.status).toBe("pending"); // NOT failed — money may have moved
+    // A NEW id can't take the balance the ambiguous attempt still holds.
+    await expect(
+      takePayment(tender(orderId, uid("other"), 800)),
+    ).rejects.toBeInstanceOf(BalanceExceededError);
+    // Retrying with the SAME id resumes the same reservation (same key).
+    const resumed = await takePayment(tender(orderId, id, 800));
+    expect(resumed.status).toBe("captured");
+    const keys = spy.mock.calls.map((c) => c[0].context.idempotencyKey);
+    expect(new Set(keys)).toEqual(new Set([id]));
+    spy.mockRestore();
+    expect(await getPosDriver().listPaymentsForOrder(orderId)).toHaveLength(1);
+  });
+
+  it("stops counting a stale unsettled tender toward the balance", async () => {
+    const orderId = await seedOrder(600);
+    const rail = requirePaymentRail("stripe_terminal");
+    const spy = vi
+      .spyOn(rail, "createCharge")
+      .mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(
+      takePayment(tender(orderId, uid("stuck"), 600)),
+    ).rejects.toBeInstanceOf(PaymentOutcomeUnknownError);
+    spy.mockRestore();
+    const realNow = Date.now();
+    const nowSpy = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(realNow + STALE_TENDER_TTL_MS + 1000);
+    const order = await getPosDriver().getOrder(orderId);
+    expect(await getOrderBalance(order!)).toBe(600);
+    await expect(
+      takePayment(tender(orderId, uid("fresh"), 600)),
+    ).resolves.toMatchObject({ amount_cents: 600 });
+    nowSpy.mockRestore();
   });
 
   it("is idempotent on the payment id", async () => {

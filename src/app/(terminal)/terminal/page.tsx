@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { TerminalClient } from "./components/terminal-client";
 import { requireLocationSurface } from "@/lib/auth/guard";
+import { roleInTenant } from "@/lib/auth/session";
+import { isRealMode } from "@/lib/auth/signing-secret";
 
 export const metadata: Metadata = {
   title: "Terminal",
@@ -33,6 +35,8 @@ export default async function TerminalPage({
     <TerminalClient
       initialTenantId={ctx.tenantId}
       initialLocationId={ctx.locationId ?? undefined}
+      deviceRole={roleInTenant(ctx.user, ctx.tenantId) ?? undefined}
+      requireActiveStaff={isRealMode()}
     />
   );
 }

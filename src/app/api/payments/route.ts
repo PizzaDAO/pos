@@ -32,8 +32,12 @@ import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
   BalanceExceededError,
   getOrderBalance,
+  isDefinitiveRailFailure,
+  PaymentOutcomeUnknownError,
+  TenderVoidedDuringChargeError,
   takePayment,
 } from "@/lib/payments/service";
+import { PUBLIC_RAILS, railAvailable } from "@/lib/payments/availability";
 import {
   enforceRateLimit,
   isClientId,
@@ -55,12 +59,6 @@ type Rail = PaymentRailKey | "cash";
 const ALL_RAILS: Rail[] = [
   "cash",
   "stripe_terminal",
-  "stripe_online",
-  "crypto_onchain_usdc",
-  "crypto_coinbase",
-];
-/** Rails a signed-out storefront customer may use (no cash / card-present). */
-const PUBLIC_RAILS: Rail[] = [
   "stripe_online",
   "crypto_onchain_usdc",
   "crypto_coinbase",
@@ -130,6 +128,7 @@ export async function POST(request: Request) {
   if (!isValid(body)) return reject("Malformed payment payload.", 422);
 
   const driver = getPosDriver();
+
   let order: Order | null = null;
   try {
     order = await driver.getOrder(body.orderId);
@@ -159,9 +158,25 @@ export async function POST(request: Request) {
     if (!auth.ok) return auth.res;
   }
 
+  // A rail with no live keys runs SIMULATED (settles without moving money).
+  // Never for anonymous online checkout outside the zero-env demo; staff may
+  // use it only with an explicit ALLOW_SIMULATED_PAYMENTS=true.
+  if (!railAvailable(body.rail, { staff: isStaff })) {
+    return reject("This payment method is not available.", 503);
+  }
+
   // ---- Idempotent replay ------------------------------------------------------
   const prior = await driver.getPayment(body.paymentId).catch(() => null);
-  if (prior) {
+  // A prior attempt whose rail outcome is unknown (pending, never reached a
+  // charge id) is RESUMED by takePayment with its reserved amounts.
+  const resuming = Boolean(
+    prior &&
+      prior.order_id === order.id &&
+      prior.status === "pending" &&
+      !prior.charge_id &&
+      !prior.raw,
+  );
+  if (prior && !resuming) {
     if (prior.order_id !== order.id) {
       return reject("Payment id already used for another order.", 409);
     }
@@ -176,16 +191,18 @@ export async function POST(request: Request) {
   if (order.status === "voided" || order.status === "refunded") {
     return reject("This order can no longer be paid.", 409);
   }
-  const balance = await getOrderBalance(order);
+  // A resumed attempt's amount is already reserved (it's in the balance).
+  const balance =
+    (await getOrderBalance(order)) + (resuming && prior ? prior.amount_cents : 0);
   if (balance <= 0) return reject("This order is already paid.", 409);
-  const amountCents = body.amountCents ?? balance;
+  const amountCents = resuming && prior ? prior.amount_cents : (body.amountCents ?? balance);
   if (amountCents <= 0 || amountCents > balance) {
     return reject(
       `Amount does not match the order balance (${balance}).`,
       422,
     );
   }
-  if (!isStaff && amountCents !== balance) {
+  if (!isStaff && !resuming && amountCents !== balance) {
     return reject(
       `Amount does not match the order balance (${balance}).`,
       422,
@@ -193,7 +210,7 @@ export async function POST(request: Request) {
   }
 
   // ---- Tip: explicit, bounded, never double-counted --------------------------
-  const tipCents = body.tipCents ?? 0;
+  const tipCents = resuming && prior ? prior.tip_cents : (body.tipCents ?? 0);
   if (tipCents > 0 && order.totals.tip_cents > 0) {
     return reject("This order already includes a tip.", 422);
   }
@@ -238,15 +255,28 @@ export async function POST(request: Request) {
     );
   } catch (err) {
     // Lost the race for the remaining balance (atomic reservation refused).
+    // Provider outcome unknown: the tender stays pending. Retry with the SAME
+    // paymentId (the rail dedupes on it) — never a new id.
+    if (err instanceof PaymentOutcomeUnknownError) {
+      return NextResponse.json(
+        { error: err.message, retry: true, paymentId: err.id },
+        { status: 503 },
+      );
+    }
+    if (err instanceof TenderVoidedDuringChargeError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
     if (err instanceof BalanceExceededError) {
       return NextResponse.json(
         { error: err.message, balanceCents: err.balanceCents },
         { status: 409 },
       );
     }
+    // A definitive decline (no money moved) is a 402 — the client may start
+    // over with a new id. Anything else stays ambiguous (502).
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Payment failed." },
-      { status: 502 },
+      { status: isDefinitiveRailFailure(err) ? 402 : 502 },
     );
   }
 }

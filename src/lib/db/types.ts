@@ -15,6 +15,12 @@ export interface Tenant {
   name: string;
   slug: string;
   status: TenantStatus;
+  /**
+   * True when the PLATFORM suspended the tenant (set in the same write as the
+   * status change). New tenants are also `suspended` until go-live, but with
+   * this false — self-serve go-live is refused only when it is true.
+   */
+  suspended_by_platform?: boolean;
   created_at: string;
 }
 

@@ -22,6 +22,7 @@ import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError } from "@/lib/reprice";
+import { effectiveTerminalRole } from "@/lib/auth/active-staff";
 import {
   captureError,
   childLogger,
@@ -101,21 +102,29 @@ export async function POST(request: Request) {
       return NextResponse.json({ order: existing }, { status: 201, headers });
     }
 
-    // Staff discounts are an explicit field, gated by role.
+    // Staff discounts are an explicit field, gated by the ACTIVE (PIN-switched)
+    // staff member's role — not the device login's role.
+    const active = await effectiveTerminalRole(request, auth);
     const discountCents = body.discount_cents ?? 0;
-    if (discountCents > 0 && auth.role !== "owner" && auth.role !== "manager") {
+    if (
+      discountCents > 0 &&
+      active.role !== "owner" &&
+      active.role !== "manager"
+    ) {
       return NextResponse.json(
         { error: "Only an owner or manager can apply a discount." },
         { status: 403, headers },
       );
     }
 
-    // Attribution: the staff member must belong to this tenant.
+    // Attribution: the server-verified active staff wins; otherwise a
+    // client-sent staff id must at least belong to this tenant.
     const staffId =
-      typeof body.staff_id === "string" &&
+      active.staff?.id ??
+      (typeof body.staff_id === "string" &&
       (await driver.getStaffById(auth.tenantId, body.staff_id))
         ? body.staff_id
-        : null;
+        : null);
 
     let priced;
     try {

@@ -122,19 +122,15 @@ describe("real billing: tier changes go through Stripe", () => {
     );
     expect(update?.body).toContain("price_pro");
 
-    // Only the verified webhook applies the new tier.
-    await applyBillingEvent({
-      type: "customer.subscription.updated",
-      data: {
-        object: {
-          id: "sub_real_1",
-          status: "active",
-          customer: "cus_1",
-          metadata: { tenant_id: tenantId },
-          items: { data: [{ id: "si_1", price: { id: "price_pro" } }] },
-        },
+    // Only the verified webhook applies the new tier — from Stripe's CURRENT
+    // state (re-fetched), not the event payload.
+    await applyBillingEvent(
+      {
+        type: "customer.subscription.updated",
+        data: { object: { id: "sub_real_1", metadata: { tenant_id: tenantId } } },
       },
-    });
+      liveSub({ tenantId, price: "price_pro", status: "active" }),
+    );
     expect((await getPosDriver().getSubscription(tenantId))?.tier).toBe("pro");
   });
 
@@ -149,37 +145,142 @@ describe("real billing: tier changes go through Stripe", () => {
     expect(body.checkoutUrl).toBe("https://checkout.stripe.test/cs_1");
     expect(await getPosDriver().getSubscription(tenant.id)).toBeNull();
 
-    await applyBillingEvent({
-      type: "checkout.session.completed",
-      data: {
-        object: {
-          id: "cs_1",
-          subscription: "sub_new_1",
-          customer: "cus_1",
-          metadata: { tenant_id: tenant.id, tier: "pro" },
+    await applyBillingEvent(
+      {
+        type: "checkout.session.completed",
+        data: {
+          object: {
+            id: "cs_1",
+            subscription: "sub_new_1",
+            customer: "cus_1",
+            payment_status: "paid",
+            metadata: { tenant_id: tenant.id, tier: "pro" },
+          },
         },
       },
-    });
+      liveSub({ tenantId: tenant.id, price: "price_pro", status: "trialing", id: "sub_new_1" }),
+    );
     const sub = await getPosDriver().getSubscription(tenant.id);
     expect(sub?.tier).toBe("pro");
+    expect(sub?.status).toBe("trialing");
     expect(sub?.stripe_subscription_id).toBe("sub_new_1");
     expect(sub?.simulated).toBe(false);
   });
 
-  it("does not grant an active plan for an incomplete subscription", async () => {
+  it("applies Stripe's current state, so stale / out-of-order events can't roll back", async () => {
     const tenantId = await tenantWithRealSub("starter");
-    await applyBillingEvent({
-      type: "customer.subscription.updated",
-      data: {
-        object: {
-          id: "sub_real_1",
-          status: "incomplete",
-          metadata: { tenant_id: tenantId },
-          items: { data: [{ price: { id: "price_multi" } }] },
+    // Stripe's truth is now: multi, active.
+    const fetcher = liveSub({ tenantId, price: "price_multi", status: "active" });
+    // A LATE, older event whose payload still says starter / past_due …
+    await applyBillingEvent(
+      {
+        type: "customer.subscription.updated",
+        created: 1000,
+        data: {
+          object: {
+            id: "sub_real_1",
+            status: "past_due",
+            metadata: { tenant_id: tenantId },
+            items: { data: [{ price: { id: "price_starter" } }] },
+          },
         },
       },
+      fetcher,
+    );
+    // … still yields Stripe's current state.
+    let sub = await getPosDriver().getSubscription(tenantId);
+    expect(sub?.tier).toBe("multi");
+    expect(sub?.status).toBe("active");
+    // An invoice event (any type) also re-fetches instead of guessing.
+    await applyBillingEvent(
+      {
+        type: "invoice.payment_failed",
+        data: { object: { subscription: "sub_real_1" } },
+      },
+      fetcher,
+    );
+    sub = await getPosDriver().getSubscription(tenantId);
+    expect(sub?.status).toBe("active");
+    await applyBillingEvent(
+      {
+        type: "invoice.payment_failed",
+        data: { object: { subscription: "sub_real_1" } },
+      },
+      liveSub({ tenantId, price: "price_multi", status: "past_due" }),
+    );
+    expect((await getPosDriver().getSubscription(tenantId))?.status).toBe("past_due");
+  });
+
+  it("does not activate a checkout whose payment is still processing", async () => {
+    const { tenant } = await getPosDriver().createTenant({
+      businessName: `Unpaid ${Date.now()}`,
+      ownerEmail: "unpaid@example.com",
     });
+    const fetcher = liveSub({ tenantId: tenant.id, price: "price_pro", status: "active", id: "sub_x" });
+    const sessionEvent = (payment_status: string, type = "checkout.session.completed") =>
+      applyBillingEvent(
+        {
+          type,
+          data: {
+            object: {
+              subscription: "sub_x",
+              customer: "cus_x",
+              payment_status,
+              metadata: { tenant_id: tenant.id, tier: "pro" },
+            },
+          },
+        },
+        fetcher,
+      );
+    await sessionEvent("unpaid");
+    expect(await getPosDriver().getSubscription(tenant.id)).toBeNull();
+    await sessionEvent("paid", "checkout.session.async_payment_succeeded");
+    expect((await getPosDriver().getSubscription(tenant.id))?.tier).toBe("pro");
+  });
+
+  it("does not grant an active plan for an incomplete subscription", async () => {
+    const tenantId = await tenantWithRealSub("starter");
+    await applyBillingEvent(
+      {
+        type: "customer.subscription.updated",
+        data: { object: { id: "sub_real_1", metadata: { tenant_id: tenantId } } },
+      },
+      liveSub({ tenantId, price: "price_multi", status: "incomplete" }),
+    );
     const sub = await getPosDriver().getSubscription(tenantId);
     expect(sub?.status).toBe("past_due");
   });
+
+  it("propagates a Stripe fetch failure (webhook answers 5xx → retry)", async () => {
+    const tenantId = await tenantWithRealSub("starter");
+    await expect(
+      applyBillingEvent(
+        {
+          type: "customer.subscription.updated",
+          data: { object: { id: "sub_real_1", metadata: { tenant_id: tenantId } } },
+        },
+        async () => {
+          throw new Error("stripe down");
+        },
+      ),
+    ).rejects.toThrow("stripe down");
+    expect((await getPosDriver().getSubscription(tenantId))?.tier).toBe("starter");
+  });
 });
+
+/** A fake Stripe subscription fetcher returning a fixed current state. */
+function liveSub(input: {
+  tenantId: string;
+  price: string;
+  status: string;
+  id?: string;
+}) {
+  return async (id: string) => ({
+    id: input.id ?? id,
+    status: input.status,
+    customer: "cus_1",
+    metadata: { tenant_id: input.tenantId },
+    items: { data: [{ id: "si_1", price: { id: input.price } }] },
+    current_period_end: 1_900_000_000,
+  });
+}

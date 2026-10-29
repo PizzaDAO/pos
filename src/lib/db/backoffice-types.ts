@@ -177,6 +177,28 @@ export interface InventoryItemView extends InventoryItem {
 // Staff & shifts
 // ----------------------------------------------------------------------------
 
+/**
+ * A server-side record of one PIN switch-in at a terminal. The signed
+ * active-staff cookie names it; it is honoured only while unexpired and not
+ * revoked (switch-out / sign-out revoke it).
+ */
+export interface StaffSession {
+  id: string;
+  user_id: string;
+  tenant_id: string;
+  staff_id: string;
+  created_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+/** Per-staff PIN lockout state. */
+export interface PinLockState {
+  attempts: number;
+  /** ISO time the lock lifts, or null when not locked. */
+  lockedUntil: string | null;
+}
+
 /** A staff member of a tenant. Role reuses the tenancy membership roles. */
 export interface Staff {
   id: string;
