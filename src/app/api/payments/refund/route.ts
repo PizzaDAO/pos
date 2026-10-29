@@ -10,7 +10,8 @@ import { NextResponse } from "next/server";
 import { refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantRole } from "@/lib/auth/api";
+import { publicTender } from "@/lib/payments/public";
 import {
   enforceRateLimit,
   isMoneyCents,
@@ -70,7 +71,11 @@ export async function POST(request: Request) {
   if (!existingPayment) {
     return NextResponse.json({ error: "Payment not found." }, { status: 404 });
   }
-  const auth = await requireTenantMember(existingPayment.tenant_id);
+  // Refunds move money out: owner or manager only (not cashier / kitchen).
+  const auth = await requireTenantRole(existingPayment.tenant_id, [
+    "owner",
+    "manager",
+  ]);
   if (!auth.ok) return auth.res;
 
   try {
@@ -98,7 +103,7 @@ export async function POST(request: Request) {
     });
 
     return NextResponse.json({
-      payment,
+      payment: publicTender(payment),
       balanceCents: balance,
       orderStatus: order?.status,
     });

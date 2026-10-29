@@ -35,7 +35,7 @@ import type {
   RefundResult,
 } from "../PaymentRail";
 import { getDefaultPlatformFee, isStripeConfigured } from "../env";
-import { computeApplicationFeeCents } from "../fees";
+import { computeApplicationFeeCents, stripeRefundParams } from "../fees";
 import {
   mapIntentStatus,
   stripeGet,
@@ -99,7 +99,12 @@ export const stripeTerminalRail: PaymentRail = {
         payment_method_types: ["card_present"],
         capture_method: req.capture === false ? "manual" : "automatic",
         application_fee_amount: fee > 0 ? fee : undefined,
-        metadata: { ...req.metadata, tip_cents: String(tip) },
+        metadata: {
+          ...req.metadata,
+          tip_cents: String(tip),
+          payment_id: req.context.idempotencyKey,
+          tenant_id: req.context.tenantId,
+        },
       },
       {
         stripeAccount: req.context.connectAccountId ?? undefined,
@@ -141,14 +146,12 @@ export const stripeTerminalRail: PaymentRail = {
     }
     const refund = await stripeRequest<{ id: string; status: string }>(
       "/refunds",
-      {
-        payment_intent: req.chargeId,
-        amount: req.amount?.amount,
+      stripeRefundParams({
+        chargeId: req.chargeId,
+        amountCents: req.amount?.amount,
         reason: req.reason,
-        // Refund the platform fee proportionally back to the platform.
-        refund_application_fee: true,
-        reverse_transfer: true,
-      },
+        fullRefund: req.fullRefund,
+      }),
       { stripeAccount: req.context.connectAccountId ?? undefined },
     );
     return {

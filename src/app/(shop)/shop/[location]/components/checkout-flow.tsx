@@ -149,11 +149,15 @@ export function CheckoutFlow({
       tipCents,
     });
     if (!placed) return;
+    // The order total already INCLUDES the tip, and the tender carries the tip
+    // separately, so base = total - tip (charging total + tip would double-count
+    // it). The server re-derives both from the order anyway.
+    const orderTip = placed.order.totals.tip_cents;
     const pay = await checkout.pay({
       order: placed.order,
       rail,
-      amountCents: placed.order.totals.total_cents,
-      tipCents,
+      amountCents: placed.order.totals.total_cents - orderTip,
+      tipCents: orderTip,
     });
     if (!pay) return;
     setPlacedOrderId(placed.order.id);

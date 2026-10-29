@@ -6,7 +6,7 @@
  *  - `createCharge` creates a PaymentIntent on the tenant's CONNECTED account
  *    with `automatic_payment_methods` and `application_fee_amount`. The client
  *    confirms it with Stripe.js using the returned `client_secret`
- *    (`raw.clientSecret`); a confirmation webhook captures it.
+ *    (`ChargeResult.clientSecret`, returned to the caller, never persisted); a confirmation webhook captures it.
  *
  * REAL path is guarded by STRIPE_SECRET_KEY. With no key (default, incl.
  * preview) it simulates instant approval so the terminal flow works end-to-end.
@@ -23,7 +23,7 @@ import type {
   RefundResult,
 } from "../PaymentRail";
 import { getDefaultPlatformFee, isStripeConfigured } from "../env";
-import { computeApplicationFeeCents } from "../fees";
+import { computeApplicationFeeCents, stripeRefundParams } from "../fees";
 import {
   mapIntentStatus,
   stripeGet,
@@ -69,11 +69,8 @@ export const stripeOnlineRail: PaymentRail = {
         chargeId: simId("pi_online"),
         status: req.capture === false ? "authorized" : "captured",
         amount,
-        raw: simRaw(KEY, {
-          applicationFeeCents: fee,
-          tipCents: tip,
-          clientSecret: `${simId("seti")}_secret`,
-        }),
+        clientSecret: `${simId("seti")}_secret`,
+        raw: simRaw(KEY, { applicationFeeCents: fee, tipCents: tip }),
       };
     }
 
@@ -89,7 +86,12 @@ export const stripeOnlineRail: PaymentRail = {
         automatic_payment_methods: { enabled: true },
         capture_method: req.capture === false ? "manual" : "automatic",
         application_fee_amount: fee > 0 ? fee : undefined,
-        metadata: { ...req.metadata, tip_cents: String(tip) },
+        metadata: {
+          ...req.metadata,
+          tip_cents: String(tip),
+          payment_id: req.context.idempotencyKey,
+          tenant_id: req.context.tenantId,
+        },
       },
       {
         stripeAccount: req.context.connectAccountId ?? undefined,
@@ -102,10 +104,11 @@ export const stripeOnlineRail: PaymentRail = {
       chargeId: intent.id,
       status: mapIntentStatus(intent.status),
       amount,
+      // The client_secret goes to the caller only; it is never stored in `raw`.
+      clientSecret: intent.client_secret,
       raw: {
         applicationFeeCents: fee,
         tipCents: tip,
-        clientSecret: intent.client_secret,
         stripeStatus: intent.status,
       },
     };
@@ -136,13 +139,12 @@ export const stripeOnlineRail: PaymentRail = {
     }
     const refund = await stripeRequest<{ id: string; status: string }>(
       "/refunds",
-      {
-        payment_intent: req.chargeId,
-        amount: req.amount?.amount,
+      stripeRefundParams({
+        chargeId: req.chargeId,
+        amountCents: req.amount?.amount,
         reason: req.reason,
-        refund_application_fee: true,
-        reverse_transfer: true,
-      },
+        fullRefund: req.fullRefund,
+      }),
       { stripeAccount: req.context.connectAccountId ?? undefined },
     );
     return {

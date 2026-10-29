@@ -126,38 +126,61 @@ export async function stripeGet<T = Record<string, unknown>>(
   return json as T;
 }
 
+/** Stripe's recommended replay window for webhook timestamps, in seconds. */
+export const STRIPE_WEBHOOK_TOLERANCE_SEC = 300;
+
+export interface VerifyWebhookOptions {
+  /** Max |now - t| in seconds before the event is rejected as a replay. */
+  toleranceSec?: number;
+  /** Override "now" (unix seconds) -- tests only. */
+  nowSec?: number;
+}
+
 /**
  * Verify a Stripe webhook signature (the `Stripe-Signature` header). Returns
- * false when no webhook secret is configured. Implements Stripe's scheme:
+ * false when no secret is available. Implements Stripe's scheme:
  * `signed_payload = "{t}.{rawBody}"`, expected = HMAC-SHA256(secret, payload).
+ *
+ * The header may carry several `v1=` entries (during secret rotation Stripe signs
+ * with both); ANY match is accepted. Timestamps outside `toleranceSec` (default
+ * 300s) are rejected so a captured request can't be replayed later.
  */
 export function verifyStripeWebhook(
   rawBody: string,
   signatureHeader: string | null,
+  secret: string | null | undefined = getStripeConfig()?.webhookSecret,
+  opts: VerifyWebhookOptions = {},
 ): boolean {
-  const config = getStripeConfig();
-  if (!config?.webhookSecret || !signatureHeader) return false;
+  if (!secret || !signatureHeader) return false;
 
-  const parts = Object.fromEntries(
-    signatureHeader.split(",").map((kv) => {
-      const [k, v] = kv.split("=");
-      return [k?.trim() ?? "", v?.trim() ?? ""];
-    }),
-  );
-  const timestamp = parts["t"];
-  const signature = parts["v1"];
-  if (!timestamp || !signature) return false;
-
-  const expected = createHmac("sha256", config.webhookSecret)
-    .update(`${timestamp}.${rawBody}`)
-    .digest("hex");
-  try {
-    const a = Buffer.from(expected, "hex");
-    const b = Buffer.from(signature, "hex");
-    return a.length === b.length && timingSafeEqual(a, b);
-  } catch {
-    return false;
+  let timestamp = "";
+  const signatures: string[] = [];
+  for (const kv of signatureHeader.split(",")) {
+    const idx = kv.indexOf("=");
+    if (idx < 0) continue;
+    const k = kv.slice(0, idx).trim();
+    const v = kv.slice(idx + 1).trim();
+    if (k === "t") timestamp = v;
+    else if (k === "v1") signatures.push(v);
   }
+  if (!timestamp || signatures.length === 0) return false;
+
+  const tolerance = opts.toleranceSec ?? STRIPE_WEBHOOK_TOLERANCE_SEC;
+  const now = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  const t = Number(timestamp);
+  if (!Number.isFinite(t) || Math.abs(now - t) > tolerance) return false;
+
+  const expected = createHmac("sha256", secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest();
+  return signatures.some((sig) => {
+    try {
+      const b = Buffer.from(sig, "hex");
+      return b.length === expected.length && timingSafeEqual(expected, b);
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**
