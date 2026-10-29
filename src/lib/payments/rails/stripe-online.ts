@@ -143,9 +143,12 @@ export const stripeOnlineRail: PaymentRail = {
         chargeId: req.chargeId,
         amountCents: req.amount?.amount,
         reason: req.reason,
-        fullRefund: req.fullRefund,
       }),
-      { stripeAccount: req.context.connectAccountId ?? undefined },
+      {
+        stripeAccount: req.context.connectAccountId ?? undefined,
+        // Unique per refund request (see refundPayment).
+        idempotencyKey: req.context.idempotencyKey,
+      },
     );
     return {
       refundId: refund.id,

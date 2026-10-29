@@ -12,6 +12,7 @@
  */
 "use client";
 
+import { MAX_LINE_QUANTITY } from "@/lib/shop/reprice";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { OrderItem } from "@/lib/db";
@@ -60,7 +61,7 @@ export const useCustomerCart = create<CustomerCartState>()(
         set((state) => ({
           items: state.items.map((i) =>
             i.id === id
-              ? withLinePricing({ ...i, quantity: Math.max(1, quantity) })
+              ? withLinePricing({ ...i, quantity: Math.min(MAX_LINE_QUANTITY, Math.max(1, quantity)) })
               : i,
           ),
         })),

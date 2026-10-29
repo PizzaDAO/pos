@@ -15,7 +15,7 @@
  */
 import type { ConnectAccount, ConnectStatus } from "@/lib/db/payment-types";
 import { getPosDriver } from "@/lib/db";
-import { cardRailsSimulated, getStripeConfig } from "./env";
+import { cardRailsSimulated, getStripeConfig, isStripeConfigured } from "./env";
 import {
   effectiveConnectAccount,
   isSimulated,
@@ -60,7 +60,7 @@ export function deriveStatus(acct: {
 export async function createConnectAccount(
   tenantId: string,
 ): Promise<ConnectAccount> {
-  if (cardRailsSimulated()) {
+  if (!isStripeConfigured()) {
     return { ...simulatedConnectAccount(tenantId), status: "pending", charges_enabled: false, payouts_enabled: false, details_submitted: false };
   }
   const acct = await stripeRequest<{
@@ -95,7 +95,7 @@ export async function createAccountLink(
   returnUrl: string,
   refreshUrl: string,
 ): Promise<string> {
-  if (cardRailsSimulated()) {
+  if (!isStripeConfigured()) {
     return `${returnUrl}?simulated=1`;
   }
   const link = await stripeRequest<{ url: string }>("/account_links", {
@@ -112,7 +112,7 @@ export async function fetchConnectStatus(
   tenantId: string,
   accountId: string,
 ): Promise<ConnectAccount> {
-  if (cardRailsSimulated() || accountId.startsWith("acct_sim_")) {
+  if (!isStripeConfigured() || accountId.startsWith("acct_sim_")) {
     return simulatedConnectAccount(tenantId);
   }
   const acct = await stripeGet<{
@@ -165,7 +165,11 @@ async function evaluateCardGate(
 ): Promise<CardGate> {
   const driver = getPosDriver();
   const stored = tenantId ? await driver.getConnectAccount(tenantId) : null;
-  if (isSimulated()) return { ok: true, accountId: stored?.account_id ?? null };
+  // Card CHARGE rails simulated (no key, or training mode): no gate, and never
+  // touch Stripe. A real stored account id is still returned as-is.
+  if (cardRailsSimulated()) {
+    return { ok: true, accountId: stored?.account_id ?? null };
+  }
   let account = effectiveConnectAccount(stored);
   if (!account) return { ok: false };
   // "throttled": refresh at most once per STALE_REFRESH_MS per tenant (the

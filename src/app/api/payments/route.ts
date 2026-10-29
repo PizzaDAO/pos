@@ -28,8 +28,14 @@ import {
   PaymentConflictError,
   takePaymentDetailed,
   deriveOnlineTender,
+  cancelOpenOnlineIntents,
+  freshClientSecret,
   getOrderBalance,
 } from "@/lib/payments/service";
+import {
+  isOnlineOrderRail,
+  onlineRailAvailable,
+} from "@/lib/payments/online-rails";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -102,6 +108,14 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
+  // The ORDER decides the currency, never the client: a body naming another
+  // currency is rejected (a $25 USD order must not be payable as 2,500 KRW).
+  if (body.currency.toUpperCase() !== order.currency.toUpperCase()) {
+    return NextResponse.json(
+      { error: "currency does not match the order." },
+      { status: 400 },
+    );
+  }
   const tenantId = order.tenant_id;
   const locationId = order.location_id;
 
@@ -130,9 +144,15 @@ export async function POST(request: Request) {
         );
       }
       const current = await driver.getOrder(order.id);
+      // A stripe_online tender still awaiting the customer gets a fresh secret
+      // from Stripe (this response only; never stored).
+      const clientSecret = await freshClientSecret(existing);
       return NextResponse.json(
         {
-          payment: publicTender(existing),
+          payment: publicTender(
+            (await driver.getPayment(existing.id)) ?? existing,
+          ),
+          clientSecret,
           balanceCents: current ? await getOrderBalance(current) : 0,
           orderStatus: current?.status,
         },
@@ -150,10 +170,38 @@ export async function POST(request: Request) {
   let tipCents = body.tipCents ?? 0;
   const isOnline = order.channel !== "in_store";
   if (isOnline) {
-    // An anonymous caller can never settle an online order with cash.
+    if (!isOnlineOrderRail(body.rail)) {
+      return NextResponse.json(
+        { error: "That payment method is not available for online orders." },
+        { status: 422 },
+      );
+    }
+    // An anonymous caller can never settle an online order with cash: it takes
+    // a till role, exactly like an in-store tender.
     if (body.rail === "cash") {
-      const auth = await requireTenantMember(tenantId);
+      const auth = await requireTenantRole(tenantId, [
+        "owner",
+        "manager",
+        "cashier",
+      ]);
       if (!auth.ok) return auth.res;
+    } else if (!onlineRailAvailable(body.rail)) {
+      // An unconfigured crypto rail would simulate and auto-confirm: no money.
+      return NextResponse.json(
+        { error: "That payment method is not available right now." },
+        { status: 409 },
+      );
+    }
+    // Never leave two live intents open for one order.
+    if (body.rail === "stripe_online") {
+      try {
+        await cancelOpenOnlineIntents(order.id, body.paymentId);
+      } catch (err) {
+        return NextResponse.json(
+          { error: err instanceof Error ? err.message : "Payment failed." },
+          { status: 502 },
+        );
+      }
     }
     ({ amountCents, tipCents } = await deriveOnlineTender(order));
     if (amountCents <= 0) {
@@ -179,7 +227,7 @@ export async function POST(request: Request) {
       rail: body.rail,
       amountCents,
       tipCents,
-      currency: body.currency,
+      currency: order.currency,
       connectAccountId,
       cashTenderedCents: body.cashTenderedCents,
       metadata: body.metadata,

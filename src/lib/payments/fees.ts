@@ -15,13 +15,13 @@ export function roundHalfUp(value: number): number {
 }
 
 /**
- * Whether the platform returns its application fee when a tender is FULLY
- * refunded (Stripe `refund_application_fee`). Default true: the merchant gets
- * the whole charge back and the platform gives up its fee on that sale. Flip
- * this single constant to keep the fee. Partial refunds never set the flag (the
- * fee is left alone).
+ * Whether the platform returns its application fee on refunds (Stripe
+ * `refund_application_fee`). Default true on EVERY refund: Stripe returns the
+ * fee in proportion to the amount refunded (all of it on a full refund), so
+ * repeated partial refunds add up to the whole fee. Flip this single constant to
+ * keep the fee.
  */
-export const REFUND_APPLICATION_FEE_ON_FULL_REFUND = true;
+export const REFUND_APPLICATION_FEE = true;
 
 /**
  * Params for a Stripe refund on a DIRECT charge (the PaymentIntent lives on the
@@ -32,16 +32,12 @@ export function stripeRefundParams(req: {
   chargeId: string;
   amountCents?: number;
   reason?: string;
-  fullRefund?: boolean;
 }): Record<string, unknown> {
   return {
     payment_intent: req.chargeId,
     amount: req.amountCents,
     reason: req.reason,
-    refund_application_fee:
-      req.fullRefund && REFUND_APPLICATION_FEE_ON_FULL_REFUND
-        ? true
-        : undefined,
+    refund_application_fee: REFUND_APPLICATION_FEE ? true : undefined,
   };
 }
 

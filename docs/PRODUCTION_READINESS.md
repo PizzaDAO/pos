@@ -566,6 +566,21 @@ domain-level validation (scheduling, zone gates, idempotency) is unchanged.
   logged). Only `succeeded`, `processing`, `payment_failed`, `canceled` and
   `account.updated` are acted on.
 - **Refunds** require `owner` or `manager` (not cashier/kitchen). Direct-charge
-  refunds are made on the connected account with no `reverse_transfer`; on a full
-  refund the platform's application fee is returned
-  (`REFUND_APPLICATION_FEE_ON_FULL_REFUND` in `payments/fees.ts`).
+  refunds are made on the connected account with no `reverse_transfer`;
+  `refund_application_fee` is set on every refund, so Stripe returns the platform
+  fee in proportion to each refund (`REFUND_APPLICATION_FEE` in
+  `payments/fees.ts`). The idempotency key is per refund request: the client
+  sends a `refundId` (reused on retry), so repeated partial refunds work and a
+  retried identical request is a no-op.
+- **Currency** is always the order's; a payment body naming another currency is
+  400, and tenders in another currency never cover an order.
+- **Connect accounts** are managed on `isStripeConfigured()` (not training mode),
+  and the drivers refuse to overwrite a real `acct_` row with a simulated one.
+  Only card CHARGE rails follow `cardRailsSimulated()`.
+- **Online orders** accept only `stripe_online`, crypto and (staff-only) cash.
+  An unconfigured crypto rail is refused unless the whole environment is a
+  simulation, and `/api/shop/location` returns `cryptoReady` so the shop hides it.
+  Before a new `stripe_online` intent is created, earlier ones still in
+  `requires_action` are canceled on the connected account.
+- **Order lines** get server-minted ids; the Supabase `createOrder` deletes the
+  order row if writing its lines fails (no item-less `placed` order).

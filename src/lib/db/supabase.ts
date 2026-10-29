@@ -23,7 +23,10 @@
  *
  * Money is always integer minor units; nothing here uses floats.
  */
-import { isConnectedForHealth } from "@/lib/payments/connect-status";
+import {
+  assertNoSimulatedOverwrite,
+  isConnectedForHealth,
+} from "@/lib/payments/connect-status";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { PosDriver } from "./driver";
 import type {
@@ -1346,7 +1349,19 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .select()
           .single(),
       ) as Row;
-      await writeOrderItems(input.id, input.items);
+      // PostgREST has no multi-statement transaction, so the order + its lines
+      // are not atomic by themselves. Compensate: if writing the lines fails,
+      // delete the order row (its children cascade) so a failed insert can never
+      // leave an item-less `placed` order on the KDS, then surface the error.
+      // (Chosen over an RPC to avoid a new SQL function + migration that cannot
+      // be exercised without a live database; the client's retry is idempotent
+      // on the order id, so a clean rollback makes the retry safe.)
+      try {
+        await writeOrderItems(input.id, input.items);
+      } catch (err) {
+        await sb.from("orders").delete().eq("id", input.id);
+        throw err;
+      }
       const order = await readOrderRow(orderRow);
       if (order.status !== "voided") await depleteForOrder(order);
       return order;
@@ -1485,6 +1500,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     async upsertConnectAccount(account) {
       const existing = await this.getConnectAccount(account.tenant_id);
+      assertNoSimulatedOverwrite(existing, account);
       return mapConnect(
         unwrap(
           await sb

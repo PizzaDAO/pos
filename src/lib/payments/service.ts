@@ -24,6 +24,7 @@ import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
+import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
 import { railChargesApplicationFee } from "./fees";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
@@ -117,10 +118,19 @@ function settledCents(payments: Payment[]): number {
     .reduce((sum, p) => sum + p.amount_cents, 0);
 }
 
+/**
+ * Tenders for an order that are in the ORDER's currency. A tender recorded in
+ * another currency can never cover or settle the order's amount due.
+ */
+async function listOrderCurrencyPayments(order: Order): Promise<Payment[]> {
+  const all = await getPosDriver().listPaymentsForOrder(order.id);
+  const cur = order.currency.toUpperCase();
+  return all.filter((p) => p.currency.toUpperCase() === cur);
+}
+
 /** Remaining unpaid balance on an order, in cents (never negative). */
 export async function getOrderBalance(order: Order): Promise<number> {
-  const driver = getPosDriver();
-  const payments = await driver.listPaymentsForOrder(order.id);
+  const payments = await listOrderCurrencyPayments(order);
   const balance = orderDueCents(order) - coveredCents(payments);
   return Math.max(0, balance);
 }
@@ -133,7 +143,7 @@ export async function getOrderBalance(order: Order): Promise<number> {
 export async function deriveOnlineTender(
   order: Order,
 ): Promise<{ amountCents: number; tipCents: number }> {
-  const payments = await getPosDriver().listPaymentsForOrder(order.id);
+  const payments = await listOrderCurrencyPayments(order);
   const covering = coveredTenders(payments);
   const amountCents = Math.max(
     0,
@@ -318,41 +328,141 @@ export async function refreshPaymentStatus(
   return applyRailStatus(payment.id, status);
 }
 
+/** True for a real (non-simulated) Stripe PaymentIntent tender. */
+function isRealIntentTender(p: Payment): boolean {
+  return (
+    p.rail === "stripe_online" &&
+    !p.simulated &&
+    !!p.charge_id &&
+    !p.charge_id.startsWith("sim_") &&
+    !!p.connect_account_id &&
+    !cardRailsSimulated()
+  );
+}
+
+/**
+ * Before a NEW stripe_online intent is created for an order, cancel any earlier
+ * stripe_online tenders still in `requires_action`: cancel the PaymentIntent on
+ * the connected account and mark the tender canceled, so two open intents can
+ * never both be confirmed. If Stripe refuses to cancel (e.g. it already
+ * succeeded), the tender is re-synced from Stripe instead; any other failure
+ * propagates and blocks creating another intent.
+ */
+export async function cancelOpenOnlineIntents(
+  orderId: string,
+  exceptPaymentId?: string,
+): Promise<void> {
+  const open = (await getPosDriver().listPaymentsForOrder(orderId)).filter(
+    (p) =>
+      p.rail === "stripe_online" &&
+      p.status === "requires_action" &&
+      p.id !== exceptPaymentId,
+  );
+  for (const p of open) {
+    if (isRealIntentTender(p)) {
+      try {
+        await stripeRequest(
+          `/payment_intents/${p.charge_id}/cancel`,
+          {},
+          { stripeAccount: p.connect_account_id },
+        );
+      } catch (err) {
+        // Not cancelable: find out what it became (e.g. succeeded) and sync.
+        const intent = await stripeGet<{ status: string }>(
+          `/payment_intents/${p.charge_id}`,
+          { stripeAccount: p.connect_account_id },
+        ).catch(() => null);
+        if (!intent) throw err;
+        await applyRailStatus(p.id, mapIntentStatus(intent.status));
+        continue;
+      }
+    }
+    await applyRailStatus(p.id, "canceled");
+  }
+}
+
+/**
+ * For the idempotent-retry path: a fresh `client_secret` for a stripe_online
+ * tender still awaiting the customer, retrieved from Stripe on the connected
+ * account (never stored). Also re-syncs the tender if Stripe moved on.
+ */
+export async function freshClientSecret(
+  payment: Payment,
+): Promise<string | undefined> {
+  if (payment.status !== "requires_action" || !isRealIntentTender(payment)) {
+    return undefined;
+  }
+  try {
+    const intent = await stripeGet<{ status: string; client_secret?: string }>(
+      `/payment_intents/${payment.charge_id}`,
+      { stripeAccount: payment.connect_account_id },
+    );
+    const mapped = mapIntentStatus(intent.status);
+    if (mapped !== "requires_action") {
+      await applyRailStatus(payment.id, mapped);
+      return undefined;
+    }
+    return intent.client_secret;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Refund a captured tender (full or partial) and persist the refunded amount. */
 export async function refundPayment(input: {
   paymentId: string;
   amountCents?: number;
   reason?: string;
+  /**
+   * Client-minted id for THIS refund request. A retry with the same id is
+   * idempotent (same Stripe key, and never applied to the tender twice), while a
+   * new id is a new refund, so repeated partial refunds work.
+   */
+  refundId?: string;
 }): Promise<Payment | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(input.paymentId);
   if (!payment) return null;
 
+  const total = payment.amount_cents + payment.tip_cents;
+  const done = Array.isArray(payment.raw?.refund_ids)
+    ? (payment.raw?.refund_ids as string[])
+    : [];
+  if (input.refundId && done.includes(input.refundId)) return payment;
+
   const rail = requirePaymentRail(payment.rail);
-  const refundAmount = input.amountCents ?? payment.amount_cents + payment.tip_cents;
+  const refundAmount = input.amountCents ?? total - payment.refunded_cents;
+  if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
+    throw new Error("Refund amount exceeds what is left on this payment.");
+  }
 
   const result = await rail.refund({
     context: {
       tenantId: payment.tenant_id,
       locationId: payment.location_id,
       connectAccountId: payment.connect_account_id,
-      idempotencyKey: `refund_${payment.id}`,
+      // Unique per refund request. Without a client refundId fall back to a
+      // counter of what was already refunded + the amount (lost-response retry
+      // before the refund persisted still dedupes; clients should send refundId).
+      idempotencyKey: input.refundId
+        ? `refund_${payment.id}_${input.refundId}`
+        : `refund_${payment.id}_${payment.refunded_cents}_${refundAmount}`,
     },
     chargeId: payment.charge_id ?? payment.id,
     amount: { amount: refundAmount, currency: payment.currency },
     reason: input.reason,
-    fullRefund:
-      payment.refunded_cents + refundAmount >=
-      payment.amount_cents + payment.tip_cents,
   });
 
   const refundedTotal = payment.refunded_cents + result.amount.amount;
-  const fullyRefunded = refundedTotal >= payment.amount_cents + payment.tip_cents;
+  const fullyRefunded = refundedTotal >= total;
 
   const updated = await driver.upsertPayment({
     ...payment,
     status: fullyRefunded ? "refunded" : payment.status,
     refunded_cents: refundedTotal,
+    raw: input.refundId
+      ? { ...(payment.raw ?? {}), refund_ids: [...done, input.refundId] }
+      : payment.raw,
   });
 
   // If all tenders on the order are fully refunded, mark the order refunded.
@@ -375,7 +485,7 @@ async function maybeMarkOrderPaid(orderId: string): Promise<void> {
   const order = await driver.getOrder(orderId);
   if (!order) return;
 
-  const payments = await driver.listPaymentsForOrder(orderId);
+  const payments = await listOrderCurrencyPayments(order);
   if (settledCents(payments) < orderDueCents(order)) return;
 
   if (order.status === "draft" || order.status === "placed") {

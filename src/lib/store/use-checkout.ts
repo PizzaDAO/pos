@@ -62,6 +62,7 @@ export function useCheckout(
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const pendingIds = useRef(createPendingTenderIds(newUuid));
+  const pendingRefundIds = useRef(createPendingTenderIds(newUuid));
 
   const refresh = useCallback(async () => {
     if (!orderId) return;
@@ -195,10 +196,18 @@ export function useCheckout(
         const res = await fetch("/api/payments/refund", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ paymentId, amountCents }),
+          body: JSON.stringify({
+            paymentId,
+            amountCents,
+            // Same id on retry of the same refund; a new refund gets a new id.
+            refundId: pendingRefundIds.current.get(
+              `${paymentId}|${amountCents ?? "all"}`,
+            ),
+          }),
         });
         const data = (await res.json()) as { error?: string };
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        pendingRefundIds.current.clear();
         await refresh();
       } catch (e) {
         setError(e instanceof Error ? e.message : "Refund failed.");

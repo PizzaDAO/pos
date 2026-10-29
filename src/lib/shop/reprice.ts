@@ -6,7 +6,9 @@
  * already folded in by `driver.getMenu`). Client-sent names, stations and
  * prices are ignored; only the line id, notes, quantity and the *selection*
  * (item / size / modifier ids + placements) are honoured, and each selection is
- * validated against the menu graph.
+ * validated against the menu graph. Line ids are minted HERE (server-side UUIDs):
+ * `order_items.id` is a global primary key, so client-chosen ids could collide
+ * with (or probe) another order's lines.
  */
 import type {
   HalfPlacement,
@@ -133,7 +135,7 @@ function repriceLine(menu: Menu, raw: OrderItem): OrderItem {
       : null;
 
   return withLinePricing({
-    id: String(raw.id),
+    id: crypto.randomUUID(),
     item_id: item.id,
     item_name: item.name,
     station: item.station,
@@ -150,7 +152,8 @@ function repriceLine(menu: Menu, raw: OrderItem): OrderItem {
 }
 
 /**
- * Rebuild every non-voided line from the menu. Voided lines are dropped (a
+ * Rebuild every non-voided line from the menu with fresh server-minted ids.
+ * Voided lines are dropped (a
  * customer cart has no use for them). Throws `RepriceError` on the first line
  * the menu cannot honour.
  */

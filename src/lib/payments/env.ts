@@ -37,9 +37,10 @@ export function isStripeConfigured(): boolean {
   return getStripeConfig() !== null;
 }
 
-/** True when the Stripe secret key is a TEST-mode key (`sk_test_...`). */
+/** True when the Stripe key is a TEST-mode key (`sk_test_...` or restricted `rk_test_...`). */
 export function isStripeTestKey(): boolean {
-  return (process.env.STRIPE_SECRET_KEY ?? "").startsWith("sk_test_");
+  const key = process.env.STRIPE_SECRET_KEY ?? "";
+  return key.startsWith("sk_test_") || key.startsWith("rk_test_");
 }
 
 /** True when `TRAINING_MODE` is explicitly enabled via env. */

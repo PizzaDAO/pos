@@ -15,7 +15,10 @@
  * Everything here is pure data + maps; it never reads env vars and works with no
  * configuration, so the app builds and runs offline in the Vercel preview.
  */
-import { isConnectedForHealth } from "@/lib/payments/connect-status";
+import {
+  assertNoSimulatedOverwrite,
+  isConnectedForHealth,
+} from "@/lib/payments/connect-status";
 import type { PosDriver } from "./driver";
 import type {
   CreateOrderInput,
@@ -962,6 +965,7 @@ export const mockDriver: PosDriver = {
 
   async upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount> {
     const existing = connectAccounts.get(account.tenant_id);
+    assertNoSimulatedOverwrite(existing, account);
     const merged: ConnectAccount = {
       ...account,
       created_at: existing?.created_at ?? account.created_at,

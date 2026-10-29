@@ -117,3 +117,24 @@ describe("stripe-test reason + precedence (S10)", () => {
     expect(demoModeInfo().reason).toBe("stripe-test");
   });
 });
+
+describe("review fixes: rk_test_ and paymentsSimulated", () => {
+  it("treats a restricted rk_test_ key as Stripe test mode", () => {
+    vi.spyOn(db, "getPosDriver").mockReturnValue({
+      name: "supabase",
+    } as unknown as ReturnType<typeof db.getPosDriver>);
+    vi.stubEnv("STRIPE_SECRET_KEY", "rk_test_x");
+    expect(demoModeInfo().reason).toBe("stripe-test");
+  });
+
+  it("paymentsSimulated reflects card-rail simulation (flag / mock), not just a missing key", () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_live_x");
+    // mock driver env => simulated even with a key
+    expect(demoModeInfo().paymentsSimulated).toBe(true);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "http://localhost:54321");
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "k");
+    expect(demoModeInfo().paymentsSimulated).toBe(false);
+    vi.stubEnv("TRAINING_MODE", "1");
+    expect(demoModeInfo().paymentsSimulated).toBe(true);
+  });
+});

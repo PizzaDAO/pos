@@ -14,6 +14,7 @@ import { requireTenantRole } from "@/lib/auth/api";
 import { publicTender } from "@/lib/payments/public";
 import {
   enforceRateLimit,
+  isClientId,
   isMoneyCents,
   isUuid,
   readJsonBody,
@@ -26,6 +27,8 @@ interface RefundBody {
   paymentId: string;
   amountCents?: number;
   reason?: string;
+  /** Client-minted id for this refund request (idempotency across retries). */
+  refundId?: string;
 }
 
 export async function POST(request: Request) {
@@ -52,6 +55,13 @@ export async function POST(request: Request) {
   if (b.amountCents !== undefined && !isMoneyCents(b.amountCents)) {
     return NextResponse.json(
       { error: "amountCents must be a non-negative integer." },
+      { status: 422 },
+    );
+  }
+
+  if (b.refundId !== undefined && !isClientId(b.refundId)) {
+    return NextResponse.json(
+      { error: "refundId is invalid." },
       { status: 422 },
     );
   }
@@ -83,6 +93,7 @@ export async function POST(request: Request) {
       paymentId: b.paymentId,
       amountCents: b.amountCents,
       reason: b.reason,
+      refundId: b.refundId,
     });
     if (!payment) {
       return NextResponse.json(

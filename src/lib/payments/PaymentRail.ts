@@ -114,8 +114,6 @@ export interface RefundRequest {
   /** Optional partial refund amount; defaults to a full refund. */
   amount?: Money;
   reason?: string;
-  /** True when this refund brings the tender to fully refunded. */
-  fullRefund?: boolean;
 }
 
 export interface RefundResult {

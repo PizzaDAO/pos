@@ -97,8 +97,9 @@ export async function POST(request: Request) {
     const returnUrl = body.returnUrl ?? `${origin}/admin?connect=return`;
     const refreshUrl = body.refreshUrl ?? `${origin}/admin?connect=refresh`;
 
-    // Simulated mode: immediately mark connected on "return".
-    if (isSimulated()) {
+    // Simulated mode: immediately mark a SIMULATED account connected on "return".
+    // (A stored real account is never rewritten as simulated.)
+    if (isSimulated() && isSimulatedAccount(account)) {
       account = await driver.upsertConnectAccount({
         ...account,
         status: "connected",

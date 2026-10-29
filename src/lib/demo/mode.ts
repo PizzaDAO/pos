@@ -25,6 +25,7 @@
  */
 import { getPosDriver } from "@/lib/db";
 import {
+  cardRailsSimulated,
   isStripeConfigured,
   isStripeTestKey,
   isTrainingFlagSet,
@@ -89,12 +90,12 @@ export function demoModeInfo(): DemoModeInfo {
   } catch {
     driver = "mock";
   }
-  const paymentsSimulated = !isStripeConfigured();
+  const paymentsSimulated = cardRailsSimulated();
   const reason: TrainingReason = isTrainingModeEnv()
     ? "flag"
     : driver === "mock"
       ? "mock"
-      : paymentsSimulated
+      : !isStripeConfigured()
         ? "stripe-unset"
         : isStripeTestKey()
           ? "stripe-test"

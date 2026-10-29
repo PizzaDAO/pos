@@ -235,14 +235,26 @@ describe("repriceItems", () => {
     ).toThrow(/more than once/);
   });
 
-  it("drops voided lines, trims notes and keeps the client line id", () => {
+  it("mints fresh server-side line ids (client ids are ignored)", () => {
     const out = repriceItems(menu, [
-      line({ id: "keep", notes: `  ${"x".repeat(300)}  ` }),
+      line({ id: "dup" }),
+      line({ id: "dup" }),
+      line({ id: "../../other-order-line" }),
+    ]);
+    const ids = out.map((l) => l.id);
+    expect(new Set(ids).size).toBe(3);
+    for (const id of ids) {
+      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    }
+  });
+
+  it("drops voided lines and trims notes", () => {
+    const out = repriceItems(menu, [
+      line({ notes: `  ${"x".repeat(300)}  ` }),
       line({ id: "gone", voided: true, item_id: "bogus" }),
     ]);
     expect(out).toHaveLength(1);
     const kept = first(out);
-    expect(kept.id).toBe("keep");
     expect(kept.notes).toHaveLength(200);
     expect(kept.voided).toBe(false);
   });

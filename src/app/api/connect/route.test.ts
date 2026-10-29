@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import type { ConnectAccount } from "@/lib/db/payment-types";
+import { resetMockPayments } from "@/lib/db/mock";
 
 const requireTenantRole = vi.fn();
 vi.mock("@/lib/auth/api", () => ({
@@ -53,6 +54,7 @@ function postReq(body: unknown) {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  resetMockPayments();
   vi.unstubAllEnvs();
   vi.stubEnv("STRIPE_SECRET_KEY", "");
   requireTenantRole.mockResolvedValue({
@@ -62,7 +64,7 @@ beforeEach(async () => {
   createAccountLink.mockResolvedValue("https://connect.stripe.test/onboard");
   // Reset stored state for the test tenant.
   const driver = getPosDriver();
-  await driver.upsertConnectAccount(acct({ account_id: "acct_reset" }));
+  await driver.upsertConnectAccount(acct({ account_id: "acct_sim_reset", simulated: true }));
   // Behave like a LIVE driver (Supabase env present). The in-memory mock is
   // already memoized by the call above, so storage still works; this only stops
   // card rails from taking the mock-driver training-mode simulated path.

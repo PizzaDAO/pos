@@ -199,7 +199,7 @@ describe("S4/S6: online tip is charged once, derived from the order", () => {
   });
 
   it("an anonymous caller cannot settle an online order with cash", async () => {
-    requireTenantMember.mockResolvedValue({
+    requireTenantRole.mockResolvedValue({
       ok: false,
       res: NextResponse.json({ error: "Not signed in." }, { status: 401 }),
     });
@@ -208,6 +208,8 @@ describe("S4/S6: online tip is charged once, derived from the order", () => {
       payReq(orderId, { paymentId: "p-cash", rail: "cash", amountCents: 1000 }),
     );
     expect(res.status).toBe(401);
+    // Same till roles as an in-store tender.
+    expect(requireTenantRole).toHaveBeenCalledWith(TENANT, ["owner", "manager", "cashier"]);
   });
 
   it("orderDueCents excludes the order tip; terminal orders are unchanged", async () => {
@@ -476,12 +478,13 @@ describe("S9: refunds are owner|manager only", () => {
 });
 
 describe("S8: direct-charge refunds", () => {
-  it("stripeRefundParams never sends reverse_transfer; fee refund only on a full refund", () => {
-    const full = stripeRefundParams({ chargeId: "pi_1", fullRefund: true });
+  it("stripeRefundParams never sends reverse_transfer; the fee is returned on every refund", () => {
+    const full = stripeRefundParams({ chargeId: "pi_1" });
     expect(full).not.toHaveProperty("reverse_transfer");
     expect(full.refund_application_fee).toBe(true);
-    const partial = stripeRefundParams({ chargeId: "pi_1", amountCents: 100, fullRefund: false });
-    expect(partial.refund_application_fee).toBeUndefined();
+    const partial = stripeRefundParams({ chargeId: "pi_1", amountCents: 100 });
+    expect(partial).not.toHaveProperty("reverse_transfer");
+    expect(partial.refund_application_fee).toBe(true);
     expect(partial.amount).toBe(100);
   });
 
@@ -496,7 +499,7 @@ describe("S8: direct-charge refunds", () => {
       let [path, body, opts] = stripeRequest.mock.calls[0]!;
       expect(path).toBe("/refunds");
       expect(body).not.toHaveProperty("reverse_transfer");
-      expect(body.refund_application_fee).toBeUndefined();
+      expect(body.refund_application_fee).toBe(true);
       expect(opts.stripeAccount).toBe(ACCT);
 
       await refundPayment({ paymentId: t.id, amountCents: 600 });
