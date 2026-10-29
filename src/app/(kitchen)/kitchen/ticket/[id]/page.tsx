@@ -9,7 +9,10 @@
  * device + no env in the preview).
  */
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { getPosDriver } from "@/lib/db";
+import { getCurrentUser } from "@/lib/auth/session";
+import { canEnterSurface } from "@/lib/auth/roles";
 import { PrintView } from "./print-view";
 
 export const runtime = "nodejs";
@@ -20,8 +23,16 @@ export default async function TicketPrintPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
+  // The ticket must belong to a tenant the session may run a kitchen for —
+  // never print another tenant's order by guessing/sharing its id.
+  const user = await getCurrentUser();
+  if (!user) redirect("/login?redirect=/kitchen");
   const driver = getPosDriver();
-  const order = await driver.getOrder(id);
+  const found = await driver.getOrder(id).catch(() => null);
+  const order =
+    found && canEnterSurface(user.memberships, "kitchen", found.tenant_id)
+      ? found
+      : null;
 
   if (!order) {
     return (
