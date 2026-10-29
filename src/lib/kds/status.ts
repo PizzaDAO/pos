@@ -66,6 +66,10 @@ export function recallStatus(current: OrderStatus): OrderStatus | null {
 /** Human label for a KDS status (board headers / ticket badges). */
 export function statusLabel(status: OrderStatus): string {
   switch (status) {
+    case "awaiting_payment":
+      return "Waiting for payment";
+    case "abandoned":
+      return "Checkout expired";
     case "placed":
       return "New";
     case "paid":

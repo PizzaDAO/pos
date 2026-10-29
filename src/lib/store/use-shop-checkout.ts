@@ -3,10 +3,17 @@
  *  1. `quoteDelivery` — POST /api/delivery/quote to price + GATE a delivery
  *     address (out-of-zone/below-minimum rejected with a message).
  *  2. `placeOrder` — POST /api/shop/orders to create the online order with the
- *     right channel + fulfillment (the server re-validates hours + zone).
+ *     right channel + fulfillment (the server re-validates hours + zone). The
+ *     order starts `awaiting_payment`: not on the KDS until it is paid. The
+ *     caller keeps ONE order id per checkout (see `checkout-order-id.ts`) so a
+ *     retry reuses the same order.
  *  3. `pay` — POST /api/payments REUSING the existing stripe_online / crypto
- *     rails (simulated when unkeyed) with an optional tip; the same idempotency
- *     model as the terminal (client UUID per tender).
+ *     rails (simulated when unkeyed) with an optional tip. For online orders the
+ *     SERVER derives the tender id from the order id + rail, so a retry is the
+ *     same tender; the `paymentId` sent here is only a placeholder it ignores.
+ *     The result's `orderStatus` is `paid` only once the order is settled.
+ *  4. `sync` — POST /api/shop/orders/[id]/pay/sync: the server re-checks open
+ *     tenders (a crypto payment confirming) and reports the order status.
  *
  * All money is integer cents.
  */
@@ -17,6 +24,7 @@ import type {
   DeliveryAddress,
   Order,
   OrderItem,
+  OrderStatus,
   Payment,
 } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
@@ -50,10 +58,25 @@ export interface PlaceOrderInput {
   tipCents: number;
 }
 
+export interface PayResult {
+  payment: Payment;
+  /** `paid` only once the order is settled; otherwise the customer must act/wait. */
+  orderStatus: OrderStatus;
+}
+
+export interface SyncResult {
+  orderStatus: OrderStatus;
+  balanceCents: number;
+  expiresAt: string | null;
+  payments: Payment[];
+}
+
 export function useShopCheckout() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pendingIds = useRef(createPendingTenderIds(newUuid));
+  /** Machine-readable code of the last failed call (e.g. `checkout_abandoned`). */
+  const lastCode = useRef<string | null>(null);
 
   /** Price + gate a delivery address. Returns null + sets `error` on rejection. */
   const quoteDelivery = useCallback(
@@ -95,6 +118,7 @@ export function useShopCheckout() {
     ): Promise<{ order: Order; customerId: string | null } | null> => {
       setLoading(true);
       setError(null);
+      lastCode.current = null;
       try {
         const res = await fetch("/api/shop/orders", {
           method: "POST",
@@ -116,8 +140,10 @@ export function useShopCheckout() {
           order?: Order;
           customer?: { id: string };
           error?: string;
+          code?: string;
         };
         if (!res.ok || !data.order) {
+          lastCode.current = data.code ?? null;
           throw new Error(data.error ?? `HTTP ${res.status}`);
         }
         return { order: data.order, customerId: data.customer?.id ?? null };
@@ -138,9 +164,10 @@ export function useShopCheckout() {
       rail: PaymentRailKey;
       amountCents: number;
       tipCents: number;
-    }): Promise<Payment | null> => {
+    }): Promise<PayResult | null> => {
       setLoading(true);
       setError(null);
+      lastCode.current = null;
       try {
         const res = await fetch("/api/payments", {
           method: "POST",
@@ -166,13 +193,19 @@ export function useShopCheckout() {
         });
         const data = (await res.json()) as {
           payment?: Payment;
+          orderStatus?: OrderStatus;
           error?: string;
+          code?: string;
         };
         if (!res.ok || !data.payment) {
+          lastCode.current = data.code ?? null;
           throw new Error(data.error ?? `HTTP ${res.status}`);
         }
         pendingIds.current.clear();
-        return data.payment;
+        return {
+          payment: data.payment,
+          orderStatus: data.orderStatus ?? input.order.status,
+        };
       } catch (e) {
         setError(e instanceof Error ? e.message : "Payment failed.");
         return null;
@@ -183,7 +216,35 @@ export function useShopCheckout() {
     [],
   );
 
-  /** Void a just-placed, unpaid order (customer declined a changed total). */
+  /**
+   * Ask the server to re-check an unpaid order's open tenders. Returns the
+   * order's status (`paid` is the only "money received" signal) or null.
+   */
+  const sync = useCallback(
+    async (orderId: string): Promise<SyncResult | null> => {
+      try {
+        const res = await fetch(`/api/shop/orders/${orderId}/pay/sync`, {
+          method: "POST",
+        });
+        if (!res.ok) return null;
+        return (await res.json()) as SyncResult;
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
+
+  /** Fire-and-forget cancel of a SUPERSEDED unpaid order (cart changed). */
+  const cancelQuietly = useCallback((orderId: string): void => {
+    void fetch("/api/shop/orders/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ orderId }),
+    }).catch(() => undefined);
+  }, []);
+
+  /** Cancel an unpaid order (declined a changed total, or gave up waiting). */
   const cancelOrder = useCallback(async (orderId: string): Promise<boolean> => {
     setLoading(true);
     try {
@@ -213,7 +274,10 @@ export function useShopCheckout() {
     quoteDelivery,
     placeOrder,
     pay,
+    sync,
     cancelOrder,
+    cancelQuietly,
     newUuid,
+    lastCode,
   };
 }
