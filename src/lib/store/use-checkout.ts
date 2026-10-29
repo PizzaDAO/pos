@@ -3,14 +3,17 @@
  *
  * Loads an order + its tenders, takes new tenders (split payment across rails),
  * polls pending crypto tenders until confirmed, and issues refunds. Every tender
- * carries a freshly-generated client UUID that is the idempotency key end-to-end
- * (`/api/payments` upserts by it), so a retry/double-tap never double-charges.
+ * carries a client UUID that is the idempotency key end-to-end (`/api/payments`
+ * upserts by it). The UUID is minted ONCE per pending tender and reused on retry
+ * (lost response, double-tap) until the tender is recorded or its amount/rail
+ * changes, so a retry never double-charges.
  */
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Order, Payment } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
+import { createPendingTenderIds, tenderSignature } from "./pending-tender";
 
 function newUuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -58,6 +61,7 @@ export function useCheckout(
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
+  const pendingIds = useRef(createPendingTenderIds(newUuid));
 
   const refresh = useCallback(async () => {
     if (!orderId) return;
@@ -144,7 +148,15 @@ export function useCheckout(
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            paymentId: newUuid(),
+            paymentId: pendingIds.current.get(
+              tenderSignature({
+                orderId,
+                rail: input.rail,
+                amountCents: input.amountCents,
+                tipCents: input.tipCents,
+                cashTenderedCents: input.cashTenderedCents,
+              }),
+            ),
             orderId,
             tenantId,
             locationId,
@@ -161,6 +173,8 @@ export function useCheckout(
           error?: string;
         };
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        // Recorded: the next tender (even an identical one) is a new tender.
+        pendingIds.current.clear();
         await refresh();
         return data.payment ?? null;
       } catch (e) {
