@@ -49,6 +49,14 @@ export function railIsSimulated(rail: PaymentRailKey | "cash"): boolean {
   }
 }
 
+/** A paymentId was reused for a different order (maps to HTTP 409). */
+export class PaymentConflictError extends Error {
+  constructor() {
+    super("paymentId already used for another order.");
+    this.name = "PaymentConflictError";
+  }
+}
+
 export interface TakePaymentInput {
   /** Client UUID — idempotency key + payment row id. */
   paymentId: string;
@@ -105,7 +113,10 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
 
   // Idempotency guard: a tender with this id already exists → return it.
   const existing = await driver.getPayment(input.paymentId);
-  if (existing) return existing;
+  if (existing) {
+    if (existing.order_id !== input.orderId) throw new PaymentConflictError();
+    return existing;
+  }
 
   // Defense in depth: in real mode a card rail must always be scoped to a real
   // connected account — never fall back to the platform account.

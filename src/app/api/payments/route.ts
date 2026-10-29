@@ -19,7 +19,11 @@ import {
   resolveCardConnectAccountId,
 } from "@/lib/payments/connect";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
-import { takePayment, getOrderBalance } from "@/lib/payments/service";
+import {
+  PaymentConflictError,
+  takePayment,
+  getOrderBalance,
+} from "@/lib/payments/service";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -148,7 +152,10 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
-    if (err instanceof CardPaymentsNotReadyError) {
+    if (
+      err instanceof CardPaymentsNotReadyError ||
+      err instanceof PaymentConflictError
+    ) {
       return NextResponse.json({ error: err.message }, { status: 409 });
     }
     return NextResponse.json(

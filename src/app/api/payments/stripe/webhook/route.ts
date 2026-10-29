@@ -18,7 +18,7 @@ import type { PaymentStatus } from "@/lib/db";
 import { verifyStripeWebhook, mapIntentStatus } from "@/lib/payments/providers/stripe-client";
 import { isStripeConfigured } from "@/lib/payments/env";
 import { refreshPaymentStatus } from "@/lib/payments/service";
-import { deriveStatus } from "@/lib/payments/connect";
+import { deriveStatus, fetchConnectStatus } from "@/lib/payments/connect";
 
 export const runtime = "nodejs";
 
@@ -40,6 +40,8 @@ export async function POST(request: Request) {
 
   let event: {
     type?: string;
+    /** Unix seconds the event was created. */
+    created?: number;
     data?: {
       object?: {
         id?: string;
@@ -63,17 +65,29 @@ export async function POST(request: Request) {
       const driver = getPosDriver();
       const row = await driver.getConnectAccountByAccountId(acct.id);
       if (row) {
-        const flags = {
-          charges_enabled: acct.charges_enabled ?? false,
-          payouts_enabled: acct.payouts_enabled ?? false,
-          details_submitted: acct.details_submitted ?? false,
-        };
-        await driver.upsertConnectAccount({
-          ...row,
-          ...flags,
-          status: deriveStatus(flags),
-          simulated: false,
-        });
+        // Events can arrive out of order: prefer the account's CURRENT state
+        // from Stripe over the event payload.
+        try {
+          const fresh = await fetchConnectStatus(row.tenant_id, row.account_id);
+          await driver.upsertConnectAccount({ ...fresh, created_at: row.created_at });
+        } catch {
+          // Fetch failed: only trust the payload if it is not older than what
+          // we already stored.
+          const eventMs = (event.created ?? 0) * 1000;
+          if (eventMs >= new Date(row.updated_at).getTime()) {
+            const flags = {
+              charges_enabled: acct.charges_enabled ?? false,
+              payouts_enabled: acct.payouts_enabled ?? false,
+              details_submitted: acct.details_submitted ?? false,
+            };
+            await driver.upsertConnectAccount({
+              ...row,
+              ...flags,
+              status: deriveStatus(flags),
+              simulated: false,
+            });
+          }
+        }
       }
     }
     return NextResponse.json({ received: true });

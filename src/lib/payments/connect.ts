@@ -145,6 +145,9 @@ export class CardPaymentsNotReadyError extends Error {
   }
 }
 
+/** Min age of a not-ready status before the UI hint re-checks Stripe. */
+export const STALE_REFRESH_MS = 5 * 60_000;
+
 type CardGate = { ok: true; accountId: string | null } | { ok: false };
 
 /**
@@ -158,14 +161,20 @@ type CardGate = { ok: true; accountId: string | null } | { ok: false };
  */
 async function evaluateCardGate(
   tenantId: string | null | undefined,
-  refresh: boolean,
+  refresh: boolean | "throttled",
 ): Promise<CardGate> {
   const driver = getPosDriver();
   const stored = tenantId ? await driver.getConnectAccount(tenantId) : null;
   if (isSimulated()) return { ok: true, accountId: stored?.account_id ?? null };
   let account = effectiveConnectAccount(stored);
   if (!account) return { ok: false };
-  if (!account.charges_enabled && refresh) {
+  // "throttled": refresh at most once per STALE_REFRESH_MS per tenant (the
+  // stored updated_at is bumped by every upsert, even when nothing changed).
+  const due =
+    refresh === true ||
+    (refresh === "throttled" &&
+      Date.now() - new Date(account.updated_at).getTime() > STALE_REFRESH_MS);
+  if (!account.charges_enabled && due) {
     try {
       const fresh = await fetchConnectStatus(account.tenant_id, account.account_id);
       account = await driver.upsertConnectAccount(fresh);
@@ -196,11 +205,13 @@ export async function resolveCardConnectAccountId(
 
 /**
  * Whether card tender can be offered for a tenant right now (UI hint; never
- * exposes the account id). No Stripe call — uses the stored status only, so it
- * is cheap to expose on public endpoints. Always true in simulated mode.
+ * exposes the account id). Uses the stored status; a stored not-ready real
+ * account older than STALE_REFRESH_MS is re-checked with Stripe (one call per
+ * tenant per window, errors swallowed) so a hidden Card can recover after
+ * onboarding completes. Always true in simulated mode.
  */
 export async function isCardReady(tenantId: string): Promise<boolean> {
-  return (await evaluateCardGate(tenantId, false)).ok;
+  return (await evaluateCardGate(tenantId, "throttled")).ok;
 }
 
 export {

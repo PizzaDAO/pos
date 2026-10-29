@@ -427,6 +427,12 @@ describe("account.updated webhook", () => {
       acct({ account_id: "acct_wh_1", charges_enabled: false, payouts_enabled: false, status: "pending" }),
     );
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    stripeGet.mockResolvedValue({
+      id: "acct_wh_1",
+      charges_enabled: true,
+      payouts_enabled: true,
+      details_submitted: true,
+    });
     const res = await webhookPOST(
       hook({ id: "acct_wh_1", charges_enabled: true, payouts_enabled: true, details_submitted: true }),
     );
@@ -441,5 +447,105 @@ describe("account.updated webhook", () => {
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
     const res = await webhookPOST(hook({ id: "acct_nobody", charges_enabled: true }));
     expect(res.status).toBe(200);
+  });
+
+  it("re-fetches from Stripe instead of trusting a stale event payload", async () => {
+    await getPosDriver().upsertConnectAccount(
+      acct({ account_id: "acct_wh_2", charges_enabled: true }),
+    );
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    // Current Stripe state: charges disabled. The (older) event claims enabled.
+    stripeGet.mockResolvedValue({ id: "acct_wh_2", charges_enabled: false });
+    await webhookPOST(hook({ id: "acct_wh_2", charges_enabled: true }));
+    expect(stripeGet).toHaveBeenCalledTimes(1);
+    expect((await getPosDriver().getConnectAccount(TENANT))?.charges_enabled).toBe(false);
+  });
+
+  it("on fetch failure applies the payload only if the event is not older than the stored row", async () => {
+    await getPosDriver().upsertConnectAccount(
+      acct({ account_id: "acct_wh_3", charges_enabled: false, status: "pending" }),
+    );
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    stripeGet.mockRejectedValue(new Error("stripe down"));
+    const old = { type: "account.updated", created: 1, data: { object: { id: "acct_wh_3", charges_enabled: true, payouts_enabled: true, details_submitted: true } } };
+    const mk = (e: unknown) =>
+      new Request("http://localhost/api/payments/stripe/webhook", {
+        method: "POST",
+        headers: { "stripe-signature": "t=1,v1=x" },
+        body: JSON.stringify(e),
+      });
+    await webhookPOST(mk(old));
+    expect((await getPosDriver().getConnectAccount(TENANT))?.charges_enabled).toBe(false);
+    const fresh = { ...old, created: Math.floor(Date.now() / 1000) + 60 };
+    await webhookPOST(mk(fresh));
+    expect((await getPosDriver().getConnectAccount(TENANT))?.charges_enabled).toBe(true);
+  });
+});
+
+describe("isCardReady recovers a stale not-ready status (throttled)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("refreshes once after 5 min, not before, and persists", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    await getPosDriver().upsertConnectAccount(
+      acct({ charges_enabled: false, status: "pending" }),
+    );
+    stripeGet.mockResolvedValue({
+      id: "acct_real_1",
+      charges_enabled: true,
+      payouts_enabled: true,
+      details_submitted: true,
+    });
+    expect(await isCardReady(TENANT)).toBe(false); // fresh row: no Stripe call
+    expect(stripeGet).not.toHaveBeenCalled();
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 6 * 60_000);
+    expect(await isCardReady(TENANT)).toBe(true);
+    expect(stripeGet).toHaveBeenCalledTimes(1);
+    expect(await isCardReady(TENANT)).toBe(true); // now stored as ready
+    expect(stripeGet).toHaveBeenCalledTimes(1);
+  });
+
+  it("an unchanged refresh bumps updated_at so the throttle holds, and errors are swallowed", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    await getPosDriver().upsertConnectAccount(
+      acct({ charges_enabled: false, status: "pending" }),
+    );
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 6 * 60_000);
+    stripeGet.mockResolvedValue({ id: "acct_real_1", charges_enabled: false });
+    expect(await isCardReady(TENANT)).toBe(false);
+    expect(await isCardReady(TENANT)).toBe(false);
+    expect(stripeGet).toHaveBeenCalledTimes(1);
+
+    // Stale again later; a Stripe error must not throw.
+    vi.setSystemTime(Date.now() + 6 * 60_000);
+    stripeGet.mockRejectedValue(new Error("boom"));
+    expect(await isCardReady(TENANT)).toBe(false);
+  });
+});
+
+describe("takePayment guards paymentId reuse", () => {
+  it("throws a conflict when the existing payment belongs to another order", async () => {
+    const first = await seedOrder();
+    const second = await seedOrder();
+    const base = {
+      paymentId: "gate-conflict-1",
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash" as const,
+      amountCents: 2000,
+      tipCents: 0,
+      currency: "USD",
+    };
+    await takePayment({ ...base, orderId: first });
+    await expect(takePayment({ ...base, orderId: second })).rejects.toThrow(
+      /already used for another order/,
+    );
+    // Same order: idempotent.
+    expect((await takePayment({ ...base, orderId: first })).id).toBe("gate-conflict-1");
   });
 });
