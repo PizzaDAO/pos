@@ -98,9 +98,18 @@ export type ReserveRefundResult =
   | { ok: true; created: boolean; refund: PaymentRefund }
   | {
       ok: false;
-      reason: "payment_not_found" | "refund_mismatch" | "exceeds_refundable";
+      reason:
+        | "payment_not_found"
+        | "refund_mismatch"
+        | "not_settled"
+        | "exceeds_refundable";
       refundableCents: number;
     };
+
+/** Outcome of voiding (canceling) an unsettled tender. */
+export type VoidTenderResult =
+  | { ok: true; payment: Payment }
+  | { ok: false; reason: "not_found" | "not_voidable"; payment?: Payment };
 
 /** Per-tenant Stripe Connect onboarding status. */
 export type ConnectStatus = "not_started" | "pending" | "connected" | "rejected";

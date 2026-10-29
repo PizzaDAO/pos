@@ -20,6 +20,7 @@ import type {
   PaymentSettings,
   ReserveRefundResult,
   ReserveTenderResult,
+  VoidTenderResult,
 } from "./payment-types";
 import type {
   Customer,
@@ -283,6 +284,22 @@ export interface PosDriver {
    * the last of the balance. Idempotent on `payment.id`.
    */
   reserveTender(payment: Payment): Promise<ReserveTenderResult>;
+
+  /**
+   * Cancel an UNSETTLED tender (pending / requires_action) under a row lock so
+   * it stops holding the order balance. Settled tenders are refunded instead.
+   */
+  voidTender(id: string): Promise<VoidTenderResult>;
+
+  /**
+   * Targeted status update from a provider signal (webhook / status poll):
+   * changes ONLY `status`, and never moves a refunded or partially refunded
+   * tender (refunded_cents > 0) back to another status. Returns the row.
+   */
+  updatePaymentStatusFromProvider(
+    id: string,
+    status: Payment["status"],
+  ): Promise<Payment | null>;
 
   /** Fetch a refund request by its id, or null. */
   getRefund(id: string): Promise<PaymentRefund | null>;

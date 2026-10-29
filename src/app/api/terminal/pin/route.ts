@@ -22,6 +22,11 @@ import { getCurrentUser } from "@/lib/auth/session";
 import { tenantsForSurface } from "@/lib/auth/roles";
 import { isValidPinFormat, verifyPin } from "@/lib/auth/pin";
 import { enforceRateLimit, readJsonBody, recordAudit } from "@/lib/security";
+import {
+  ACTIVE_STAFF_COOKIE,
+  activeStaffCookieOptions,
+  signActiveStaff,
+} from "@/lib/auth/active-staff";
 
 export const runtime = "nodejs";
 
@@ -121,8 +126,17 @@ export async function POST(request: Request) {
     detail: `Active staff switched to ${matched.name} (${matched.role}).`,
   });
 
-  // Success: return only non-sensitive identity for attribution (no hash).
-  return NextResponse.json({
+  // Success: return only non-sensitive identity for attribution (no hash),
+  // and bind the active staff server-side in a signed httpOnly cookie — the
+  // role that authorizes discounts/refunds/voids at this terminal.
+  const signed = signActiveStaff(matched.tenant_id, matched.id);
+  if (!signed) {
+    return NextResponse.json(
+      { error: "Staff switching is unavailable (server not configured)." },
+      { status: 503 },
+    );
+  }
+  const res = NextResponse.json({
     activeStaff: {
       id: matched.id,
       tenant_id: matched.tenant_id,
@@ -130,4 +144,16 @@ export async function POST(request: Request) {
       role: matched.role,
     },
   });
+  res.cookies.set(ACTIVE_STAFF_COOKIE, signed, activeStaffCookieOptions());
+  return res;
+}
+
+/** DELETE /api/terminal/pin — sign the active staff member out (clear cookie). */
+export async function DELETE() {
+  const res = NextResponse.json({ ok: true });
+  res.cookies.set(ACTIVE_STAFF_COOKIE, "", {
+    ...activeStaffCookieOptions(),
+    maxAge: 0,
+  });
+  return res;
 }

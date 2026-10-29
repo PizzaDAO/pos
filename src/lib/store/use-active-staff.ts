@@ -53,6 +53,8 @@ export function useActiveStaff() {
       // ignore
     }
     setActiveStaff(null);
+    // Clear the server-side (httpOnly) active-staff binding too.
+    void fetch("/api/terminal/pin", { method: "DELETE" }).catch(() => null);
   }, []);
 
   /** Verify a PIN server-side and, on success, set the active staff. */

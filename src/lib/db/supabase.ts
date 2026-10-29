@@ -358,6 +358,8 @@ function mapSubscription(r: Row): Subscription {
     simulated: r.simulated as boolean,
     stripe_customer_id: (r.stripe_customer_id as string | null) ?? null,
     stripe_subscription_id: (r.stripe_subscription_id as string | null) ?? null,
+    last_event_created:
+      r.last_event_created == null ? null : Number(r.last_event_created),
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -1517,6 +1519,38 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       };
     },
 
+    async voidTender(id) {
+      const res = unwrap(
+        await sb.rpc("void_tender", { p_payment_id: id }),
+      ) as { ok: boolean; reason?: string; payment?: Row };
+      if (res.ok && res.payment) {
+        return { ok: true, payment: mapPayment(res.payment) };
+      }
+      return {
+        ok: false,
+        reason: (res.reason === "not_found" ? "not_found" : "not_voidable") as
+          | "not_found"
+          | "not_voidable",
+        payment: res.payment ? mapPayment(res.payment) : undefined,
+      };
+    },
+
+    async updatePaymentStatusFromProvider(id, status) {
+      // Targeted update: status only, and never on a refunded / partially
+      // refunded tender (the filters make it a no-op for those rows).
+      const r = unwrap(
+        await sb
+          .from("payments")
+          .update({ status, updated_at: nowIso() })
+          .eq("id", id)
+          .neq("status", "refunded")
+          .eq("refunded_cents", 0)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPayment(r) : this.getPayment(id);
+    },
+
     async getRefund(id) {
       const r = unwrap(
         await sb.from("payment_refunds").select("*").eq("id", id).maybeSingle(),
@@ -1551,6 +1585,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         reason: (res.reason ?? "exceeds_refundable") as
           | "payment_not_found"
           | "refund_mismatch"
+          | "not_settled"
           | "exceeds_refundable",
         refundableCents: res.refundable_cents ?? 0,
       };

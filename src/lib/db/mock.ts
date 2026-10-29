@@ -38,7 +38,9 @@ import type {
   PaymentSettings,
   ReserveRefundResult,
   ReserveTenderResult,
+  VoidTenderResult,
 } from "./payment-types";
+import { countsTowardBalance } from "@/lib/payments/balance";
 import type {
   Customer,
   DeliveryRecord,
@@ -990,11 +992,7 @@ export const mockDriver: PosDriver = {
     }
     let covered = 0;
     for (const p of payments.values()) {
-      if (
-        p.order_id === order.id &&
-        p.status !== "failed" &&
-        p.status !== "canceled"
-      ) {
+      if (p.order_id === order.id && countsTowardBalance(p)) {
         covered += p.amount_cents;
       }
     }
@@ -1009,11 +1007,34 @@ export const mockDriver: PosDriver = {
     const now = nowIso();
     const created: Payment = {
       ...payment,
-      created_at: payment.created_at || now,
+      // Server time, like reserve_payment() (drives the stale-tender TTL).
+      created_at: now,
       updated_at: now,
     };
     payments.set(created.id, created);
     return { ok: true, created: true, payment: { ...created } };
+  },
+
+  async voidTender(id: string): Promise<VoidTenderResult> {
+    const p = payments.get(id);
+    if (!p) return { ok: false, reason: "not_found" };
+    if (p.status === "canceled") return { ok: true, payment: { ...p } };
+    if (p.status !== "pending" && p.status !== "requires_action") {
+      return { ok: false, reason: "not_voidable", payment: { ...p } };
+    }
+    const updated: Payment = { ...p, status: "canceled", updated_at: nowIso() };
+    payments.set(id, updated);
+    return { ok: true, payment: { ...updated } };
+  },
+
+  async updatePaymentStatusFromProvider(id, status): Promise<Payment | null> {
+    const p = payments.get(id);
+    if (!p) return null;
+    // Never resurrect a refunded / partially refunded tender.
+    if (p.status === "refunded" || p.refunded_cents > 0) return { ...p };
+    const updated: Payment = { ...p, status, updated_at: nowIso() };
+    payments.set(id, updated);
+    return { ...updated };
   },
 
   async getRefund(id: string): Promise<PaymentRefund | null> {
@@ -1032,6 +1053,10 @@ export const mockDriver: PosDriver = {
     const payment = payments.get(input.paymentId);
     if (!payment) {
       return { ok: false, reason: "payment_not_found", refundableCents: 0 };
+    }
+    // Only settled money can be refunded (mirrors reserve_refund()).
+    if (payment.status !== "captured" && payment.status !== "authorized") {
+      return { ok: false, reason: "not_settled", refundableCents: 0 };
     }
     let pending = 0;
     for (const r of refunds.values()) {

@@ -32,6 +32,7 @@ import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
   BalanceExceededError,
   getOrderBalance,
+  PaymentOutcomeUnknownError,
   railIsSimulated,
   takePayment,
 } from "@/lib/payments/service";
@@ -179,7 +180,16 @@ export async function POST(request: Request) {
 
   // ---- Idempotent replay ------------------------------------------------------
   const prior = await driver.getPayment(body.paymentId).catch(() => null);
-  if (prior) {
+  // A prior attempt whose rail outcome is unknown (pending, never reached a
+  // charge id) is RESUMED by takePayment with its reserved amounts.
+  const resuming = Boolean(
+    prior &&
+      prior.order_id === order.id &&
+      prior.status === "pending" &&
+      !prior.charge_id &&
+      !prior.raw,
+  );
+  if (prior && !resuming) {
     if (prior.order_id !== order.id) {
       return reject("Payment id already used for another order.", 409);
     }
@@ -194,16 +204,18 @@ export async function POST(request: Request) {
   if (order.status === "voided" || order.status === "refunded") {
     return reject("This order can no longer be paid.", 409);
   }
-  const balance = await getOrderBalance(order);
+  // A resumed attempt's amount is already reserved (it's in the balance).
+  const balance =
+    (await getOrderBalance(order)) + (resuming && prior ? prior.amount_cents : 0);
   if (balance <= 0) return reject("This order is already paid.", 409);
-  const amountCents = body.amountCents ?? balance;
+  const amountCents = resuming && prior ? prior.amount_cents : (body.amountCents ?? balance);
   if (amountCents <= 0 || amountCents > balance) {
     return reject(
       `Amount does not match the order balance (${balance}).`,
       422,
     );
   }
-  if (!isStaff && amountCents !== balance) {
+  if (!isStaff && !resuming && amountCents !== balance) {
     return reject(
       `Amount does not match the order balance (${balance}).`,
       422,
@@ -211,7 +223,7 @@ export async function POST(request: Request) {
   }
 
   // ---- Tip: explicit, bounded, never double-counted --------------------------
-  const tipCents = body.tipCents ?? 0;
+  const tipCents = resuming && prior ? prior.tip_cents : (body.tipCents ?? 0);
   if (tipCents > 0 && order.totals.tip_cents > 0) {
     return reject("This order already includes a tip.", 422);
   }
@@ -256,6 +268,14 @@ export async function POST(request: Request) {
     );
   } catch (err) {
     // Lost the race for the remaining balance (atomic reservation refused).
+    // Provider outcome unknown: the tender stays pending. Retry with the SAME
+    // paymentId (the rail dedupes on it) — never a new id.
+    if (err instanceof PaymentOutcomeUnknownError) {
+      return NextResponse.json(
+        { error: err.message, retry: true, paymentId: err.id },
+        { status: 503 },
+      );
+    }
     if (err instanceof BalanceExceededError) {
       return NextResponse.json(
         { error: err.message, balanceCents: err.balanceCents },

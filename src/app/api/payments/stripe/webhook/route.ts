@@ -51,7 +51,9 @@ export async function POST(request: Request) {
 
   const matched = await driver.getPaymentByChargeId(intentId);
   if (matched) {
-    await driver.upsertPayment({ ...matched, status: mapped });
+    // Targeted status-only update; never moves a refunded / partially
+    // refunded tender back (e.g. a late payment_intent.succeeded).
+    await driver.updatePaymentStatusFromProvider(matched.id, mapped);
     await refreshPaymentStatus(matched.id);
   }
 
