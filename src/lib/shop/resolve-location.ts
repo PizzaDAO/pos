@@ -7,7 +7,8 @@
  * only when exactly one location across all tenants has that slug; when several
  * tenants share it the caller gets 409 (ambiguous) instead of a random tenant.
  */
-import { getPosDriver, type Location } from "@/lib/db";
+import { getPosDriver, type Location, type Tenant } from "@/lib/db";
+import { storefrontPath } from "./storefront";
 
 export type ResolveLocationResult =
   | { ok: true; location: Location }
@@ -48,4 +49,65 @@ export async function resolveStorefrontLocation(input: {
     };
   }
   return { ok: false, status: 404, error: "Location not found." };
+}
+
+export interface StoreChoice {
+  location: Location;
+  tenant: Tenant;
+}
+
+export type LegacySlugResolution =
+  | { kind: "none" }
+  | { kind: "redirect"; path: string }
+  | { kind: "choose"; choices: StoreChoice[] };
+
+/**
+ * Resolve the legacy single-segment `/shop/{slug}`. A TENANT slug (globally
+ * unique) wins: redirect to its only location or list its locations. A bare
+ * legacy LOCATION slug redirects only when exactly one location has it. When
+ * the slug is a tenant's AND another tenant's location slug, everything is
+ * shown in one chooser — never an arbitrary redirect.
+ */
+export async function resolveLegacyShopSlug(
+  slug: string,
+): Promise<LegacySlugResolution> {
+  const driver = getPosDriver();
+  const [tenant, byLocation] = await Promise.all([
+    driver.getTenantBySlug(slug),
+    driver.listLocationsBySlug(slug),
+  ]);
+  const tenantChoices: StoreChoice[] = tenant
+    ? (await driver.listLocations(tenant.id)).map((location) => ({
+        location,
+        tenant,
+      }))
+    : [];
+  const otherTenantLocations = (
+    await Promise.all(
+      byLocation
+        .filter((l) => !tenant || l.tenant_id !== tenant.id)
+        .map(async (location) => ({
+          location,
+          tenant: await driver.getTenant(location.tenant_id),
+        })),
+    )
+  ).filter((c): c is StoreChoice => c.tenant !== null);
+
+  const ambiguous = Boolean(tenant) && otherTenantLocations.length > 0;
+  const choices = tenant
+    ? [...tenantChoices, ...otherTenantLocations]
+    : otherTenantLocations;
+
+  if (choices.length === 0) return { kind: "none" };
+  const only = choices[0];
+  if (choices.length === 1 && only && !ambiguous) {
+    return {
+      kind: "redirect",
+      path: storefrontPath({
+        tenantSlug: only.tenant.slug,
+        locationSlug: only.location.slug,
+      }),
+    };
+  }
+  return { kind: "choose", choices };
 }

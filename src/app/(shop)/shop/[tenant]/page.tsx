@@ -4,12 +4,13 @@
  * Storefronts now live at `/shop/{tenantSlug}/{locationSlug}` because location
  * slugs are only unique within a tenant. This route keeps old links working:
  *
- *   1. `slug` is a LOCATION slug held by exactly one location → redirect to its
- *      canonical two-segment URL.
- *   2. Several tenants share that location slug → render a chooser (never pick
- *      one arbitrarily).
- *   3. Otherwise `slug` is a TENANT slug → redirect to its only location, or
- *      list its locations.
+ *   1. `slug` is a TENANT slug (globally unique) → that tenant wins: redirect
+ *      to its only location, or list its locations.
+ *   2. Otherwise `slug` is a legacy LOCATION slug held by exactly one location
+ *      → redirect to its canonical two-segment URL; several tenants share it
+ *      → chooser (never pick one arbitrarily).
+ *   3. The slug matches a tenant AND another tenant's location → one chooser
+ *      with both (never auto-redirect).
  *   4. Nothing matches → 404.
  *
  * (The dynamic segment is named `tenant` to share the `[tenant]` directory with
@@ -18,8 +19,8 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { getPosDriver, type Location, type Tenant } from "@/lib/db";
 import { storefrontPath } from "@/lib/shop/storefront";
+import { resolveLegacyShopSlug } from "@/lib/shop/resolve-location";
 
 export const metadata: Metadata = {
   title: "Choose a store",
@@ -28,47 +29,16 @@ export const metadata: Metadata = {
 
 export const dynamic = "force-dynamic";
 
-interface Choice {
-  location: Location;
-  tenant: Tenant;
-}
-
 export default async function LegacyShopPage({
   params,
 }: {
   params: Promise<{ tenant: string }>;
 }) {
   const { tenant: slug } = await params;
-  const driver = getPosDriver();
-
-  let choices: Choice[] = [];
-  const byLocation = await driver.listLocationsBySlug(slug);
-  if (byLocation.length > 0) {
-    const resolved = await Promise.all(
-      byLocation.map(async (location) => ({
-        location,
-        tenant: await driver.getTenant(location.tenant_id),
-      })),
-    );
-    choices = resolved.filter((c): c is Choice => c.tenant !== null);
-  } else {
-    const tenant = await driver.getTenantBySlug(slug);
-    if (tenant) {
-      const locations = await driver.listLocations(tenant.id);
-      choices = locations.map((location) => ({ location, tenant }));
-    }
-  }
-
-  if (choices.length === 0) notFound();
-  if (choices.length === 1 && choices[0]) {
-    const only = choices[0];
-    redirect(
-      storefrontPath({
-        tenantSlug: only.tenant.slug,
-        locationSlug: only.location.slug,
-      }),
-    );
-  }
+  const resolved = await resolveLegacyShopSlug(slug);
+  if (resolved.kind === "none") notFound();
+  if (resolved.kind === "redirect") redirect(resolved.path);
+  const choices = resolved.choices;
 
   return (
     <main id="main-content" className="mx-auto max-w-xl px-4 py-10">
