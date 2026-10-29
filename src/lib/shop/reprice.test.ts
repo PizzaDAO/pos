@@ -96,6 +96,12 @@ function mod(
   };
 }
 
+function first<T>(xs: T[]): T {
+  const x = xs[0];
+  if (x === undefined) throw new Error("expected at least one element");
+  return x;
+}
+
 function line(over: Partial<OrderItem> = {}): OrderItem {
   return {
     id: "line-1",
@@ -116,7 +122,7 @@ function line(over: Partial<OrderItem> = {}): OrderItem {
 
 describe("repriceItems", () => {
   it("overwrites tampered base and modifier prices, names and station", () => {
-    const [out] = repriceItems(menu, [
+    const out = first(repriceItems(menu, [
       line({
         item_name: "Free pizza",
         base_price_cents: 1,
@@ -128,7 +134,7 @@ describe("repriceItems", () => {
         unit_price_cents: 1,
         line_total_cents: 1,
       }),
-    ]);
+    ]));
     expect(out.item_name).toBe("Margherita");
     expect(out.station).toBe("oven");
     expect(out.base_price_cents).toBe(1400);
@@ -198,10 +204,10 @@ describe("repriceItems", () => {
   });
 
   it("charges left+right halves of one topping the same as whole", () => {
-    const whole = repriceItems(menu, [
+    const whole = first(repriceItems(menu, [
       line({ modifiers: [mod("g-crust", "m-thin"), mod("g-top", "m-mush")] }),
-    ])[0];
-    const halves = repriceItems(menu, [
+    ]));
+    const halves = first(repriceItems(menu, [
       line({
         modifiers: [
           mod("g-crust", "m-thin"),
@@ -209,7 +215,7 @@ describe("repriceItems", () => {
           mod("g-top", "m-mush", "right"),
         ],
       }),
-    ])[0];
+    ]));
     // 151 whole; halves ceil(151/2)=76 each = 152 (builder rounding, 1c apart).
     expect(whole.unit_price_cents).toBe(1551);
     expect(halves.unit_price_cents).toBe(1400 + 76 + 76);
@@ -235,8 +241,9 @@ describe("repriceItems", () => {
       line({ id: "gone", voided: true, item_id: "bogus" }),
     ]);
     expect(out).toHaveLength(1);
-    expect(out[0].id).toBe("keep");
-    expect(out[0].notes).toHaveLength(200);
-    expect(out[0].voided).toBe(false);
+    const kept = first(out);
+    expect(kept.id).toBe("keep");
+    expect(kept.notes).toHaveLength(200);
+    expect(kept.voided).toBe(false);
   });
 });
