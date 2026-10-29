@@ -63,6 +63,45 @@ export interface Payment {
   updated_at: string;
 }
 
+/**
+ * A refund REQUEST against a tender. The client-supplied `id` is the
+ * idempotency key end-to-end (the rail key is `refund_<paymentId>_<id>`), so a
+ * retry of the same refund never refunds twice while distinct partial refunds
+ * each reach the rail.
+ */
+export interface PaymentRefund {
+  id: string;
+  payment_id: string;
+  tenant_id: string;
+  amount_cents: number;
+  status: "pending" | "succeeded" | "failed";
+  reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Outcome of atomically reserving a tender against an order's balance. */
+export type ReserveTenderResult =
+  | { ok: true; created: boolean; payment: Payment }
+  | {
+      ok: false;
+      reason:
+        | "order_not_found"
+        | "order_mismatch"
+        | "order_closed"
+        | "exceeds_balance";
+      balanceCents: number;
+    };
+
+/** Outcome of atomically reserving a refund against a tender's refundable. */
+export type ReserveRefundResult =
+  | { ok: true; created: boolean; refund: PaymentRefund }
+  | {
+      ok: false;
+      reason: "payment_not_found" | "refund_mismatch" | "exceeds_refundable";
+      refundableCents: number;
+    };
+
 /** Per-tenant Stripe Connect onboarding status. */
 export type ConnectStatus = "not_started" | "pending" | "connected" | "rejected";
 

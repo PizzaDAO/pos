@@ -29,7 +29,11 @@
 import { NextResponse } from "next/server";
 import { getPosDriver, type Order } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
-import { takePayment, getOrderBalance } from "@/lib/payments/service";
+import {
+  BalanceExceededError,
+  getOrderBalance,
+  takePayment,
+} from "@/lib/payments/service";
 import {
   enforceRateLimit,
   isClientId,
@@ -233,6 +237,13 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
+    // Lost the race for the remaining balance (atomic reservation refused).
+    if (err instanceof BalanceExceededError) {
+      return NextResponse.json(
+        { error: err.message, balanceCents: err.balanceCents },
+        { status: 409 },
+      );
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Payment failed." },
       { status: 502 },

@@ -31,7 +31,14 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentRefund,
+  PaymentSettings,
+  ReserveRefundResult,
+  ReserveTenderResult,
+} from "./payment-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -201,6 +208,8 @@ const businessDayCloses = new Map<string, BusinessDayClose>();
 const orders = new Map<string, Order>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
+/** Refund requests keyed by client refund id (idempotency key). */
+const refunds = new Map<string, PaymentRefund>();
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 /** Online-ordering customers keyed by id. */
@@ -959,6 +968,126 @@ export const mockDriver: PosDriver = {
     return payments.get(id) ?? null;
   },
 
+  // Atomic in the mock because the check + insert run synchronously (no await
+  // between them) on the single JS thread — mirroring the Postgres row lock in
+  // reserve_payment().
+  async reserveTender(payment: Payment): Promise<ReserveTenderResult> {
+    ensureKitchenSeed();
+    const existing = payments.get(payment.id);
+    if (existing) return { ok: true, created: false, payment: existing };
+    const order = orders.get(payment.order_id);
+    if (!order) {
+      return { ok: false, reason: "order_not_found", balanceCents: 0 };
+    }
+    if (
+      order.tenant_id !== payment.tenant_id ||
+      order.location_id !== payment.location_id
+    ) {
+      return { ok: false, reason: "order_mismatch", balanceCents: 0 };
+    }
+    if (order.status === "voided" || order.status === "refunded") {
+      return { ok: false, reason: "order_closed", balanceCents: 0 };
+    }
+    let covered = 0;
+    for (const p of payments.values()) {
+      if (
+        p.order_id === order.id &&
+        p.status !== "failed" &&
+        p.status !== "canceled"
+      ) {
+        covered += p.amount_cents;
+      }
+    }
+    const total = order.totals.total_cents;
+    if (payment.amount_cents <= 0 || covered + payment.amount_cents > total) {
+      return {
+        ok: false,
+        reason: "exceeds_balance",
+        balanceCents: Math.max(0, total - covered),
+      };
+    }
+    const now = nowIso();
+    const created: Payment = {
+      ...payment,
+      created_at: payment.created_at || now,
+      updated_at: now,
+    };
+    payments.set(created.id, created);
+    return { ok: true, created: true, payment: { ...created } };
+  },
+
+  async getRefund(id: string): Promise<PaymentRefund | null> {
+    const r = refunds.get(id);
+    return r ? { ...r } : null;
+  },
+
+  async reserveRefund(input): Promise<ReserveRefundResult> {
+    const existing = refunds.get(input.id);
+    if (existing) {
+      if (existing.payment_id !== input.paymentId) {
+        return { ok: false, reason: "refund_mismatch", refundableCents: 0 };
+      }
+      return { ok: true, created: false, refund: { ...existing } };
+    }
+    const payment = payments.get(input.paymentId);
+    if (!payment) {
+      return { ok: false, reason: "payment_not_found", refundableCents: 0 };
+    }
+    let pending = 0;
+    for (const r of refunds.values()) {
+      if (r.payment_id === payment.id && r.status === "pending") {
+        pending += r.amount_cents;
+      }
+    }
+    const refundable =
+      payment.amount_cents +
+      payment.tip_cents -
+      payment.refunded_cents -
+      pending;
+    if (input.amountCents <= 0 || input.amountCents > refundable) {
+      return {
+        ok: false,
+        reason: "exceeds_refundable",
+        refundableCents: Math.max(0, refundable),
+      };
+    }
+    const now = nowIso();
+    const refund: PaymentRefund = {
+      id: input.id,
+      payment_id: payment.id,
+      tenant_id: payment.tenant_id,
+      amount_cents: input.amountCents,
+      status: "pending",
+      reason: input.reason,
+      created_at: now,
+      updated_at: now,
+    };
+    refunds.set(refund.id, refund);
+    return { ok: true, created: true, refund: { ...refund } };
+  },
+
+  async finalizeRefund(id, status): Promise<Payment | null> {
+    const refund = refunds.get(id);
+    if (!refund) return null;
+    const payment = payments.get(refund.payment_id);
+    if (!payment) return null;
+    if (refund.status !== "pending") return { ...payment };
+    refunds.set(id, { ...refund, status, updated_at: nowIso() });
+    if (status === "failed") return { ...payment };
+    const refunded = payment.refunded_cents + refund.amount_cents;
+    const updated: Payment = {
+      ...payment,
+      refunded_cents: refunded,
+      status:
+        refunded >= payment.amount_cents + payment.tip_cents
+          ? "refunded"
+          : payment.status,
+      updated_at: nowIso(),
+    };
+    payments.set(updated.id, updated);
+    return { ...updated };
+  },
+
   async getPaymentByChargeId(chargeId: string): Promise<Payment | null> {
     for (const p of payments.values()) {
       if (p.charge_id === chargeId) return p;
@@ -1651,6 +1780,7 @@ export function resetMockOrders(): void {
 /** Test helper: clear payments + connect state. */
 export function resetMockPayments(): void {
   payments.clear();
+  refunds.clear();
   connectAccounts.clear();
 }
 

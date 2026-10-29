@@ -181,7 +181,9 @@ export function useCheckout(
         const res = await fetch("/api/payments/refund", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ paymentId, amountCents }),
+          // One idempotency key per refund REQUEST (retries of this request
+          // reuse it; a new partial refund gets a new one).
+          body: JSON.stringify({ paymentId, amountCents, refundId: newUuid() }),
         });
         const data = (await res.json()) as { error?: string };
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);

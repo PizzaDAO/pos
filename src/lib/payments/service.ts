@@ -10,6 +10,13 @@
  * and returns it unchanged if found — so a retried request (offline replay,
  * double-tap, lost response) never creates a second charge.
  *
+ * ATOMIC BALANCE: before any rail is called, the tender is RESERVED (inserted
+ * as `pending`) through `driver.reserveTender`, which checks the remaining
+ * balance and inserts in one atomic step (Postgres: row lock on the order).
+ * Two concurrent requests can therefore never both take the last of the
+ * balance. If the rail then fails, the reservation is marked `failed` (failed
+ * tenders don't count toward the balance).
+ *
  * SPLIT PAYMENT: an order may have several tenders across rails. The order is
  * marked `paid` once the sum of captured (or pending-crypto) base amounts covers
  * the order total. `getOrderBalance` returns the remaining balance the UI drives
@@ -86,6 +93,28 @@ function settledCents(payments: Payment[]): number {
     .reduce((sum, p) => sum + p.amount_cents, 0);
 }
 
+/** The tender doesn't fit in the order's remaining balance (→ HTTP 409). */
+export class BalanceExceededError extends Error {
+  constructor(
+    message: string,
+    readonly balanceCents: number,
+  ) {
+    super(message);
+    this.name = "BalanceExceededError";
+  }
+}
+
+/** A refund doesn't fit / conflicts (→ HTTP 409/422). */
+export class RefundRejectedError extends Error {
+  constructor(
+    message: string,
+    readonly status: 409 | 422,
+  ) {
+    super(message);
+    this.name = "RefundRejectedError";
+  }
+}
+
 /** Remaining unpaid balance on an order, in cents (never negative). */
 export async function getOrderBalance(order: Order): Promise<number> {
   const driver = getPosDriver();
@@ -107,6 +136,42 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
   if (existing) return existing;
 
   const rail = requirePaymentRail(input.rail);
+
+  // ATOMIC reservation against the remaining balance BEFORE charging.
+  const reservedAt = nowIso();
+  const reservation = await driver.reserveTender({
+    id: input.paymentId,
+    order_id: input.orderId,
+    tenant_id: input.tenantId,
+    location_id: input.locationId,
+    rail: input.rail,
+    status: "pending",
+    amount_cents: input.amountCents,
+    tip_cents: input.tipCents,
+    application_fee_cents: 0,
+    currency: input.currency,
+    charge_id: null,
+    connect_account_id: input.connectAccountId ?? null,
+    crypto_tx_hash: null,
+    crypto_chain: null,
+    cash_tendered_cents: null,
+    cash_change_cents: null,
+    refunded_cents: 0,
+    simulated: railIsSimulated(input.rail),
+    raw: null,
+    created_at: reservedAt,
+    updated_at: reservedAt,
+  });
+  if (!reservation.ok) {
+    throw new BalanceExceededError(
+      reservation.reason === "exceeds_balance"
+        ? `Amount exceeds the remaining balance (${reservation.balanceCents}).`
+        : "This order can no longer be paid.",
+      reservation.balanceCents,
+    );
+  }
+  // A concurrent request with the same id won the race → idempotent replay.
+  if (!reservation.created) return reservation.payment;
   const amount = { amount: input.amountCents, currency: input.currency };
   const tip =
     input.tipCents > 0
@@ -119,18 +184,27 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
     metadata.cashTenderedCents = String(input.cashTenderedCents);
   }
 
-  const result = await rail.createCharge({
-    context: {
-      tenantId: input.tenantId,
-      locationId: input.locationId,
-      connectAccountId: input.connectAccountId ?? null,
-      idempotencyKey: input.paymentId,
-    },
-    amount,
-    tip,
-    capture: true,
-    metadata,
-  });
+  let result: Awaited<ReturnType<typeof rail.createCharge>>;
+  try {
+    result = await rail.createCharge({
+      context: {
+        tenantId: input.tenantId,
+        locationId: input.locationId,
+        connectAccountId: input.connectAccountId ?? null,
+        idempotencyKey: input.paymentId,
+      },
+      amount,
+      tip,
+      capture: true,
+      metadata,
+    });
+  } catch (err) {
+    // Release the reservation so the balance is available again.
+    await driver
+      .upsertPayment({ ...reservation.payment, status: "failed" })
+      .catch(() => null);
+    throw err;
+  }
 
   // Pull the application fee the rail computed (card rails only).
   const applicationFeeCents = railChargesApplicationFee(input.rail)
@@ -164,7 +238,7 @@ export async function takePayment(input: TakePaymentInput): Promise<Payment> {
     refunded_cents: 0,
     simulated: railIsSimulated(input.rail),
     raw: result.raw ?? null,
-    created_at: nowIso(),
+    created_at: reservation.payment.created_at,
     updated_at: nowIso(),
   };
 
@@ -204,9 +278,16 @@ export async function refreshPaymentStatus(
   return updated;
 }
 
-/** Refund a captured tender (full or partial) and persist the refunded amount. */
+/**
+ * Refund a captured tender (full or partial). `refundId` is the client's
+ * idempotency key for THIS refund request: retries with the same id never
+ * refund twice (ledger + rail key `refund_<paymentId>_<refundId>`), while
+ * distinct partial refunds each reach the rail. The refundable amount is
+ * reserved atomically (Postgres: row lock on the payment) before the rail call.
+ */
 export async function refundPayment(input: {
   paymentId: string;
+  refundId: string;
   amountCents?: number;
   reason?: string;
 }): Promise<Payment | null> {
@@ -214,29 +295,66 @@ export async function refundPayment(input: {
   const payment = await driver.getPayment(input.paymentId);
   if (!payment) return null;
 
+  // Idempotent replay of a refund that already settled.
+  const prior = await driver.getRefund(input.refundId);
+  if (prior) {
+    if (prior.payment_id !== payment.id) {
+      throw new RefundRejectedError(
+        "Refund id already used for another payment.",
+        409,
+      );
+    }
+    if (prior.status === "succeeded") return payment;
+    if (prior.status === "failed") {
+      throw new RefundRejectedError(
+        "This refund failed; retry with a new refund id.",
+        409,
+      );
+    }
+  }
+
+  const refundAmount =
+    input.amountCents ??
+    payment.amount_cents + payment.tip_cents - payment.refunded_cents;
+
+  const reservation = await driver.reserveRefund({
+    id: input.refundId,
+    paymentId: payment.id,
+    amountCents: refundAmount,
+    reason: input.reason ?? null,
+  });
+  if (!reservation.ok) {
+    throw new RefundRejectedError(
+      reservation.reason === "exceeds_refundable"
+        ? `Refund exceeds the refundable amount (${reservation.refundableCents}).`
+        : reservation.reason === "refund_mismatch"
+          ? "Refund id already used for another payment."
+          : "Payment not found.",
+      reservation.reason === "exceeds_refundable" ? 422 : 409,
+    );
+  }
+  const refund = reservation.refund;
+
   const rail = requirePaymentRail(payment.rail);
-  const refundAmount = input.amountCents ?? payment.amount_cents + payment.tip_cents;
+  try {
+    await rail.refund({
+      context: {
+        tenantId: payment.tenant_id,
+        locationId: payment.location_id,
+        connectAccountId: payment.connect_account_id,
+        // Unique per refund REQUEST; stable across retries of that request.
+        idempotencyKey: refundIdempotencyKey(payment.id, refund.id),
+      },
+      chargeId: payment.charge_id ?? payment.id,
+      amount: { amount: refund.amount_cents, currency: payment.currency },
+      reason: input.reason,
+    });
+  } catch (err) {
+    await driver.finalizeRefund(refund.id, "failed").catch(() => null);
+    throw err;
+  }
 
-  const result = await rail.refund({
-    context: {
-      tenantId: payment.tenant_id,
-      locationId: payment.location_id,
-      connectAccountId: payment.connect_account_id,
-      idempotencyKey: `refund_${payment.id}`,
-    },
-    chargeId: payment.charge_id ?? payment.id,
-    amount: { amount: refundAmount, currency: payment.currency },
-    reason: input.reason,
-  });
-
-  const refundedTotal = payment.refunded_cents + result.amount.amount;
-  const fullyRefunded = refundedTotal >= payment.amount_cents + payment.tip_cents;
-
-  const updated = await driver.upsertPayment({
-    ...payment,
-    status: fullyRefunded ? "refunded" : payment.status,
-    refunded_cents: refundedTotal,
-  });
+  const updated = await driver.finalizeRefund(refund.id, "succeeded");
 
   // If all tenders on the order are fully refunded, mark the order refunded.
   const all = await driver.listPaymentsForOrder(payment.order_id);
@@ -245,6 +363,11 @@ export async function refundPayment(input: {
   if (allRefunded) await driver.updateOrderStatus(payment.order_id, "refunded");
 
   return updated;
+}
+
+/** Rail idempotency key for one refund request of one payment. */
+export function refundIdempotencyKey(paymentId: string, refundId: string): string {
+  return `refund_${paymentId}_${refundId}`;
 }
 
 /**

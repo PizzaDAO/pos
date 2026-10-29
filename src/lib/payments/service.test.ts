@@ -249,7 +249,7 @@ describe("refund / void paths", () => {
       tipCents: 0,
       currency: "USD",
     });
-    const refunded = await refundPayment({ paymentId: "refund-1" });
+    const refunded = await refundPayment({ paymentId: "refund-1", refundId: "r-full-1" });
     expect(refunded?.status).toBe("refunded");
     expect(refunded?.refunded_cents).toBe(2000);
     const order = await getPosDriver().getOrder(orderId);
@@ -270,6 +270,7 @@ describe("refund / void paths", () => {
     });
     const refunded = await refundPayment({
       paymentId: "refund-partial",
+      refundId: "r-partial-1",
       amountCents: 500,
     });
     expect(refunded?.refunded_cents).toBe(500);

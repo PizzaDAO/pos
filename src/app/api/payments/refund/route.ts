@@ -3,11 +3,17 @@
  *
  * POST /api/payments/refund — refund a captured tender (full or partial) via its
  * rail and persist the refunded amount. When every tender on the order is fully
- * refunded the order is marked `refunded`. Refunds are idempotent at the rail
- * via a derived key. Simulated rails always "succeed".
+ * refunded the order is marked `refunded`. Simulated rails always "succeed".
+ *
+ * IDEMPOTENCY: the client sends a `refundId` (UUID) per refund REQUEST. Retries
+ * with the same refundId return the settled result without refunding again;
+ * distinct refundIds are distinct (partial) refunds, each with its own rail
+ * idempotency key `refund_<paymentId>_<refundId>`. Omitting refundId mints a
+ * fresh one server-side (not retry-safe — clients should always send one).
  */
 import { NextResponse } from "next/server";
-import { refundPayment } from "@/lib/payments/service";
+import { randomUUID } from "node:crypto";
+import { RefundRejectedError, refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
@@ -23,6 +29,8 @@ export const runtime = "nodejs";
 
 interface RefundBody {
   paymentId: string;
+  /** Client idempotency key for this refund request (UUID). */
+  refundId?: string;
   amountCents?: number;
   reason?: string;
 }
@@ -47,6 +55,15 @@ export async function POST(request: Request) {
       { error: "paymentId must be a valid UUID." },
       { status: 422 },
     );
+  }
+  if (b.refundId !== undefined && !isUuid(b.refundId)) {
+    return NextResponse.json(
+      { error: "refundId must be a valid UUID." },
+      { status: 422 },
+    );
+  }
+  if (b.reason !== undefined && (typeof b.reason !== "string" || b.reason.length > 500)) {
+    return NextResponse.json({ error: "Invalid reason." }, { status: 422 });
   }
   if (b.amountCents !== undefined && !isMoneyCents(b.amountCents)) {
     return NextResponse.json(
@@ -78,18 +95,27 @@ export async function POST(request: Request) {
   ]);
   if (!auth.ok) return auth.res;
 
-  // Never refund more than what's left on the tender.
+  const refundId = b.refundId ?? randomUUID();
+  // A retry of an already-recorded refund skips the pre-checks: the service
+  // replays it idempotently (it may legitimately be "fully refunded" now).
+  const isReplay = Boolean(
+    b.refundId && (await driver.getRefund(b.refundId).catch(() => null)),
+  );
+
+  // Never refund more than what's left on the tender. (Advisory pre-check;
+  // the authoritative check is the atomic reservation in the service.)
   const refundable =
     existingPayment.amount_cents +
     existingPayment.tip_cents -
     existingPayment.refunded_cents;
-  if (refundable <= 0) {
+  if (!isReplay && refundable <= 0) {
     return NextResponse.json(
       { error: "This payment has already been fully refunded." },
       { status: 409 },
     );
   }
   if (
+    !isReplay &&
     b.amountCents !== undefined &&
     (b.amountCents <= 0 || b.amountCents > refundable)
   ) {
@@ -102,6 +128,7 @@ export async function POST(request: Request) {
   try {
     const payment = await refundPayment({
       paymentId: b.paymentId,
+      refundId,
       amountCents: b.amountCents ?? refundable,
       reason: b.reason,
     });
@@ -125,10 +152,14 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       payment,
+      refundId,
       balanceCents: balance,
       orderStatus: order?.status,
     });
   } catch (err) {
+    if (err instanceof RefundRejectedError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Refund failed." },
       { status: 502 },

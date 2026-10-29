@@ -13,7 +13,14 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentRefund,
+  PaymentSettings,
+  ReserveRefundResult,
+  ReserveTenderResult,
+} from "./payment-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -267,6 +274,40 @@ export interface PosDriver {
 
   /** Fetch a single payment tender by id, or null. */
   getPayment(id: string): Promise<Payment | null>;
+
+  /**
+   * ATOMICALLY insert a new tender only if it fits in the order's remaining
+   * balance (sum of non-failed/non-canceled tenders vs `totals.total_cents`).
+   * Concurrent calls for the same order are serialized (Postgres: row lock on
+   * the order inside `reserve_payment`), so two requests can never both take
+   * the last of the balance. Idempotent on `payment.id`.
+   */
+  reserveTender(payment: Payment): Promise<ReserveTenderResult>;
+
+  /** Fetch a refund request by its id, or null. */
+  getRefund(id: string): Promise<PaymentRefund | null>;
+
+  /**
+   * ATOMICALLY record a pending refund only if it fits in the tender's
+   * refundable amount (amount + tip − refunded − pending). Idempotent on the
+   * refund id.
+   */
+  reserveRefund(input: {
+    id: string;
+    paymentId: string;
+    amountCents: number;
+    reason: string | null;
+  }): Promise<ReserveRefundResult>;
+
+  /**
+   * Settle a pending refund: `succeeded` adds its amount to the tender's
+   * refunded_cents exactly once (marking it refunded when fully refunded);
+   * `failed` releases the reservation. Returns the updated tender.
+   */
+  finalizeRefund(
+    id: string,
+    status: "succeeded" | "failed",
+  ): Promise<Payment | null>;
 
   /** Fetch a tender by its rail-native charge id (for webhook reconciliation). */
   getPaymentByChargeId(chargeId: string): Promise<Payment | null>;

@@ -40,7 +40,12 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentRefund,
+  PaymentSettings,
+} from "./payment-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
   BusinessDayClose,
@@ -226,6 +231,19 @@ function mapPayment(r: Row): Payment {
     refunded_cents: r.refunded_cents as number,
     simulated: r.simulated as boolean,
     raw: (r.raw as Record<string, unknown> | null) ?? null,
+    created_at: r.created_at as string,
+    updated_at: r.updated_at as string,
+  };
+}
+
+function mapRefund(r: Row): PaymentRefund {
+  return {
+    id: r.id as string,
+    payment_id: r.payment_id as string,
+    tenant_id: r.tenant_id as string,
+    amount_cents: r.amount_cents as number,
+    status: r.status as PaymentRefund["status"],
+    reason: (r.reason as string | null) ?? null,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -1467,6 +1485,85 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         await sb.from("payments").select("*").eq("id", id).maybeSingle(),
       ) as Row | null;
       return r ? mapPayment(r) : null;
+    },
+
+    // Atomic balance check + insert in ONE transaction (row lock on the order)
+    // — see supabase/migrations/20260610000000_atomic_tenders_refunds.sql.
+    async reserveTender(payment) {
+      const res = unwrap(
+        await sb.rpc("reserve_payment", { p_payment: payment }),
+      ) as {
+        ok: boolean;
+        created?: boolean;
+        payment?: Row;
+        reason?: string;
+        balance_cents?: number;
+      };
+      if (res.ok && res.payment) {
+        return {
+          ok: true,
+          created: Boolean(res.created),
+          payment: mapPayment(res.payment),
+        };
+      }
+      return {
+        ok: false,
+        reason: (res.reason ?? "exceeds_balance") as
+          | "order_not_found"
+          | "order_mismatch"
+          | "order_closed"
+          | "exceeds_balance",
+        balanceCents: res.balance_cents ?? 0,
+      };
+    },
+
+    async getRefund(id) {
+      const r = unwrap(
+        await sb.from("payment_refunds").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapRefund(r) : null;
+    },
+
+    async reserveRefund(input) {
+      const res = unwrap(
+        await sb.rpc("reserve_refund", {
+          p_refund_id: input.id,
+          p_payment_id: input.paymentId,
+          p_amount_cents: input.amountCents,
+          p_reason: input.reason,
+        }),
+      ) as {
+        ok: boolean;
+        created?: boolean;
+        refund?: Row;
+        reason?: string;
+        refundable_cents?: number;
+      };
+      if (res.ok && res.refund) {
+        return {
+          ok: true,
+          created: Boolean(res.created),
+          refund: mapRefund(res.refund),
+        };
+      }
+      return {
+        ok: false,
+        reason: (res.reason ?? "exceeds_refundable") as
+          | "payment_not_found"
+          | "refund_mismatch"
+          | "exceeds_refundable",
+        refundableCents: res.refundable_cents ?? 0,
+      };
+    },
+
+    async finalizeRefund(id, status) {
+      const res = unwrap(
+        await sb.rpc("finalize_refund", {
+          p_refund_id: id,
+          p_status: status,
+        }),
+      ) as Row | null;
+      return res ? mapPayment(res) : null;
     },
 
     async getPaymentByChargeId(chargeId) {
