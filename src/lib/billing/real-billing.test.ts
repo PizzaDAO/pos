@@ -156,6 +156,7 @@ describe("real billing: tier changes go through Stripe", () => {
           id: "cs_1",
           subscription: "sub_new_1",
           customer: "cus_1",
+          payment_status: "paid",
           metadata: { tenant_id: tenant.id, tier: "pro" },
         },
       },
@@ -164,6 +165,64 @@ describe("real billing: tier changes go through Stripe", () => {
     expect(sub?.tier).toBe("pro");
     expect(sub?.stripe_subscription_id).toBe("sub_new_1");
     expect(sub?.simulated).toBe(false);
+  });
+
+  it("ignores out-of-order events older than the last applied one", async () => {
+    const tenantId = await tenantWithRealSub("starter");
+    const upd = (created: number, price: string, status = "active") =>
+      applyBillingEvent({
+        type: "customer.subscription.updated",
+        created,
+        data: {
+          object: {
+            id: "sub_real_1",
+            status,
+            metadata: { tenant_id: tenantId },
+            items: { data: [{ price: { id: price } }] },
+          },
+        },
+      });
+    await upd(2000, "price_multi");
+    expect((await getPosDriver().getSubscription(tenantId))?.tier).toBe("multi");
+    // A stale (earlier) event arriving late must not roll the tier back.
+    await upd(1000, "price_starter", "past_due");
+    const sub = await getPosDriver().getSubscription(tenantId);
+    expect(sub?.tier).toBe("multi");
+    expect(sub?.status).toBe("active");
+    expect(sub?.last_event_created).toBe(2000);
+    // Status-only events obey the same ordering.
+    await applyBillingEvent({
+      type: "invoice.payment_failed",
+      created: 1500,
+      data: { object: { metadata: { tenant_id: tenantId } } },
+    });
+    expect((await getPosDriver().getSubscription(tenantId))?.status).toBe(
+      "active",
+    );
+  });
+
+  it("does not activate a checkout whose payment is still processing", async () => {
+    const { tenant } = await getPosDriver().createTenant({
+      businessName: `Unpaid ${Date.now()}`,
+      ownerEmail: "unpaid@example.com",
+    });
+    const session = (payment_status: string, type = "checkout.session.completed") =>
+      applyBillingEvent({
+        type,
+        created: 3000,
+        data: {
+          object: {
+            subscription: "sub_x",
+            customer: "cus_x",
+            payment_status,
+            metadata: { tenant_id: tenant.id, tier: "pro" },
+          },
+        },
+      });
+    await session("unpaid");
+    expect(await getPosDriver().getSubscription(tenant.id)).toBeNull();
+    await session("paid", "checkout.session.async_payment_succeeded");
+    expect((await getPosDriver().getSubscription(tenant.id))?.tier).toBe("pro");
   });
 
   it("does not grant an active plan for an incomplete subscription", async () => {

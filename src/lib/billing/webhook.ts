@@ -17,6 +17,8 @@ import { tierForPriceId } from "./service";
 
 export interface BillingEvent {
   type?: string;
+  /** Unix seconds when Stripe created the event (ordering guard). */
+  created?: number;
   data?: { object?: Record<string, unknown> };
 }
 
@@ -81,6 +83,15 @@ function isoFromUnix(v: unknown): string | null {
     : null;
 }
 
+/**
+ * Checkout completed but payment is still processing (e.g. bank debits):
+ * don't treat it as a paid subscription until Stripe says so.
+ */
+function checkoutIsPaid(obj: Obj): boolean {
+  const ps = asStr(obj.payment_status);
+  return ps === "paid" || ps === "no_payment_required";
+}
+
 export async function applyBillingEvent(
   event: BillingEvent,
 ): Promise<Subscription | null> {
@@ -91,16 +102,45 @@ export async function applyBillingEvent(
   const existing = await driver.getSubscription(tenantId);
   const now = new Date().toISOString();
 
+  // Stripe does not guarantee delivery order: ignore events older than the
+  // last one applied to this subscription.
+  const created =
+    typeof event.created === "number" && Number.isFinite(event.created)
+      ? event.created
+      : null;
+  const lastApplied = existing?.last_event_created ?? null;
+  if (created !== null && lastApplied !== null && created < lastApplied) {
+    return existing;
+  }
+  const stamp = created ?? lastApplied ?? null;
+
+  /** Persist a status-only change (with the event stamp) on an existing row. */
+  const setStatus = async (status: SubscriptionStatus) => {
+    if (!existing) return null;
+    return driver.upsertSubscription({
+      ...existing,
+      status,
+      current_period_end:
+        status === "active"
+          ? (isoFromUnix(obj.period_end) ?? existing.current_period_end)
+          : existing.current_period_end,
+      last_event_created: stamp,
+      updated_at: now,
+    });
+  };
+
   switch (event.type) {
     case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded":
     case "customer.subscription.created":
     case "customer.subscription.updated": {
-      const isSession = event.type === "checkout.session.completed";
+      const isSession = event.type.startsWith("checkout.session.");
+      if (isSession && !checkoutIsPaid(obj)) return existing;
       const tier = tierOf(obj) ?? existing?.tier ?? null;
       if (!tier) return existing;
       const status: SubscriptionStatus | null = isSession
-        ? // Checkout completed: trial or paid; the subscription.* events
-          // that follow carry the precise status.
+        ? // Checkout paid: trial or active; the subscription.* events that
+          // follow carry the precise status.
           (existing?.status ?? "active")
         : mapStripeSubscriptionStatus(String(obj.status ?? ""));
       const row: Subscription = {
@@ -125,6 +165,7 @@ export async function applyBillingEvent(
           (isSession ? asStr(obj.subscription) : asStr(obj.id)) ??
           existing?.stripe_subscription_id ??
           null,
+        last_event_created: stamp,
         created_at: existing?.created_at ?? now,
         updated_at: now,
       };
@@ -136,17 +177,11 @@ export async function applyBillingEvent(
       return saved;
     }
     case "invoice.payment_failed":
-      return existing
-        ? driver.advanceSubscriptionStatus(tenantId, "past_due")
-        : null;
+      return setStatus("past_due");
     case "customer.subscription.deleted":
-      return existing
-        ? driver.advanceSubscriptionStatus(tenantId, "canceled")
-        : null;
+      return setStatus("canceled");
     case "invoice.paid":
-      return existing
-        ? driver.advanceSubscriptionStatus(tenantId, "active")
-        : null;
+      return setStatus("active");
     default:
       return existing;
   }
