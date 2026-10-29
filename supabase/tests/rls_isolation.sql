@@ -103,6 +103,11 @@ insert into public.staff (id, tenant_id, name, role, active) values
   ('57b00001-0000-0000-0000-000000000001', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
    'Staff B', 'cashier', true);
 
+-- A connect_accounts row per tenant (server/service path writes these).
+insert into public.connect_accounts (tenant_id, account_id, status, simulated) values
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'acct_fixture_a', 'connected', false),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'acct_fixture_b', 'connected', false);
+
 -- A store_settings row per location so anon's public-surface read returns rows.
 insert into public.store_settings (tenant_id, location_id, currency, tax_rate_bps) values
   ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'USD', 825),
@@ -362,6 +367,54 @@ begin
     and c.relrowsecurity and not c.relforcerowsecurity;
   assert unforced is null,
     format('RLS enabled but not FORCED on: %s', unforced);
+end $$;
+
+-- 16) connect_accounts is READ-ONLY to tenant staff: an owner can read their own
+--     tenant's row (not Bob's) but CANNOT insert, update or delete it (money-
+--     routing config is written only by the service-role server path), and
+--     account_id is unique.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int; blocked boolean;
+begin
+  select count(*) into n from public.connect_accounts
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+  assert n = 1, format('owner should read only own connect account, saw %s', n);
+
+  blocked := false;
+  begin
+    insert into public.connect_accounts (tenant_id, account_id)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'acct_owner_insert');
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to insert connect_accounts';
+
+  blocked := false;
+  begin
+    update public.connect_accounts set account_id = 'acct_owner_hijack'
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to update connect_accounts';
+
+  blocked := false;
+  begin
+    delete from public.connect_accounts
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to delete connect_accounts';
+end $$;
+reset role;
+
+do $$
+declare dup boolean := false; id text;
+begin
+  select account_id into id from public.connect_accounts
+    where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  assert id = 'acct_fixture_a', format('owner update must have left account_id untouched, saw %s', id);
+  begin
+    update public.connect_accounts set account_id = 'acct_fixture_b'
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when unique_violation then dup := true; end;
+  assert dup, 'connect_accounts.account_id must be unique';
 end $$;
 
 select 'RLS isolation test PASSED' as result;
