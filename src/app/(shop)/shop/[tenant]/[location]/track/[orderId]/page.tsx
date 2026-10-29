@@ -15,8 +15,13 @@ export const metadata: Metadata = {
 export default async function TrackPage({
   params,
 }: {
-  params: Promise<{ location: string; orderId: string }>;
+  params: Promise<{ tenant: string; location: string; orderId: string }>;
 }) {
-  const { location, orderId } = await params;
-  return <TrackClient slug={location} orderId={orderId} />;
+  const { tenant, location, orderId } = await params;
+  return (
+    <TrackClient
+      store={{ tenantSlug: tenant, locationSlug: location }}
+      orderId={orderId}
+    />
+  );
 }

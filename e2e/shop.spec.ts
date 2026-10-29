@@ -1,5 +1,5 @@
 /**
- * Online ordering (/shop/<slug>) E2E — PUBLIC, no auth required.
+ * Online ordering (/shop/<tenant>/<location>) E2E — PUBLIC, no auth required.
  *
  * Covers: build a half-and-half pizza → cart → checkout for PICKUP and for
  * DELIVERY (in-zone address quote) → order confirmation → tracking page shows a

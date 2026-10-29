@@ -38,6 +38,7 @@ export interface DeliveryQuoteResult {
 
 export interface PlaceOrderInput {
   orderId: string;
+  tenantSlug: string;
   locationSlug: string;
   items: OrderItem[];
   fulfillmentType: "pickup" | "delivery";
@@ -56,8 +57,8 @@ export function useShopCheckout() {
   /** Price + gate a delivery address. Returns null + sets `error` on rejection. */
   const quoteDelivery = useCallback(
     async (input: {
-      tenantId: string;
-      locationId: string;
+      tenantSlug: string;
+      locationSlug: string;
       dropoff: DeliveryAddress;
       subtotalCents: number;
       currency: string;
@@ -99,6 +100,7 @@ export function useShopCheckout() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             id: input.orderId,
+            tenantSlug: input.tenantSlug,
             locationSlug: input.locationSlug,
             items: input.items,
             fulfillmentType: input.fulfillmentType,

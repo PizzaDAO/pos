@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
 import { useOrderTracking } from "@/lib/store/use-order-tracking";
+import { storefrontPath, type StorefrontRef } from "@/lib/shop/storefront";
 
 /** Pickup vs delivery timelines (delivery adds out_for_delivery). */
 function steps(isDelivery: boolean): { status: OrderStatus; label: string }[] {
@@ -40,10 +41,10 @@ function currentIndex(
 }
 
 export function TrackClient({
-  slug,
+  store,
   orderId,
 }: {
-  slug: string;
+  store: StorefrontRef;
   orderId: string;
 }) {
   const { data, loading } = useOrderTracking(orderId);
@@ -59,7 +60,7 @@ export function TrackClient({
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-3">
         <p className="text-muted-foreground">We couldn’t find that order.</p>
-        <Link href={`/shop/${slug}`}>
+        <Link href={storefrontPath(store)}>
           <Button variant="outline">Back to menu</Button>
         </Link>
       </div>
@@ -162,8 +163,8 @@ export function TrackClient({
       </div>
 
       <div className="mt-6 text-center">
-        <Link href={`/shop/${slug}`} className="text-sm underline">
-          ← Back to {slug}
+        <Link href={storefrontPath(store)} className="text-sm underline">
+          ← Back to {store.locationSlug}
         </Link>
       </div>
     </main>

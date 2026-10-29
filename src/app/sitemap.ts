@@ -1,9 +1,10 @@
 import type { MetadataRoute } from "next";
-import { locations } from "@/lib/db/seed-data";
+import { locations, tenants } from "@/lib/db/seed-data";
+import { storefrontPath } from "@/lib/shop/storefront";
 
 /**
  * Sitemap of publicly-indexable surfaces: the marketing home page and each
- * public storefront (`/shop/{slug}`). Operational app surfaces are excluded
+ * public storefront (`/shop/{tenantSlug}/{locationSlug}`). Operational app surfaces are excluded
  * (also `noindex` + disallowed in robots). Slugs come from the seed location
  * list at build time — no DB call, so the zero-env build is unaffected.
  */
@@ -15,12 +16,18 @@ const siteUrl =
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const now = new Date();
-  const storefronts: MetadataRoute.Sitemap = locations.map((loc) => ({
-    url: `${siteUrl}/shop/${loc.slug}`,
-    lastModified: now,
-    changeFrequency: "daily",
-    priority: 0.8,
-  }));
+  const storefronts: MetadataRoute.Sitemap = locations.flatMap((loc) => {
+    const tenant = tenants.find((t) => t.id === loc.tenant_id);
+    if (!tenant) return [];
+    return [
+      {
+        url: `${siteUrl}${storefrontPath({ tenantSlug: tenant.slug, locationSlug: loc.slug })}`,
+        lastModified: now,
+        changeFrequency: "daily" as const,
+        priority: 0.8,
+      },
+    ];
+  });
 
   return [
     {

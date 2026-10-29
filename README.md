@@ -7,7 +7,7 @@ A multi-tenant SaaS point-of-sale platform for pizzerias. Independent pizzerias 
 - **`/terminal`** — counter POS (Web PWA, offline-first)
 - **`/kitchen`** — kitchen display system (KDS)
 - **`/admin`** — tenant back office (menu, inventory, reports, staff)
-- **`/shop/{location}`** — customer online ordering (pickup + delivery)
+- **`/shop/{tenant}/{location}`** — customer online ordering (pickup + delivery); legacy `/shop/{location}` redirects when unambiguous
 - **`/platform`** — super-admin (us): tenants, billing, support
 
 ## Stack
@@ -49,7 +49,7 @@ npm run format       # prettier --write .
 
 ### Surfaces (placeholders in Phase 0)
 
-`/` landing · `/api/health` (`{ ok: true }`) · `/terminal` · `/kitchen` · `/admin` · `/shop/[location]` · `/platform`
+`/` landing · `/api/health` (`{ ok: true }`) · `/terminal` · `/kitchen` · `/admin` · `/shop/[tenant]/[location]` · `/platform`
 
 ### Database (Supabase — deferred)
 

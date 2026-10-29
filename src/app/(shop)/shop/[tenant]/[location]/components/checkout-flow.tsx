@@ -28,6 +28,7 @@ import {
   generateSlots,
 } from "@/lib/shop/scheduling";
 import type { ShopResponse } from "@/lib/store/use-shop";
+import { storefrontPath, type StorefrontRef } from "@/lib/shop/storefront";
 
 type Fulfillment = "pickup" | "delivery";
 type Step = "fulfillment" | "identity" | "payment" | "done";
@@ -38,11 +39,11 @@ const ONLINE_RAILS: { key: PaymentRailKey; label: string }[] = [
 ];
 
 export function CheckoutFlow({
-  slug,
+  store,
   shop,
   onClose,
 }: {
-  slug: string;
+  store: StorefrontRef;
   shop: ShopResponse;
   onClose: () => void;
 }) {
@@ -51,7 +52,7 @@ export function CheckoutFlow({
   const subtotalCents = useCustomerCart((s) => s.subtotalCents());
   const clearCart = useCustomerCart((s) => s.clear);
 
-  const { settings, paymentSettings, location } = shop;
+  const { settings, paymentSettings } = shop;
   const currency = settings.currency;
   const fulfillmentSettings = settings.fulfillment;
 
@@ -113,8 +114,8 @@ export function CheckoutFlow({
 
   async function handleGetQuote() {
     const q = await checkout.quoteDelivery({
-      tenantId: location.tenant_id,
-      locationId: location.id,
+      tenantSlug: store.tenantSlug,
+      locationSlug: store.locationSlug,
       dropoff: address,
       subtotalCents,
       currency,
@@ -131,7 +132,8 @@ export function CheckoutFlow({
     const orderId = checkout.newUuid();
     const placed = await checkout.placeOrder({
       orderId,
-      locationSlug: slug,
+      tenantSlug: store.tenantSlug,
+      locationSlug: store.locationSlug,
       items,
       fulfillmentType: fulfillment,
       scheduledFor: when,
@@ -159,7 +161,12 @@ export function CheckoutFlow({
     const res = await fetch("/api/shop/auth/magic-link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ locationSlug: slug, email, name }),
+      body: JSON.stringify({
+        tenantSlug: store.tenantSlug,
+        locationSlug: store.locationSlug,
+        email,
+        name,
+      }),
     });
     const data = (await res.json()) as { magicLinkUrl?: string };
     setMagicLinkUrl(data.magicLinkUrl ?? null);
@@ -523,7 +530,7 @@ export function CheckoutFlow({
                     : "We'll have it ready for pickup."}
                 </p>
               </div>
-              <Link href={`/shop/${slug}/track/${placedOrderId}`}>
+              <Link href={`${storefrontPath(store)}/track/${placedOrderId}`}>
                 <Button className="h-12 w-full">Track your order</Button>
               </Link>
               <Button variant="outline" className="w-full" onClick={onClose}>

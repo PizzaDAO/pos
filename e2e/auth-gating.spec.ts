@@ -14,6 +14,7 @@ import {
   OWNER_PASSWORD,
   PLATFORM_EMAIL,
   PLATFORM_PASSWORD,
+  SHOP_LOCATION_SLUG_PICKUP_DELIVERY,
   SHOP_SLUG_PICKUP_DELIVERY,
 } from "./support/env";
 
@@ -29,6 +30,18 @@ test.describe("public storefront is reachable without auth", () => {
     });
     // It must NOT have bounced us to a login.
     expect(page.url()).toContain(`/shop/${SHOP_SLUG_PICKUP_DELIVERY}`);
+  });
+
+  test("legacy /shop/<locationSlug> redirects to /shop/<tenant>/<location>", async ({
+    page,
+  }) => {
+    await page.goto(`/shop/${SHOP_LOCATION_SLUG_PICKUP_DELIVERY}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await expect(page).toHaveURL(
+      new RegExp(`/shop/${SHOP_SLUG_PICKUP_DELIVERY}$`),
+    );
+    await expect(page.getByText("Order online")).toBeVisible();
   });
 });
 
