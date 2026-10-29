@@ -243,6 +243,12 @@ export interface OrderFulfillment {
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */
   delivery_notes?: string;
+  /**
+   * Contact details the customer entered for THIS order (pickup name / call-
+   * back phone). Stored per order so a guest checkout never rewrites the
+   * tenant's customer record.
+   */
+  contact?: { name: string | null; phone: string | null };
 }
 
 /** A structured delivery address (Phase 4). */

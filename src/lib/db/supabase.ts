@@ -1662,14 +1662,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         : byEmail
           ? mapCustomer(byEmail)
           : null;
+      // Matched only by EMAIL (guest checkout with a new id): anyone can type
+      // an email, so never overwrite the stored name/phone — only fill blanks.
+      const fillBlanksOnly = !byId && Boolean(byEmail);
       const now = nowIso();
       const merged: Customer = {
         ...customer,
         id: base?.id ?? customer.id,
         email,
         verified: customer.verified || base?.verified || false,
-        name: customer.name ?? base?.name ?? null,
-        phone: customer.phone ?? base?.phone ?? null,
+        name: fillBlanksOnly
+          ? (base?.name ?? customer.name ?? null)
+          : (customer.name ?? base?.name ?? null),
+        phone: fillBlanksOnly
+          ? (base?.phone ?? customer.phone ?? null)
+          : (customer.phone ?? base?.phone ?? null),
         created_at: base?.created_at ?? now,
         updated_at: now,
       };
