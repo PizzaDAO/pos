@@ -8,17 +8,27 @@ import {
 import type { ConnectAccount } from "@/lib/db/payment-types";
 import { resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 
-// Capture Stripe calls from the terminal connection-token route.
+// Capture Stripe calls from the card rails + terminal connection-token route.
 const stripeRequest = vi.fn();
+const stripeGet = vi.fn();
 vi.mock("@/lib/payments/providers/stripe-client", async (orig) => ({
   ...(await orig<typeof import("@/lib/payments/providers/stripe-client")>()),
   stripeRequest: (...a: unknown[]) => stripeRequest(...a),
+  stripeGet: (...a: unknown[]) => stripeGet(...a),
+  verifyStripeWebhook: () => true,
+}));
+
+const requireTenantRole = vi.fn();
+vi.mock("@/lib/auth/api", () => ({
+  requireTenantRole: (...a: unknown[]) => requireTenantRole(...a),
 }));
 
 import { POST as paymentsPOST } from "@/app/api/payments/route";
 import { POST as tokenPOST } from "@/app/api/payments/stripe/connection-token/route";
+import { POST as webhookPOST } from "@/app/api/payments/stripe/webhook/route";
+import { NextResponse } from "next/server";
 import { takePayment } from "@/lib/payments/service";
-import { CARD_NOT_READY_MESSAGE } from "@/lib/payments/connect";
+import { CARD_NOT_READY_MESSAGE, isCardReady } from "@/lib/payments/connect";
 
 const TENANT = "10000000-0000-0000-0000-0000000000a1";
 const LOCATION = "10000000-0000-0000-0000-0000000000b1";
@@ -39,7 +49,14 @@ function acct(o: Partial<ConnectAccount>): ConnectAccount {
 }
 
 let seq = 0;
-async function seedOrder(total = 2000): Promise<string> {
+const OTHER_TENANT = "10000000-0000-0000-0000-0000000000a2";
+const OTHER_LOCATION = "10000000-0000-0000-0000-0000000000b2";
+
+async function seedOrder(
+  total = 2000,
+  tenantId = TENANT,
+  locationId = LOCATION,
+): Promise<string> {
   seq += 1;
   const id = `gate-order-${seq}`;
   const totals: OrderTotals = {
@@ -66,8 +83,8 @@ async function seedOrder(total = 2000): Promise<string> {
   };
   const input: CreateOrderInput = {
     id,
-    tenant_id: TENANT,
-    location_id: LOCATION,
+    tenant_id: tenantId,
+    location_id: locationId,
     channel: "in_store",
     currency: "USD",
     items: [line],
@@ -107,6 +124,10 @@ beforeEach(async () => {
   resetMockOrders();
   resetMockPayments();
   stripeRequest.mockReset();
+  stripeGet.mockReset();
+  stripeGet.mockResolvedValue({ id: "acct_real_1", charges_enabled: false });
+  requireTenantRole.mockReset();
+  requireTenantRole.mockResolvedValue({ ok: true, user: { id: "u1", email: "s@x" } });
   vi.unstubAllEnvs();
   vi.stubEnv("STRIPE_SECRET_KEY", "");
   // Clear any stored account for the tenant by resetting to a placeholder.
@@ -158,31 +179,33 @@ describe("real mode: card rails refuse tenants without a usable account", () => 
     ).rejects.toThrow(CARD_NOT_READY_MESSAGE);
   });
 
-  it("no-account tenant is refused too (unknown tenant)", async () => {
+  it("an order whose tenant has no account is refused", async () => {
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const orderId = await seedOrder(2000, OTHER_TENANT, OTHER_LOCATION);
     const req = new Request("http://localhost/api/payments", {
       method: "POST",
       headers: { "x-forwarded-for": "8.8.8.8" },
       body: JSON.stringify({
         paymentId: "gate-none",
-        orderId: await seedOrder(),
-        tenantId: "10000000-0000-0000-0000-0000000000ff",
-        locationId: LOCATION,
+        orderId,
+        tenantId: OTHER_TENANT,
+        locationId: OTHER_LOCATION,
         rail: "stripe_online",
         amountCents: 2000,
         currency: "USD",
       }),
     });
     expect((await paymentsPOST(req)).status).toBe(409);
+    expect(stripeRequest).not.toHaveBeenCalled();
   });
 
-  it("connection-token: refuses without a usable account (incl. no tenantId)", async () => {
+  it("connection-token: refuses without a usable account (409) and without a tenantId (400)", async () => {
     await getPosDriver().upsertConnectAccount(acct({ charges_enabled: false }));
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
     const a = await tokenPOST(tokenReq(TENANT));
     expect(a.status).toBe(409);
     const b = await tokenPOST(tokenReq(undefined));
-    expect(b.status).toBe(409);
+    expect(b.status).toBe(400);
     expect(stripeRequest).not.toHaveBeenCalled();
   });
 });
@@ -229,5 +252,194 @@ describe("simulated mode and non-card rails are unaffected", () => {
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
     const res = await paymentsPOST(payReq(await seedOrder(), "cash", "e"));
     expect(res.status).toBe(201);
+  });
+});
+
+describe("tenant/location come from the order, not the client", () => {
+  function mismatchReq(orderId: string, tenantId: string, locationId: string) {
+    return new Request("http://localhost/api/payments", {
+      method: "POST",
+      headers: { "x-forwarded-for": "7.7.7.7" },
+      body: JSON.stringify({
+        paymentId: `gate-mm-${tenantId.slice(-2)}-${locationId.slice(-2)}`,
+        orderId,
+        tenantId,
+        locationId,
+        rail: "stripe_online",
+        amountCents: 2000,
+        currency: "USD",
+      }),
+    });
+  }
+
+  it("rejects a tenantId that differs from the order (no PaymentIntent on the other tenant)", async () => {
+    // The OTHER tenant is fully onboarded; an attacker names it on TENANT's order.
+    await getPosDriver().upsertConnectAccount(
+      acct({ tenant_id: OTHER_TENANT, account_id: "acct_victim" }),
+    );
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const res = await paymentsPOST(
+      mismatchReq(await seedOrder(), OTHER_TENANT, LOCATION),
+    );
+    expect(res.status).toBe(400);
+    expect(stripeRequest).not.toHaveBeenCalled();
+    expect(await getPosDriver().getPayment("gate-mm-a2-b1")).toBeNull();
+  });
+
+  it("rejects a locationId that differs from the order", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const res = await paymentsPOST(
+      mismatchReq(await seedOrder(), TENANT, OTHER_LOCATION),
+    );
+    expect(res.status).toBe(400);
+    expect(stripeRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe("idempotent retry happens before the card gate", () => {
+  it("returns the existing tender even if the account is no longer ready", async () => {
+    await getPosDriver().upsertConnectAccount(acct({ account_id: "acct_real_9" }));
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    stripeRequest.mockResolvedValue({ id: "pi_1", status: "succeeded", client_secret: "cs" });
+    const orderId = await seedOrder();
+    const mk = () =>
+      new Request("http://localhost/api/payments", {
+        method: "POST",
+        headers: { "x-forwarded-for": "6.6.6.6" },
+        body: JSON.stringify({
+          paymentId: "gate-retry-1",
+          orderId,
+          tenantId: TENANT,
+          locationId: LOCATION,
+          rail: "stripe_online",
+          amountCents: 2000,
+          currency: "USD",
+        }),
+      });
+    expect((await paymentsPOST(mk())).status).toBe(201);
+    // Account becomes unusable (e.g. disabled); the retry must not be refused.
+    await getPosDriver().upsertConnectAccount(
+      acct({ account_id: "acct_real_9", charges_enabled: false }),
+    );
+    stripeGet.mockResolvedValue({ id: "acct_real_9", charges_enabled: false });
+    const intents = stripeRequest.mock.calls.length;
+    const retry = await paymentsPOST(mk());
+    expect(retry.status).toBe(201);
+    expect((await retry.json()).payment.id).toBe("gate-retry-1");
+    expect(stripeRequest.mock.calls.length).toBe(intents);
+  });
+});
+
+describe("stale charges_enabled is refreshed from Stripe once", () => {
+  it("proceeds and persists when Stripe says charges are now enabled", async () => {
+    await getPosDriver().upsertConnectAccount(
+      acct({ account_id: "acct_real_1", charges_enabled: false, status: "pending" }),
+    );
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    stripeGet.mockResolvedValue({
+      id: "acct_real_1",
+      charges_enabled: true,
+      payouts_enabled: true,
+      details_submitted: true,
+    });
+    stripeRequest.mockResolvedValue({ id: "pi_2", status: "succeeded", client_secret: "cs" });
+    const res = await paymentsPOST(payReq(await seedOrder(), "stripe_online", "r"));
+    expect(res.status).toBe(201);
+    expect(stripeGet).toHaveBeenCalledTimes(1);
+    expect((await getPosDriver().getConnectAccount(TENANT))?.charges_enabled).toBe(true);
+  });
+
+  it("still refuses when Stripe says charges are not enabled", async () => {
+    await getPosDriver().upsertConnectAccount(
+      acct({ charges_enabled: false, status: "pending" }),
+    );
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const res = await paymentsPOST(payReq(await seedOrder(), "stripe_online", "s"));
+    expect(res.status).toBe(409);
+    expect(stripeGet).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("connection-token requires staff on the tenant", () => {
+  it("returns 401/403 from the auth helper without minting", async () => {
+    await getPosDriver().upsertConnectAccount(acct({ account_id: "acct_real_9" }));
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    requireTenantRole.mockResolvedValue({
+      ok: false,
+      res: NextResponse.json({ error: "Not authorized for this tenant." }, { status: 403 }),
+    });
+    const res = await tokenPOST(tokenReq(TENANT));
+    expect(res.status).toBe(403);
+    expect(stripeRequest).not.toHaveBeenCalled();
+  });
+
+  it("checks owner|manager|cashier for the body tenant", async () => {
+    await tokenPOST(tokenReq(TENANT));
+    expect(requireTenantRole).toHaveBeenCalledWith(TENANT, [
+      "owner",
+      "manager",
+      "cashier",
+    ]);
+  });
+
+  it("is 400 without a tenantId (before auth)", async () => {
+    expect((await tokenPOST(tokenReq(undefined))).status).toBe(400);
+    expect(requireTenantRole).not.toHaveBeenCalled();
+  });
+});
+
+describe("isCardReady (public UI hint)", () => {
+  it("is always true in simulated mode", async () => {
+    expect(await isCardReady(TENANT)).toBe(true);
+    expect(await isCardReady("10000000-0000-0000-0000-0000000000ee")).toBe(true);
+  });
+
+  it("is false in real mode without a charges-enabled real account, with no Stripe call", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    await getPosDriver().upsertConnectAccount(acct({ charges_enabled: false }));
+    expect(await isCardReady(TENANT)).toBe(false);
+    await getPosDriver().upsertConnectAccount(
+      acct({ account_id: "acct_sim_x", simulated: true }),
+    );
+    expect(await isCardReady(TENANT)).toBe(false);
+    expect(await isCardReady("10000000-0000-0000-0000-0000000000ee")).toBe(false);
+    expect(stripeGet).not.toHaveBeenCalled();
+  });
+
+  it("is true for a charges-enabled real account", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    await getPosDriver().upsertConnectAccount(acct({}));
+    expect(await isCardReady(TENANT)).toBe(true);
+  });
+});
+
+describe("account.updated webhook", () => {
+  function hook(obj: Record<string, unknown>) {
+    return new Request("http://localhost/api/payments/stripe/webhook", {
+      method: "POST",
+      headers: { "stripe-signature": "t=1,v1=x" },
+      body: JSON.stringify({ type: "account.updated", data: { object: obj } }),
+    });
+  }
+
+  it("syncs charges_enabled onto the tenant matched by account id", async () => {
+    await getPosDriver().upsertConnectAccount(
+      acct({ account_id: "acct_wh_1", charges_enabled: false, payouts_enabled: false, status: "pending" }),
+    );
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const res = await webhookPOST(
+      hook({ id: "acct_wh_1", charges_enabled: true, payouts_enabled: true, details_submitted: true }),
+    );
+    expect(res.status).toBe(200);
+    const row = await getPosDriver().getConnectAccount(TENANT);
+    expect(row?.charges_enabled).toBe(true);
+    expect(row?.status).toBe("connected");
+    expect(await isCardReady(TENANT)).toBe(true);
+  });
+
+  it("ignores an unknown account id", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
+    const res = await webhookPOST(hook({ id: "acct_nobody", charges_enabled: true }));
+    expect(res.status).toBe(200);
   });
 });

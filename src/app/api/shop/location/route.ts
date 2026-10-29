@@ -8,6 +8,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { isCardReady } from "@/lib/payments/connect";
 
 export const runtime = "nodejs";
 
@@ -24,10 +25,13 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Location not found." }, { status: 404 });
   }
 
-  const [menu, settings, paymentSettings] = await Promise.all([
+  const [menu, settings, paymentSettings, cardReady] = await Promise.all([
     driver.getMenu(location.tenant_id, location.id),
     driver.getStoreSettings(location.tenant_id, location.id),
     driver.getPaymentSettings(location.tenant_id, location.id),
+    // Server-computed card-readiness only (never the account id): lets the
+    // storefront hide Card when it would be refused. Always true when simulated.
+    isCardReady(location.tenant_id),
   ]);
 
   return NextResponse.json(
@@ -36,6 +40,7 @@ export async function GET(request: Request) {
       menu,
       settings,
       paymentSettings,
+      cardReady,
       driver: driver.name,
     },
     { headers: { "Cache-Control": "no-store" } },

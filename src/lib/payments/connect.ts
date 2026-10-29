@@ -16,6 +16,11 @@
 import type { ConnectAccount, ConnectStatus } from "@/lib/db/payment-types";
 import { getPosDriver } from "@/lib/db";
 import { getStripeConfig, isStripeConfigured } from "./env";
+import {
+  effectiveConnectAccount,
+  isSimulated,
+  isSimulatedAccount,
+} from "./connect-status";
 import { stripeGet, stripeRequest } from "./providers/stripe-client";
 
 function nowIso(): string {
@@ -37,7 +42,7 @@ export function simulatedConnectAccount(tenantId: string): ConnectAccount {
   };
 }
 
-function deriveStatus(acct: {
+export function deriveStatus(acct: {
   charges_enabled?: boolean;
   payouts_enabled?: boolean;
   details_submitted?: boolean;
@@ -129,35 +134,6 @@ export async function fetchConnectStatus(
   };
 }
 
-/** Whether the platform is using simulated rails (no Stripe key). */
-export function isSimulated(): boolean {
-  return !isStripeConfigured();
-}
-
-/** True for a stored account that was simulated (never a real Stripe account). */
-export function isSimulatedAccount(
-  account: Pick<ConnectAccount, "account_id" | "simulated"> | null | undefined,
-): boolean {
-  return (
-    !!account && (account.simulated || account.account_id.startsWith("acct_sim_"))
-  );
-}
-
-/**
- * The stored account as it should be treated right now. When Stripe is
- * configured a simulated `acct_sim_…` row (left over from onboarding before the
- * key was set) is NOT a real account: treat it as not connected so it is never
- * shown as connected or passed to real Stripe as a connected-account id.
- */
-export function effectiveConnectAccount(
-  account: ConnectAccount | null,
-): ConnectAccount | null {
-  if (account && !isSimulated() && isSimulatedAccount(account)) return null;
-  return account;
-}
-
-export { getStripeConfig };
-
 export const CARD_NOT_READY_MESSAGE =
   "Card payments aren't set up for this pizzeria yet — finish Stripe onboarding in Admin → Payments.";
 
@@ -169,23 +145,67 @@ export class CardPaymentsNotReadyError extends Error {
   }
 }
 
+type CardGate = { ok: true; accountId: string | null } | { ok: false };
+
+/**
+ * Shared card-readiness evaluation.
+ *
+ * REAL mode (Stripe configured): the tenant MUST have a real (non-simulated)
+ * account with `charges_enabled`. If the stored flag is false and `refresh` is
+ * set, the live status is fetched from Stripe ONCE and persisted before
+ * re-checking (onboarding may have finished since the last stored status).
+ * SIMULATED mode: always ok; returns the stored id or null (no Stripe call).
+ */
+async function evaluateCardGate(
+  tenantId: string | null | undefined,
+  refresh: boolean,
+): Promise<CardGate> {
+  const driver = getPosDriver();
+  const stored = tenantId ? await driver.getConnectAccount(tenantId) : null;
+  if (isSimulated()) return { ok: true, accountId: stored?.account_id ?? null };
+  let account = effectiveConnectAccount(stored);
+  if (!account) return { ok: false };
+  if (!account.charges_enabled && refresh) {
+    try {
+      const fresh = await fetchConnectStatus(account.tenant_id, account.account_id);
+      account = await driver.upsertConnectAccount(fresh);
+    } catch {
+      // Keep the stored (not-ready) status if the refresh fails.
+    }
+  }
+  if (!account.charges_enabled) return { ok: false };
+  return { ok: true, accountId: account.account_id };
+}
+
 /**
  * Resolve the connected-account id a card rail may charge on behalf of.
  *
- * REAL mode (Stripe configured): the tenant MUST have a real (non-simulated)
- * account with `charges_enabled`; otherwise throws CardPaymentsNotReadyError so
- * nothing card-related ever runs on the platform account ("we never custody
- * tenant card funds"). SIMULATED mode: returns the stored id or null, exactly as
- * before (rails settle simulated, no Stripe call).
+ * REAL mode: throws CardPaymentsNotReadyError unless the tenant has a
+ * charges-enabled real account, so nothing card-related ever runs on the
+ * platform account ("we never custody tenant card funds"). A stale
+ * `charges_enabled: false` is refreshed from Stripe once. SIMULATED mode:
+ * returns the stored id or null, exactly as before.
  */
 export async function resolveCardConnectAccountId(
   tenantId: string | null | undefined,
 ): Promise<string | null> {
-  const stored = tenantId
-    ? await getPosDriver().getConnectAccount(tenantId)
-    : null;
-  if (isSimulated()) return stored?.account_id ?? null;
-  const account = effectiveConnectAccount(stored);
-  if (!account || !account.charges_enabled) throw new CardPaymentsNotReadyError();
-  return account.account_id;
+  const gate = await evaluateCardGate(tenantId, true);
+  if (!gate.ok) throw new CardPaymentsNotReadyError();
+  return gate.accountId;
 }
+
+/**
+ * Whether card tender can be offered for a tenant right now (UI hint; never
+ * exposes the account id). No Stripe call — uses the stored status only, so it
+ * is cheap to expose on public endpoints. Always true in simulated mode.
+ */
+export async function isCardReady(tenantId: string): Promise<boolean> {
+  return (await evaluateCardGate(tenantId, false)).ok;
+}
+
+export {
+  getStripeConfig,
+  effectiveConnectAccount,
+  isSimulated,
+  isSimulatedAccount,
+};

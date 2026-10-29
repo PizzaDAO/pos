@@ -125,7 +125,13 @@ export function AdminShell({
   const [tenantName, setTenantName] = useState("Back office");
   const [locations, setLocations] = useState<Location[]>([]);
   const [locationId, setLocationId] = useState<string>("");
+  // Returning from Stripe onboarding (?connect=return|refresh) lands on the
+  // Payments tab, whose mount triggers the GET refresh of the account status.
   const [tab, setTab] = useState<Tab>("menu");
+  useEffect(() => {
+    const c = new URLSearchParams(window.location.search).get("connect");
+    if (c === "return" || c === "refresh") setTab("payments");
+  }, []);
 
   const { entitlements, refresh: refreshEntitlements } =
     useEntitlements(tenantId);

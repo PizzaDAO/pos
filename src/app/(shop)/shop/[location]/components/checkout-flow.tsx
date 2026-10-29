@@ -81,7 +81,15 @@ export function CheckoutFlow({
   const [magicLinkUrl, setMagicLinkUrl] = useState<string | null>(null);
 
   // Payment
-  const [rail, setRail] = useState<PaymentRailKey>("stripe_online");
+  // Card is hidden when the tenant isn't Stripe-onboarded (it would be refused
+  // after the order is already placed); default to the first available rail.
+  const cardReady = shop.cardReady !== false;
+  const availableRails = ONLINE_RAILS.filter(
+    (r) => cardReady || r.key !== "stripe_online",
+  );
+  const [rail, setRail] = useState<PaymentRailKey>(
+    availableRails[0]?.key ?? "stripe_online",
+  );
   const [tipCents, setTipCents] = useState(0);
   const [placedOrderId, setPlacedOrderId] = useState<string | null>(null);
   const [placedOrderNumber, setPlacedOrderNumber] = useState<string | null>(
@@ -420,7 +428,7 @@ export function CheckoutFlow({
                   Payment
                 </h3>
                 <div className="grid grid-cols-1 gap-2">
-                  {ONLINE_RAILS.map((r) => (
+                  {availableRails.map((r) => (
                     <button
                       key={r.key}
                       type="button"

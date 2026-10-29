@@ -6,13 +6,16 @@
  * connected account when Stripe is configured. With no key (default, incl.
  * preview) returns a simulated token so the in-store flow can be exercised.
  *
- * Body: `{ tenantId }`.
+ * Body: `{ tenantId }`. Staff only: owner|manager|cashier of that tenant (the
+ * terminal session's roles; kitchen has no payment role) — otherwise anyone
+ * could mint a token on any tenant's connected account.
  */
 import { NextResponse } from "next/server";
 import {
   CardPaymentsNotReadyError,
   resolveCardConnectAccountId,
 } from "@/lib/payments/connect";
+import { requireTenantRole } from "@/lib/auth/api";
 import { isStripeConfigured } from "@/lib/payments/env";
 import { stripeRequest } from "@/lib/payments/providers/stripe-client";
 
@@ -25,6 +28,16 @@ export async function POST(request: Request) {
   } catch {
     body = {};
   }
+
+  if (!body.tenantId) {
+    return NextResponse.json({ error: "tenantId is required." }, { status: 400 });
+  }
+  const auth = await requireTenantRole(body.tenantId, [
+    "owner",
+    "manager",
+    "cashier",
+  ]);
+  if (!auth.ok) return auth.res;
 
   if (!isStripeConfigured()) {
     return NextResponse.json({

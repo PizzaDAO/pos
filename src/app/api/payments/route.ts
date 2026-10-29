@@ -81,18 +81,57 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
 
+  // NEVER trust the client's tenant/location: the order is the source of truth.
+  // A body that names a different tenant/location is rejected outright.
+  if (
+    body.tenantId !== order.tenant_id ||
+    body.locationId !== order.location_id
+  ) {
+    return NextResponse.json(
+      { error: "tenantId/locationId do not match the order." },
+      { status: 400 },
+    );
+  }
+  const tenantId = order.tenant_id;
+  const locationId = order.location_id;
+
+  // Idempotent retry: return the existing tender BEFORE the card gate, so a
+  // retry after a successful charge is never turned into a refusal.
+  try {
+    const existing = await driver.getPayment(body.paymentId);
+    if (existing) {
+      if (existing.order_id !== order.id) {
+        return NextResponse.json(
+          { error: "paymentId already used for another order." },
+          { status: 409 },
+        );
+      }
+      const current = await driver.getOrder(order.id);
+      return NextResponse.json(
+        {
+          payment: existing,
+          balanceCents: current ? await getOrderBalance(current) : 0,
+          orderStatus: current?.status,
+        },
+        { status: 201 },
+      );
+    }
+  } catch {
+    // Fall through: takePayment repeats the idempotency check.
+  }
+
   // Resolve the connected account for card rails (simulated when no Stripe key).
   // In real mode a tenant without a charges-enabled account is refused (409).
   try {
     let connectAccountId: string | null = null;
     if (body.rail === "stripe_terminal" || body.rail === "stripe_online") {
-      connectAccountId = await resolveCardConnectAccountId(body.tenantId);
+      connectAccountId = await resolveCardConnectAccountId(tenantId);
     }
     const payment = await takePayment({
       paymentId: body.paymentId,
       orderId: body.orderId,
-      tenantId: body.tenantId,
-      locationId: body.locationId,
+      tenantId,
+      locationId,
       rail: body.rail,
       amountCents: body.amountCents,
       tipCents: body.tipCents ?? 0,

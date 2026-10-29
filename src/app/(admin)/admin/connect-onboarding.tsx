@@ -30,7 +30,13 @@ export function ConnectOnboarding({
       const data = (await res.json()) as {
         account: ConnectAccount | null;
         simulated: boolean;
+        error?: string;
       };
+      if (!res.ok) {
+        setError(data.error ?? `Failed to load status (HTTP ${res.status}).`);
+        return;
+      }
+      setError(null);
       setAccount(data.account);
       setSimulated(data.simulated);
     } catch (e) {

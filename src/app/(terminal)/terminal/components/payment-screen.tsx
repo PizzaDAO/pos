@@ -34,6 +34,8 @@ export interface PaymentScreenProps {
   tenantId: string;
   locationId: string;
   paymentSettings: PaymentSettings;
+  /** False hides card tenders (tenant not Stripe-onboarded in real mode). */
+  cardReady?: boolean;
   onClose: () => void;
   onPaid: () => void;
 }
@@ -43,6 +45,7 @@ export function PaymentScreen({
   tenantId,
   locationId,
   paymentSettings,
+  cardReady = true,
   onClose,
   onPaid,
 }: PaymentScreenProps) {
@@ -134,7 +137,11 @@ export function PaymentScreen({
                     Payment method
                   </div>
                   <div className="grid grid-cols-1 gap-2">
-                    {PAYMENT_RAIL_KEYS.map((key) => (
+                    {PAYMENT_RAIL_KEYS.filter(
+                      (key) =>
+                        cardReady ||
+                        (key !== "stripe_terminal" && key !== "stripe_online"),
+                    ).map((key) => (
                       <button
                         key={key}
                         type="button"

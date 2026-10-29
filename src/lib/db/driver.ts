@@ -256,6 +256,9 @@ export interface PosDriver {
   /** Current Connect onboarding status for a tenant, or null if not started. */
   getConnectAccount(tenantId: string): Promise<ConnectAccount | null>;
 
+  /** Find the Connect row for a Stripe account id (webhook routing). */
+  getConnectAccountByAccountId(accountId: string): Promise<ConnectAccount | null>;
+
   /** Upsert (persist) a tenant's Connect account status. */
   upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount>;
 
