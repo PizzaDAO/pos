@@ -34,12 +34,10 @@ import {
   getOrderBalance,
   isDefinitiveRailFailure,
   PaymentOutcomeUnknownError,
-  railIsSimulated,
   TenderVoidedDuringChargeError,
   takePayment,
 } from "@/lib/payments/service";
-import { simulatedRailsAllowed } from "@/lib/payments/simulation";
-import { isSupabaseAuthConfigured } from "@/lib/auth/supabase-server";
+import { PUBLIC_RAILS, railAvailable } from "@/lib/payments/availability";
 import {
   enforceRateLimit,
   isClientId,
@@ -61,12 +59,6 @@ type Rail = PaymentRailKey | "cash";
 const ALL_RAILS: Rail[] = [
   "cash",
   "stripe_terminal",
-  "stripe_online",
-  "crypto_onchain_usdc",
-  "crypto_coinbase",
-];
-/** Rails a signed-out storefront customer may use (no cash / card-present). */
-const PUBLIC_RAILS: Rail[] = [
   "stripe_online",
   "crypto_onchain_usdc",
   "crypto_coinbase",
@@ -137,20 +129,6 @@ export async function POST(request: Request) {
 
   const driver = getPosDriver();
 
-  // A rail with no live keys runs SIMULATED (settles without moving money).
-  // Never allow that against the real driver / real auth unless explicitly
-  // opted in — otherwise an unkeyed rail would mark real orders paid.
-  if (
-    railIsSimulated(body.rail) &&
-    !simulatedRailsAllowed({
-      driverName: driver.name,
-      realAuth: isSupabaseAuthConfigured(),
-      allowFlag: process.env.ALLOW_SIMULATED_PAYMENTS,
-    })
-  ) {
-    return reject("This payment method is not available.", 503);
-  }
-
   let order: Order | null = null;
   try {
     order = await driver.getOrder(body.orderId);
@@ -178,6 +156,13 @@ export async function POST(request: Request) {
     // signed-in operational role of the ORDER's tenant.
     const auth = await requireTenantAccess(order.tenant_id, "terminal");
     if (!auth.ok) return auth.res;
+  }
+
+  // A rail with no live keys runs SIMULATED (settles without moving money).
+  // Never for anonymous online checkout outside the zero-env demo; staff may
+  // use it only with an explicit ALLOW_SIMULATED_PAYMENTS=true.
+  if (!railAvailable(body.rail, { staff: isStaff })) {
+    return reject("This payment method is not available.", 503);
   }
 
   // ---- Idempotent replay ------------------------------------------------------

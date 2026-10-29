@@ -33,6 +33,7 @@ import { computeOrderTotals } from "@/lib/pricing";
 import { priceOrder } from "@/lib/order-pricing";
 import { maxTipCents, RepriceError } from "@/lib/reprice";
 import { enforceRateLimit, isEmail, isMoneyCents } from "@/lib/security";
+import { publicOnlineRails } from "@/lib/payments/availability";
 import { ensureCustomer } from "@/lib/shop/auth";
 import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
 import {
@@ -62,6 +63,8 @@ interface ShopOrderBody {
   deliveryNotes?: string;
   notes?: string;
   tipCents?: number;
+  /** The online rail the customer will pay with (checked BEFORE creating). */
+  rail?: string;
 }
 
 function isValid(body: unknown): body is ShopOrderBody {
@@ -119,6 +122,21 @@ export async function POST(request: Request) {
     }
     const delivery = await driver.getDeliveryForOrder(existing.id);
     return NextResponse.json({ order: existing, delivery }, { status: 200 });
+  }
+
+  // Refuse BEFORE creating a placed (KDS-visible) order when the customer
+  // couldn't pay for it: the chosen rail (or, for older clients, any online
+  // rail) must currently accept payments.
+  const usableRails = publicOnlineRails() as string[];
+  if (
+    body.rail !== undefined
+      ? !usableRails.includes(body.rail)
+      : usableRails.length === 0
+  ) {
+    return NextResponse.json(
+      { error: "Online payment is not available right now." },
+      { status: 503 },
+    );
   }
 
   // The tenant is derived from the resolved location — never the client.

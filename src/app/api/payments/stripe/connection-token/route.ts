@@ -15,8 +15,7 @@ import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isStripeConfigured } from "@/lib/payments/env";
 import { stripeRequest } from "@/lib/payments/providers/stripe-client";
-import { simulatedRailsAllowed } from "@/lib/payments/simulation";
-import { isSupabaseAuthConfigured } from "@/lib/auth/supabase-server";
+import { railAvailable } from "@/lib/payments/availability";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
@@ -33,13 +32,8 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.res;
 
   if (!isStripeConfigured()) {
-    if (
-      !simulatedRailsAllowed({
-        driverName: getPosDriver().name,
-        realAuth: isSupabaseAuthConfigured(),
-        allowFlag: process.env.ALLOW_SIMULATED_PAYMENTS,
-      })
-    ) {
+    // Terminal staff only (guarded above) — the training opt-in applies.
+    if (!railAvailable("stripe_terminal", { staff: true })) {
       return NextResponse.json(
         { error: "Card readers are not configured." },
         { status: 503 },

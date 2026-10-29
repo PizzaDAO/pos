@@ -14,6 +14,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
+import { publicOnlineRails } from "@/lib/payments/availability";
 
 export const runtime = "nodejs";
 
@@ -44,6 +45,9 @@ export async function GET(request: Request) {
       menu,
       settings,
       paymentSettings,
+      // Online rails that would actually accept a customer payment now (the
+      // storefront hides the rest instead of failing at checkout).
+      onlineRails: publicOnlineRails(),
       driver: driver.name,
     },
     { headers: { "Cache-Control": "no-store" } },

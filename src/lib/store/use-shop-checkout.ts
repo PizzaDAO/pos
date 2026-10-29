@@ -42,6 +42,8 @@ export interface PlaceOrderInput {
   deliveryNotes?: string;
   notes?: string;
   tipCents: number;
+  /** The rail the customer chose (validated server-side before creating). */
+  rail?: string;
 }
 
 export function useShopCheckout() {
@@ -106,6 +108,7 @@ export function useShopCheckout() {
             deliveryNotes: input.deliveryNotes,
             notes: input.notes,
             tipCents: input.tipCents,
+            rail: input.rail,
           }),
         });
         const data = (await res.json()) as {

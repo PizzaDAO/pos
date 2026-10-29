@@ -82,7 +82,13 @@ export function CheckoutFlow({
   const [magicLinkUrl, setMagicLinkUrl] = useState<string | null>(null);
 
   // Payment
-  const [rail, setRail] = useState<PaymentRailKey>("stripe_online");
+  // Only rails the server says can take a payment right now.
+  const availableRails = ONLINE_RAILS.filter(
+    (r) => !shop.onlineRails || shop.onlineRails.includes(r.key),
+  );
+  const [rail, setRail] = useState<PaymentRailKey>(
+    availableRails[0]?.key ?? "stripe_online",
+  );
   const [tipCents, setTipCents] = useState(0);
   const [placedOrderId, setPlacedOrderId] = useState<string | null>(null);
   const [placedOrderNumber, setPlacedOrderNumber] = useState<string | null>(
@@ -153,6 +159,7 @@ export function CheckoutFlow({
       address: fulfillment === "delivery" ? address : undefined,
       notes: undefined,
       tipCents,
+      rail,
     });
     if (!placed) return;
     const pay = await checkout.pay({
@@ -445,7 +452,12 @@ export function CheckoutFlow({
                   Payment
                 </h3>
                 <div className="grid grid-cols-1 gap-2">
-                  {ONLINE_RAILS.map((r) => (
+                  {availableRails.length === 0 && (
+                    <p className="text-sm text-destructive">
+                      Online payment isn&apos;t available right now.
+                    </p>
+                  )}
+                  {availableRails.map((r) => (
                     <button
                       key={r.key}
                       type="button"
@@ -524,7 +536,7 @@ export function CheckoutFlow({
                 </Button>
                 <Button
                   className="flex-1"
-                  disabled={checkout.loading}
+                  disabled={checkout.loading || availableRails.length === 0}
                   onClick={handlePlaceAndPay}
                 >
                   {checkout.loading ? (
