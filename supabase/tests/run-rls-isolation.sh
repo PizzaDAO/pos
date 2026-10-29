@@ -13,9 +13,13 @@
 #   DATABASE_URL="postgres://postgres:postgres@localhost:5432/pos_test" \
 #     bash supabase/tests/run-rls-isolation.sh
 #
-# It applies migrations idempotently-ish (create-or-replace functions; tables
-# will error if already present — point it at a FRESH database). The isolation
-# test itself runs in a transaction and rolls back, mutating nothing persistent.
+# This SCRIPT applies migrations idempotently-ish (create-or-replace functions;
+# tables will error if already present), so point it at a FRESH database.
+# The isolation test itself (rls_isolation.sql) is fixture-scoped — its
+# assertions only count the two fixture tenants — and runs in a transaction that
+# rolls back, so the .sql ALONE is safe to run against a live, non-empty
+# database (psql -f supabase/tests/rls_isolation.sql); only this harness needs
+# a fresh one.
 #
 # On a VANILLA Postgres (local/CI) the auth.uid() shim is applied first so the
 # policies resolve. Against a REAL Supabase project, set SKIP_AUTH_SHIM=1 — the

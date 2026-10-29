@@ -8,6 +8,11 @@
 -- HOW TO RUN (once a live Supabase DB exists — see supabase/README.md):
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/rls_isolation.sql
 --
+-- Assertions are FIXTURE-SCOPED (the two fixture tenants aaaaaaaa-… and
+-- bbbbbbbb-…), so this file is valid against a live, non-empty database as well
+-- as a fresh one; it runs in a transaction and rolls back. (The harness script
+-- run-rls-isolation.sh also applies migrations, so that script needs a fresh DB.)
+--
 -- This script simulates the authenticated user by setting `request.jwt.claims`
 -- (which Supabase's `auth.uid()` reads) and switching to the `authenticated`
 -- role so RLS is enforced. It rolls everything back at the end — it does not
@@ -200,7 +205,9 @@ select pg_temp.act_as('33333333-3333-3333-3333-333333333333');
 do $$
 declare n int;
 begin
-  select count(*) into n from public.tenants;
+  -- Scoped to the two fixture tenants so this holds on a non-empty database.
+  select count(*) into n from public.tenants
+    where id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('Platform admin should see 2 tenants, saw %s', n);
 end $$;
 reset role;
@@ -270,6 +277,9 @@ end $$;
 -- (would error), whereas '{}'::json ->> 'sub' is NULL → auth.uid() = NULL.
 select set_config('request.jwt.claims', '{}', true);
 
+-- NOTE: every count over a whole table above/below is scoped to the two fixture
+-- tenants (or to RLS-restricted fixture users), so the file is valid against a
+-- non-empty database, not just a fresh one.
 -- 12) MENU is intentionally PUBLIC-READABLE (storefront). The `anon` role sees
 --     BOTH tenants' menu items (public reads), but writes stay tenant-scoped.
 --     This is the storefront-public surface anon retains SELECT on after the
@@ -278,12 +288,15 @@ set local role anon;
 do $$
 declare n int;
 begin
-  select count(*) into n from public.menu_items;
+  select count(*) into n from public.menu_items
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('anon (storefront) should read both menus (2 items), saw %s', n);
-  select count(*) into n from public.menu_categories;
+  select count(*) into n from public.menu_categories
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('anon should read both menu categories, saw %s', n);
   -- store_settings is part of the public surface (currency/tax/hours).
-  select count(*) into n from public.store_settings;
+  select count(*) into n from public.store_settings
+    where tenant_id in ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
   assert n = 2, format('anon should read both stores'' settings, saw %s', n);
   -- A storefront resolves a LOCATION by slug; anon can read the location row
   -- (active tenant) so the slug lookup works.
