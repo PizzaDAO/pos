@@ -46,20 +46,32 @@ row and one upstream charge.
 
 - **No double-charge / duplicate-order bugs were found.** The end-to-end UUID
   idempotency model held under every retry/replay/split scenario tested.
-- **Documented behavioural nuance (not a bug):** `refreshPaymentStatus`
-  early-returns when a tender is *already* `captured`/`refunded` and therefore
-  does **not** re-run `maybeMarkOrderPaid`. This is correct for the intended flow
-  (the watcher/webhook transitions pending → captured *through*
-  `refreshPaymentStatus`, which settles the order in the same call). If a future
-  live webhook captures a tender by writing the status **directly** via
-  `upsertPayment`, it must also call `maybeMarkOrderPaid` (or route through
-  `refreshPaymentStatus`) so the order settles. The crypto-confirm test exercises
-  the correct watcher path (`payments/service.test.ts`). Noted here for the
-  live-wiring phase.
+- **Resolved (payments-security-fixes, S5):** the earlier "nuance" is closed.
+  Every rail status change (takePayment, polling, Stripe and Coinbase webhooks)
+  now goes through `applyRailStatus` in `payments/service.ts`, which (a) never
+  downgrades a `captured`/`refunded` tender, and (b) **always** re-runs the
+  order-paid check, even when the tender was already captured. The webhooks no
+  longer write the status directly. Replays are no-ops.
+- **Coverage rules** (`payments/service.ts`):
+  - `orderDueCents(order) = total_cents - totals.tip_cents`. Online orders fold
+    the customer's tip into `total_cents`; the tip rides on the tender's
+    `tip_cents`, not its base `amount_cents`. Terminal orders have an order tip of
+    0, so due == total there.
+  - A tender *covers* the balance when `pending`, `authorized` or `captured`
+    (`requires_action`, `failed`, `canceled`, `refunded` do not). The order is
+    marked `paid` only when SETTLED (`authorized`/`captured`) base amounts reach
+    the due amount, and only from `draft`/`placed` (a late settlement never
+    regresses `in_kitchen`/`ready`/`completed`).
+  - For online orders `/api/payments` ignores the client's `amountCents` and
+    `tipCents` and derives them from the order and its covering tenders
+    (`deriveOnlineTender`), so the tip is charged exactly once.
+- **Client retries (S11):** the terminal and shop hooks mint one tender id per
+  pending tender (`store/pending-tender.ts`) and reuse it on retry until the
+  tender is recorded or its amount/rail changes.
 
 ## Live-wiring follow-ups
 
 - Forward the tender UUID as the Stripe `Idempotency-Key` (already wired in the
   rails) and as the crypto deposit reference/memo.
-- Make all webhook handlers idempotent on the rail charge id, and have any
-  direct-capture webhook settle the order (see the nuance above).
+- Webhook handlers are idempotent on the rail charge id and settle the order via
+  `applyRailStatus` (done, S5).

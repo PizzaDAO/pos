@@ -36,6 +36,14 @@ tenant's driver calls. The SQL test proves a member of tenant A cannot read or
 write tenant B's tenants/locations/memberships/users, that a blocked cross-tenant
 write leaves no row, and that a platform admin sees everything.
 
+**Customers do not insert orders directly.** `orders_insert` (migration
+`20261030000000_orders_insert_staff_only.sql`) is limited to tenant members and
+platform admins: online orders are written server-side by `/api/shop/orders`
+(service role) after the cart is **repriced from the menu**, so a signed-in
+customer can no longer write an order with arbitrary status/totals straight onto
+the KDS. Customers keep SELECT on their own orders. `rls_isolation.sql` asserts
+the customer insert is denied and a member insert still works.
+
 The SQL isolation test now also covers the **operational tables** (orders,
 payments) and the **public menu** surface: it asserts a member of tenant A sees
 only tenant A's orders/payments, a cross-tenant order write is blocked and leaves
@@ -318,8 +326,30 @@ on the Supabase driver, so a half-wired production never reports
 rendered server-side as an in-flow labelled `<aside>` (`src/components/training-banner.tsx`) in the terminal,
 kitchen, and admin layouts.
 
-**Go-live:** the badge clears only when Supabase AND `STRIPE_SECRET_KEY` are set
-and `TRAINING_MODE` is off — that is the explicit "now taking real orders" switch.
+**Card rails and training mode (payments-security-fixes, S10).** When training is
+on because of the `TRAINING_MODE` flag **or the mock driver**, the card rails
+(Stripe Terminal/online, Connect, connection tokens) take the **simulated path
+whatever Stripe key is set** (`cardRailsSimulated()` in `payments/env.ts`), so a
+live key plus the flag can never make a real charge behind a "training" banner.
+
+Banner reasons, in precedence order (`/api/ready` returns `trainingReason`):
+
+| Reason | When | Card rails |
+|---|---|---|
+| `flag` | `TRAINING_MODE` set | simulated |
+| `mock` | mock driver | simulated |
+| `stripe-unset` | live driver, no `STRIPE_SECRET_KEY` | simulated |
+| `stripe-test` | live driver, `sk_test_` key, no flag | **real Stripe test mode** ("TRAINING — Stripe test mode, no real money") |
+| none | live driver, `sk_live_` key, no flag | real |
+
+**While production runs on Stripe TEST keys, drop `TRAINING_MODE=1`** so the real
+test-mode Stripe path (Connect accounts, PaymentIntents, webhooks) is exercised;
+the banner then reads "TRAINING — Stripe test mode, no real money". Leaving the
+flag on keeps cards simulated and tests nothing in Stripe.
+
+**Go-live:** the badge clears only when Supabase AND a live (`sk_live_`)
+`STRIPE_SECRET_KEY` are set and `TRAINING_MODE` is off — that is the explicit
+"now taking real orders" switch.
 
 ---
 
@@ -433,6 +463,7 @@ so CI/dev never throttle.
 | `POST /api/terminal/pin` | `pin` (8) | IP |
 | `POST /api/shop/auth/magic-link` | `auth` (10) | IP + email |
 | `POST /api/orders` | `orders` (60) | IP |
+| `POST /api/shop/orders` | `orders` (60) | IP |
 | `POST /api/payments` | `payments` (30) | IP |
 | `POST /api/payments/refund` | `payments` (30) | IP |
 
@@ -513,3 +544,28 @@ Dependency-free guards (`src/lib/security/validate.ts`): `readJsonBody` enforces
 length + allowlists charset; `isEmail` bounds + shape-checks. Wired into the
 order/payment/refund/PIN/magic-link routes (the money + auth paths). Existing
 domain-level validation (scheduling, zone gates, idempotency) is unchanged.
+
+### 11f. Payments hardening (payments-security-fixes)
+
+- **Shop orders are repriced server-side.** `POST /api/shop/orders` rebuilds every
+  line from `driver.getMenu` (location overrides applied, 86'd items excluded) via
+  `src/lib/shop/reprice.ts`; client prices, names and stations are ignored.
+  Unknown/86'd items, bad sizes, illegal half placements, min/max_select
+  violations and quantities outside 1-50 are 422. The tip must be an integer
+  between 0 and the subtotal. The route is rate-limited (`orders` bucket).
+- **`GET /api/payments?orderId=`** requires a member of the order's tenant, and
+  tenders are returned without rail internals (`publicTender`). The Stripe
+  `client_secret` is never stored; it is returned only in the `POST /api/payments`
+  response that created the intent.
+- **Stripe Connect webhook** (`/api/payments/stripe/webhook`, secret
+  `STRIPE_WEBHOOK_SECRET`; the Billing endpoint `/api/billing/webhook` uses
+  `STRIPE_BILLING_WEBHOOK_SECRET`): signatures use a 5-minute timestamp tolerance
+  and accept any of several `v1` entries (secret rotation). `payment_intent.*`
+  events must carry `account` equal to the tender's `connect_account_id`, and the
+  intent amount and currency must match the tender, or they are ignored (200,
+  logged). Only `succeeded`, `processing`, `payment_failed`, `canceled` and
+  `account.updated` are acted on.
+- **Refunds** require `owner` or `manager` (not cashier/kitchen). Direct-charge
+  refunds are made on the connected account with no `reverse_transfer`; on a full
+  refund the platform's application fee is returned
+  (`REFUND_APPLICATION_FEE_ON_FULL_REFUND` in `payments/fees.ts`).
