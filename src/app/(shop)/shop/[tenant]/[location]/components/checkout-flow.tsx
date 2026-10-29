@@ -146,8 +146,10 @@ export function CheckoutFlow({
     const pay = await checkout.pay({
       order: placed.order,
       rail,
+      // The tip is already part of the server-priced order total, so the
+      // tender carries no separate tip (it would be charged twice).
       amountCents: placed.order.totals.total_cents,
-      tipCents,
+      tipCents: 0,
     });
     if (!pay) return;
     setPlacedOrderId(placed.order.id);

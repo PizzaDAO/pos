@@ -12,6 +12,12 @@
  *  4. Creates the order with the correct CHANNEL (online_pickup/online_delivery)
  *     and status `placed` so it lands on the Phase 3 KDS board.
  *
+ * PRICING IS SERVER-SIDE: the browser's line/modifier prices and totals are
+ * ignored. Each line is re-priced from the location's menu (size price +
+ * modifier prices incl. the half-and-half rule); unknown / unavailable / 86'd
+ * items, sizes or modifiers are rejected with 422. The tip is an explicit,
+ * bounded field; the delivery fee comes from the server-side quote.
+ *
  * Idempotent on the client order UUID (createOrder upserts by id). No env vars
  * required — payments + delivery providers run simulated with none.
  */
@@ -24,6 +30,9 @@ import {
   type OrderItem,
 } from "@/lib/db";
 import { computeOrderTotals } from "@/lib/pricing";
+import { priceOrder } from "@/lib/order-pricing";
+import { maxTipCents, RepriceError } from "@/lib/reprice";
+import { enforceRateLimit, isEmail, isMoneyCents } from "@/lib/security";
 import { ensureCustomer } from "@/lib/shop/auth";
 import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
 import {
@@ -44,6 +53,7 @@ interface ShopOrderBody {
   /** Storefront tenant slug (locations.slug is only unique per tenant). */
   tenantSlug?: string;
   locationSlug: string;
+  /** Client lines — only ids/selections are used; prices are recomputed. */
   items: OrderItem[];
   fulfillmentType: "pickup" | "delivery";
   scheduledFor: "asap" | string;
@@ -65,11 +75,18 @@ function isValid(body: unknown): body is ShopOrderBody {
     (b.scheduledFor === "asap" || typeof b.scheduledFor === "string") &&
     typeof b.customer === "object" &&
     b.customer !== null &&
-    typeof (b.customer as Record<string, unknown>).email === "string"
+    isEmail((b.customer as Record<string, unknown>).email) &&
+    (b.tipCents === undefined || isMoneyCents(b.tipCents)) &&
+    (b.notes === undefined ||
+      (typeof b.notes === "string" && b.notes.length <= 1000))
   );
 }
 
 export async function POST(request: Request) {
+  // Public order intake — rate-limit per IP.
+  const limited = enforceRateLimit(request, "orders");
+  if (limited) return limited;
+
   let body: unknown;
   try {
     body = await request.json();
@@ -88,6 +105,13 @@ export async function POST(request: Request) {
   // Idempotency: if this order id was already placed, return it unchanged.
   const existing = await driver.getOrder(body.id);
   if (existing) {
+    // Never hand out an in-store order through the public storefront.
+    if (existing.channel === "in_store") {
+      return NextResponse.json(
+        { error: "Order id already in use." },
+        { status: 409 },
+      );
+    }
     const delivery = await driver.getDeliveryForOrder(existing.id);
     return NextResponse.json({ order: existing, delivery }, { status: 200 });
   }
@@ -129,9 +153,39 @@ export async function POST(request: Request) {
     );
   }
 
-  const activeItems = body.items.filter((i) => !i.voided);
+  // ---- Server-side repricing (client prices are never trusted) -------------
+  let activeItems: OrderItem[];
+  let baseTotals: ReturnType<typeof computeOrderTotals>;
+  try {
+    const priced = await priceOrder({
+      tenantId,
+      locationId,
+      items: body.items,
+      discountCents: 0,
+      tipCents: 0,
+      voided: "drop",
+      settings,
+    });
+    activeItems = priced.items;
+    // Subtotal (pre-delivery) so zone minimums are checked correctly.
+    baseTotals = priced.totals;
+  } catch (err) {
+    if (err instanceof RepriceError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
+    }
+    throw err;
+  }
   if (activeItems.length === 0) {
     return NextResponse.json({ error: "Cart is empty." }, { status: 422 });
+  }
+
+  // ---- Tip: explicit + bounded ---------------------------------------------
+  const tipCents = body.tipCents ?? 0;
+  if (tipCents > maxTipCents(baseTotals.total_cents)) {
+    return NextResponse.json(
+      { error: "Tip amount is too large." },
+      { status: 422 },
+    );
   }
 
   // ---- Fulfillment-type gate ------------------------------------------------
@@ -181,14 +235,6 @@ export async function POST(request: Request) {
     email: body.customer.email,
     name: body.customer.name ?? null,
     phone: body.customer.phone ?? null,
-  });
-
-  // ---- Subtotal (pre-delivery) so zone minimums are checked correctly -------
-  const baseTotals = computeOrderTotals({
-    items: activeItems,
-    discountCents: 0,
-    taxRateBps: settings.tax_rate_bps,
-    tipCents: 0,
   });
 
   // ---- Delivery quote + zone gate ------------------------------------------
@@ -247,7 +293,7 @@ export async function POST(request: Request) {
     items: activeItems,
     discountCents: 0,
     taxRateBps: settings.tax_rate_bps,
-    tipCents: body.tipCents ?? 0,
+    tipCents,
   });
   totals.total_cents += deliveryFeeCents;
 
@@ -272,7 +318,7 @@ export async function POST(request: Request) {
     channel:
       body.fulfillmentType === "delivery" ? "online_delivery" : "online_pickup",
     currency: settings.currency,
-    items: body.items,
+    items: activeItems,
     discount_cents: 0,
     totals,
     notes: body.notes?.trim() ? body.notes.trim() : null,

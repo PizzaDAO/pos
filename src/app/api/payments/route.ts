@@ -10,25 +10,69 @@
  *
  * GET /api/payments?orderId= — list tenders + remaining balance for an order.
  *
+ * MONEY IS SERVER-DERIVED: the tenant, location and currency come from the
+ * STORED order (client values must match or the request is rejected), and the
+ * charge amount is checked against the order's remaining balance:
+ *   - `amountCents` omitted → charge the full remaining balance;
+ *   - staff (terminal) may take a partial tender (split payment), 1..balance;
+ *   - an anonymous storefront customer must pay exactly the balance.
+ * Tips are only accepted via the explicit `tipCents` field, bounded, and not at
+ * all when the order already carries an order-level tip (online orders).
+ *
+ * Auth: in-store orders require an operational (terminal) role of the order's
+ * tenant. Online orders may be paid by the anonymous customer (the order UUID
+ * is the capability) but ONLY via online rails — never cash/card-present.
+ * GET requires a terminal role of the order's tenant.
+ *
  * No env vars are required; with none, rails settle via the simulated path.
  */
 import { NextResponse } from "next/server";
-import { getPosDriver } from "@/lib/db";
+import { getPosDriver, type Order } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { takePayment, getOrderBalance } from "@/lib/payments/service";
-import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
+import {
+  enforceRateLimit,
+  isClientId,
+  isMoneyCents,
+  readJsonBody,
+} from "@/lib/security";
+import { getCurrentUser } from "@/lib/auth/session";
+import { canEnterSurface } from "@/lib/auth/roles";
+import {
+  requireOrderAccess,
+  requireTenantAccess,
+} from "@/lib/auth/tenant-guard";
+import { maxTipCents } from "@/lib/reprice";
 
 export const runtime = "nodejs";
+
+type Rail = PaymentRailKey | "cash";
+
+const ALL_RAILS: Rail[] = [
+  "cash",
+  "stripe_terminal",
+  "stripe_online",
+  "crypto_onchain_usdc",
+  "crypto_coinbase",
+];
+/** Rails a signed-out storefront customer may use (no cash / card-present). */
+const PUBLIC_RAILS: Rail[] = [
+  "stripe_online",
+  "crypto_onchain_usdc",
+  "crypto_coinbase",
+];
 
 interface TakePaymentBody {
   paymentId: string;
   orderId: string;
-  tenantId: string;
-  locationId: string;
-  rail: PaymentRailKey | "cash";
-  amountCents: number;
+  /** Optional; must match the stored order when present. */
+  tenantId?: string;
+  locationId?: string;
+  currency?: string;
+  rail: Rail;
+  /** Base amount applied to the balance; defaults to the full balance. */
+  amountCents?: number;
   tipCents?: number;
-  currency: string;
   cashTenderedCents?: number;
   metadata?: Record<string, string>;
 }
@@ -36,19 +80,39 @@ interface TakePaymentBody {
 function isValid(body: unknown): body is TakePaymentBody {
   if (!body || typeof body !== "object") return false;
   const b = body as Record<string, unknown>;
+  const optStr = (v: unknown) => v === undefined || typeof v === "string";
   return (
-    typeof b.paymentId === "string" &&
+    isClientId(b.paymentId) &&
     typeof b.orderId === "string" &&
-    typeof b.tenantId === "string" &&
-    typeof b.locationId === "string" &&
+    optStr(b.tenantId) &&
+    optStr(b.locationId) &&
+    optStr(b.currency) &&
     typeof b.rail === "string" &&
+    ALL_RAILS.includes(b.rail as Rail) &&
     // Amount + optional tip must be non-negative integer cents (reject NaN /
     // negative / fractional / absurd values before they reach the rail).
-    isMoneyCents(b.amountCents) &&
+    (b.amountCents === undefined || isMoneyCents(b.amountCents)) &&
     (b.tipCents === undefined || isMoneyCents(b.tipCents)) &&
     (b.cashTenderedCents === undefined || isMoneyCents(b.cashTenderedCents)) &&
-    typeof b.currency === "string"
+    (b.metadata === undefined ||
+      (typeof b.metadata === "object" && b.metadata !== null))
   );
+}
+
+/** Keep only a small set of short string metadata entries. */
+function cleanMetadata(
+  meta: Record<string, unknown> | undefined,
+): Record<string, string> | undefined {
+  if (!meta) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(meta).slice(0, 10)) {
+    if (typeof v === "string" && k.length <= 40) out[k] = v.slice(0, 200);
+  }
+  return out;
+}
+
+function reject(error: string, status: number) {
+  return NextResponse.json({ error }, { status });
 }
 
 export async function POST(request: Request) {
@@ -57,52 +121,115 @@ export async function POST(request: Request) {
   if (limited) return limited;
 
   const parsed = await readJsonBody(request);
-  if (!parsed.ok) {
-    return NextResponse.json(
-      { error: parsed.error },
-      { status: parsed.status },
-    );
-  }
+  if (!parsed.ok) return reject(parsed.error, parsed.status);
   const body = parsed.body;
-  if (!isValid(body)) {
+  if (!isValid(body)) return reject("Malformed payment payload.", 422);
+
+  const driver = getPosDriver();
+  let order: Order | null = null;
+  try {
+    order = await driver.getOrder(body.orderId);
+  } catch {
+    order = null;
+  }
+  if (!order) return reject("Order not found.", 404);
+
+  // Client-supplied context must match the stored order (never trusted).
+  if (
+    (body.tenantId !== undefined && body.tenantId !== order.tenant_id) ||
+    (body.locationId !== undefined && body.locationId !== order.location_id) ||
+    (body.currency !== undefined && body.currency !== order.currency)
+  ) {
+    return reject("Payment does not match the order.", 422);
+  }
+
+  // ---- Authorization --------------------------------------------------------
+  const user = await getCurrentUser();
+  const isStaff = Boolean(
+    user && canEnterSurface(user.memberships, "terminal", order.tenant_id),
+  );
+  if (order.channel === "in_store" || !PUBLIC_RAILS.includes(body.rail)) {
+    // In-store orders, and cash / card-present tenders on any order, need a
+    // signed-in operational role of the ORDER's tenant.
+    const auth = await requireTenantAccess(order.tenant_id, "terminal");
+    if (!auth.ok) return auth.res;
+  }
+
+  // ---- Idempotent replay ------------------------------------------------------
+  const prior = await driver.getPayment(body.paymentId).catch(() => null);
+  if (prior) {
+    if (prior.order_id !== order.id) {
+      return reject("Payment id already used for another order.", 409);
+    }
+    const balance = await getOrderBalance(order);
     return NextResponse.json(
-      { error: "Malformed payment payload." },
-      { status: 422 },
+      { payment: prior, balanceCents: balance, orderStatus: order.status },
+      { status: 201 },
     );
   }
 
-  const driver = getPosDriver();
-  const order = await driver.getOrder(body.orderId);
-  if (!order) {
-    return NextResponse.json({ error: "Order not found." }, { status: 404 });
+  // ---- Amount: derived from the stored order balance ------------------------
+  if (order.status === "voided" || order.status === "refunded") {
+    return reject("This order can no longer be paid.", 409);
+  }
+  const balance = await getOrderBalance(order);
+  if (balance <= 0) return reject("This order is already paid.", 409);
+  const amountCents = body.amountCents ?? balance;
+  if (amountCents <= 0 || amountCents > balance) {
+    return reject(
+      `Amount does not match the order balance (${balance}).`,
+      422,
+    );
+  }
+  if (!isStaff && amountCents !== balance) {
+    return reject(
+      `Amount does not match the order balance (${balance}).`,
+      422,
+    );
+  }
+
+  // ---- Tip: explicit, bounded, never double-counted --------------------------
+  const tipCents = body.tipCents ?? 0;
+  if (tipCents > 0 && order.totals.tip_cents > 0) {
+    return reject("This order already includes a tip.", 422);
+  }
+  if (tipCents > maxTipCents(order.totals.total_cents)) {
+    return reject("Tip amount is too large.", 422);
+  }
+  if (
+    body.rail === "cash" &&
+    body.cashTenderedCents !== undefined &&
+    body.cashTenderedCents < amountCents + tipCents
+  ) {
+    return reject("Cash tendered is less than the amount due.", 422);
   }
 
   // Resolve the connected account for card rails (simulated when no Stripe key).
   let connectAccountId: string | null = null;
   if (body.rail === "stripe_terminal" || body.rail === "stripe_online") {
-    const account = await driver.getConnectAccount(body.tenantId);
+    const account = await driver.getConnectAccount(order.tenant_id);
     connectAccountId = account?.account_id ?? null;
   }
 
   try {
     const payment = await takePayment({
       paymentId: body.paymentId,
-      orderId: body.orderId,
-      tenantId: body.tenantId,
-      locationId: body.locationId,
+      orderId: order.id,
+      tenantId: order.tenant_id,
+      locationId: order.location_id,
       rail: body.rail,
-      amountCents: body.amountCents,
-      tipCents: body.tipCents ?? 0,
-      currency: body.currency,
+      amountCents,
+      tipCents,
+      currency: order.currency,
       connectAccountId,
       cashTenderedCents: body.cashTenderedCents,
-      metadata: body.metadata,
+      metadata: cleanMetadata(body.metadata),
     });
 
-    const refreshed = await driver.getOrder(body.orderId);
-    const balance = refreshed ? await getOrderBalance(refreshed) : 0;
+    const refreshed = await driver.getOrder(order.id);
+    const remaining = refreshed ? await getOrderBalance(refreshed) : 0;
     return NextResponse.json(
-      { payment, balanceCents: balance, orderStatus: refreshed?.status },
+      { payment, balanceCents: remaining, orderStatus: refreshed?.status },
       { status: 201 },
     );
   } catch (err) {
@@ -122,11 +249,10 @@ export async function GET(request: Request) {
       { status: 400 },
     );
   }
+  const auth = await requireOrderAccess(orderId, "terminal");
+  if (!auth.ok) return auth.res;
+  const { order } = auth;
   const driver = getPosDriver();
-  const order = await driver.getOrder(orderId);
-  if (!order) {
-    return NextResponse.json({ error: "Order not found." }, { status: 404 });
-  }
   const payments = await driver.listPaymentsForOrder(orderId);
   const balance = await getOrderBalance(order);
   return NextResponse.json({
