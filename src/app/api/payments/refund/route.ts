@@ -10,7 +10,7 @@ import { NextResponse } from "next/server";
 import { refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import {
   enforceRateLimit,
   isMoneyCents,
@@ -70,13 +70,39 @@ export async function POST(request: Request) {
   if (!existingPayment) {
     return NextResponse.json({ error: "Payment not found." }, { status: 404 });
   }
-  const auth = await requireTenantMember(existingPayment.tenant_id);
+  // Money leaves the business: owner|manager|cashier only (not kitchen).
+  const auth = await requireTenantAccess(existingPayment.tenant_id, [
+    "owner",
+    "manager",
+    "cashier",
+  ]);
   if (!auth.ok) return auth.res;
+
+  // Never refund more than what's left on the tender.
+  const refundable =
+    existingPayment.amount_cents +
+    existingPayment.tip_cents -
+    existingPayment.refunded_cents;
+  if (refundable <= 0) {
+    return NextResponse.json(
+      { error: "This payment has already been fully refunded." },
+      { status: 409 },
+    );
+  }
+  if (
+    b.amountCents !== undefined &&
+    (b.amountCents <= 0 || b.amountCents > refundable)
+  ) {
+    return NextResponse.json(
+      { error: `Refund must be between 1 and ${refundable} cents.` },
+      { status: 422 },
+    );
+  }
 
   try {
     const payment = await refundPayment({
       paymentId: b.paymentId,
-      amountCents: b.amountCents,
+      amountCents: b.amountCents ?? refundable,
       reason: b.reason,
     });
     if (!payment) {

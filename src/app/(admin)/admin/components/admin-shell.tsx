@@ -291,7 +291,7 @@ export function AdminShell({
         {tab === "payments" && <ConnectOnboarding tenantId={tenantId} />}
         {tab === "delivery" &&
           (deliveryAllowed ? (
-            <DeliveryDispatch />
+            <DeliveryDispatch tenantId={tenantId} locationId={locationId} />
           ) : (
             <FeatureLocked
               feature="Delivery"

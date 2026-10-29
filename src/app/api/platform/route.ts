@@ -16,7 +16,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import type { AuditAction } from "@/lib/db";
-import { getCurrentUser } from "@/lib/auth/session";
+import { requirePlatformAdminApi } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
 
@@ -27,9 +27,9 @@ export const runtime = "nodejs";
  * is not a platform admin, so every sensitive action below stays gated.
  */
 async function requirePlatformAdmin(): Promise<{ id: string; email: string } | null> {
-  const user = await getCurrentUser({ simulatedAs: "platform" });
-  if (!user || !user.isPlatformAdmin) return null;
-  return { id: user.id, email: user.email };
+  const auth = await requirePlatformAdminApi();
+  if (!auth.ok) return null;
+  return { id: auth.user.id, email: auth.user.email };
 }
 
 export async function GET(request: Request) {
@@ -90,6 +90,14 @@ export async function POST(request: Request) {
     body = (await request.json()) as PlatformBody;
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
+  if (
+    !body ||
+    !["impersonate_start", "impersonate_end", "suspend", "reactivate"].includes(
+      body.action,
+    )
+  ) {
+    return NextResponse.json({ error: "Unknown action." }, { status: 422 });
   }
   if (!body.tenantId) {
     return NextResponse.json({ error: "tenantId is required." }, { status: 422 });

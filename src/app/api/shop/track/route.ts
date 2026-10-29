@@ -8,6 +8,10 @@
  * websocket. Refreshing the delivery here also pulls provider tracking (simulated
  * driver/ETA for in-house, provider tracking ref for DoorDash).
  *
+ * PUBLIC: the unguessable order UUID is the customer's capability. Only ONLINE
+ * orders are trackable here (in-store orders 404) so terminal orders are never
+ * exposed through the public storefront.
+ *
  * No env vars required.
  */
 import { NextResponse } from "next/server";
@@ -24,8 +28,8 @@ export async function GET(request: Request) {
   }
 
   const driver = getPosDriver();
-  const order = await driver.getOrder(orderId);
-  if (!order) {
+  const order = await driver.getOrder(orderId).catch(() => null);
+  if (!order || order.channel === "in_store") {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
 

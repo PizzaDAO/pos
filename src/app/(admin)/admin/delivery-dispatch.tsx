@@ -10,11 +10,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Truck } from "lucide-react";
-import {
-  DEMO_LOCATION_DOWNTOWN_ID,
-  DEMO_TENANT_ID,
-  type DeliveryRecord,
-} from "@/lib/db";
+import type { DeliveryRecord } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 
@@ -24,20 +20,27 @@ interface Row {
   orderStatus: string | null;
 }
 
-export function DeliveryDispatch() {
+export function DeliveryDispatch({
+  tenantId,
+  locationId,
+}: {
+  tenantId: string;
+  locationId: string;
+}) {
   const [rows, setRows] = useState<Row[]>([]);
   const [draftDriver, setDraftDriver] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!tenantId || !locationId) return;
     const res = await fetch(
-      `/api/delivery/dispatch?tenantId=${DEMO_TENANT_ID}&locationId=${DEMO_LOCATION_DOWNTOWN_ID}`,
+      `/api/delivery/dispatch?tenantId=${encodeURIComponent(tenantId)}&locationId=${encodeURIComponent(locationId)}`,
       { cache: "no-store" },
     );
     if (!res.ok) return;
     const data = (await res.json()) as { deliveries: Row[] };
     setRows(data.deliveries);
-  }, []);
+  }, [tenantId, locationId]);
 
   useEffect(() => {
     void load();

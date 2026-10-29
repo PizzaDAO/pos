@@ -11,6 +11,9 @@
  * (default, incl. preview) a simulated `acct_sim_…` account is returned that
  * reports `connected`, so card rails + the admin UI work end-to-end. Status is
  * persisted via the DB abstraction (mock driver).
+ *
+ * Auth: owner|manager session of the tenant, or the signup wizard's onboarding
+ * token for that tenant while it is still onboarding.
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
@@ -20,20 +23,19 @@ import {
   fetchConnectStatus,
   isSimulated,
 } from "@/lib/payments/connect";
-import { requireTenantRole } from "@/lib/auth/api";
+import { requireTenantAdminOrOnboarding } from "@/lib/auth/onboarding-token";
 import { recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  if (!tenantId) {
-    return NextResponse.json(
-      { error: "tenantId is required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAdminOrOnboarding(
+    request,
+    searchParams.get("tenantId"),
+  );
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
   const driver = getPosDriver();
   let account = await driver.getConnectAccount(tenantId);
 
@@ -64,10 +66,23 @@ export async function POST(request: Request) {
     );
   }
 
-  // Only an owner|manager of the tenant may start/modify Connect onboarding —
-  // this controls where the tenant's card revenue settles.
-  const auth = await requireTenantRole(body.tenantId, ["owner", "manager"]);
+  // Only an owner|manager of the tenant (or its own signup wizard) may
+  // start/modify Connect onboarding — this controls where card revenue settles.
+  const auth = await requireTenantAdminOrOnboarding(request, body.tenantId);
   if (!auth.ok) return auth.res;
+
+  // Redirect targets must stay on this origin (no open redirect via Stripe).
+  const origin = new URL(request.url).origin;
+  const sameOrigin = (u: string | undefined) => {
+    if (!u) return undefined;
+    try {
+      return new URL(u, origin).origin === origin
+        ? new URL(u, origin).toString()
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
 
   const driver = getPosDriver();
   try {
@@ -78,9 +93,10 @@ export async function POST(request: Request) {
       account = await driver.upsertConnectAccount(account);
     }
 
-    const origin = new URL(request.url).origin;
-    const returnUrl = body.returnUrl ?? `${origin}/admin?connect=return`;
-    const refreshUrl = body.refreshUrl ?? `${origin}/admin?connect=refresh`;
+    const returnUrl =
+      sameOrigin(body.returnUrl) ?? `${origin}/admin?connect=return`;
+    const refreshUrl =
+      sameOrigin(body.refreshUrl) ?? `${origin}/admin?connect=refresh`;
 
     // Simulated mode: immediately mark connected on "return".
     if (isSimulated()) {
@@ -102,7 +118,10 @@ export async function POST(request: Request) {
 
     // Audit the Connect change (tenant-scoped) — a money-routing-sensitive op.
     await recordAudit({
-      actor: { id: auth.user.id, label: auth.user.email },
+      actor: {
+        id: auth.user?.id ?? "system",
+        label: auth.user?.email ?? "self-serve onboarding",
+      },
       action: "connect_change",
       tenantId: body.tenantId,
       detail: `Stripe Connect onboarding ${isSimulated() ? "(simulated) " : ""}started/refreshed; account ${account.account_id}, status ${account.status}.`,

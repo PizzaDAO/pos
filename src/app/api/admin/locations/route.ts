@@ -8,20 +8,21 @@
  *      action" proof point.
  *
  * All data through the DB abstraction (mock driver); no env vars.
+ *
+ * Auth: owner|manager of the tenant (session-derived).
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
-import { requireTenantRole } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  if (!tenantId) {
-    return NextResponse.json({ error: "tenantId is required." }, { status: 400 });
-  }
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin");
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
   const driver = getPosDriver();
   const [locations, subscription] = await Promise.all([
     driver.listLocations(tenantId),
@@ -56,7 +57,7 @@ export async function POST(request: Request) {
     );
   }
   // Only an owner|manager of this tenant may add a location.
-  const auth = await requireTenantRole(body.tenantId, ["owner", "manager"]);
+  const auth = await requireTenantAccess(body.tenantId, "admin");
   if (!auth.ok) return auth.res;
 
   const driver = getPosDriver();

@@ -41,10 +41,22 @@ const STEP_LABELS: { id: OnboardingStep; label: string }[] = [
   { id: "go_live", label: "Go live" },
 ];
 
+/**
+ * Capability token minted by `create_business` and bound to the new tenant.
+ * The public wizard has no login yet, so the tenant-scoped steps (location,
+ * Connect, menu, plan, go-live) authenticate with this instead of a bare
+ * tenantId. Kept in memory only; it stops working once the tenant goes live.
+ */
+let onboardingToken: string | null = null;
+
+function authHeaders(): Record<string, string> {
+  return onboardingToken ? { "x-onboarding-token": onboardingToken } : {};
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   const data = (await res.json()) as T & { error?: string };
@@ -74,7 +86,8 @@ export function SignupWizard() {
 
   const loadPlans = useCallback(async (tenantId: string | null) => {
     const qs = tenantId ? `?tenantId=${tenantId}` : "";
-    const res = await fetch(`/api/billing${qs}`);
+    const res = await fetch(`/api/billing${qs}`, { headers: authHeaders() });
+    if (!res.ok) return;
     const data = (await res.json()) as {
       plans: Plan[];
       subscription: Subscription | null;
@@ -98,11 +111,15 @@ export function SignupWizard() {
     setBusy(true);
     setError(null);
     try {
-      const data = await postJson<{ tenant: Tenant }>("/api/signup", {
+      const data = await postJson<{
+        tenant: Tenant;
+        onboardingToken?: string;
+      }>("/api/signup", {
         action: "create_business",
         businessName,
         ownerEmail,
       });
+      onboardingToken = data.onboardingToken ?? null;
       setTenant(data.tenant);
       markComplete("business", "location");
       void loadPlans(data.tenant.id);

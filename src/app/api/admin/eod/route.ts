@@ -7,10 +7,12 @@
  *      Re-closing the same (location, date) returns the frozen snapshot.
  *
  * `date` is "yyyy-mm-dd" (location-tz business date). No env vars; mock driver.
+ *
+ * Auth: owner|manager of the tenant; the location must belong to it.
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantRole } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
 
@@ -20,15 +22,14 @@ function todayIso(): string {
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
   const date = searchParams.get("date") ?? todayIso();
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+  const locationId = auth.locationId as string;
   const driver = getPosDriver();
   const close = await driver.getBusinessDayClose(tenantId, locationId, date);
   if (close) return NextResponse.json({ close, closed: true });
@@ -55,7 +56,10 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
-  const auth = await requireTenantRole(body.tenantId, ["owner", "manager"]);
+  const auth = await requireTenantAccess(body.tenantId, "admin", {
+    locationId: body.locationId,
+    requireLocation: true,
+  });
   if (!auth.ok) return auth.res;
   const date = body.date ?? todayIso();
   const close = await getPosDriver().closeBusinessDay(

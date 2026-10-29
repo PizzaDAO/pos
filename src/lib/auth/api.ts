@@ -1,17 +1,17 @@
 /**
- * Route-handler authorization helpers — the API-layer counterpart to the page
- * guards. Tenant-scoped API routes accept a `tenantId` from the client; these
- * helpers ensure the SESSION actually authorizes that tenant + role, so a
- * logged-in user can't act on a tenant they don't belong to (defense in depth on
- * top of RLS, and the authoritative check in simulated/service-role mode).
+ * Route-handler authorization helpers (legacy names). Thin wrappers over the
+ * single shared guard in `./tenant-guard` so every tenant-scoped API route
+ * flows through ONE implementation. New code should call
+ * `requireTenantAccess` directly.
  *
- * Both return an error `NextResponse` (caller returns it) or null on success.
- * In simulated mode the session is the seeded demo owner, so the demo tenant
- * passes and the app keeps working with zero env.
+ * Both return `{ ok: true, user }` or `{ ok: false, res }` (a 401/403 response
+ * the caller returns as-is). In simulated mode the session is the seeded demo
+ * owner, so the demo tenant passes and the app keeps working with zero env.
  */
 import { NextResponse } from "next/server";
 import type { MembershipRole } from "@/lib/db";
-import { getCurrentUser, type SessionUser } from "./session";
+import type { SessionUser } from "./session";
+import { requireTenantAccess } from "./tenant-guard";
 
 export interface AuthorizedTenant {
   user: SessionUser;
@@ -26,23 +26,15 @@ export async function requireTenantRole(
   tenantId: string,
   roles: MembershipRole[],
 ): Promise<{ ok: true; user: SessionUser } | { ok: false; res: NextResponse }> {
-  const user = await getCurrentUser();
-  if (!user) {
+  if (!tenantId) {
     return {
       ok: false,
-      res: NextResponse.json({ error: "Not signed in." }, { status: 401 }),
+      res: NextResponse.json({ error: "tenantId is required." }, { status: 400 }),
     };
   }
-  const role = user.memberships.find((m) => m.tenant_id === tenantId)?.role;
-  if (!role || !roles.includes(role)) {
-    return {
-      ok: false,
-      res: NextResponse.json({ error: "Not authorized for this tenant." }, {
-        status: 403,
-      }),
-    };
-  }
-  return { ok: true, user };
+  const auth = await requireTenantAccess(tenantId, roles);
+  if (!auth.ok) return auth;
+  return { ok: true, user: auth.user };
 }
 
 /** Tenant-member (any role) check for a tenant-scoped read/write. */

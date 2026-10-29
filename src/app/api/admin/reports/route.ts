@@ -9,18 +9,26 @@
  * Returns a {@link SalesReport}: sliced by day/item/category/channel/location,
  * payment mix (cash/card/crypto), tips, fees, and void/refund tallies. Derived
  * from orders/payments via the DB abstraction. No env vars; mock driver.
+ *
+ * Auth: owner|manager of the tenant. tenantId defaults to the caller's single
+ * authorized tenant (never to a hardcoded demo tenant); locationId must belong
+ * to it.
  */
 import { NextResponse } from "next/server";
-import { DEMO_TENANT_ID, getPosDriver } from "@/lib/db";
+import { getPosDriver } from "@/lib/db";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId") ?? DEMO_TENANT_ID;
   const locationParam = searchParams.get("locationId");
-  const locationId =
-    !locationParam || locationParam === "all" ? null : locationParam;
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+    locationId:
+      !locationParam || locationParam === "all" ? null : locationParam,
+  });
+  if (!auth.ok) return auth.res;
+  const { tenantId, locationId } = auth;
   const from = searchParams.get("from");
   const to = searchParams.get("to");
 

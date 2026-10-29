@@ -12,7 +12,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
 import {
   captureError,
@@ -66,7 +66,12 @@ export async function POST(request: Request) {
   // In-store terminal orders are placed by a signed-in device user who must be a
   // member of the order's tenant. (Customer/online orders go through the public
   // /api/shop/orders route instead.)
-  const auth = await requireTenantMember(body.tenant_id);
+  // The location must belong to that tenant (no writing into another tenant's
+  // location under your own tenant id).
+  const auth = await requireTenantAccess(body.tenant_id, "terminal", {
+    locationId: body.location_id,
+    requireLocation: true,
+  });
   if (!auth.ok) return auth.res;
 
   try {
@@ -96,15 +101,15 @@ export async function POST(request: Request) {
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "terminal", {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
+  if (!auth.ok) return auth.res;
   const driver = getPosDriver();
-  const orders = await driver.listOrders(tenantId, locationId);
+  const orders = await driver.listOrders(
+    auth.tenantId,
+    auth.locationId as string,
+  );
   return NextResponse.json({ orders });
 }
