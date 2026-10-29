@@ -32,8 +32,11 @@ import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
   BalanceExceededError,
   getOrderBalance,
+  railIsSimulated,
   takePayment,
 } from "@/lib/payments/service";
+import { simulatedRailsAllowed } from "@/lib/payments/simulation";
+import { isSupabaseAuthConfigured } from "@/lib/auth/supabase-server";
 import {
   enforceRateLimit,
   isClientId,
@@ -130,6 +133,21 @@ export async function POST(request: Request) {
   if (!isValid(body)) return reject("Malformed payment payload.", 422);
 
   const driver = getPosDriver();
+
+  // A rail with no live keys runs SIMULATED (settles without moving money).
+  // Never allow that against the real driver / real auth unless explicitly
+  // opted in — otherwise an unkeyed rail would mark real orders paid.
+  if (
+    railIsSimulated(body.rail) &&
+    !simulatedRailsAllowed({
+      driverName: driver.name,
+      realAuth: isSupabaseAuthConfigured(),
+      allowFlag: process.env.ALLOW_SIMULATED_PAYMENTS,
+    })
+  ) {
+    return reject("This payment method is not available.", 503);
+  }
+
   let order: Order | null = null;
   try {
     order = await driver.getOrder(body.orderId);
