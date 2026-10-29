@@ -5,10 +5,10 @@ Other modules never read POS tables; they use the `/v1` contract and consume eve
 
 ## Dependency
 
-`@openpizza/core` is a `file:` dependency with `install-links=true` (`.npmrc`).
-
-> TODO: Vercel/CI cannot resolve `file:/Users/.../core/packages/core`. Publish the
-> package to npm (or vendor a tarball) and switch to `~0.1` before deploying.
+`@openpizza/core` is vendored as `vendor/openpizza-core-<ver>.tgz` (`"file:vendor/..."` in
+package.json; the lockfile has no path outside the repo). Update with
+`npm run core:vendor -- <path to core/packages/core>` (re-packs, re-points, reinstalls).
+Replace with a semver range once the package is on npm.
 
 ## `/api/v1/*` (src/lib/core/v1.ts)
 
@@ -29,15 +29,17 @@ fresh quote in `details.quote`).
 ### Auth
 
 `Authorization: Bearer <hub JWT>`, verified against `OPENPIZZA_HUB_JWKS_URL`
-(ES256/RS256/EdDSA, WebCrypto, keys cached 10 min, refetched on unknown `kid`).
-Required: `aud = openpizza:api`, unexpired; optional `OPENPIZZA_HUB_ISSUER`.
+(ES256/RS256/EdDSA, WebCrypto, keys cached 10 min, refetched on unknown `kid`, with
+exponential backoff and stale-key fallback when the hub is down).
+Required: `aud = openpizza:api`, unexpired, and **`OPENPIZZA_HUB_ISSUER` whenever the JWKS URL
+is set** (otherwise every request is rejected).
 
 * **Tenant comes from the `tid` claim only.** No tenant parameter is read; ids that
   belong to another tenant answer `404`.
 * `lids` restricts locations (lists are filtered, path locations answer `403`).
 * Scopes are checked per route (`orders:read`, `quotes:write`, wildcards `*`,
   `orders:*`, `*:read`, `menu:write` implies `menu.availability:write`).
-* **Simulated mode** (no Supabase config and no JWKS URL): the dev token
+* **Simulated mode** (mock driver active, no JWKS URL, `VERCEL_ENV !== production`): the dev token
   `dev-openpizza-token` acts as the demo tenant with every scope. Setting a JWKS URL
   disables it.
 
@@ -55,6 +57,21 @@ Required: `aud = openpizza:api`, unexpired; optional `OPENPIZZA_HUB_ISSUER`.
   adjustment labels/sources sent on create are applied to pricing but not stored.
 * Not supported on create yet: **delivery** fulfillment and `tax_exempt` (both 501),
   `fire_at`. `dine_in` is stored as pickup.
+
+### Write guards
+
+Parity with the security-branch routes: tenant must be `active` (else 403 on every write);
+`adjustments` need the `orders:discount` scope; tips are capped (`maxTipCents`); anything
+but a counter order is plan-gated (`canUseOnlineOrdering`); pickup/delivery enabled,
+accepting orders, scheduling window and store hours come from `priceCart`. A **terminal**
+principal (scope `orders:place_direct`, covered by `*`/`orders:*`) may place counter
+(`in_store`) orders directly and skip hours; every other principal gets **held** orders
+even for `pay_at_counter`, and `release` of an `awaiting_payment` hold needs full payment
+coverage unless the token has `orders:release_unpaid`. Cancel refuses while any tender is
+pending/authorized/requires_action. Release/cancel are compare-and-set on `status`
+(`transitionOrderStatus`), inventory depletes only for the caller that won the transition.
+Replays that hit an id outside the token's tenant/locations answer the same neutral
+`IDEMPOTENCY_CONFLICT`. Bodies are stream-limited to 256 KB (413); bad percent-escapes are 400.
 
 ### Order writes
 
@@ -92,6 +109,16 @@ cron  GET|POST /api/core/outbox  -> claim (SKIP LOCKED) -> hydrate contract payl
 * Retry schedule is the package's `RETRY_SCHEDULE_SECONDS` (10s, 1m, 5m, 30m, 2h,
   6h, 12h, 24h) then `dead`. Rows whose subject was deleted are dead-lettered
   (`subject_gone`).
+* **Enqueue switch:** triggers write rows only while `core_config.outbox_enabled = 'true'`;
+  the cron sets it from the hub env (`core_set_outbox_enabled`), so an unconfigured POS never
+  accumulates a backlog. Run the cron once after configuring the hub, before go-live.
+* **Claim counts the attempt**, hydration is bounded (15 s) and a run has a 45 s budget, so a
+  poison row ends dead-lettered. Retention (`core_outbox_prune`, run by the cron): delivered
+  rows 7 d, dead 30 d, stale pending 3 d; snapshots are ids only (no PII) and are nulled once
+  delivered. `menu.updated` coalesces into an unclaimed pending row and keeps all item ids.
+* The per-tenant `sequence` upsert holds a row lock until the transaction ends; triggers emit
+  last in their statement, and writers should keep transactions short.
+* The mock store is never signed or sent (`deliverOutbox` returns `skipped: "mock_store"`).
 * Schedule `/api/core/outbox` every minute (Vercel Cron on Pro, or an external
   scheduler) with `Authorization: Bearer $CRON_SECRET`. Not in `vercel.json` because
   Hobby only allows daily crons. With the hub env unset it is a no-op.

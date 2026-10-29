@@ -10,6 +10,7 @@ function req(token?: string): Request {
 }
 
 const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+const ISS = "https://hub.test";
 
 beforeEach(() => resetJwksCache());
 
@@ -38,7 +39,7 @@ describe("authenticateV1 (hub JWKS)", () => {
       claimsFor(tid, "orders:read menu:read", { lids: [DEMO_TENANT_ID] }, NOW),
     );
     const p = await authenticateV1(req(token), {
-      env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+      env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl, OPENPIZZA_HUB_ISSUER: ISS },
       fetch: hub.fetch,
       now: () => NOW,
     });
@@ -51,7 +52,7 @@ describe("authenticateV1 (hub JWKS)", () => {
   it("caches the JWKS across requests", async () => {
     const hub = await createTestHub();
     const deps = {
-      env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+      env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl, OPENPIZZA_HUB_ISSUER: ISS },
       fetch: hub.fetch,
       now: () => NOW,
     };
@@ -65,7 +66,7 @@ describe("authenticateV1 (hub JWKS)", () => {
     const hub = await createTestHub();
     await expect(
       authenticateV1(req(DEV_TOKEN), {
-        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl, OPENPIZZA_HUB_ISSUER: ISS },
         fetch: hub.fetch,
         now: () => NOW,
       }),
@@ -82,7 +83,7 @@ describe("authenticateV1 (hub JWKS)", () => {
     const token = await hub.sign(claimsFor(DEMO_TENANT_ID, "*", extra, NOW));
     await expect(
       authenticateV1(req(token), {
-        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl, OPENPIZZA_HUB_ISSUER: ISS },
         fetch: hub.fetch,
         now: () => NOW,
       }),
@@ -94,7 +95,7 @@ describe("authenticateV1 (hub JWKS)", () => {
     const token = await hub.rogue(claimsFor(DEMO_TENANT_ID, "*", {}, NOW));
     await expect(
       authenticateV1(req(token), {
-        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl, OPENPIZZA_HUB_ISSUER: ISS },
         fetch: hub.fetch,
         now: () => NOW,
       }),
@@ -110,7 +111,7 @@ describe("authenticateV1 (hub JWKS)", () => {
     ).toString("base64url");
     await expect(
       authenticateV1(req(`${h}.${forged}.${s}`), {
-        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl, OPENPIZZA_HUB_ISSUER: ISS },
         fetch: hub.fetch,
         now: () => NOW,
       }),
@@ -130,5 +131,52 @@ describe("authenticateV1 (hub JWKS)", () => {
         now: () => NOW,
       }),
     ).rejects.toMatchObject({ code: "UNAUTHENTICATED" });
+  });
+
+  it("fails closed when a JWKS is set without a pinned issuer", async () => {
+    const hub = await createTestHub();
+    const token = await hub.sign(claimsFor(DEMO_TENANT_ID, "*", {}, NOW));
+    await expect(
+      authenticateV1(req(token), {
+        env: { OPENPIZZA_HUB_JWKS_URL: hub.jwksUrl },
+        fetch: hub.fetch,
+        now: () => NOW,
+      }),
+    ).rejects.toMatchObject({ code: "UNAUTHENTICATED" });
+  });
+});
+
+describe("JWKS fetch failures", () => {
+  const env = { OPENPIZZA_HUB_JWKS_URL: "https://hub.test/jwks", OPENPIZZA_HUB_ISSUER: ISS };
+
+  it("backs off after a failure instead of refetching on every request", async () => {
+    let calls = 0;
+    const down = (async () => {
+      calls += 1;
+      return new Response("oops", { status: 503 });
+    }) as unknown as typeof fetch;
+    let now = NOW;
+    const hub = await createTestHub();
+    const token = await hub.sign(claimsFor(DEMO_TENANT_ID, "*", {}, NOW));
+    for (let i = 0; i < 5; i++) {
+      await expect(
+        authenticateV1(req(token), { env, fetch: down, now: () => now }),
+      ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    }
+    expect(calls).toBe(1);
+    now += 6_000; // past the first backoff step
+    await expect(
+      authenticateV1(req(token), { env, fetch: down, now: () => now }),
+    ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    expect(calls).toBe(2);
+  });
+
+  it("answers a Problem (not a 500) for a non-JSON JWKS", async () => {
+    const html = (async () => new Response("<html>", { status: 200 })) as unknown as typeof fetch;
+    const hub = await createTestHub();
+    const token = await hub.sign(claimsFor(DEMO_TENANT_ID, "*", {}, NOW));
+    await expect(
+      authenticateV1(req(token), { env, fetch: html, now: () => NOW }),
+    ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
   });
 });

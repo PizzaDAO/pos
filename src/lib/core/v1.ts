@@ -26,6 +26,7 @@ import {
   QuoteRequestSchema,
   SalesSummaryQuerySchema,
   V1_ROUTES,
+  hasScopes,
   isProblemError,
   priceCart,
   problem,
@@ -47,12 +48,12 @@ import {
   type OrderFulfillment,
 } from "@/lib/db";
 import { priceOrder } from "@/lib/order-pricing";
-import { RepriceError } from "@/lib/reprice";
+import { RepriceError, maxTipCents } from "@/lib/reprice";
 import { getPlan } from "@/lib/saas/plans";
-import { resolveEntitlements } from "@/lib/saas/entitlements";
+import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlements";
 import { authenticateV1, type AuthDeps } from "./auth";
 import {
-  customerStats,
+  NO_STATS,
   loadCustomer,
   loadDelivery,
   loadDrawerSessions,
@@ -60,6 +61,7 @@ import {
   loadLocations,
   loadMenu,
   loadOrder,
+  loadOrdersPage,
   loadPayment,
   loadStaffList,
   loadTenantOrders,
@@ -111,12 +113,32 @@ function zodProblem(err: ZodError, detail = "Request is invalid."): ProblemError
   });
 }
 
+const MAX_BODY_BYTES = 256_000;
+
+/** Read the JSON body, aborting as soon as the byte budget is exceeded. */
 async function readBody(req: Request): Promise<unknown> {
-  const text = await req.text();
-  if (!text.trim()) return {};
-  if (text.length > 256_000) {
-    throw ProblemError.of("VALIDATION_FAILED", { detail: "Body too large." });
+  const declared = Number(req.headers.get("content-length") ?? 0);
+  if (declared > MAX_BODY_BYTES) {
+    throw ProblemError.of("VALIDATION_FAILED", { detail: "Body too large.", status: 413 });
   }
+  let text = "";
+  if (req.body) {
+    const reader = req.body.getReader();
+    const decoder = new TextDecoder();
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw ProblemError.of("VALIDATION_FAILED", { detail: "Body too large.", status: 413 });
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  }
+  if (!text.trim()) return {};
   try {
     return JSON.parse(text);
   } catch {
@@ -198,6 +220,23 @@ function allowedLocation(p: Principal, locationId: string): boolean {
 
 function scopedLocationIds(p: Principal): string[] | null {
   return p.location_ids;
+}
+
+/** Suspended / cancelled tenants may not write through /v1. */
+async function requireActiveTenant(ctx: Ctx): Promise<void> {
+  const tenant = await ctx.driver.getTenant(ctx.principal.tenant_id);
+  if (!tenant || tenant.status !== "active") {
+    throw ProblemError.of("FORBIDDEN", { detail: "This tenant is not active; writes are disabled." });
+  }
+}
+
+/**
+ * A "terminal" principal may take counter orders directly and bypass nothing
+ * else. Everyone else (agents, kiosks, guests, integrations) places held orders
+ * and is subject to plan gating and store hours.
+ */
+function isTerminal(p: Principal): boolean {
+  return hasScopes(p.scopes, "orders:place_direct");
 }
 
 async function ownedLocation(ctx: Ctx, locationId: string): Promise<LocationBundle> {
@@ -318,6 +357,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
   },
 
   "menu.setAvailability": async (ctx) => {
+    await requireActiveTenant(ctx);
     const bundle = await ownedLocation(ctx, ctx.params.location_id!);
     const parsed = AvailabilityUpdateSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
@@ -388,17 +428,35 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     const f = parsed.data;
     if (f.location_id) await ownedLocation(ctx, f.location_id);
     const ids = f.location_id ? [f.location_id] : scopedLocationIds(ctx.principal);
-    let orders = await loadTenantOrders(ctx.principal.tenant_id, {
+    const limit = f.limit ?? DEFAULT_LIMIT;
+    const cursor = f.cursor ? decodeCursor(f.cursor) : null;
+    // business_date is location-local: pad the UTC created_at range by a day.
+    const padDay = (d: string, days: number) =>
+      new Date(new Date(`${d}T00:00:00Z`).getTime() + days * 86_400_000).toISOString();
+    const rows = await loadOrdersPage(ctx.principal.tenant_id, {
       locationIds: ids,
+      limit,
+      after: cursor ? { created_at: cursor[0], id: cursor[1] } : undefined,
+      createdFrom: f.created_since ?? (f.business_date_from ? padDay(f.business_date_from, -1) : undefined),
+      createdTo: f.business_date_to ? padDay(f.business_date_to, 2) : undefined,
+      updatedSince: f.updated_since,
       driver: ctx.driver,
+      filter: (o) =>
+        (!f.fulfillment_status || f.fulfillment_status.includes(o.fulfillment_status)) &&
+        (!f.payment_status || f.payment_status.includes(o.payment_status)) &&
+        (!f.channel || f.channel.includes(o.channel)) &&
+        (!f.customer_id || o.customer_id === f.customer_id) &&
+        (!f.business_date_from || o.business_date >= f.business_date_from) &&
+        (!f.business_date_to || o.business_date <= f.business_date_to),
     });
-    if (f.fulfillment_status) orders = orders.filter((o) => f.fulfillment_status!.includes(o.fulfillment_status));
-    if (f.payment_status) orders = orders.filter((o) => f.payment_status!.includes(o.payment_status));
-    if (f.channel) orders = orders.filter((o) => f.channel!.includes(o.channel));
-    if (f.customer_id) orders = orders.filter((o) => o.customer_id === f.customer_id);
-    if (f.business_date_from) orders = orders.filter((o) => o.business_date >= f.business_date_from!);
-    if (f.business_date_to) orders = orders.filter((o) => o.business_date <= f.business_date_to!);
-    return { body: pageItems(orders, q) };
+    const data = rows.slice(0, limit);
+    const last = data[data.length - 1];
+    return {
+      body: {
+        data,
+        next_cursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
+      },
+    };
   },
 
   "orders.get": async (ctx) => {
@@ -410,6 +468,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
   "orders.create": createOrder,
 
   "orders.cancel": async (ctx) => {
+    await requireActiveTenant(ctx);
     const order = await ownedOrder(ctx, ctx.params.order_id!);
     const parsed = OrderCancelInputSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
@@ -422,6 +481,12 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
       });
     }
     const payments = await ctx.driver.listPaymentsForOrder(order.id);
+    // In-flight money can still capture after we void: refuse until it settles.
+    if (payments.some((p) => ["pending", "authorized", "requires_action"].includes(p.status))) {
+      throw ProblemError.of("CANCEL_NOT_ALLOWED", {
+        detail: "Order has payments in flight; wait for them to settle or cancel them first.",
+      });
+    }
     const live = payments.filter(
       (p) => p.status === "captured" && p.amount_cents + p.tip_cents > p.refunded_cents,
     );
@@ -430,11 +495,16 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         detail: "Order has captured payments; refund them first.",
       });
     }
-    await ctx.driver.updateOrderStatus(order.id, "voided");
+    // Compare-and-set: a concurrent release/payment wins and we report it.
+    const res = await ctx.driver.transitionOrderStatus(order.id, [order.status], "voided");
+    if (!res.ok && res.reason === "conflict" && res.order.status !== "voided") {
+      throw ProblemError.of("CONFLICT", { detail: "Order changed while canceling; reload and retry." });
+    }
     return { body: await mapOrderFor(ctx, order.id) };
   },
 
   "orders.release": async (ctx) => {
+    await requireActiveTenant(ctx);
     const order = await ownedOrder(ctx, ctx.params.order_id!);
     if (order.status !== "draft") {
       if (order.status === "voided") {
@@ -445,12 +515,32 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     }
     const expires = order.hold?.expires_at;
     if (expires && new Date(expires).getTime() <= ctx.now().getTime()) {
-      await ctx.driver.updateOrderStatus(order.id, "voided");
+      await ctx.driver.transitionOrderStatus(order.id, ["draft"], "voided");
       throw ProblemError.of("INVALID_TRANSITION", {
         detail: "The hold expired and the order was canceled.",
       });
     }
-    await ctx.driver.updateOrderStatus(order.id, "placed");
+    // An awaiting_payment hold is only released once fully paid, unless the
+    // caller holds the explicit scope (e.g. a terminal taking cash).
+    if (
+      order.hold?.reason === "awaiting_payment" &&
+      !hasScopes(ctx.principal.scopes, "orders:release_unpaid")
+    ) {
+      const payments = await ctx.driver.listPaymentsForOrder(order.id);
+      const covered = payments
+        .filter((p) => p.status === "captured")
+        .reduce((sum, p) => sum + p.amount_cents, 0);
+      if (covered < order.totals.total_cents) {
+        throw ProblemError.of("PAYMENT_REQUIRED", {
+          detail: "The order is not fully paid; it cannot be released yet.",
+          details: { amount_due_cents: order.totals.total_cents - covered },
+        });
+      }
+    }
+    const res = await ctx.driver.transitionOrderStatus(order.id, ["draft"], "placed");
+    if (!res.ok && res.reason === "conflict" && res.order.status === "voided") {
+      throw ProblemError.of("INVALID_TRANSITION", { detail: "Order was canceled." });
+    }
     return { body: await mapOrderFor(ctx, order.id) };
   },
 
@@ -468,17 +558,26 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
 
   "customers.list": async (ctx) => {
     const tenantId = ctx.principal.tenant_id;
-    const [customers, stats] = await Promise.all([
-      ctx.driver.listCustomers(tenantId),
-      customerStats(tenantId, undefined, ctx.driver),
-    ]);
-    const mapped = customers.map((c) =>
-      toContractCustomer(
-        c,
-        stats.get(c.id) ?? { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 },
-      ),
-    );
-    return { body: pageItems(mapped, ctx.url.searchParams) };
+    const q = ctx.url.searchParams;
+    const limit = Number(q.get("limit") ?? DEFAULT_LIMIT);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+      throw ProblemError.of("VALIDATION_FAILED", { detail: `limit must be an integer 1..${MAX_LIMIT}.` });
+    }
+    const cursor = q.get("cursor") ? decodeCursor(q.get("cursor")!) : null;
+    const rows = await ctx.driver.listCustomers(tenantId, {
+      after: cursor ? { created_at: cursor[0], id: cursor[1] } : undefined,
+      limit: limit + 1,
+    });
+    const data = rows.slice(0, limit);
+    // Stats only for the page being returned (aggregate, not a full scan).
+    const stats = await ctx.driver.customerOrderStats(tenantId, data.map((c) => c.id));
+    const last = data[data.length - 1];
+    return {
+      body: {
+        data: data.map((c) => toContractCustomer(c, stats.get(c.id) ?? NO_STATS)),
+        next_cursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
+      },
+    };
   },
 
   "customers.lookup": async (ctx) => {
@@ -491,7 +590,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     let found = email ? await ctx.driver.getCustomerByEmail(tenantId, email) : null;
     if (!found && phone) {
       found =
-        (await ctx.driver.listCustomers(tenantId)).find(
+        (await ctx.driver.listCustomers(tenantId, { limit: 1000 })).find(
           (c) => c.phone?.replace(/[\s().-]/g, "") === phone,
         ) ?? null;
     }
@@ -524,13 +623,17 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
 
   "drawerSessions.list": async (ctx) => {
     const bundle = await ownedLocation(ctx, ctx.params.location_id!);
-    const sessions = await loadDrawerSessions(bundle, ctx.driver);
-    return {
-      body: pageItems(
-        sessions.map((s) => ({ ...s, created_at: s.opened_at, updated_at: s.closed_at ?? s.opened_at })),
-        ctx.url.searchParams,
-      ),
-    };
+    const q = ctx.url.searchParams;
+    let page: { data: { id: string }[]; next_cursor: string | null } = { data: [], next_cursor: null };
+    const sessions = await loadDrawerSessions(bundle, ctx.driver, (shifts) => {
+      const p = pageItems(
+        shifts.map((x) => ({ ...x, created_at: x.opened_at, updated_at: x.closed_at ?? x.opened_at })),
+        q,
+      );
+      page = p;
+      return p.data;
+    });
+    return { body: { data: sessions, next_cursor: page.next_cursor } };
   },
 
   "deliveries.list": async (ctx) => {
@@ -540,17 +643,20 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     );
     const locFilter = ctx.url.searchParams.get("location_id");
     const status = ctx.url.searchParams.get("status");
-    const out = [];
+    const records = [];
     for (const b of bundles) {
       if (locFilter && b.location.id !== locFilter) continue;
-      const records = await ctx.driver.listDeliveries(ctx.principal.tenant_id, b.location.id);
-      for (const r of records) {
-        if (status && r.status !== status) continue;
-        const d = await loadDelivery(ctx.principal.tenant_id, r.id, ctx.driver);
-        if (d) out.push(d);
+      for (const r of await ctx.driver.listDeliveries(ctx.principal.tenant_id, b.location.id)) {
+        if (!status || r.status === status) records.push(r);
       }
     }
-    return { body: pageItems(out, ctx.url.searchParams) };
+    const page = pageItems(records, ctx.url.searchParams);
+    const data = (
+      await Promise.all(
+        page.data.map((r) => loadDelivery(ctx.principal.tenant_id, r.id, ctx.driver)),
+      )
+    ).filter((d): d is NonNullable<typeof d> => d !== null);
+    return { body: { data, next_cursor: page.next_cursor } };
   },
 
   "deliveries.get": async (ctx) => {
@@ -569,6 +675,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     }
     const orders = await loadTenantOrders(ctx.principal.tenant_id, {
       locationIds: [bundle.location.id],
+      ...paddedRange(from, to),
       driver: ctx.driver,
     });
     const dates = [...new Set(orders.map((o) => o.business_date))]
@@ -581,13 +688,13 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         bundle.location.id,
         date,
       );
-      const payments = (
-        await Promise.all(
-          orders
-            .filter((o) => o.business_date === date)
-            .map((o) => ctx.driver.listPaymentsForOrder(o.id)),
-        )
-      )
+      const payments = [
+        ...(
+          await ctx.driver.listPaymentsForOrders(
+            orders.filter((o) => o.business_date === date).map((o) => o.id),
+          )
+        ).values(),
+      ]
         .flat()
         .map(toContractPayment);
       data.push(
@@ -617,6 +724,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     );
     const orders = await loadTenantOrders(ctx.principal.tenant_id, {
       locationIds: ids,
+      ...paddedRange(q.from, q.to),
       driver: ctx.driver,
     });
     let categories: Map<string, { id: string; name: string }> | undefined;
@@ -646,6 +754,13 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     };
   },
 };
+
+/** business_date is location-local: pad the UTC created_at window by a day each side. */
+function paddedRange(from: string, to: string): { createdFrom: string; createdTo: string } {
+  const t = (d: string, days: number) =>
+    new Date(new Date(`${d}T00:00:00Z`).getTime() + days * 86_400_000).toISOString();
+  return { createdFrom: t(from, -1), createdTo: t(to, 2) };
+}
 
 const UNSUPPORTED: V1Operation[] = [
   "orders.updateStatus",
@@ -696,8 +811,23 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   if (!parsed.success) throw zodProblem(parsed.error);
   const input = parsed.data;
   const tenantId = ctx.principal.tenant_id;
+  await requireActiveTenant(ctx);
   const bundle = await ownedLocation(ctx, input.location_id);
+  const terminal = isTerminal(ctx.principal);
 
+  // Discounts/comps are an owner/manager power in POS: callers need an explicit scope.
+  if ((input.adjustments?.length ?? 0) > 0) {
+    requireScopes(ctx.principal, ["orders:discount"]);
+  }
+  // Plan gate: anything but a counter order is "online ordering".
+  if (!(terminal && input.channel === "in_store")) {
+    const gate = canUseOnlineOrdering(
+      resolveEntitlements(await ctx.driver.getSubscription(tenantId)),
+    );
+    if (!gate.allowed) {
+      throw ProblemError.of("FORBIDDEN", { detail: gate.reason ?? "Plan does not allow this." });
+    }
+  }
   if (!input.lines || input.lines.length === 0) {
     throw ProblemError.of("VALIDATION_FAILED", {
       detail: input.quote_id
@@ -717,11 +847,16 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     input.id ??
     (idemKey ? uuidv5(`${tenantId}:${idemKey}`) : globalThis.crypto.randomUUID());
 
-  // Idempotent replay.
+  // Idempotent replay. Foreign-tenant / out-of-scope ids answer exactly like a
+  // different-request conflict so id existence never leaks.
   const existing = await ctx.driver.getOrder(orderId);
   if (existing) {
-    if (existing.tenant_id !== tenantId) {
-      throw ProblemError.of("IDEMPOTENCY_CONFLICT", { detail: "Order id already in use." });
+    const conflict = () =>
+      ProblemError.of("IDEMPOTENCY_CONFLICT", {
+        detail: "This id is already in use or was used with a different request.",
+      });
+    if (existing.tenant_id !== tenantId || !allowedLocation(ctx.principal, existing.location_id)) {
+      throw conflict();
     }
     const sent = signature(
       input.lines.map((l) => ({ item_id: l.item_id, quantity: l.quantity })),
@@ -729,11 +864,7 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     const had = signature(
       existing.items.filter((i) => !i.voided).map((i) => ({ item_id: i.item_id, quantity: i.quantity })),
     );
-    if (sent !== had) {
-      throw ProblemError.of("IDEMPOTENCY_CONFLICT", {
-        detail: "This id was already used with different lines.",
-      });
-    }
+    if (sent !== had) throw conflict();
     return {
       status: 200,
       body: await mapOrderFor(ctx, existing.id),
@@ -742,7 +873,8 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   }
 
   const menu = await loadMenu(bundle, ctx.driver);
-  const inStore = input.channel === "in_store";
+  // Only a terminal may skip the hours check, and only for counter orders.
+  const inStore = terminal && input.channel === "in_store";
   const quote = priceCart({
     menu,
     location: bundle.contract,
@@ -765,6 +897,13 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
         errors: quote.errors,
       }),
     );
+  }
+  const preTip = quote.totals.total_cents - quote.totals.tip_cents;
+  if (quote.totals.tip_cents > maxTipCents(preTip)) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: "Tip is too large.",
+      path: "tip",
+    });
   }
   if (input.quote_hash && input.quote_hash !== quote.quote_hash) {
     throw new ProblemError(
@@ -848,8 +987,10 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
 
   // Held unless the caller will take payment at the counter.
   const now = ctx.now();
+  // Held unless a terminal takes the order at the counter (or invoices it).
   const holdReason =
-    input.hold?.reason ?? (input.payment_intent === "prepaid" ? "awaiting_payment" : null);
+    input.hold?.reason ??
+    (input.payment_intent === "prepaid" || !terminal ? "awaiting_payment" : null);
   const ttl = input.hold?.ttl_seconds ?? 900;
   const hold = holdReason
     ? { reason: holdReason, expires_at: new Date(now.getTime() + ttl * 1000).toISOString() }
@@ -957,9 +1098,16 @@ export async function handleV1(
       const m = r.regex.exec(path);
       if (m) {
         route = r;
-        params = Object.fromEntries(
-          r.names.map((n, i) => [n, decodeURIComponent(m[i + 1]!)]),
-        );
+        try {
+          params = Object.fromEntries(
+            r.names.map((n, i) => [n, decodeURIComponent(m[i + 1]!)]),
+          );
+        } catch {
+          throw ProblemError.of("VALIDATION_FAILED", {
+            detail: "Malformed percent-encoding in the path.",
+            status: 400,
+          });
+        }
         break;
       }
     }

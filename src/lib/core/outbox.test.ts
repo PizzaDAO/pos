@@ -133,9 +133,18 @@ describe("mock driver writes outbox rows", () => {
     await d.createOrder({ ...orderInput(id, "draft"), hold: { reason: "awaiting_payment", expires_at: null } });
     expect(types()).toEqual([]);
     await d.updateOrderStatus(id, "placed");
-    expect(types()).toEqual(["order.status_changed", "order.placed"]);
+    // leaving a hold announces the order once, as placed
+    expect(types()).toEqual(["order.placed"]);
     await d.updateOrderStatus(id, "voided");
-    expect(types().slice(2)).toEqual(["order.status_changed", "order.canceled"]);
+    expect(types().slice(1)).toEqual(["order.status_changed", "order.canceled"]);
+  });
+
+  it("a canceled, never-announced hold emits nothing", async () => {
+    const d = getPosDriver();
+    const id = "11111111-0000-4000-8000-0000000000f2";
+    await d.createOrder({ ...orderInput(id, "draft"), hold: { reason: "awaiting_payment", expires_at: null } });
+    await d.updateOrderStatus(id, "voided");
+    expect(types()).toEqual([]);
   });
 
   it("payments, customers, staff, drawer, business day, menu emit once per change", async () => {
@@ -330,6 +339,7 @@ describe("deliverOutbox", () => {
       ingestUrl: INGEST,
       secret: SECRET,
       store: memoryOutbox,
+      unsafeAllowMockStore: true,
       fetch: fakeFetch,
     });
     expect(res).toEqual({ claimed: 1, delivered: 1, retried: 0, dead: 0 });
@@ -361,7 +371,7 @@ describe("deliverOutbox", () => {
     ).rejects.toThrow();
 
     // nothing left to deliver
-    expect((await deliverOutbox({ ingestUrl: INGEST, secret: SECRET, store: memoryOutbox, fetch: fakeFetch })).claimed).toBe(0);
+    expect((await deliverOutbox({ ingestUrl: INGEST, secret: SECRET, store: memoryOutbox, unsafeAllowMockStore: true, fetch: fakeFetch })).claimed).toBe(0);
   });
 
   it("supports secret rotation (several secrets sign)", async () => {
@@ -372,6 +382,7 @@ describe("deliverOutbox", () => {
       ingestUrl: INGEST,
       secret: [newSecret, SECRET],
       store: memoryOutbox,
+      unsafeAllowMockStore: true,
       fetch: (async (_u: string, init: RequestInit) => {
         got = { headers: new Headers(init.headers), body: String(init.body) };
         return new Response(null, { status: 200 });
@@ -395,6 +406,7 @@ describe("deliverOutbox", () => {
         ingestUrl: INGEST,
         secret: SECRET,
         store: memoryOutbox,
+        unsafeAllowMockStore: true,
         fetch: failing,
         now: () => clock,
         random: () => 0.5, // no jitter: delay == schedule
@@ -430,7 +442,7 @@ describe("deliverOutbox", () => {
       if (fail) throw new Error("ECONNRESET");
       return new Response(null, { status: 200 });
     }) as unknown as typeof fetch;
-    const args = { ingestUrl: INGEST, secret: SECRET, store: memoryOutbox, fetch: flaky, now: () => clock };
+    const args = { ingestUrl: INGEST, secret: SECRET, store: memoryOutbox, unsafeAllowMockStore: true, fetch: flaky, now: () => clock };
     expect((await deliverOutbox(args)).retried).toBe(1);
     expect(row.last_error).toBe("ECONNRESET");
     fail = false;
@@ -453,11 +465,92 @@ describe("deliverOutbox", () => {
       ingestUrl: INGEST,
       secret: SECRET,
       store: memoryOutbox,
+      unsafeAllowMockStore: true,
       driver: d,
       fetch: (async () => new Response(null, { status: 200 })) as unknown as typeof fetch,
     });
     expect(res.dead).toBe(1);
     expect(memoryOutbox.rows[0]!.last_error).toBe("subject_gone");
+  });
+});
+
+describe("hardening", () => {
+  it("never signs or sends from the mock store by default", async () => {
+    await getPosDriver().createOrder(orderInput("77777777-0000-4000-8000-000000000001"));
+    let called = false;
+    const res = await deliverOutbox({
+      ingestUrl: INGEST,
+      secret: SECRET,
+      store: memoryOutbox,
+      fetch: (async () => {
+        called = true;
+        return new Response(null, { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    expect(res.skipped).toBe("mock_store");
+    expect(called).toBe(false);
+    expect(memoryOutbox.rows[0]!.attempts).toBe(0);
+  });
+
+  it("claim counts the attempt, so a hydration timeout still dead-letters", async () => {
+    await getPosDriver().createOrder(orderInput("77777777-0000-4000-8000-000000000002"));
+    const row = memoryOutbox.rows[0]!;
+    let clock = new Date(Date.now() + 1000);
+    const hangingDriver = { getOrder: () => new Promise(() => undefined) } as never;
+    const args = () => ({
+      ingestUrl: INGEST,
+      secret: SECRET,
+      store: memoryOutbox,
+      unsafeAllowMockStore: true,
+      driver: hangingDriver,
+      hydrateTimeoutMs: 5,
+      now: () => clock,
+      random: () => 0.5,
+      fetch: (async () => new Response(null, { status: 200 })) as unknown as typeof fetch,
+    });
+    for (let i = 0; i < RETRY_SCHEDULE_SECONDS.length; i++) {
+      await deliverOutbox(args());
+      expect(row.attempts).toBe(i + 1);
+      clock = new Date(new Date(row.next_attempt_at).getTime() + 1000);
+    }
+    const last = await deliverOutbox(args());
+    expect(last.dead).toBe(1);
+    expect(row.status).toBe("dead");
+    expect(row.last_error).toBe("hydration timed out");
+  });
+
+  it("menu edits coalesce into an unclaimed row and keep every item id", async () => {
+    const d = getPosDriver();
+    const cat = "20000000-0000-0000-0000-000000000001";
+    const a = await d.upsertItem({ tenant_id: DEMO_TENANT_ID, category_id: cat, name: "A" });
+    const b = await d.upsertItem({ tenant_id: DEMO_TENANT_ID, category_id: cat, name: "B" });
+    expect(memoryOutbox.rows).toHaveLength(1);
+    expect(memoryOutbox.rows[0]!.row_snapshot?.changed_item_ids).toEqual([a.id, b.id]);
+    // once claimed, a new edit is NOT dropped: it gets its own row
+    await memoryOutbox.claim(10, new Date(Date.now() + 1000));
+    const c = await d.upsertItem({ tenant_id: DEMO_TENANT_ID, category_id: cat, name: "C" });
+    expect(memoryOutbox.rows).toHaveLength(2);
+    expect(memoryOutbox.rows[1]!.row_snapshot?.changed_item_ids).toEqual([c.id]);
+    const ev = await hydrateEvent(memoryOutbox.rows[0]!, d);
+    expect((ev!.data as { changed_item_ids: string[] }).changed_item_ids).toEqual([a.id, b.id]);
+  });
+
+  it("customer events hydrate without scanning tenant orders", async () => {
+    const d = getPosDriver();
+    const now = new Date().toISOString();
+    await d.upsertCustomer({
+      id: "88888888-0000-4000-8000-000000000001",
+      tenant_id: DEMO_TENANT_ID,
+      email: "scan@example.com",
+      name: "No Scan",
+      phone: null,
+      verified: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const spy = { ...d, listOrders: () => { throw new Error("tenant scan!"); }, listOrdersPage: () => { throw new Error("tenant scan!"); } };
+    const ev = await hydrateEvent(memoryOutbox.rows[0]!, spy as never);
+    expect(ev?.type).toBe("customer.created");
   });
 });
 

@@ -53,15 +53,13 @@ POS is the commerce source for the Open Pizza hub: it serves the `/v1` contract 
 `/api/v1/*` and emits contract events through a transactional outbox. Full notes in
 [`docs/OPENPIZZA_CORE.md`](./docs/OPENPIZZA_CORE.md).
 
-```bash
-npm run core:refresh   # re-copy ../core after pulling a newer @openpizza/core
-```
+`@openpizza/core` is **vendored** as a tarball in [`vendor/`](./vendor) (the lockfile resolves
+`file:vendor/openpizza-core-<ver>.tgz`, nothing outside this repo), so `npm ci` and Vercel
+builds work. To update it from a core checkout:
 
-> **TODO (blocks Vercel builds):** `@openpizza/core` is a local `file:` dependency
-> (`install-links=true` in `.npmrc`), so it resolves on a dev machine with the
-> `openpizza/core` checkout side by side but **not on Vercel/CI**, which only sees this
-> repo. Publish `@openpizza/core` to npm (plans/core.md section 11) or vendor a packed
-> tarball, then change the dependency to a semver range (`~0.1`).
+```bash
+npm run core:vendor -- ../core/packages/core
+```
 
 ### Surfaces (placeholders in Phase 0)
 

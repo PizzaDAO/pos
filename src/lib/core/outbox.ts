@@ -35,7 +35,7 @@ import {
 import { getPosDriver, type PosDriver } from "@/lib/db";
 import { readSupabaseConfig } from "@/lib/db/supabase";
 import {
-  customerStats,
+  NO_STATS,
   loadDelivery,
   loadLocation,
   loadLocations,
@@ -78,7 +78,18 @@ export type NewOutboxEvent = Pick<
   Partial<Pick<OutboxRow, "subject_version" | "changes" | "row_snapshot">>;
 
 export interface OutboxStore {
+  /** True for the in-memory mock store: never signed or sent anywhere. */
+  readonly isMock?: boolean;
+  /**
+   * Claim due rows. Claiming INCREMENTS `attempts` and leases the row, so a
+   * worker that dies or times out mid-delivery still moves the row toward the
+   * dead-letter state.
+   */
   claim(limit: number, now: Date): Promise<OutboxRow[]>;
+  /** Delete delivered/dead rows past retention; expire stale pending rows. */
+  prune?(): Promise<void>;
+  /** Tell the database whether triggers should enqueue at all. */
+  setEnabled?(enabled: boolean): Promise<void>;
   markDelivered(id: string, at: Date): Promise<void>;
   markRetry(id: string, attempts: number, nextAt: Date, error: string): Promise<void>;
   markDead(id: string, attempts: number, error: string): Promise<void>;
@@ -89,6 +100,9 @@ export interface OutboxStore {
 // ---------------------------------------------------------------------------
 
 export class MemoryOutbox implements OutboxStore {
+  readonly isMock = true;
+  /** Bounded so a long-running mock server cannot grow without limit. */
+  static readonly MAX_ROWS = 2000;
   rows: OutboxRow[] = [];
   private seq = new Map<string, number>();
   private counter = 0;
@@ -116,6 +130,9 @@ export class MemoryOutbox implements OutboxStore {
       delivered_at: null,
     };
     this.rows.push(row);
+    if (this.rows.length > MemoryOutbox.MAX_ROWS) {
+      this.rows.splice(0, this.rows.length - MemoryOutbox.MAX_ROWS);
+    }
     return row;
   }
 
@@ -132,8 +149,11 @@ export class MemoryOutbox implements OutboxStore {
     const due = this.rows
       .filter((r) => r.status === "pending" && r.next_attempt_at <= now.toISOString())
       .slice(0, limit);
-    // lease: hide from a concurrent claim for 2 minutes
-    for (const r of due) r.next_attempt_at = new Date(now.getTime() + 120_000).toISOString();
+    // lease: hide from a concurrent claim for 2 minutes; count the attempt now
+    for (const r of due) {
+      r.next_attempt_at = new Date(now.getTime() + 120_000).toISOString();
+      r.attempts += 1;
+    }
     return due.map((r) => ({ ...r }));
   }
   private find(id: string): OutboxRow | undefined {
@@ -173,6 +193,14 @@ export function createSupabaseOutbox(config: { url: string; key: string }): Outb
       const { data, error } = await sb.rpc("core_outbox_claim", { p_limit: limit });
       if (error) throw new Error(`core_outbox_claim failed: ${error.message}`);
       return (data ?? []) as OutboxRow[];
+    },
+    async prune() {
+      const { error } = await sb.rpc("core_outbox_prune");
+      if (error) throw new Error(`core_outbox_prune failed: ${error.message}`);
+    },
+    async setEnabled(enabled) {
+      const { error } = await sb.rpc("core_set_outbox_enabled", { p_enabled: enabled });
+      if (error) throw new Error(`core_set_outbox_enabled failed: ${error.message}`);
     },
     async markDelivered(id, at) {
       const { error } = await sb
@@ -279,15 +307,21 @@ export async function hydrateEvent(
     };
   } else if (t === "menu.updated") {
     const snap = row.row_snapshot ?? {};
-    const changedItem =
-      (snap.changed_item_id as string | null | undefined) ??
-      (snap.target_type === "item" ? (snap.target_id as string) : null);
+    const changedItems = [
+      ...new Set(
+        [
+          ...((snap.changed_item_ids as string[] | undefined) ?? []),
+          ...(snap.changed_item_id ? [snap.changed_item_id as string] : []),
+          ...(snap.target_type === "item" ? [snap.target_id as string] : []),
+        ].filter(Boolean),
+      ),
+    ];
     const locIds = row.location_id
       ? [row.location_id]
       : (await loadLocations(tenant, driver)).map((b) => b.location.id);
     data = {
       location_ids: locIds,
-      changed_item_ids: changedItem ? [changedItem] : [],
+      changed_item_ids: changedItems,
     };
     subjectId = row.subject_id;
   } else if (t === "location.updated") {
@@ -296,11 +330,9 @@ export async function hydrateEvent(
   } else if (t === "customer.created" || t === "customer.updated") {
     const c = await driver.getCustomer(row.subject_id);
     if (c && c.tenant_id === tenant) {
-      const stats = (await customerStats(tenant, undefined, driver)).get(c.id);
-      data = toContractCustomer(
-        c,
-        stats ?? { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 },
-      );
+      // Aggregate for this one customer; never a tenant-wide order scan.
+      const stats = (await driver.customerOrderStats(tenant, [c.id])).get(c.id);
+      data = toContractCustomer(c, stats ?? NO_STATS);
     }
   } else if (t.startsWith("staff.")) {
     data = (await loadStaffList(tenant, driver)).find((s) => s.id === row.subject_id) ?? null;
@@ -361,10 +393,18 @@ export interface DeliverOptions {
   now?: () => Date;
   limit?: number;
   timeoutMs?: number;
+  /** Max time to build one event payload (default 15s). */
+  hydrateTimeoutMs?: number;
+  /** Wall-clock budget per run (default 45s); unprocessed rows are released. */
+  deadlineMs?: number;
   random?: () => number;
+  /** Tests only: allow signing/sending rows from the in-memory mock store. */
+  unsafeAllowMockStore?: boolean;
 }
 
 export interface DeliverResult {
+  /** Set when nothing was attempted (e.g. "mock_store"). */
+  skipped?: string;
   claimed: number;
   delivered: number;
   retried: number;
@@ -373,6 +413,10 @@ export interface DeliverResult {
 
 export async function deliverOutbox(opts: DeliverOptions): Promise<DeliverResult> {
   const store = opts.store ?? getOutboxStore();
+  // The mock store holds simulated data: never sign it or send it to a real hub.
+  if (store.isMock && !opts.unsafeAllowMockStore) {
+    return { skipped: "mock_store", claimed: 0, delivered: 0, retried: 0, dead: 0 };
+  }
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const now = opts.now ?? (() => new Date());
   const result: DeliverResult = { claimed: 0, delivered: 0, retried: 0, dead: 0 };
@@ -380,11 +424,22 @@ export async function deliverOutbox(opts: DeliverOptions): Promise<DeliverResult
   const rows = await store.claim(opts.limit ?? 50, now());
   result.claimed = rows.length;
 
+  const deadline = now().getTime() + (opts.deadlineMs ?? 45_000);
   for (const row of rows) {
-    const attempts = row.attempts + 1;
+    if (Date.now() > deadline && !opts.unsafeAllowMockStore) {
+      // Out of time: hand the row back un-counted for the next run.
+      await store.markRetry(row.id, row.attempts - 1, now(), row.last_error ?? "");
+      continue;
+    }
+    // `claim` already counted this attempt.
+    const attempts = row.attempts;
     let error: string | null = null;
     try {
-      const event = await hydrateEvent(row, opts.driver);
+      const event = await withTimeout(
+        hydrateEvent(row, opts.driver),
+        opts.hydrateTimeoutMs ?? 15_000,
+        "hydration timed out",
+      );
       if (!event) {
         // Subject deleted since the change: nothing to send.
         await store.markDead(row.id, attempts, "subject_gone");
@@ -429,6 +484,14 @@ export async function deliverOutbox(opts: DeliverOptions): Promise<DeliverResult
     }
   }
   return result;
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
 /** Delivery config from env; null when the hub is not configured. */

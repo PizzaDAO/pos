@@ -19,6 +19,7 @@ import {
   type Location,
   type Order,
   type PosDriver,
+  type Shift,
   type StoreSettings,
 } from "@/lib/db";
 import {
@@ -82,22 +83,39 @@ export async function loadMenu(
   return toContractMenu({ menu, overrides, currency: bundle.settings.currency });
 }
 
+export async function mapOrders(
+  orders: Order[],
+  timezoneOf: (locationId: string) => string,
+  driver?: PosDriver,
+): Promise<CoreOrder[]> {
+  if (orders.length === 0) return [];
+  const d = driverOf(driver);
+  // Two batched reads for the whole page (no per-order queries).
+  const customerIds = [
+    ...new Set(orders.map((o) => o.customer_id).filter((x): x is string => !!x)),
+  ];
+  const [payments, customers] = await Promise.all([
+    d.listPaymentsForOrders(orders.map((o) => o.id)),
+    customerIds.length ? d.getCustomers(customerIds) : Promise.resolve([]),
+  ]);
+  const byCustomer = new Map(customers.map((c) => [c.id, c]));
+  return orders.map((order) => {
+    const c = order.customer_id ? byCustomer.get(order.customer_id) : undefined;
+    return toContractOrder({
+      order,
+      payments: payments.get(order.id) ?? [],
+      timezone: timezoneOf(order.location_id),
+      customer: c && c.tenant_id === order.tenant_id ? c : null,
+    });
+  });
+}
+
 export async function mapOrder(
   order: Order,
   timezone: string,
   driver?: PosDriver,
 ): Promise<CoreOrder> {
-  const d = driverOf(driver);
-  const [payments, customer] = await Promise.all([
-    d.listPaymentsForOrder(order.id),
-    order.customer_id ? d.getCustomer(order.customer_id) : Promise.resolve(null),
-  ]);
-  return toContractOrder({
-    order,
-    payments,
-    timezone,
-    customer: customer && customer.tenant_id === order.tenant_id ? customer : null,
-  });
+  return (await mapOrders([order], () => timezone, driver))[0] as CoreOrder;
 }
 
 export async function loadOrder(
@@ -112,26 +130,101 @@ export async function loadOrder(
   return mapOrder(order, loc?.location.timezone ?? "UTC", d);
 }
 
-/** Every order of a tenant (optionally one location), mapped, oldest first. */
-export async function loadTenantOrders(
+const SCAN_PAGE = 200;
+const MAX_SCAN_PAGES = 25;
+
+export interface OrdersPageQuery {
+  locationIds?: string[] | null;
+  /** Wanted page size; one extra row is returned so callers can detect more. */
+  limit: number;
+  after?: { created_at: string; id: string };
+  createdFrom?: string;
+  createdTo?: string;
+  updatedSince?: string;
+  /** Post-mapping filter (status/channel/...). Scanning continues until enough match. */
+  filter?: (o: CoreOrder) => boolean;
+  driver?: PosDriver;
+}
+
+/**
+ * Oldest-first page of mapped orders across locations. Paging is keyset in SQL
+ * (bounded scan: at most MAX_SCAN_PAGES pages of SCAN_PAGE rows per location),
+ * never "load everything then slice".
+ */
+export async function loadOrdersPage(
   tenantId: string,
-  opts: { locationIds?: string[] | null; driver?: PosDriver } = {},
+  q: OrdersPageQuery,
 ): Promise<CoreOrder[]> {
-  const d = driverOf(opts.driver);
+  const d = driverOf(q.driver);
   const bundles = (await loadLocations(tenantId, d)).filter(
-    (b) => !opts.locationIds || opts.locationIds.includes(b.location.id),
+    (b) => !q.locationIds || q.locationIds.includes(b.location.id),
   );
-  const out: CoreOrder[] = [];
+  const tz = new Map(bundles.map((b) => [b.location.id, b.location.timezone]));
+  const want = q.limit + 1;
+  const merged: CoreOrder[] = [];
   for (const b of bundles) {
-    const orders = await d.listOrders(tenantId, b.location.id);
-    const mapped = await Promise.all(
-      orders.map((o) => mapOrder(o, b.location.timezone, d)),
-    );
-    out.push(...mapped);
+    let after = q.after;
+    let got = 0;
+    for (let page = 0; page < MAX_SCAN_PAGES && got < want; page++) {
+      const rows = await d.listOrdersPage(tenantId, b.location.id, {
+        after,
+        limit: SCAN_PAGE,
+        createdFrom: q.createdFrom,
+        createdTo: q.createdTo,
+        updatedSince: q.updatedSince,
+      });
+      if (rows.length === 0) break;
+      const mapped = await mapOrders(rows, (l) => tz.get(l) ?? "UTC", d);
+      for (const m of mapped) {
+        if (!q.filter || q.filter(m)) {
+          merged.push(m);
+          got += 1;
+        }
+      }
+      const last = rows[rows.length - 1]!;
+      after = { created_at: last.created_at, id: last.id };
+      if (rows.length < SCAN_PAGE) break;
+    }
   }
-  return out.sort(
+  merged.sort(
     (a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
   );
+  return merged.slice(0, want);
+}
+
+/**
+ * Every order whose creation falls in a (padded) range, for rollups. Bounded by
+ * the range and a hard row cap so a runaway range cannot exhaust memory.
+ */
+export async function loadTenantOrders(
+  tenantId: string,
+  opts: {
+    locationIds?: string[] | null;
+    createdFrom?: string;
+    createdTo?: string;
+    maxRows?: number;
+    driver?: PosDriver;
+  } = {},
+): Promise<CoreOrder[]> {
+  const out: CoreOrder[] = [];
+  let after: { created_at: string; id: string } | undefined;
+  const max = opts.maxRows ?? 20_000;
+  for (;;) {
+    const page = await loadOrdersPage(tenantId, {
+      locationIds: opts.locationIds,
+      limit: SCAN_PAGE * 5,
+      after,
+      createdFrom: opts.createdFrom,
+      createdTo: opts.createdTo,
+      driver: opts.driver,
+    });
+    const take = page.slice(0, SCAN_PAGE * 5);
+    out.push(...take);
+    if (page.length <= SCAN_PAGE * 5 || out.length >= max) break;
+    const last = take[take.length - 1]!;
+    after = { created_at: last.created_at, id: last.id };
+  }
+  return out;
 }
 
 export async function loadPayment(
@@ -143,76 +236,46 @@ export async function loadPayment(
   return p && p.tenant_id === tenantId ? toContractPayment(p) : null;
 }
 
-export async function customerStats(
-  tenantId: string,
-  orders?: CoreOrder[],
-  driver?: PosDriver,
-): Promise<
-  Map<
-    string,
-    { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
-  >
-> {
-  const all = orders ?? (await loadTenantOrders(tenantId, { driver }));
-  const stats = new Map<
-    string,
-    { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
-  >();
-  for (const o of all) {
-    if (!o.customer_id || o.fulfillment_status === "canceled" || o.fulfillment_status === "held") {
-      continue;
-    }
-    const s = stats.get(o.customer_id) ?? {
-      order_count: 0,
-      last_order_at: null,
-      lifetime_spend_cents: 0,
-    };
-    s.order_count += 1;
-    s.lifetime_spend_cents += o.totals.total_cents;
-    if (!s.last_order_at || o.created_at > s.last_order_at) {
-      s.last_order_at = o.created_at;
-    }
-    stats.set(o.customer_id, s);
-  }
-  return stats;
-}
-
 export async function loadCustomer(
   tenantId: string,
   customerId: string,
   driver?: PosDriver,
 ): Promise<CoreCustomer | null> {
   const d = driverOf(driver);
-  const c = await d.getCustomer(customerId);
+  const c = (await d.getCustomers([customerId]))[0];
   if (!c || c.tenant_id !== tenantId) return null;
-  const stats = await customerStats(tenantId, undefined, d);
-  return toContractCustomer(
-    c,
-    stats.get(c.id) ?? { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 },
-  );
+  const stats = await d.customerOrderStats(tenantId, [c.id]);
+  return toContractCustomer(c, stats.get(c.id) ?? NO_STATS);
 }
+
+export const NO_STATS = {
+  order_count: 0,
+  last_order_at: null,
+  lifetime_spend_cents: 0,
+};
 
 export async function loadStaffList(
   tenantId: string,
   driver?: PosDriver,
 ): Promise<CoreStaffMember[]> {
   const d = driverOf(driver);
-  const staff = await d.listStaff(tenantId);
-  return Promise.all(
-    staff.map(async (s) => {
-      // listStaff strips the hash; the trusted lookup tells us whether one is set.
-      const full = await d.getStaffById(tenantId, s.id);
-      return toContractStaff(s, Boolean(full?.pin_hash));
-    }),
-  );
+  const [staff, withPin] = await Promise.all([
+    d.listStaff(tenantId),
+    d.listStaffWithPin(tenantId),
+  ]);
+  return staff.map((s) => toContractStaff(s, withPin.has(s.id)));
 }
 
+/** Drawer sessions for a location; reconciliation is computed only for `select`ed rows. */
 export async function loadDrawerSessions(
   bundle: LocationBundle,
   driver?: PosDriver,
+  select: (shifts: Shift[]) => Shift[] = (x) => x,
 ): Promise<CoreDrawerSession[]> {
   const d = driverOf(driver);
-  const shifts = await d.listShifts(bundle.location.tenant_id, bundle.location.id);
+  const shifts = select(
+    await d.listShifts(bundle.location.tenant_id, bundle.location.id),
+  );
   return Promise.all(
     shifts.map(async (shift) =>
       toContractDrawerSession({

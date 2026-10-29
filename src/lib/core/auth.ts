@@ -23,7 +23,7 @@ import {
   type Principal,
 } from "@openpizza/core";
 import { DEMO_TENANT_ID } from "@/lib/db/seed-data";
-import { readSupabaseConfig } from "@/lib/db/supabase";
+import { getPosDriver } from "@/lib/db";
 
 export const DEV_TOKEN = "dev-openpizza-token";
 
@@ -47,7 +47,18 @@ const JWKS_TTL_MS = 10 * 60_000;
 const JWKS_MIN_REFETCH_MS = 30_000;
 const CLOCK_SKEW_S = 30;
 
-const jwksCache = new Map<string, { keys: Jwk[]; fetchedAt: number }>();
+interface JwksEntry {
+  keys: Jwk[];
+  /** Last time we TRIED to fetch (success or failure). */
+  fetchedAt: number;
+  /** No refetch before this instant after failures (exponential backoff). */
+  retryAt: number;
+  failures: number;
+}
+
+const BACKOFF_BASE_MS = 5_000;
+const BACKOFF_MAX_MS = 5 * 60_000;
+const jwksCache = new Map<string, JwksEntry>();
 
 /** Test helper: forget cached JWKS. */
 export function resetJwksCache(): void {
@@ -78,29 +89,61 @@ async function loadJwks(
   const cached = jwksCache.get(url);
   const now = deps.now();
   if (cached) {
+    // Negative cache: after a failure, do not hammer the hub.
+    if (now < cached.retryAt) {
+      if (cached.keys.length > 0) return cached.keys;
+      throw ProblemError.of("UPSTREAM_UNAVAILABLE", {
+        detail: "The hub JWKS is temporarily unavailable.",
+      });
+    }
     const age = now - cached.fetchedAt;
-    if (!force && age < JWKS_TTL_MS) return cached.keys;
-    if (force && age < JWKS_MIN_REFETCH_MS) return cached.keys;
+    if (cached.keys.length > 0) {
+      if (!force && age < JWKS_TTL_MS) return cached.keys;
+      if (force && age < JWKS_MIN_REFETCH_MS) return cached.keys;
+    }
   }
-  let res: Response;
+  const fail = (detail: string): never => {
+    const failures = (cached?.failures ?? 0) + 1;
+    jwksCache.set(url, {
+      keys: cached?.keys ?? [],
+      fetchedAt: now,
+      retryAt: now + Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS),
+      failures,
+    });
+    if (cached && cached.keys.length > 0) {
+      // Keep serving the last good keys while the hub is down.
+      throw new StaleKeys(cached.keys);
+    }
+    throw ProblemError.of("UPSTREAM_UNAVAILABLE", { detail });
+  };
   try {
-    res = await deps.fetch(url, { headers: { accept: "application/json" } });
-  } catch {
-    if (cached) return cached.keys;
-    throw ProblemError.of("UPSTREAM_UNAVAILABLE", {
-      detail: "Could not fetch the hub JWKS.",
-    });
+    let res: Response;
+    try {
+      res = await deps.fetch(url, { headers: { accept: "application/json" } });
+    } catch {
+      return fail("Could not fetch the hub JWKS.");
+    }
+    if (!res.ok) return fail(`Hub JWKS returned HTTP ${res.status}.`);
+    let body: { keys?: Jwk[] };
+    try {
+      body = (await res.json()) as { keys?: Jwk[] };
+    } catch {
+      return fail("Hub JWKS is not valid JSON.");
+    }
+    const keys = Array.isArray(body?.keys) ? body.keys : [];
+    if (keys.length === 0) return fail("Hub JWKS has no keys.");
+    jwksCache.set(url, { keys, fetchedAt: now, retryAt: 0, failures: 0 });
+    return keys;
+  } catch (e) {
+    if (e instanceof StaleKeys) return e.keys;
+    throw e;
   }
-  if (!res.ok) {
-    if (cached) return cached.keys;
-    throw ProblemError.of("UPSTREAM_UNAVAILABLE", {
-      detail: `Hub JWKS returned HTTP ${res.status}.`,
-    });
+}
+
+class StaleKeys extends Error {
+  constructor(readonly keys: Jwk[]) {
+    super("stale");
   }
-  const body = (await res.json()) as { keys?: Jwk[] };
-  const keys = Array.isArray(body.keys) ? body.keys : [];
-  jwksCache.set(url, { keys, fetchedAt: now });
-  return keys;
 }
 
 function algParams(alg: string): {
@@ -195,9 +238,16 @@ export async function verifyHubJwt(
   return payload;
 }
 
-/** True when `/api/v1` runs in zero-env simulated mode. */
+/**
+ * True when `/api/v1` runs in zero-env simulated mode: the in-memory mock
+ * driver is active, no JWKS is configured, and this is not a production deploy.
+ */
 export function isSimulatedV1(env: Record<string, string | undefined>): boolean {
-  return !env.OPENPIZZA_HUB_JWKS_URL && readSupabaseConfig() === null;
+  return (
+    getPosDriver().name === "mock" &&
+    !env.OPENPIZZA_HUB_JWKS_URL &&
+    env.VERCEL_ENV !== "production"
+  );
 }
 
 /** Authenticate a request; throws `ProblemError` (401/502) on failure. */
@@ -230,10 +280,18 @@ export async function authenticateV1(
     );
   }
 
+  // Fail closed: a JWKS without a pinned issuer would trust any issuer
+  // that happens to share the signing keys.
+  const issuer = env.OPENPIZZA_HUB_ISSUER;
+  if (!issuer) {
+    throw unauthenticated(
+      "Bearer verification is misconfigured (OPENPIZZA_HUB_ISSUER is required with OPENPIZZA_HUB_JWKS_URL).",
+    );
+  }
   const raw = await verifyHubJwt(token, jwksUrl, {
     fetch: deps.fetch ?? globalThis.fetch.bind(globalThis),
     now: deps.now ?? Date.now,
-    issuer: env.OPENPIZZA_HUB_ISSUER || undefined,
+    issuer,
   });
   const claims = CoreTokenClaimsSchema.safeParse(raw);
   if (!claims.success) throw unauthenticated("Token claims are invalid.");

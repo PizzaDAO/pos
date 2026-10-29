@@ -20,8 +20,6 @@ import type {
 } from "@/lib/db";
 import { memoryOutbox, type MemoryOutbox } from "./outbox";
 
-const MENU_DEBOUNCE_MS = 60_000;
-
 function orderEvents(
   box: MemoryOutbox,
   order: Order,
@@ -43,10 +41,15 @@ function orderEvents(
   }
   if (before.status !== order.status) {
     const changes = { status: [before.status, order.status] as [unknown, unknown] };
-    box.append({ ...base, event_type: "order.status_changed", changes });
-    if (before.status === "draft" && order.status !== "draft" && order.status !== "voided") {
-      box.append({ ...base, event_type: "order.placed", changes });
+    if (before.status === "draft") {
+      // Leaving a hold: announce the order as placed (once). A hold that is
+      // canceled was never announced, so nothing is emitted.
+      if (order.status !== "voided") {
+        box.append({ ...base, event_type: "order.placed", changes });
+      }
+      return;
     }
+    box.append({ ...base, event_type: "order.status_changed", changes });
     const alias: Partial<Record<OrderStatus, string>> = {
       ready: "order.ready",
       completed: "order.completed",
@@ -101,24 +104,30 @@ export function withOutbox(
   box: MemoryOutbox = memoryOutbox,
 ): PosDriver {
   const emitMenuUpdated = (tenantId: string, itemId: string | null) => {
-    const now = Date.now();
-    const recent = box.rows.some(
+    // Coalesce into a pending row that has NOT been claimed yet; once a worker
+    // has claimed it (attempts > 0) further edits get their own row.
+    const open = box.rows.find(
       (r) =>
         r.tenant_id === tenantId &&
         r.event_type === "menu.updated" &&
         r.subject_type === "menu" &&
         r.subject_id === tenantId &&
         r.status === "pending" &&
-        now - new Date(r.occurred_at).getTime() < MENU_DEBOUNCE_MS,
+        r.attempts === 0,
     );
-    if (recent) return;
+    if (open) {
+      const ids = new Set((open.row_snapshot?.changed_item_ids as string[] | undefined) ?? []);
+      if (itemId) ids.add(itemId);
+      open.row_snapshot = { changed_item_ids: [...ids] };
+      return;
+    }
     box.append({
       tenant_id: tenantId,
       location_id: null,
       event_type: "menu.updated",
       subject_type: "menu",
       subject_id: tenantId,
-      row_snapshot: { changed_item_id: itemId },
+      row_snapshot: { changed_item_ids: itemId ? [itemId] : [] },
     });
   };
 

@@ -11,7 +11,7 @@
  * Schedule it every minute (Vercel Cron on Pro, or any external scheduler).
  */
 import { NextResponse } from "next/server";
-import { deliverOutbox, readHubEnv } from "@/lib/core/outbox";
+import { deliverOutbox, getOutboxStore, readHubEnv } from "@/lib/core/outbox";
 import { readSupabaseConfig } from "@/lib/db/supabase";
 
 export const runtime = "nodejs";
@@ -39,10 +39,15 @@ async function run(req: Request): Promise<Response> {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const hub = readHubEnv();
+  const store = getOutboxStore();
+  // Triggers only enqueue while a hub is configured, so an unconfigured POS
+  // never accumulates an unbounded backlog.
+  await store.setEnabled?.(hub !== null).catch(() => undefined);
+  await store.prune?.().catch(() => undefined);
   if (!hub) {
     return NextResponse.json({ skipped: "hub_not_configured" });
   }
-  const result = await deliverOutbox(hub);
+  const result = await deliverOutbox({ ...hub, store });
   return NextResponse.json(result);
 }
 

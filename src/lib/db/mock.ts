@@ -922,11 +922,108 @@ export const mockDriver: PosDriver = {
     return orders.get(id) ?? null;
   },
 
-  async listOrders(tenantId, locationId): Promise<Order[]> {
+  async listOrders(tenantId, locationId, opts): Promise<Order[]> {
     ensureKitchenSeed();
+    const limit = Math.min(Math.max(opts?.limit ?? 500, 1), 1000);
     return [...orders.values()]
-      .filter((o) => o.tenant_id === tenantId && o.location_id === locationId)
-      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+      .filter(
+        (o) =>
+          o.tenant_id === tenantId &&
+          o.location_id === locationId &&
+          (!opts?.from || o.created_at >= opts.from) &&
+          (!opts?.to || o.created_at <= opts.to),
+      )
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(opts?.offset ?? 0, (opts?.offset ?? 0) + limit);
+  },
+
+  async listOrdersPage(tenantId, locationId, opts): Promise<Order[]> {
+    ensureKitchenSeed();
+    const after = opts.after;
+    return [...orders.values()]
+      .filter(
+        (o) =>
+          o.tenant_id === tenantId &&
+          o.location_id === locationId &&
+          (!opts.createdFrom || o.created_at >= opts.createdFrom) &&
+          (!opts.createdTo || o.created_at <= opts.createdTo) &&
+          (!opts.updatedSince || o.updated_at >= opts.updatedSince) &&
+          (!after ||
+            o.created_at > after.created_at ||
+            (o.created_at === after.created_at && o.id > after.id)),
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+      .slice(0, Math.min(Math.max(opts.limit, 1), 500));
+  },
+
+  async transitionOrderStatus(id, from, to) {
+    ensureKitchenSeed();
+    const current = orders.get(id);
+    if (!current) return { ok: false, reason: "not_found" } as const;
+    if (!from.includes(current.status)) {
+      return { ok: false, reason: "conflict", order: current } as const;
+    }
+    const order = (await this.updateOrderStatus(id, to)) as Order;
+    return { ok: true, order } as const;
+  },
+
+  async listPaymentsForOrders(orderIds: string[]) {
+    const out = new Map<string, Payment[]>();
+    const wanted = new Set(orderIds);
+    for (const p of [...payments.values()].sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    )) {
+      if (!wanted.has(p.order_id)) continue;
+      const list = out.get(p.order_id) ?? [];
+      list.push({ ...p });
+      out.set(p.order_id, list);
+    }
+    return out;
+  },
+
+  async getCustomers(ids: string[]): Promise<Customer[]> {
+    return ids.flatMap((id) => {
+      const c = customers.get(id);
+      return c ? [{ ...c }] : [];
+    });
+  },
+
+  async customerOrderStats(tenantId: string, customerIds: string[]) {
+    ensureKitchenSeed();
+    const wanted = new Set(customerIds);
+    const out = new Map<
+      string,
+      { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
+    >();
+    for (const o of orders.values()) {
+      if (
+        o.tenant_id !== tenantId ||
+        !o.customer_id ||
+        !wanted.has(o.customer_id) ||
+        o.status === "voided" ||
+        o.status === "draft"
+      ) {
+        continue;
+      }
+      const s = out.get(o.customer_id) ?? {
+        order_count: 0,
+        last_order_at: null,
+        lifetime_spend_cents: 0,
+      };
+      s.order_count += 1;
+      s.lifetime_spend_cents += o.totals.total_cents;
+      if (!s.last_order_at || o.created_at > s.last_order_at) s.last_order_at = o.created_at;
+      out.set(o.customer_id, s);
+    }
+    return out;
+  },
+
+  async listStaffWithPin(tenantId: string): Promise<Set<string>> {
+    return new Set(
+      [...staffById.values()]
+        .filter((s) => s.tenant_id === tenantId && s.pin_hash)
+        .map((s) => s.id),
+    );
   },
 
   async updateOrderStatus(
@@ -1159,11 +1256,19 @@ export const mockDriver: PosDriver = {
     return customers.get(id) ?? null;
   },
 
-  async listCustomers(tenantId: string): Promise<Customer[]> {
-    return [...customers.values()]
-      .filter((c) => c.tenant_id === tenantId)
-      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+  async listCustomers(tenantId, opts): Promise<Customer[]> {
+    const after = opts?.after;
+    const rows = [...customers.values()]
+      .filter(
+        (c) =>
+          c.tenant_id === tenantId &&
+          (!after ||
+            c.created_at > after.created_at ||
+            (c.created_at === after.created_at && c.id > after.id)),
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
       .map((c) => ({ ...c }));
+    return opts?.limit ? rows.slice(0, opts.limit) : rows;
   },
 
   async getTenantSettings(tenantId: string): Promise<TenantSettings> {

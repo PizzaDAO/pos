@@ -80,6 +80,28 @@ export type MenuEntityKind =
   | "modifierGroup"
   | "modifier";
 
+/** Bounds for `listOrders` (newest first). Explicit so no default row cap applies. */
+export interface OrderListOptions {
+  /** Max rows (default 500, hard max 1000). */
+  limit?: number;
+  offset?: number;
+  /** Inclusive ISO created_at range. */
+  from?: string;
+  to?: string;
+}
+
+export interface OrderPageOptions {
+  /** Exclusive keyset cursor. */
+  after?: { created_at: string; id: string };
+  /** Page size (1..500). */
+  limit: number;
+  /** Inclusive ISO created_at bounds. */
+  createdFrom?: string;
+  createdTo?: string;
+  /** Only rows updated at/after this ISO instant. */
+  updatedSince?: string;
+}
+
 export interface PosDriver {
   /** Stable id of the active driver implementation (for diagnostics/UX). */
   readonly name: "mock" | "supabase";
@@ -251,7 +273,57 @@ export interface PosDriver {
   getOrder(id: string): Promise<Order | null>;
 
   /** List recent orders for a location (newest first). */
-  listOrders(tenantId: string, locationId: string): Promise<Order[]>;
+  listOrders(
+    tenantId: string,
+    locationId: string,
+    opts?: OrderListOptions,
+  ): Promise<Order[]>;
+
+  /**
+   * Keyset page of a location's orders, OLDEST first by (created_at, id), with
+   * the order graph batch-loaded (no per-order queries). The core `/v1` feed.
+   */
+  listOrdersPage(
+    tenantId: string,
+    locationId: string,
+    opts: OrderPageOptions,
+  ): Promise<Order[]>;
+
+  /**
+   * Atomic compare-and-set status transition: moves the order to `to` only if
+   * its CURRENT status is in `from`. `transitioned` is true for exactly one
+   * concurrent caller; side effects (inventory depletion on release) run only
+   * then. Never throws for a lost race: `{ok:false, reason:"conflict"}`.
+   */
+  transitionOrderStatus(
+    id: string,
+    from: OrderStatus[],
+    to: OrderStatus,
+  ): Promise<
+    | { ok: true; order: Order }
+    | { ok: false; reason: "not_found" }
+    | { ok: false; reason: "conflict"; order: Order }
+  >;
+
+  /** Batch read: tenders for several orders (one query), grouped by order id. */
+  listPaymentsForOrders(orderIds: string[]): Promise<Map<string, Payment[]>>;
+
+  /** Batch read: customers by id (one query). */
+  getCustomers(ids: string[]): Promise<Customer[]>;
+
+  /** Aggregate order stats for the given customers (bounded; no full scans). */
+  customerOrderStats(
+    tenantId: string,
+    customerIds: string[],
+  ): Promise<
+    Map<
+      string,
+      { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
+    >
+  >;
+
+  /** Ids of staff that have a quick-switch PIN set (hashes never leave the driver). */
+  listStaffWithPin(tenantId: string): Promise<Set<string>>;
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
@@ -337,7 +409,10 @@ export interface PosDriver {
   getCustomer(id: string): Promise<Customer | null>;
 
   /** All of a tenant's customers (newest first) — the core `/v1/customers` feed. */
-  listCustomers(tenantId: string): Promise<Customer[]>;
+  listCustomers(
+    tenantId: string,
+    opts?: { after?: { created_at: string; id: string }; limit?: number },
+  ): Promise<Customer[]>;
 
   // -- Per-tenant POS settings (core v1) ---------------------------------------
 
