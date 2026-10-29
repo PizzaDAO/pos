@@ -11,11 +11,12 @@
  * ONLY while the tenant's onboarding is not yet live. After go-live the normal
  * session + membership guard applies.
  *
- * Secret: ONBOARDING_TOKEN_SECRET, else the Supabase service-role key (always
- * present in real mode), else a per-process random secret (simulated/zero-env
- * mode, whose state is per-process anyway). Never read at module load.
+ * Secret: see ./signing-secret — ONBOARDING_TOKEN_SECRET or the service-role
+ * key; in real mode with neither, signing THROWS and verification fails
+ * (fail closed). Never read at module load.
  */
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { signingSecret } from "./signing-secret";
 import { getPosDriver } from "@/lib/db";
 import type { SessionUser } from "./session";
 import { requireTenantAccess, type GuardFailure } from "./tenant-guard";
@@ -25,27 +26,31 @@ export const ONBOARDING_TOKEN_HEADER = "x-onboarding-token";
 /** Token lifetime: long enough to finish the wizard, short enough to expire. */
 const TTL_MS = 24 * 60 * 60 * 1000;
 
-let processSecret: string | null = null;
-
-function secret(): string {
-  const configured =
-    process.env.ONBOARDING_TOKEN_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (configured) return configured;
-  if (!processSecret) processSecret = randomBytes(32).toString("hex");
-  return processSecret;
+/** Thrown when no signing secret is configured in real mode (fail closed). */
+export class SigningSecretMissingError extends Error {
+  constructor() {
+    super(
+      "Server signing secret is not configured (set ONBOARDING_TOKEN_SECRET).",
+    );
+    this.name = "SigningSecretMissingError";
+  }
 }
 
-function mac(payload: string): string {
-  return createHmac("sha256", secret())
+function mac(payload: string): string | null {
+  const key = signingSecret();
+  if (!key) return null;
+  return createHmac("sha256", key)
     .update(`onboarding:v1:${payload}`)
     .digest("hex");
 }
 
-/** Mint a token for a freshly-created tenant. */
+/** Mint a token for a freshly-created tenant. Throws if no secret (real mode). */
 export function signOnboardingToken(tenantId: string, now = Date.now()): string {
   const exp = String(now + TTL_MS);
   const payload = `${tenantId}.${exp}`;
-  return `${payload}.${mac(payload)}`;
+  const sig = mac(payload);
+  if (!sig) throw new SigningSecretMissingError();
+  return `${payload}.${sig}`;
 }
 
 /** Verify a token's signature, expiry and tenant binding (pure, no I/O). */
@@ -65,7 +70,9 @@ export function verifyOnboardingToken(
   const exp = Number(payload.slice(expDot + 1));
   if (boundTenant !== tenantId) return false;
   if (!Number.isFinite(exp) || exp < now) return false;
-  const expected = Buffer.from(mac(payload), "hex");
+  const expectedHex = mac(payload);
+  if (!expectedHex) return false; // no secret in real mode → fail closed
+  const expected = Buffer.from(expectedHex, "hex");
   let given: Buffer;
   try {
     given = Buffer.from(sig, "hex");
