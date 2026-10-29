@@ -1,7 +1,7 @@
 /**
  * Storefront data hook (Phase 4). Loads the resolved location + menu + store
  * settings (incl. fulfillment) + payment settings from `/api/shop/location` via
- * TanStack Query, keyed by the public location slug.
+ * TanStack Query, keyed by the storefront's (tenant slug, location slug) pair.
  */
 "use client";
 
@@ -12,6 +12,7 @@ import type {
   PaymentSettings,
   StoreSettings,
 } from "@/lib/db";
+import type { StorefrontRef } from "@/lib/shop/storefront";
 
 export interface ShopResponse {
   location: Location;
@@ -25,12 +26,12 @@ export interface ShopResponse {
   driver: string;
 }
 
-export function useShop(slug: string) {
+export function useShop(store: StorefrontRef) {
   return useQuery<ShopResponse>({
-    queryKey: ["shop", slug],
+    queryKey: ["shop", store.tenantSlug, store.locationSlug],
     queryFn: async () => {
       const res = await fetch(
-        `/api/shop/location?slug=${encodeURIComponent(slug)}`,
+        `/api/shop/location?tenant=${encodeURIComponent(store.tenantSlug)}&location=${encodeURIComponent(store.locationSlug)}`,
         { cache: "no-store" },
       );
       if (!res.ok) throw new Error(`Failed to load shop (HTTP ${res.status})`);

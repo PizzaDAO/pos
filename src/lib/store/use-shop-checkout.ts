@@ -47,6 +47,7 @@ export interface DeliveryQuoteResult {
 
 export interface PlaceOrderInput {
   orderId: string;
+  tenantSlug: string;
   locationSlug: string;
   items: OrderItem[];
   fulfillmentType: "pickup" | "delivery";
@@ -125,6 +126,7 @@ export function useShopCheckout() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             id: input.orderId,
+            tenantSlug: input.tenantSlug,
             locationSlug: input.locationSlug,
             items: input.items,
             fulfillmentType: input.fulfillmentType,

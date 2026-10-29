@@ -33,6 +33,7 @@ import { computeOrderTotals } from "@/lib/pricing";
 import { RepriceError, repriceItems } from "@/lib/shop/reprice";
 import { enforceRateLimit, isMoneyCents } from "@/lib/security";
 import { ensureCustomer } from "@/lib/shop/auth";
+import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
 import {
   asapAvailability,
   checkScheduledTime,
@@ -49,6 +50,8 @@ export const runtime = "nodejs";
 
 interface ShopOrderBody {
   id: string;
+  /** Storefront tenant slug (locations.slug is only unique per tenant). */
+  tenantSlug?: string;
   locationSlug: string;
   items: OrderItem[];
   fulfillmentType: "pickup" | "delivery";
@@ -113,10 +116,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ order: existing, delivery }, { status: 200 });
   }
 
-  const location = await driver.getLocationBySlug(body.locationSlug);
-  if (!location) {
-    return NextResponse.json({ error: "Location not found." }, { status: 404 });
+  // The tenant is derived from the resolved location — never the client.
+  const resolved = await resolveStorefrontLocation({
+    tenantSlug: body.tenantSlug,
+    locationSlug: body.locationSlug,
+  });
+  if (!resolved.ok) {
+    return NextResponse.json(
+      { error: resolved.error },
+      { status: resolved.status },
+    );
   }
+  const location = resolved.location;
   const tenantId = location.tenant_id;
   const locationId = location.id;
 

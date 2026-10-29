@@ -49,10 +49,12 @@ const ONLINE_RAILS: { key: PaymentRailKey; label: string }[] = [
 ];
 
 export function CheckoutFlow({
+  tenantSlug,
   slug,
   shop,
   onClose,
 }: {
+  tenantSlug: string;
   slug: string;
   shop: ShopResponse;
   onClose: () => void;
@@ -190,6 +192,7 @@ export function CheckoutFlow({
       if (superseded) checkout.cancelQuietly(superseded);
       placed = await checkout.placeOrder({
         orderId,
+        tenantSlug,
         locationSlug: slug,
         items,
         fulfillmentType: fulfillment,
@@ -316,7 +319,7 @@ export function CheckoutFlow({
     const res = await fetch("/api/shop/auth/magic-link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ locationSlug: slug, email, name }),
+      body: JSON.stringify({ tenantSlug, locationSlug: slug, email, name }),
     });
     const data = (await res.json()) as { magicLinkUrl?: string };
     setMagicLinkUrl(data.magicLinkUrl ?? null);
@@ -739,7 +742,7 @@ export function CheckoutFlow({
                     : "We'll have it ready for pickup."}
                 </p>
               </div>
-              <Link href={`/shop/${slug}/track/${placedOrderId}`}>
+              <Link href={`/shop/${tenantSlug}/${slug}/track/${placedOrderId}`}>
                 <Button className="h-12 w-full">Track your order</Button>
               </Link>
               <Button variant="outline" className="w-full" onClick={onClose}>

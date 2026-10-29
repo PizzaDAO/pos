@@ -986,11 +986,19 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     async createLocation(input) {
       const now = nowIso();
-      const existingSlugs = new Set(
-        (
-          (unwrap(await sb.from("locations").select("slug")) as Row[]) ?? []
+      // Slugs are unique per tenant (unique (tenant_id, slug)); "track" is
+      // reserved by the legacy storefront tracking route.
+      const existingSlugs = new Set([
+        "track",
+        ...(
+          (unwrap(
+            await sb
+              .from("locations")
+              .select("slug")
+              .eq("tenant_id", input.tenant_id),
+          ) as Row[]) ?? []
         ).map((r) => r.slug as string),
-      );
+      ]);
       let slug = slugify(input.name);
       if (existingSlugs.has(slug)) {
         let n = 2;
@@ -1336,11 +1344,36 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       ).map(mapLocation);
     },
 
-    async getLocationBySlug(slug) {
+    async getTenantBySlug(slug) {
       const r = unwrap(
-        await sb.from("locations").select("*").eq("slug", slug).maybeSingle(),
+        await sb.from("tenants").select("*").eq("slug", slug).maybeSingle(),
+      ) as Row | null;
+      return r ? mapTenant(r) : null;
+    },
+
+    async getLocationBySlugs(tenantSlug, locationSlug) {
+      // tenants.slug is globally unique; locations.slug is unique per tenant
+      // (unique (tenant_id, slug)) — so the pair resolves at most one row.
+      const tenant = await this.getTenantBySlug(tenantSlug);
+      if (!tenant) return null;
+      const r = unwrap(
+        await sb
+          .from("locations")
+          .select("*")
+          .eq("tenant_id", tenant.id)
+          .eq("slug", locationSlug)
+          .maybeSingle(),
       ) as Row | null;
       return r ? mapLocation(r) : null;
+    },
+
+    async listLocationsBySlug(slug) {
+      // NOT maybeSingle(): several tenants may share a location slug.
+      return (
+        unwrap(
+          await sb.from("locations").select("*").eq("slug", slug).limit(50),
+        ) as Row[]
+      ).map(mapLocation);
     },
 
     async getMenu(tenantId, locationId, opts) {
@@ -2004,6 +2037,50 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     // -- Menu management ---------------------------------------------------
+    async getMenuEntityTenant(entity, id) {
+      const one = async (table: string, cols: string) =>
+        unwrap(
+          await sb.from(table).select(cols).eq("id", id).maybeSingle(),
+        ) as Row | null;
+      switch (entity) {
+        case "category":
+          return ((await one("menu_categories", "tenant_id"))?.tenant_id ??
+            null) as string | null;
+        case "item":
+          return ((await one("menu_items", "tenant_id"))?.tenant_id ??
+            null) as string | null;
+        case "modifierGroup":
+          return ((await one("modifier_groups", "tenant_id"))?.tenant_id ??
+            null) as string | null;
+        case "size": {
+          const size = await one("item_sizes", "item_id");
+          if (!size) return null;
+          const item = unwrap(
+            await sb
+              .from("menu_items")
+              .select("tenant_id")
+              .eq("id", size.item_id as string)
+              .maybeSingle(),
+          ) as Row | null;
+          return (item?.tenant_id ?? null) as string | null;
+        }
+        case "modifier": {
+          const mod = await one("modifiers", "group_id");
+          if (!mod) return null;
+          const group = unwrap(
+            await sb
+              .from("modifier_groups")
+              .select("tenant_id")
+              .eq("id", mod.group_id as string)
+              .maybeSingle(),
+          ) as Row | null;
+          return (group?.tenant_id ?? null) as string | null;
+        }
+        default:
+          return null;
+      }
+    },
+
     async listCategories(tenantId) {
       return (
         unwrap(
@@ -2456,6 +2533,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         );
     },
 
+    async getInventoryItem(id) {
+      const r = unwrap(
+        await sb.from("inventory_items").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapInventoryItem(r) : null;
+    },
+
     async upsertInventoryItem(item) {
       const existing = item.id
         ? (unwrap(
@@ -2723,6 +2807,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return mapStaff(
         unwrap(await sb.from("staff").upsert(row).select().single()) as Row,
       );
+    },
+
+    async getShift(id) {
+      const r = unwrap(
+        await sb.from("shifts").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapShift(r) : null;
     },
 
     async listShifts(tenantId, locationId) {

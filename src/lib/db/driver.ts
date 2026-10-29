@@ -73,6 +73,14 @@ import type {
   TenantOnboarding,
 } from "./saas-types";
 
+/** Menu entity kinds addressable by the back-office menu editor. */
+export type MenuEntityKind =
+  | "category"
+  | "item"
+  | "size"
+  | "modifierGroup"
+  | "modifier";
+
 export interface PosDriver {
   /** Stable id of the active driver implementation (for diagnostics/UX). */
   readonly name: "mock" | "supabase";
@@ -190,8 +198,25 @@ export interface PosDriver {
   /** All locations for a tenant. */
   listLocations(tenantId: string): Promise<Location[]>;
 
-  /** Resolve a location by its public slug (storefront URL), or null. */
-  getLocationBySlug(slug: string): Promise<Location | null>;
+  /** Resolve a tenant by its (globally unique) public slug, or null. */
+  getTenantBySlug(slug: string): Promise<Tenant | null>;
+
+  /**
+   * Resolve a storefront location by `/shop/{tenantSlug}/{locationSlug}`.
+   * `locations.slug` is only unique WITHIN a tenant (unique (tenant_id, slug)),
+   * so a location must always be resolved together with its tenant's slug.
+   */
+  getLocationBySlugs(
+    tenantSlug: string,
+    locationSlug: string,
+  ): Promise<Location | null>;
+
+  /**
+   * Every location (across tenants) with this slug — used ONLY by the legacy
+   * `/shop/{locationSlug}` redirect, which redirects when exactly one matches
+   * and shows a chooser when several tenants share the slug.
+   */
+  listLocationsBySlug(slug: string): Promise<Location[]>;
 
   /**
    * Fully-assembled menu graph for a location (categories → items →
@@ -476,6 +501,17 @@ export interface PosDriver {
   // per-location price/availability + 86 live in the override methods below.
   // --------------------------------------------------------------------------
 
+  /**
+   * The tenant that owns a menu entity (category/item/size/modifier group/
+   * modifier), or null if it doesn't exist. Lets API routes verify that a
+   * client-supplied id belongs to the authorized tenant before mutating it
+   * (the server driver bypasses RLS, so this check is the tenant boundary).
+   */
+  getMenuEntityTenant(
+    entity: MenuEntityKind,
+    id: string,
+  ): Promise<string | null>;
+
   listCategories(tenantId: string): Promise<MenuCategory[]>;
   upsertCategory(input: CategoryInput): Promise<MenuCategory>;
   deleteCategory(id: string): Promise<void>;
@@ -523,6 +559,9 @@ export interface PosDriver {
     tenantId: string,
     locationId: string,
   ): Promise<InventoryItemView[]>;
+
+  /** Fetch a single inventory item by id (any tenant), or null. */
+  getInventoryItem(id: string): Promise<InventoryItem | null>;
 
   upsertInventoryItem(item: InventoryItem): Promise<InventoryItem>;
 
@@ -588,6 +627,9 @@ export interface PosDriver {
    * PIN route — the hash never leaves the server. Returns null if unknown.
    */
   getStaffById(tenantId: string, staffId: string): Promise<Staff | null>;
+
+  /** Fetch a single shift by id (any tenant), or null. */
+  getShift(id: string): Promise<Shift | null>;
 
   /** List shifts for a location (newest first). */
   listShifts(tenantId: string, locationId: string): Promise<Shift[]>;

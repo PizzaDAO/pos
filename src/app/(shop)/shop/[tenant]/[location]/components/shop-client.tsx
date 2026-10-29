@@ -24,15 +24,17 @@ import { MenuBrowse } from "@/app/(terminal)/terminal/components/menu-browse";
 import { PizzaBuilder } from "@/app/(terminal)/terminal/components/pizza-builder";
 import { CustomerCart } from "./customer-cart-panel";
 import { CheckoutFlow } from "./checkout-flow";
+import { storefrontKey, type StorefrontRef } from "@/lib/shop/storefront";
 
 export function ShopClient({
-  slug,
+  store,
   locationName,
 }: {
-  slug: string;
+  store: StorefrontRef;
   locationName: string;
 }) {
-  const { data, isLoading, isError, refetch } = useShop(slug);
+  const { data, isLoading, isError, refetch } = useShop(store);
+  const cartKey = storefrontKey(store);
 
   const setLocation = useCustomerCart((s) => s.setLocation);
   const items = useCustomerCart((s) => s.items);
@@ -48,8 +50,8 @@ export function ShopClient({
 
   // Bind the cart to this location (clears if switching shops).
   useEffect(() => {
-    setLocation(slug);
-  }, [slug, setLocation]);
+    setLocation(cartKey);
+  }, [cartKey, setLocation]);
 
   if (isLoading) {
     return (
@@ -194,7 +196,8 @@ export function ShopClient({
 
       {checkoutOpen && (
         <CheckoutFlow
-          slug={slug}
+          tenantSlug={store.tenantSlug}
+          slug={store.locationSlug}
           shop={data}
           onClose={() => setCheckoutOpen(false)}
         />

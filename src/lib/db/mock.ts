@@ -601,7 +601,18 @@ export const mockDriver: PosDriver = {
 
   async createLocation(input: CreateLocationInput): Promise<Location> {
     const now = nowIso();
-    const slug = uniqueSlug(input.name, new Set(locations.map((l) => l.slug)));
+    // Slugs are unique WITHIN a tenant (DB: unique (tenant_id, slug)) — two
+    // tenants may both have e.g. "downtown"; storefront URLs carry the tenant
+    // slug to disambiguate. "track" is reserved by the legacy tracking route.
+    const slug = uniqueSlug(
+      input.name,
+      new Set([
+        "track",
+        ...locations
+          .filter((l) => l.tenant_id === input.tenant_id)
+          .map((l) => l.slug),
+      ]),
+    );
     const location: Location = {
       id: genId("loc"),
       tenant_id: input.tenant_id,
@@ -846,8 +857,25 @@ export const mockDriver: PosDriver = {
     return locations.filter((l) => l.tenant_id === tenantId);
   },
 
-  async getLocationBySlug(slug: string): Promise<Location | null> {
-    return locations.find((l) => l.slug === slug) ?? null;
+  async getTenantBySlug(slug: string): Promise<Tenant | null> {
+    const t = tenants.find((x) => x.slug === slug);
+    return t ? { ...t } : null;
+  },
+
+  async getLocationBySlugs(
+    tenantSlug: string,
+    locationSlug: string,
+  ): Promise<Location | null> {
+    const tenant = tenants.find((t) => t.slug === tenantSlug);
+    if (!tenant) return null;
+    const loc = locations.find(
+      (l) => l.tenant_id === tenant.id && l.slug === locationSlug,
+    );
+    return loc ? { ...loc } : null;
+  },
+
+  async listLocationsBySlug(slug: string): Promise<Location[]> {
+    return locations.filter((l) => l.slug === slug).map((l) => ({ ...l }));
   },
 
   async getMenu(tenantId, locationId, opts): Promise<Menu> {
@@ -1409,6 +1437,31 @@ export const mockDriver: PosDriver = {
 
   // -- Menu management (Phase 5) ---------------------------------------------
 
+  async getMenuEntityTenant(entity, id): Promise<string | null> {
+    switch (entity) {
+      case "category":
+        return menuCategories.find((c) => c.id === id)?.tenant_id ?? null;
+      case "item":
+        return menuItems.find((i) => i.id === id)?.tenant_id ?? null;
+      case "size": {
+        const size = itemSizes.find((s) => s.id === id);
+        if (!size) return null;
+        return menuItems.find((i) => i.id === size.item_id)?.tenant_id ?? null;
+      }
+      case "modifierGroup":
+        return modifierGroups.find((g) => g.id === id)?.tenant_id ?? null;
+      case "modifier": {
+        const mod = modifiers.find((m) => m.id === id);
+        if (!mod) return null;
+        return (
+          modifierGroups.find((g) => g.id === mod.group_id)?.tenant_id ?? null
+        );
+      }
+      default:
+        return null;
+    }
+  },
+
   async listCategories(tenantId: string): Promise<MenuCategory[]> {
     return menuCategories
       .filter((c) => c.tenant_id === tenantId)
@@ -1667,6 +1720,11 @@ export const mockDriver: PosDriver = {
       .map((i) => ({ ...i, low: i.on_hand <= i.low_threshold }));
   },
 
+  async getInventoryItem(id: string): Promise<InventoryItem | null> {
+    const item = inventoryItems.get(id);
+    return item ? { ...item } : null;
+  },
+
   async upsertInventoryItem(item: InventoryItem): Promise<InventoryItem> {
     const existing = inventoryItems.get(item.id);
     const now = nowIso();
@@ -1825,6 +1883,11 @@ export const mockDriver: PosDriver = {
     };
     staffById.set(merged.id, merged);
     return { ...merged, pin_hash: undefined };
+  },
+
+  async getShift(id: string): Promise<Shift | null> {
+    const shift = shifts.get(id);
+    return shift ? { ...shift } : null;
   },
 
   async listShifts(tenantId: string, locationId: string): Promise<Shift[]> {
