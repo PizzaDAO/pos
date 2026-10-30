@@ -1117,6 +1117,43 @@ begin
     format('a claimed refund row gets a corrective event, saw %s', t);
   assert (select changes from public.core_outbox where subject_id = p_live2 order by sequence desc limit 1)
          = '{"refunded_cents":[400,0]}'::jsonb, 'the correction records the restored refunded_cents';
+  -- (6) two OVERLAPPING reservations: a release retracts the row recording
+  -- THAT reservation (refunded_cents moved by the released amount), never the
+  -- newest or an unrelated pending one.
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents)
+  values ('0aea0f01-0000-0000-0000-000000000001', o_live, v_t, v_l, 'cash', 'captured', 1000),
+         ('0aea0f01-0000-0000-0000-000000000002', o_live, v_t, v_l, 'cash', 'captured', 1000);
+  r := public.reserve_payment_refund('0aea0f01-0000-0000-0000-000000000001', 300, 'ov-a');
+  r := public.reserve_payment_refund('0aea0f01-0000-0000-0000-000000000001', 400, 'ov-b');
+  assert (select array_agg(changes order by sequence) from public.core_outbox
+           where subject_id = '0aea0f01-0000-0000-0000-000000000001' and event_type = 'payment.refunded')
+         = array['{"refunded_cents":[0,300]}'::jsonb, '{"refunded_cents":[300,700]}'::jsonb],
+    'each reservation has its own payment.refunded row';
+  perform public.release_payment_refund('0aea0f01-0000-0000-0000-000000000001', 300, 'ov-a');
+  assert (select array_agg(status::text order by sequence) from public.core_outbox
+           where subject_id = '0aea0f01-0000-0000-0000-000000000001' and event_type = 'payment.refunded')
+         = array['dead', 'pending'],
+    'releasing the OLDER reservation retracts its row (0->300), not the newest (300->700)';
+  select array_agg(event_type order by sequence) into t from public.core_outbox
+   where subject_id = '0aea0f01-0000-0000-0000-000000000001';
+  assert t = array['payment.captured', 'payment.refunded', 'payment.refunded'],
+    format('a retracted overlapping release emits nothing new, saw %s', t);
+  -- ...and when the released reservation's row was already claimed, the other
+  -- (still pending) reservation's row survives and a correction goes out.
+  r := public.reserve_payment_refund('0aea0f01-0000-0000-0000-000000000002', 300, 'ov-c');
+  r := public.reserve_payment_refund('0aea0f01-0000-0000-0000-000000000002', 400, 'ov-d');
+  update public.core_outbox set attempts = 1
+   where subject_id = '0aea0f01-0000-0000-0000-000000000002' and event_type = 'payment.refunded'
+     and changes = '{"refunded_cents":[300,700]}'::jsonb;
+  perform public.release_payment_refund('0aea0f01-0000-0000-0000-000000000002', 400, 'ov-d');
+  assert (select status::text from public.core_outbox
+           where subject_id = '0aea0f01-0000-0000-0000-000000000002'
+             and changes = '{"refunded_cents":[0,300]}'::jsonb) = 'pending',
+    'an unrelated pending refund row is never retracted';
+  assert (select changes from public.core_outbox
+           where subject_id = '0aea0f01-0000-0000-0000-000000000002' order by sequence desc limit 1)
+         = '{"refunded_cents":[700,300]}'::jsonb,
+    'a claimed overlapping reservation gets a corrective event';
 
   -- (7) order.updated ignores checkout bookkeeping inside fulfillment.
   delete from public.core_outbox where subject_id = o_live;

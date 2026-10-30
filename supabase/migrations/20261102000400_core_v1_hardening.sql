@@ -226,8 +226,13 @@ $$;
 -- call; when the rail fails, release_payment_refund undoes it (refunded_cents
 -- goes DOWN, refunded -> captured). That release emits no payment.captured:
 -- it retracts the still-unclaimed payment.refunded row instead (dead,
--- 'retracted'). Only if that row was already claimed by a worker (it may have
--- reached the hub) is a corrective event emitted for the restored status.
+-- 'retracted'). The row retracted is the one recording THIS reservation: its
+-- `changes.refunded_cents` transition [before, after] moved by exactly the
+-- released amount (overlapping reservations each have their own row; an
+-- unrelated pending refund row is never killed). Only if no such row is still
+-- unclaimed (a worker may have sent it to the hub) is a corrective event
+-- emitted for the restored status. Refund rows always record refunded_cents
+-- (also when the status flips to refunded) so they can be matched.
 create or replace function public.core_trg_payments()
 returns trigger
 language plpgsql
@@ -252,6 +257,10 @@ begin
        where tenant_id = new.tenant_id and subject_type = 'payment'
          and subject_id = new.id and event_type = 'payment.refunded'
          and status = 'pending' and attempts = 0
+         and jsonb_typeof(changes -> 'refunded_cents') = 'array'
+         and (changes -> 'refunded_cents' ->> 1)::bigint
+             - (changes -> 'refunded_cents' ->> 0)::bigint
+             = old.refunded_cents - new.refunded_cents
        order by sequence desc
        limit 1
        for update skip locked;
@@ -281,6 +290,10 @@ begin
       else null end;
   elsif new.status is distinct from old.status then
     v_changes := jsonb_build_object('status', jsonb_build_array(old.status, new.status));
+    if new.refunded_cents is distinct from old.refunded_cents then
+      v_changes := v_changes || jsonb_build_object('refunded_cents',
+        jsonb_build_array(old.refunded_cents, new.refunded_cents));
+    end if;
     v_type := case new.status::text
       when 'authorized' then 'payment.authorized'
       when 'captured' then 'payment.captured'

@@ -312,6 +312,38 @@ describe("6. a released refund reservation", () => {
     expect(last.event_type).toBe("payment.captured");
     expect(last.changes).toEqual({ refunded_cents: [400, 0] });
   });
+
+  it("overlapping reservations: a release retracts ITS row, not the newest", async () => {
+    const d = getPosDriver();
+    const id = "c6000000-0000-4000-8000-000000000003";
+    await d.createOrder(order(id, "placed", { channel: "in_store" }));
+    const p = await d.upsertPayment(payment(id, "captured"));
+    await d.reservePaymentRefund(p.id, 300, "rf-a");
+    await d.reservePaymentRefund(p.id, 400, "rf-b");
+    const [a, b] = rowsFor(p.id).filter((r) => r.event_type === "payment.refunded");
+    expect(a!.changes).toEqual({ refunded_cents: [0, 300] });
+    expect(b!.changes).toEqual({ refunded_cents: [300, 700] });
+    await d.releasePaymentRefund(p.id, 300, "rf-a");
+    expect(a!.status).toBe("dead");
+    expect(b!.status).toBe("pending");
+    expect(typesFor(p.id)).toEqual(["payment.captured", "payment.refunded", "payment.refunded"]);
+  });
+
+  it("overlapping reservations: a claimed row gets a correction; the other pending row survives", async () => {
+    const d = getPosDriver();
+    const id = "c6000000-0000-4000-8000-000000000004";
+    await d.createOrder(order(id, "placed", { channel: "in_store" }));
+    const p = await d.upsertPayment(payment(id, "captured"));
+    await d.reservePaymentRefund(p.id, 300, "rf-a");
+    await d.reservePaymentRefund(p.id, 400, "rf-b");
+    const [a, b] = rowsFor(p.id).filter((r) => r.event_type === "payment.refunded");
+    b!.attempts = 1; // a worker already claimed rf-b's row
+    await d.releasePaymentRefund(p.id, 400, "rf-b");
+    expect(a!.status).toBe("pending"); // unrelated: never killed
+    const last = rowsFor(p.id).at(-1)!;
+    expect(last.event_type).toBe("payment.captured");
+    expect(last.changes).toEqual({ refunded_cents: [700, 300] });
+  });
 });
 
 describe("7. order.updated", () => {

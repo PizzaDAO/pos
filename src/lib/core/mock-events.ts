@@ -165,10 +165,20 @@ function paymentType(status: string): string | null {
 /**
  * Same rules as public.core_trg_payments(): nothing for an order the hub has not
  * seen (its later order.placed is hydrated with the tenders); a released refund
- * reservation (refunded_cents goes down) retracts its unclaimed
- * payment.refunded row, or, when a worker already claimed that row, emits a
- * correction for the restored status.
+ * reservation (refunded_cents goes down) retracts the unclaimed
+ * payment.refunded row recording THAT reservation (its refunded_cents
+ * transition moved by exactly the released amount), or, when no such row is
+ * unclaimed, emits a correction for the restored status.
  */
+/** How far a row's recorded refunded_cents transition moved (null if none). */
+function refundDelta(
+  changes: Record<string, [unknown, unknown]> | null,
+): number | null {
+  const t = changes?.refunded_cents;
+  if (!t || typeof t[0] !== "number" || typeof t[1] !== "number") return null;
+  return t[1] - t[0];
+}
+
 function paymentEvents(
   box: MemoryOutbox,
   orderAnnounced: boolean,
@@ -179,6 +189,7 @@ function paymentEvents(
   let type: string | null = null;
   let changes: Record<string, [unknown, unknown]> | null = null;
   if (before && after.refunded_cents < before.refunded_cents) {
+    const released = before.refunded_cents - after.refunded_cents;
     const open = [...box.rows]
       .reverse()
       .find(
@@ -188,7 +199,8 @@ function paymentEvents(
           r.subject_id === after.id &&
           r.event_type === "payment.refunded" &&
           r.status === "pending" &&
-          r.attempts === 0,
+          r.attempts === 0 &&
+          refundDelta(r.changes) === released,
       );
     if (open) {
       open.status = "dead";
@@ -205,6 +217,9 @@ function paymentEvents(
     type = paymentType(after.status);
   } else if (before.status !== after.status) {
     changes = { status: [before.status, after.status] };
+    if (before.refunded_cents !== after.refunded_cents) {
+      changes.refunded_cents = [before.refunded_cents, after.refunded_cents];
+    }
     type = paymentType(after.status);
   } else if (after.refunded_cents > before.refunded_cents) {
     changes = { refunded_cents: [before.refunded_cents, after.refunded_cents] };
