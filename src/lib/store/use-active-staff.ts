@@ -15,6 +15,8 @@ export interface ActiveStaff {
   tenant_id: string;
   name: string;
   role: string;
+  /** Server staff-session id of this switch-in (recorded on queued orders). */
+  session_id?: string;
 }
 
 const KEY = "pos.activeStaff";

@@ -144,12 +144,12 @@ export async function POST(request: Request) {
 
   // Replace any previous switch-in on this device (revoke it server-side).
   await revokeRequestStaffSession(request);
-  const signed = await openStaffSession({
+  const opened = await openStaffSession({
     userId: user.id,
     tenantId: matched.tenant_id,
     staffId: matched.id,
   });
-  if (!signed) {
+  if (!opened) {
     return NextResponse.json(
       { error: "Staff switching is unavailable (server not configured)." },
       { status: 503 },
@@ -170,9 +170,12 @@ export async function POST(request: Request) {
       tenant_id: matched.tenant_id,
       name: matched.name,
       role: matched.role,
+      // Recorded with orders queued offline under this switch-in; useless
+      // without this device login (the session row is bound to its user id).
+      session_id: opened.sessionId,
     },
   });
-  res.cookies.set(ACTIVE_STAFF_COOKIE, signed, activeStaffCookieOptions());
+  res.cookies.set(ACTIVE_STAFF_COOKIE, opened.cookie, activeStaffCookieOptions());
   return res;
 }
 
