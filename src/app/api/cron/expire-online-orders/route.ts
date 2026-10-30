@@ -33,6 +33,7 @@ function authorized(request: Request): boolean {
 }
 
 export async function GET(request: Request) {
+  const startedAt = Date.now();
   if (!authorized(request)) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
@@ -40,7 +41,10 @@ export async function GET(request: Request) {
   // Also sweep in-store card-reader tenders left open (tablet died mid-payment):
   // re-read from Stripe, capture if it went through, else cancel. Failure here
   // must not fail the online-order sweep.
-  const terminal = await reconcileTerminalTenders().catch((err) => {
+  const terminal = await reconcileTerminalTenders({
+    // Inside maxDuration: whatever the online sweep left, at most 40s.
+    budgetMs: Math.max(5_000, Math.min(40_000, 55_000 - (Date.now() - startedAt))),
+  }).catch((err) => {
     captureError(err, { scope: "terminal-reconcile-cron" });
     return null;
   });

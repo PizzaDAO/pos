@@ -7,7 +7,7 @@
  * Auth: owner | manager | cashier of the tender's tenant.
  */
 import { NextResponse } from "next/server";
-import { cardReaderMode } from "@/lib/payments/env";
+import { cardReaderMode, isStripeLiveKey } from "@/lib/payments/env";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 import { simulateCardTender } from "@/lib/payments/terminal/flow";
 import {
@@ -23,8 +23,9 @@ export async function POST(
   request: Request,
   ctx: { params: Promise<{ id: string }> },
 ) {
-  // A live deployment has no simulator: indistinguishable from a missing route.
-  if (cardReaderMode() === "stripe_live") {
+  // A deployment with a live key has no simulator (whatever the mode, even
+  // training): indistinguishable from a missing route.
+  if (cardReaderMode() === "stripe_live" || isStripeLiveKey()) {
     return NextResponse.json({ error: "Not found." }, { status: 404 });
   }
   const limited = enforceRateLimit(request, "payments");

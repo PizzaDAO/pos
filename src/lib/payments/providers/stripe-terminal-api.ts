@@ -244,6 +244,32 @@ export function cancelReaderAction(
   );
 }
 
+/**
+ * `cancel_action` ONLY if the reader is still working on THIS PaymentIntent. A
+ * reader can already have moved on to another payment (another tablet, a new
+ * tender), and cancel_action would wipe that customer's screen. Returns true
+ * when a cancel_action was sent. Errors from cancel_action (e.g.
+ * `terminal_reader_busy`) propagate; a failed reader lookup skips the cancel
+ * (the caller still cancels the PaymentIntent, which makes a late tap fail).
+ */
+export async function cancelReaderActionForIntent(
+  stripeAccount: string,
+  readerId: string,
+  paymentIntentId: string,
+): Promise<boolean> {
+  let reader: StripeReader;
+  try {
+    reader = await retrieveReader(stripeAccount, readerId);
+  } catch {
+    return false;
+  }
+  if (reader.action?.process_payment_intent?.payment_intent !== paymentIntentId) {
+    return false;
+  }
+  await cancelReaderAction(stripeAccount, readerId);
+  return true;
+}
+
 /** GET /v1/payment_intents/:id with the latest charge expanded (receipt fields). */
 export function retrievePaymentIntent(
   stripeAccount: string,

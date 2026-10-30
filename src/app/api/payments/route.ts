@@ -48,6 +48,7 @@ import {
   onlineRailAvailable,
 } from "@/lib/payments/online-rails";
 import { cardRailsSimulated } from "@/lib/payments/env";
+import { closeOpenCardTender } from "@/lib/payments/terminal/flow";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -309,6 +310,29 @@ export async function POST(request: Request) {
     if (amountCents <= 0) {
       return NextResponse.json(
         { error: "This order has nothing left to pay." },
+        { status: 409 },
+      );
+    }
+  }
+
+  // IN-STORE: a card tender may be live on the reader (the customer can still tap).
+  // Taking cash / crypto now would double charge, so close it first, STRICTLY. If
+  // the card already went through, or the customer is mid-authorization, refuse
+  // (409) and let the cashier re-check the balance.
+  if (order.channel === "in_store" && body.rail !== "stripe_terminal") {
+    const closed = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
+    if (closed === "settled" || closed === "in_flight") {
+      const current = await driver.getOrder(order.id);
+      return NextResponse.json(
+        {
+          error:
+            closed === "settled"
+              ? "This order was already paid by card. Check the balance."
+              : "The customer is paying by card on the reader. Wait for it to finish or cancel it first.",
+          code: closed === "settled" ? "already_paid_by_card" : "card_in_progress",
+          balanceCents: current ? await getOrderBalance(current) : undefined,
+          orderStatus: current?.status,
+        },
         { status: 409 },
       );
     }

@@ -56,7 +56,7 @@ describe("stripe_terminal rail (server-driven)", () => {
     expect(res.clientSecret).toBeUndefined();
   });
 
-  it("platform fee: pre-tip amount with reader/none tipping, amount + tip with a POS tip", async () => {
+  it("platform fee: always on the pre-tip amount, in every tip mode", async () => {
     goReal();
     const fee = async (tipMode: string, tip: number) => {
       stripeRequest.mockClear();
@@ -72,7 +72,7 @@ describe("stripe_terminal rail (server-driven)", () => {
     };
     expect(await fee("reader", 0)).toBe(260); // 2.5% of 10000 + 10
     expect(await fee("none", 0)).toBe(260);
-    expect(await fee("pos", 2000)).toBe(310); // 2.5% of 12000 + 10
+    expect(await fee("pos", 2000)).toBe(260); // tips carry no platform fee
   });
 
   it("refund is a direct-charge refund: refund_application_fee, no reverse_transfer", async () => {

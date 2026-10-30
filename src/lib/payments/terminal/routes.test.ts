@@ -29,6 +29,12 @@ vi.mock("@/lib/auth/api", () => ({
     requireTenantRole(tenantId, ["owner", "manager", "cashier", "kitchen"]),
 }));
 
+let sessionUser: { id: string; email: string } | null = { id: "u1", email: "u@x" };
+vi.mock("@/lib/auth/session", () => ({
+  getCurrentUser: async () => sessionUser,
+}));
+
+import { GET as statusGET } from "@/app/api/payments/status/route";
 import { GET as readersGET } from "@/app/api/terminal/readers/route";
 import { POST as resetPOST } from "@/app/api/terminal/readers/[id]/reset/route";
 import { POST as startPOST } from "@/app/api/terminal/payments/route";
@@ -93,6 +99,7 @@ async function seedOrder(total = 2000) {
 
 /** Mimic requireTenantRole for a session holding `role` in TENANT. */
 function sessionRole(role: string | null) {
+  sessionUser = role ? { id: "u1", email: "u@x" } : null;
   requireTenantRole.mockImplementation(async (tenantId: string, roles: string[]) => {
     if (!role) {
       return { ok: false, res: NextResponse.json({ error: "Not signed in." }, { status: 401 }) };
@@ -303,6 +310,21 @@ describe("tender lifecycle routes (simulated reader)", () => {
     expect(requireTenantRole.mock.calls.length).toBe(authCallsBefore); // live 404s before auth
   });
 
+  it("simulate is 404 with a live key even when training mode keeps the reader simulated", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "http://localhost:54321");
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "k");
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_live_x");
+    vi.stubEnv("TRAINING_MODE", "1");
+    const res = await simulatePOST(
+      req(`/api/terminal/payments/${paymentId}/simulate`, json({ outcome: "approve" })),
+      params(paymentId),
+    );
+    expect(res.status).toBe(404);
+    expect((await getPosDriver().getPayment(paymentId))!.status).toBe("requires_action");
+  });
+
   it("the generic payments GET shows the card receipt and last_error but no other rail internals", async () => {
     const orderId = await seedOrder();
     const { paymentId } = await startTender(orderId);
@@ -474,6 +496,91 @@ describe("generic /api/payments and stripe_terminal", () => {
   });
 });
 
+describe("GET /api/payments/status requires staff on the payment's tenant", () => {
+  const get = (id: string) => statusGET(req(`/api/payments/status?paymentId=${id}`));
+
+  it("signed out is 401 (for known and unknown ids alike)", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId);
+    sessionRole(null);
+    expect((await get(paymentId)).status).toBe(401);
+    expect((await get("nope")).status).toBe(401);
+  });
+
+  it("owner|manager|cashier of the order's tenant get the tender and the balance", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId);
+    for (const role of ["owner", "manager", "cashier"]) {
+      sessionRole(role);
+      const res = await get(paymentId);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.payment.id).toBe(paymentId);
+      expect(body.balanceCents).toBe(2000);
+    }
+    expect(requireTenantRole).toHaveBeenCalledWith(TENANT, ["owner", "manager", "cashier"]);
+  });
+
+  it("kitchen and other-tenant callers get the SAME 404 as an unknown id (no existence leak)", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId);
+    sessionRole("kitchen");
+    const denied = await get(paymentId);
+    const unknown = await get("00000000-0000-0000-0000-00000000dead");
+    expect(denied.status).toBe(404);
+    expect(unknown.status).toBe(404);
+    expect(await denied.json()).toEqual(await unknown.json());
+  });
+
+  it("a denied caller does not trigger a status refresh (no side effects)", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId);
+    const driver = getPosDriver();
+    await driver.upsertPayment({
+      ...(await driver.getPayment(paymentId))!,
+      raw: { ...((await driver.getPayment(paymentId))!.raw ?? {}), sim_outcome: "approve" },
+    });
+    sessionRole("kitchen");
+    await get(paymentId);
+    expect((await driver.getPayment(paymentId))!.status).toBe("requires_action");
+  });
+});
+
+describe("cash (or another rail) taken while a card tender is live on the reader", () => {
+  const cash = (orderId: string, amountCents: number) =>
+    paymentsPOST(
+      req(
+        "/api/payments",
+        json({
+          paymentId: uuid(),
+          orderId,
+          tenantId: TENANT,
+          locationId: LOCATION,
+          rail: "cash",
+          amountCents,
+          currency: "USD",
+        }),
+      ),
+    );
+
+  it("closes the live card tender first, then takes the cash (simulated reader)", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId);
+    const res = await cash(orderId, 2000);
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.orderStatus).toBe("paid");
+    expect((await getPosDriver().getPayment(paymentId))!.status).toBe("canceled");
+  });
+
+  it("a partial cash tender also closes the card tender (the cashier restarts card for the rest)", async () => {
+    const orderId = await seedOrder();
+    const { paymentId } = await startTender(orderId, 1500);
+    expect((await cash(orderId, 500)).status).toBe(201);
+    expect((await getPosDriver().getPayment(paymentId))!.status).toBe("canceled");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Webhook: card-present tenders settle by re-reading the PaymentIntent.
 // ---------------------------------------------------------------------------
@@ -549,6 +656,81 @@ describe("Connect webhook: card-present", () => {
       }),
     );
   }
+
+  const cashReq = (orderId: string) =>
+    paymentsPOST(
+      req(
+        "/api/payments",
+        json({
+          paymentId: uuid(),
+          orderId,
+          tenantId: TENANT,
+          locationId: LOCATION,
+          rail: "cash",
+          amountCents: 2000,
+          currency: "USD",
+        }),
+      ),
+    );
+
+  it("cash while the customer is mid-authorization on the reader is refused (409 card_in_progress); nothing is taken", async () => {
+    const { orderId, payment } = await startRealTender();
+    readerState = {
+      id: "tmr_1",
+      status: "online",
+      action: { status: "in_progress", process_payment_intent: { payment_intent: "pi_1" } },
+    };
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path.endsWith("/cancel_action")) {
+        throw new (await import("@/lib/payments/providers/stripe-client")).StripeError(
+          "busy",
+          409,
+          { error: { code: "terminal_reader_busy" } },
+        );
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    const res = await cashReq(orderId);
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("card_in_progress");
+    const all = await getPosDriver().listPaymentsForOrder(orderId);
+    expect(all.map((p) => p.rail)).toEqual(["stripe_terminal"]);
+    expect(all[0]!.id).toBe(payment.id);
+    expect(all[0]!.status).toBe("requires_action");
+  });
+
+  it("cash after the card already went through is refused (409 already_paid_by_card); the card is recorded, the order paid once", async () => {
+    const { orderId, payment } = await startRealTender();
+    piState = { ...piState, status: "succeeded" };
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path.endsWith("/cancel")) {
+        const { StripeError } = await import("@/lib/payments/providers/stripe-client");
+        throw new StripeError("already succeeded", 400, { error: { code: "payment_intent_unexpected_state" } });
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    const res = await cashReq(orderId);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe("already_paid_by_card");
+    expect(body.orderStatus).toBe("paid");
+    const all = await getPosDriver().listPaymentsForOrder(orderId);
+    expect(all.map((p) => p.rail)).toEqual(["stripe_terminal"]);
+    expect(all[0]!.status).toBe("captured");
+    expect(all[0]!.id).toBe(payment.id);
+  });
+
+  it("cash with the card tender cleanly canceled on Stripe goes through", async () => {
+    const { orderId, payment } = await startRealTender();
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path.endsWith("/cancel")) return { id: "pi_1", status: "canceled" };
+      throw new Error(`unexpected ${path}`);
+    });
+    const res = await cashReq(orderId);
+    expect(res.status).toBe(201);
+    expect((await getPosDriver().getPayment(payment.id))!.status).toBe("canceled");
+    expect((await getPosDriver().getOrder(orderId))!.status).toBe("paid");
+  });
 
   it("payment_intent.succeeded with an on-reader tip settles via the re-read PI (tip recorded, order paid)", async () => {
     const { orderId, payment } = await startRealTender();

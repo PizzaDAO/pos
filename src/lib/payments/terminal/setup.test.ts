@@ -211,11 +211,47 @@ describe("ensureTerminalLocation", () => {
     expect(locOpts).toEqual({ stripeAccount: ACCT });
 
     stripeRequest.mockClear();
-    // Same inputs again: the config is re-synced (presets may have changed) but
-    // no new Location is created.
+    // Same inputs again: config and Location are re-synced (presets/address may
+    // have changed) but no NEW Location or Configuration is created.
     await ensureTerminalLocation({ tenantId: TENANT, locationId: LOCATION });
     const paths = stripeRequest.mock.calls.map((c) => c[0] as string);
-    expect(paths).toEqual([`/terminal/configurations/${row.configuration_id}`]);
+    expect(paths).toEqual([
+      `/terminal/configurations/${row.configuration_id}`,
+      `/terminal/locations/${row.stripe_location_id}`,
+    ]);
+  });
+
+  it("simulated mode saves tip mode + address but NEVER overwrites real Stripe ids", async () => {
+    goReal();
+    await connect();
+    stubStripe();
+    const real = await ensureTerminalLocation({ tenantId: TENANT, locationId: LOCATION, address: ADDRESS });
+
+    vi.unstubAllEnvs(); // back to simulated (no key)
+    stripeRequest.mockClear();
+    const sim = await ensureTerminalLocation({
+      tenantId: TENANT,
+      locationId: LOCATION,
+      tipMode: "pos",
+      address: { ...ADDRESS, line1: "9 New St" },
+    });
+    expect(sim.tip_mode).toBe("pos");
+    expect(sim.address?.line1).toBe("9 New St");
+    expect(sim.connect_account_id).toBe(ACCT);
+    expect(sim.stripe_location_id).toBe(real.stripe_location_id);
+    expect(sim.configuration_id).toBe(real.configuration_id);
+    expect(stripeRequest).not.toHaveBeenCalled();
+
+    // Back in test mode the real Location is reused (not recreated) and gets the new address.
+    goReal();
+    stripeRequest.mockClear();
+    const again = await ensureTerminalLocation({ tenantId: TENANT, locationId: LOCATION });
+    expect(again.stripe_location_id).toBe(real.stripe_location_id);
+    const locUpdate = stripeRequest.mock.calls.find(
+      (c) => c[0] === `/terminal/locations/${real.stripe_location_id}`,
+    );
+    expect(locUpdate![1]).toMatchObject({ address: { line1: "9 New St" } });
+    expect(stripeRequest.mock.calls.map((c) => c[0])).not.toContain("/terminal/locations");
   });
 
   it("real: a changed address updates the Location; a changed account recreates both", async () => {

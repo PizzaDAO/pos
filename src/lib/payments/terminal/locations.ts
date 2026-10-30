@@ -108,10 +108,6 @@ export function tipPercentagesFromBps(bps: readonly number[]): number[] {
   return [...pct].sort((x, y) => x - y).slice(0, 3);
 }
 
-function sameAddress(a: TerminalAddress | null, b: TerminalAddress | null): boolean {
-  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-}
-
 /** The stored tip mode for a location (default `reader`). */
 export async function getTerminalTipMode(
   locationId: string,
@@ -163,9 +159,18 @@ export async function ensureTerminalLocation(
   };
 
   if (mode === "simulated") {
+    // Save the tip mode + address locally, but NEVER overwrite real Stripe ids
+    // (a temporary training/simulated run must not orphan the real Location).
+    const realLocation =
+      !!existing?.stripe_location_id && !existing.stripe_location_id.startsWith("tml_sim_");
     return driver.upsertTerminalLocation({
       ...base,
-      stripe_location_id: `tml_sim_${input.locationId}`,
+      connect_account_id: existing?.connect_account_id ?? null,
+      stripe_location_id: realLocation
+        ? existing!.stripe_location_id
+        : `tml_sim_${input.locationId}`,
+      configuration_id: existing?.configuration_id ?? null,
+      livemode: existing?.livemode ?? false,
     });
   }
 
@@ -212,10 +217,9 @@ export async function ensureTerminalLocation(
       configurationId,
     });
     stripeLocationId = created.id;
-  } else if (
-    !sameAddress(existing?.address ?? null, address) ||
-    configurationId !== (existing?.configuration_id ?? null)
-  ) {
+  } else {
+    // Always sync: a simulated-mode save may have changed the stored address
+    // without touching the real Location.
     await updateLocation(accountId, stripeLocationId, {
       displayName: location.name,
       address,

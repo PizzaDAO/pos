@@ -28,6 +28,7 @@ import { StripeError } from "@/lib/payments/providers/stripe-client";
 import {
   TerminalFlowError,
   cancelCardTender,
+  closeOpenCardTender,
   reconcileTerminalTenders,
   resetReader,
   retryCardTender,
@@ -36,7 +37,7 @@ import {
   syncCardTender,
 } from "./flow";
 import { ReaderNotFoundError, simulatedReaderId } from "./readers";
-import { getOrderBalance } from "../service";
+import { getOrderBalance, takePayment } from "../service";
 import { CardPaymentsNotReadyError } from "../connect";
 
 const TENANT = DEMO_TENANT_ID;
@@ -323,10 +324,122 @@ describe("simulated reader", () => {
     const orderId = await seedOrder();
     const { payment } = await start(orderId);
     expect(payment.charge_id!.startsWith("sim_")).toBe(true);
-    await simulateCardTender(payment.id, { outcome: "approve" });
+    // No simulator wherever a live key is configured, even in training mode.
+    await expect(simulateCardTender(payment.id, { outcome: "approve" })).rejects.toMatchObject({
+      code: "not_simulated",
+      status: 404,
+    });
+    // The tender still settles (demo auto-approve) without ever touching Stripe.
+    vi.stubEnv("TERMINAL_SIM_AUTO_APPROVE_MS", "1");
+    await new Promise((r) => setTimeout(r, 15));
+    expect((await syncCardTender(payment.id)).payment.status).toBe("captured");
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(stripeRequest).not.toHaveBeenCalled();
     expect(stripeGet).not.toHaveBeenCalled();
+  });
+
+  it("sim tip: approving without a tip keeps the POS tip already on the tender", async () => {
+    const now = new Date().toISOString();
+    await getPosDriver().upsertTerminalLocation({
+      location_id: LOCATION,
+      tenant_id: TENANT,
+      connect_account_id: null,
+      stripe_location_id: `tml_sim_${LOCATION}`,
+      configuration_id: null,
+      livemode: false,
+      address: null,
+      tip_mode: "pos",
+      created_at: now,
+      updated_at: now,
+    });
+    const { payment } = await startCardTender({
+      paymentId: uuid(),
+      orderId: await seedOrder(),
+      readerId: SIM_READER,
+      amountCents: 2000,
+      tipCents: 400,
+    });
+    const done = await simulateCardTender(payment.id, { outcome: "approve" });
+    expect(done.payment.tip_cents).toBe(400);
+    expect(done.payment.raw).not.toHaveProperty("sim_tip_cents", 0);
+  });
+
+  it("closeOpenCardTender: cancels a live card tender; reports settled when a card already went through", async () => {
+    const orderId = await seedOrder();
+    expect(await closeOpenCardTender(orderId)).toBe("none");
+    const { payment } = await start(orderId);
+    expect(await closeOpenCardTender(orderId)).toBe("canceled");
+    expect((await getPosDriver().getPayment(payment.id))!.status).toBe("canceled");
+
+    const second = await start(orderId);
+    await simulateCardTender(second.payment.id, { outcome: "approve" });
+    expect(await closeOpenCardTender(orderId)).toBe("none"); // nothing OPEN left
+  });
+
+  it("cash that covers the order closes a live card tender (no later tap can double charge)", async () => {
+    const orderId = await seedOrder();
+    const { payment } = await start(orderId);
+    await takePayment({
+      paymentId: uuid(),
+      orderId,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash",
+      amountCents: 2000,
+      tipCents: 0,
+      currency: "USD",
+    });
+    expect((await getPosDriver().getPayment(payment.id))!.status).toBe("canceled");
+    expect(await orderStatus(orderId)).toBe("paid");
+  });
+
+  it("a partial cash tender leaves the live card tender alone", async () => {
+    const orderId = await seedOrder();
+    const { payment } = await start(orderId, 1200);
+    await takePayment({
+      paymentId: uuid(),
+      orderId,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash",
+      amountCents: 800,
+      tipCents: 0,
+      currency: "USD",
+    });
+    expect((await getPosDriver().getPayment(payment.id))!.status).toBe("requires_action");
+    expect(await orderStatus(orderId)).toBe("placed");
+  });
+
+  it("a double settlement on an IN-STORE order is flagged as a duplicate and listed for the admin", async () => {
+    const driver = getPosDriver();
+    const orderId = await seedOrder();
+    const { payment } = await start(orderId);
+    await simulateCardTender(payment.id, { outcome: "approve", tipCents: 300 });
+    // A tip alone is never a duplicate.
+    expect((await driver.getOrder(orderId))!.fulfillment?.late_payment).toBeUndefined();
+
+    await takePayment({
+      paymentId: uuid(),
+      orderId,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash",
+      amountCents: 2000,
+      tipCents: 0,
+      currency: "USD",
+    });
+    const order = (await driver.getOrder(orderId))!;
+    expect(order.channel).toBe("in_store");
+    expect(order.fulfillment?.late_payment).toMatchObject({ kind: "duplicate", amount_cents: 2000 });
+    const open = await driver.listOpenLatePayments(TENANT, LOCATION, 100);
+    expect(open.map((o) => o.id)).toContain(orderId);
+  });
+
+  it("a lone captured card tender with a tip is not flagged", async () => {
+    const orderId = await seedOrder();
+    const { payment } = await start(orderId);
+    await simulateCardTender(payment.id, { outcome: "approve", tipCents: 500 });
+    expect((await getPosDriver().getOrder(orderId))!.fulfillment).toBeUndefined();
   });
 
   it("reconcile cancels a tender left open and settles an approved one", async () => {
@@ -476,7 +589,7 @@ describe("stripe_test mode (stubbed Stripe)", () => {
     expect(callsTo("/confirm")).toHaveLength(0);
   });
 
-  it("POS tip mode: skip_tipping is sent and the fee covers amount + tip", async () => {
+  it("POS tip mode: skip_tipping is sent and the fee is on the PRE-TIP amount", async () => {
     const now = new Date().toISOString();
     await getPosDriver().upsertTerminalLocation({
       location_id: LOCATION,
@@ -500,7 +613,7 @@ describe("stripe_test mode (stubbed Stripe)", () => {
     expect(res.payment.tip_cents).toBe(400);
     const body = callsTo("/payment_intents")[0]![1] as Record<string, unknown>;
     expect(body.amount).toBe(2400);
-    expect(body.application_fee_amount).toBe(70); // 2.5% of 2400 + 10
+    expect(body.application_fee_amount).toBe(60); // pre-tip only: 2.5% of 2000 + 10
     const pbody = callsTo("/process_payment_intent")[0]![1] as {
       process_config: Record<string, unknown>;
     };
@@ -619,8 +732,19 @@ describe("stripe_test mode (stubbed Stripe)", () => {
     expect((await syncCardTender(payment.id)).payment.status).toBe("canceled");
   });
 
+  const onIntent = (pi: string) => ({
+    id: "tmr_1",
+    status: "online",
+    action: {
+      type: "process_payment_intent",
+      status: "in_progress",
+      process_payment_intent: { payment_intent: pi },
+    },
+  });
+
   it("cancel: cancel_action then the intent is canceled on the connected account", async () => {
     const payment = await startReal(await seedOrder());
+    readerState = onIntent("pi_1");
     stripeRequest.mockClear();
     const res = await cancelCardTender(payment.id);
     expect(res.outcome).toBe("canceled");
@@ -633,8 +757,98 @@ describe("stripe_test mode (stubbed Stripe)", () => {
     expect(res.payment.status).toBe("canceled");
   });
 
+  it("cancel does NOT touch a reader that has moved on to another PaymentIntent (PI cancel only)", async () => {
+    const payment = await startReal(await seedOrder());
+    readerState = onIntent("pi_someone_else");
+    stripeRequest.mockClear();
+    const res = await cancelCardTender(payment.id);
+    expect(res.outcome).toBe("canceled");
+    const paths = stripeRequest.mock.calls.map((c) => c[0]);
+    expect(paths).not.toContain("/terminal/readers/tmr_1/cancel_action");
+    expect(paths).toContain("/payment_intents/pi_1/cancel");
+    // the reader was looked up before any cancel
+    expect(stripeGet.mock.calls.some((c) => (c[0] as string).startsWith("/terminal/readers/tmr_1"))).toBe(true);
+  });
+
+  it("cancel_action is sent once per cancel (no duplicate from the provider step)", async () => {
+    const payment = await startReal(await seedOrder());
+    readerState = onIntent("pi_1");
+    // After the first cancel_action the reader is clear, like the real one.
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path.endsWith("/cancel_action")) {
+        readerState = { id: "tmr_1", status: "online", action: null };
+        return { id: "tmr_1", action: null };
+      }
+      if (path.endsWith("/cancel")) return { id: "pi_1", status: "canceled" };
+      throw new Error(`unexpected ${path}`);
+    });
+    await cancelCardTender(payment.id);
+    expect(callsTo("/cancel_action")).toHaveLength(1);
+  });
+
+  it("retry on another reader only clears the old reader if it is still on this intent", async () => {
+    const orderId = await seedOrder();
+    const payment = await startReal(orderId);
+    const now = new Date().toISOString();
+    await getPosDriver().upsertTerminalReader({
+      id: "tmr_2",
+      tenant_id: TENANT,
+      location_id: LOCATION,
+      connect_account_id: ACCT,
+      label: "Second",
+      device_type: null,
+      serial_number: null,
+      livemode: false,
+      created_at: now,
+      updated_at: now,
+    });
+    readerState = onIntent("pi_other"); // tmr_1 now serves someone else
+    stripeRequest.mockClear();
+    await retryCardTender(payment.id, "tmr_2");
+    expect(callsTo("/terminal/readers/tmr_1/cancel_action")).toHaveLength(0);
+    expect(callsTo("/terminal/readers/tmr_2/process_payment_intent")).toHaveLength(1);
+  });
+
+  it("a canceled real tender whose PaymentIntent later SUCCEEDED is recorded as captured", async () => {
+    const orderId = await seedOrder();
+    const payment = await startReal(orderId);
+    await cancelCardTender(payment.id);
+    expect((await getPosDriver().getPayment(payment.id))!.status).toBe("canceled");
+
+    // still unpaid: stays canceled
+    setPi(payment.id, { status: "requires_payment_method" });
+    expect((await syncCardTender(payment.id)).payment.status).toBe("canceled");
+
+    // the customer tapped after all
+    setPi(payment.id, { status: "succeeded", amount: 2000 });
+    const res = await syncCardTender(payment.id);
+    expect(res.payment.status).toBe("captured");
+    expect(await orderStatus(orderId)).toBe("paid");
+  });
+
+  it("a late-succeeded canceled tender on an already-paid in-store order is flagged as a duplicate", async () => {
+    const orderId = await seedOrder();
+    const payment = await startReal(orderId);
+    await cancelCardTender(payment.id);
+    await takePayment({
+      paymentId: uuid(),
+      orderId,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash",
+      amountCents: 2000,
+      tipCents: 0,
+      currency: "USD",
+    });
+    setPi(payment.id, { status: "succeeded", amount: 2000 });
+    await syncCardTender(payment.id);
+    const order = (await getPosDriver().getOrder(orderId))!;
+    expect(order.fulfillment?.late_payment).toMatchObject({ kind: "duplicate", amount_cents: 2000 });
+  });
+
   it("cancel while the customer is paying (terminal_reader_busy) is 'in_flight' and cancels nothing", async () => {
     const payment = await startReal(await seedOrder());
+    readerState = onIntent("pi_1");
     stripeRequest.mockClear();
     stripeRequest.mockImplementation(async (path: string) => {
       if (path.endsWith("/cancel_action")) {
@@ -838,6 +1052,42 @@ describe("stripe_test mode (stubbed Stripe)", () => {
     await expect(
       resetReader({ tenantId: TENANT, locationId: LOCATION, readerId: "tmr_1" }),
     ).rejects.toMatchObject({ code: "reader_busy" });
+  });
+
+  it("reconcile: a failing tender records attempts and backs off; it does not hold the queue", async () => {
+    const bad = await startReal(await seedOrder());
+    stripeGet.mockRejectedValue(new StripeError("stripe down", 500, null));
+    const first = await reconcileTerminalTenders({ olderThanMs: -1000 });
+    expect(first).toMatchObject({ checked: 1, errors: 1, backedOff: 0 });
+    const row = (await getPosDriver().getPayment(bad.id))!;
+    expect(row.raw?.reconcile_attempts).toBe(1);
+    expect(typeof row.raw?.last_reconcile_at).toBe("string");
+
+    stripeGet.mockClear();
+    const second = await reconcileTerminalTenders({ olderThanMs: -1000 });
+    expect(second).toMatchObject({ checked: 0, backedOff: 1 });
+    expect(stripeGet).not.toHaveBeenCalled(); // not hammering a down Stripe
+  });
+
+  it("reconcile: a PaymentIntent that doesn't match is flagged for manual review and leaves the scan", async () => {
+    const payment = await startReal(await seedOrder());
+    setPi(payment.id, { status: "succeeded", amount: 100 });
+    const first = await reconcileTerminalTenders({ olderThanMs: -1000 });
+    expect(first).toMatchObject({ checked: 1, flagged: 1 });
+    const row = (await getPosDriver().getPayment(payment.id))!;
+    expect(row.status).toBe("requires_action");
+    expect(row.raw?.needs_manual_review).toBe(true);
+    const second = await reconcileTerminalTenders({ olderThanMs: -1000 });
+    expect(second.checked).toBe(0);
+    expect(second.backedOff).toBe(0);
+  });
+
+  it("reconcile: stops when the time budget runs out", async () => {
+    await startReal(await seedOrder());
+    await startReal(await seedOrder());
+    const summary = await reconcileTerminalTenders({ olderThanMs: -1000, budgetMs: 0 });
+    expect(summary.stoppedEarly).toBe(true);
+    expect(summary.checked).toBe(0);
   });
 
   it("reconcile: an abandoned real tender is canceled on Stripe", async () => {

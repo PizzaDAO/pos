@@ -9,9 +9,9 @@
  *    the reader by `process_payment_intent` (see `terminal/flow.ts`), and the READER
  *    collects the card and confirms. Stripe says never to confirm card_present
  *    server-side.
- *  - `application_fee_amount` is computed on the PRE-TIP amount when the customer
- *    tips on the reader (the tip is not known when the PI is created); with a POS
- *    tip (known up front) it covers amount + tip, like online.
+ *  - `application_fee_amount` is computed on the PRE-TIP amount in EVERY tip mode
+ *    (product decision): the platform takes no fee on tips. (An on-reader tip is
+ *    not even known when the PI is created.)
  *  - Reader tips arrive in `amount_details.tip.amount`; flow.ts records them.
  *
  * OFFLINE: card needs internet. Stripe's offline mode requires the native iOS /
@@ -51,15 +51,14 @@ import { simId, simRaw } from "./simulate";
 const KEY = "stripe_terminal" as const;
 
 /**
- * Platform fee for a tender. With on-reader tipping the tip is unknown when the
- * PaymentIntent (and so its `application_fee_amount`) is created, so the fee is on
- * the pre-tip amount only; a POS tip is known up front and is included.
+ * Platform fee for a tender: ALWAYS on the pre-tip amount, whatever the tip mode
+ * (a reader tip is unknown at PaymentIntent creation, and the decision is that
+ * tips carry no platform fee anywhere).
  */
-function feeForTender(amount: number, tip: number, tipMode?: string): number {
+function feeForTender(amount: number): number {
   const { bps, flatCents } = getDefaultPlatformFee();
-  const feeBase = tipMode === "reader" || tipMode === "none" ? amount : amount + tip;
   return computeApplicationFeeCents({
-    amountCents: feeBase,
+    amountCents: amount,
     feeBps: bps,
     feeFlatCents: flatCents,
   });
@@ -74,7 +73,7 @@ export const stripeTerminalRail: PaymentRail = {
       amount: req.amount.amount + tip,
       currency: req.amount.currency,
     };
-    const fee = feeForTender(req.amount.amount, tip);
+    const fee = feeForTender(req.amount.amount);
     return {
       rail: KEY,
       total,
@@ -90,7 +89,7 @@ export const stripeTerminalRail: PaymentRail = {
     };
     const tipMode = req.metadata?.tip_mode;
     const readerId = req.metadata?.reader_id;
-    const fee = feeForTender(req.amount.amount, tip, tipMode);
+    const fee = feeForTender(req.amount.amount);
 
     if (cardRailsSimulated()) {
       if (readerId) {

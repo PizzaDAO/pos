@@ -1834,6 +1834,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .select("*")
             .eq("rail", "stripe_terminal")
             .in("status", ["requires_action", "pending"])
+            .is("raw->>needs_manual_review", null)
             .lt("updated_at", olderThan)
             .order("updated_at")
             .limit(limit),

@@ -31,10 +31,11 @@ import { LiveTenderConflictError } from "@/lib/db/payment-types";
 import type { TerminalTipMode } from "@/lib/db/payment-types";
 import { captureError } from "@/lib/observability";
 import { resolveCardConnectAccountId } from "../connect";
-import { cardReaderMode, terminalSimAutoApproveMs } from "../env";
+import { cardReaderMode, isStripeLiveKey, terminalSimAutoApproveMs } from "../env";
 import { mapIntentStatus, StripeError } from "../providers/stripe-client";
 import {
   cancelReaderAction,
+  cancelReaderActionForIntent,
   presentPaymentMethod,
   processPaymentIntent,
   retrievePaymentIntent,
@@ -322,6 +323,7 @@ async function beginReaderAttempt(
       last_error: null,
       process_started_at: nowIso(),
       sim_outcome: null,
+      sim_tip_cents: null,
     },
   });
   if (isSimTender(payment) || reader.simulated) return;
@@ -412,7 +414,11 @@ export async function syncCardTender(paymentId: string): Promise<CardSyncResult>
     return { payment: await reload(payment), readerAction: null };
   }
   if (payment.status === "canceled" || payment.status === "failed") {
-    return { payment, readerAction: null };
+    // A real card may still have been tapped after we gave up on the tender (a
+    // cancel that raced the customer): if the PaymentIntent SUCCEEDED the money
+    // is real, so record it (the duplicate flag catches double money).
+    if (isSimTender(payment) || !payment.charge_id) return { payment, readerAction: null };
+    return syncReal(payment, true);
   }
   return isSimTender(payment) ? syncSimulated(payment) : syncReal(payment);
 }
@@ -458,12 +464,34 @@ async function syncSimulated(payment: Payment): Promise<CardSyncResult> {
   };
 }
 
-async function syncReal(payment: Payment): Promise<CardSyncResult> {
+/**
+ * Mark a tender whose PaymentIntent doesn't fit it for MANUAL REVIEW: alerted, and
+ * dropped from the reconcile scan (it can never be settled or canceled safely by
+ * a machine).
+ */
+async function flagForManualReview(payment: Payment, why: string): Promise<void> {
+  captureError(new Error(`terminal tender needs manual review: ${why}`), {
+    scope: "terminal-manual-review",
+    paymentId: payment.id,
+    orderId: payment.order_id,
+    tenantId: payment.tenant_id,
+  });
+  await applyRailStatus(payment.id, payment.status, {
+    raw: { needs_manual_review: true, manual_review_reason: why, manual_review_at: nowIso() },
+  }).catch(() => null);
+}
+
+/**
+ * Sync a REAL tender with its PaymentIntent. `settleOnly` (a tender we already
+ * canceled/failed): only a `succeeded` PI changes anything.
+ */
+async function syncReal(payment: Payment, settleOnly = false): Promise<CardSyncResult> {
   const accountId = payment.connect_account_id;
   if (!accountId || !payment.charge_id) {
     throw new TerminalFlowError("mismatch", "This payment has no card reader intent.", 409, payment);
   }
   const pi = await retrievePaymentIntent(accountId, payment.charge_id);
+  const alreadyFlagged = !!readRaw(payment, "needs_manual_review");
 
   // Trust Stripe, but only for THIS tender: id, correlation id, currency, amount.
   const tipMode = readRaw<string>(payment, "tip_mode");
@@ -486,6 +514,9 @@ async function syncReal(payment: Payment): Promise<CardSyncResult> {
       piAmount: pi.amount,
       expectedAmount: payment.amount_cents + payment.tip_cents,
     });
+    if (!alreadyFlagged) {
+      await flagForManualReview(payment, "PaymentIntent does not match the tender");
+    }
     throw new TerminalFlowError(
       "mismatch",
       "The card payment doesn't match this order. Nothing was recorded.",
@@ -506,6 +537,8 @@ async function syncReal(payment: Payment): Promise<CardSyncResult> {
     });
     return { payment: await reload(payment), readerAction: null };
   }
+
+  if (settleOnly) return { payment, readerAction: null };
 
   const mapped = mapIntentStatus(pi.status);
   if (mapped !== "requires_action") {
@@ -580,7 +613,9 @@ export async function retryCardTender(
   );
   // Switching readers: clear the old one's screen (best effort).
   if (previousReader && previousReader !== reader.id && accountId && !isSimulatedReaderId(previousReader)) {
-    await cancelReaderAction(accountId, previousReader).catch(() => undefined);
+    await cancelReaderActionForIntent(accountId, previousReader, payment.charge_id!).catch(
+      () => undefined,
+    );
   }
   const tipMode = (readRaw<TerminalTipMode>(payment, "tip_mode") ?? DEFAULT_TIP_MODE) as TerminalTipMode;
   await beginReaderAttempt(payment, reader, tipMode);
@@ -609,7 +644,12 @@ export async function cancelCardTender(
   const readerId = readRaw<string>(payment, "reader_id");
   if (!isSimTender(payment) && readerId && payment.connect_account_id) {
     try {
-      await cancelReaderAction(payment.connect_account_id, readerId);
+      // Only if the reader is still on THIS intent (retrieveReader first).
+      await cancelReaderActionForIntent(
+        payment.connect_account_id,
+        readerId,
+        payment.charge_id!,
+      );
     } catch (err) {
       if (err instanceof StripeError && err.code === "terminal_reader_busy") {
         return { outcome: "in_flight", payment };
@@ -672,8 +712,8 @@ export async function simulateCardTender(
   paymentId: string,
   input: SimulateInput,
 ): Promise<CardSyncResult> {
-  const mode = cardReaderMode();
-  if (mode === "stripe_live") {
+  // No simulator wherever a live key is configured, whatever the mode.
+  if (cardReaderMode() === "stripe_live" || isStripeLiveKey()) {
     throw new TerminalFlowError("not_simulated", "Not available.", 404);
   }
   const payment = await loadTerminalTender(paymentId);
@@ -685,7 +725,11 @@ export async function simulateCardTender(
 
   if (isSimTender(payment)) {
     await applyRailStatus(payment.id, "requires_action", {
-      raw: { sim_outcome: input.outcome, sim_tip_cents: tip },
+      raw: {
+        sim_outcome: input.outcome,
+        // Only when a tip was passed, so the fallback to payment.tip_cents works.
+        ...(tip > 0 ? { sim_tip_cents: tip } : {}),
+      },
     });
   } else {
     const readerId = readRaw<string>(payment, "reader_id");
@@ -700,6 +744,29 @@ export async function simulateCardTender(
   return syncCardTender(paymentId);
 }
 
+/**
+ * Strict-close any open card-reader tender on an order before ANOTHER way of
+ * paying is taken (cash, crypto...), so a customer can't be charged twice. Cancels
+ * each open tender strictly (`cancelCardTender`). Returns:
+ *  - `none`: nothing was open;
+ *  - `canceled`: all open tenders are canceled, the other payment may proceed;
+ *  - `settled`: a card went through (the order may be paid by card);
+ *  - `in_flight`: the customer is mid-authorization on the reader.
+ * Callers refuse the new tender (409) on `settled` / `in_flight`.
+ */
+export async function closeOpenCardTender(
+  orderId: string,
+): Promise<"none" | "canceled" | "settled" | "in_flight"> {
+  const open = (await getPosDriver().listPaymentsForOrder(orderId)).filter(
+    (p) => p.rail === "stripe_terminal" && isOpen(p),
+  );
+  for (const p of open) {
+    const { outcome } = await cancelCardTender(p.id);
+    if (outcome !== "canceled") return outcome;
+  }
+  return open.length > 0 ? "canceled" : "none";
+}
+
 // ---------------------------------------------------------------------------
 // Reconcile (cron / end of day)
 // ---------------------------------------------------------------------------
@@ -709,20 +776,66 @@ export interface ReconcileSummary {
   settled: number;
   canceled: number;
   errors: number;
+  /** Tenders that don't match their PaymentIntent: alerted, parked for a human. */
+  flagged: number;
+  /** Tenders skipped because their retry backoff hasn't elapsed. */
+  backedOff: number;
+  /** True when the time budget ran out before the scan finished. */
+  stoppedEarly: boolean;
+}
+
+/** Retry delay after `attempts` failed reconcile tries: 1, 2, 4 ... capped at 60 min. */
+export function reconcileBackoffMs(attempts: number): number {
+  return Math.min(60 * 60_000, 60_000 * 2 ** Math.max(0, attempts - 1));
 }
 
 /**
  * Sweep card tenders left open (tablet died, cashier walked away): re-read each
  * from Stripe; if it succeeded it is captured, otherwise it is canceled so the
  * reader can never complete a stale payment.
+ *
+ * A tender whose sync/cancel fails records `reconcile_attempts` + `last_reconcile_at`
+ * and is retried with exponential backoff (a failing head-of-queue tender can't
+ * starve the rest, and a down Stripe isn't hammered). A PaymentIntent that does
+ * not match its tender is flagged for manual review and leaves the scan for good.
+ * The sweep stops when `budgetMs` (default 40s, inside the cron's maxDuration) runs out.
  */
 export async function reconcileTerminalTenders(
-  opts: { olderThanMs?: number; limit?: number } = {},
+  opts: { olderThanMs?: number; limit?: number; budgetMs?: number } = {},
 ): Promise<ReconcileSummary> {
-  const cutoff = new Date(Date.now() - (opts.olderThanMs ?? 15 * 60_000)).toISOString();
+  const started = Date.now();
+  const budgetMs = opts.budgetMs ?? 40_000;
+  const cutoff = new Date(started - (opts.olderThanMs ?? 15 * 60_000)).toISOString();
   const stale = await getPosDriver().listStaleTerminalTenders(cutoff, opts.limit ?? 50);
-  const summary: ReconcileSummary = { checked: 0, settled: 0, canceled: 0, errors: 0 };
+  const summary: ReconcileSummary = {
+    checked: 0,
+    settled: 0,
+    canceled: 0,
+    errors: 0,
+    flagged: 0,
+    backedOff: 0,
+    stoppedEarly: false,
+  };
+  const recordFailure = async (t: Payment) => {
+    const fresh = (await getPosDriver().getPayment(t.id)) ?? t;
+    await applyRailStatus(t.id, fresh.status, {
+      raw: {
+        reconcile_attempts: (readRaw<number>(fresh, "reconcile_attempts") ?? 0) + 1,
+        last_reconcile_at: nowIso(),
+      },
+    }).catch(() => null);
+  };
   for (const t of stale) {
+    if (Date.now() - started >= budgetMs) {
+      summary.stoppedEarly = true;
+      break;
+    }
+    const attempts = readRaw<number>(t, "reconcile_attempts") ?? 0;
+    const last = Date.parse(readRaw<string>(t, "last_reconcile_at") ?? "");
+    if (attempts > 0 && Number.isFinite(last) && Date.now() < last + reconcileBackoffMs(attempts)) {
+      summary.backedOff += 1;
+      continue;
+    }
     summary.checked += 1;
     try {
       const { payment } = await syncCardTender(t.id);
@@ -731,11 +844,21 @@ export async function reconcileTerminalTenders(
       } else if (isOpen(payment)) {
         const { outcome } = await cancelCardTender(payment.id);
         if (outcome === "canceled") summary.canceled += 1;
-        if (outcome === "settled") summary.settled += 1;
+        else if (outcome === "settled") summary.settled += 1;
+        else {
+          // in_flight: the customer is mid-payment; look again later.
+          summary.errors += 1;
+          await recordFailure(t);
+        }
       }
     } catch (err) {
-      summary.errors += 1;
-      captureError(err, { scope: "terminal-reconcile", paymentId: t.id });
+      if (err instanceof TerminalFlowError && err.code === "mismatch") {
+        summary.flagged += 1; // already alerted + parked by syncReal
+      } else {
+        summary.errors += 1;
+        captureError(err, { scope: "terminal-reconcile", paymentId: t.id });
+        await recordFailure(t);
+      }
     }
   }
   return summary;

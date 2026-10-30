@@ -1082,10 +1082,12 @@ export const mockDriver: PosDriver = {
   ): Promise<Order | null> {
     ensureKitchenSeed();
     const order = orders.get(id);
-    if (!order || !order.fulfillment) return null;
+    if (!order) return null;
+    // An in-store order has no fulfillment: a lifecycle marker (e.g. a duplicate
+    // payment flag) creates the blob.
     const updated: Order = {
       ...order,
-      fulfillment: { ...order.fulfillment, ...patch },
+      fulfillment: { ...(order.fulfillment ?? {}), ...patch } as OrderFulfillment,
       updated_at: nowIso(),
     };
     orders.set(id, updated);
@@ -1294,6 +1296,7 @@ export const mockDriver: PosDriver = {
         (p) =>
           p.rail === "stripe_terminal" &&
           tenderHoldsOpenSlot(p.status) &&
+          !p.raw?.needs_manual_review &&
           p.updated_at < olderThan,
       )
       .sort((a, b) => a.updated_at.localeCompare(b.updated_at))

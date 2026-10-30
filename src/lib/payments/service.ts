@@ -32,7 +32,7 @@ import { deriveTenderId } from "./ids";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
-import { cancelReaderAction } from "./providers/stripe-terminal-api";
+import { cancelReaderActionForIntent } from "./providers/stripe-terminal-api";
 import { railChargesApplicationFee } from "./fees";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
@@ -308,6 +308,11 @@ export async function takePaymentDetailed(
     }
     throw err;
   }
+  if (saved.status === "captured" || saved.status === "authorized") {
+    // This tender may have just covered the order: any card-reader / card intent
+    // still open on it must not stay live (it could be tapped and double charge).
+    await closeSiblingsOfSettledOrder(saved);
+  }
   await maybeMarkOrderPaid(input.orderId);
   return { payment: saved, clientSecret: result.clientSecret };
 }
@@ -409,7 +414,11 @@ export async function cancelTenderOnProvider(p: Payment): Promise<void> {
     // fail, and it throws if the card already succeeded (the caller re-syncs).
     const readerId = typeof p.raw?.reader_id === "string" ? p.raw.reader_id : null;
     if (readerId) {
-      await cancelReaderAction(p.connect_account_id!, readerId).catch(() => undefined);
+      await cancelReaderActionForIntent(
+        p.connect_account_id!,
+        readerId,
+        p.charge_id!,
+      ).catch(() => undefined);
     }
     await stripeRequest(
       `/payment_intents/${p.charge_id}/cancel`,
@@ -518,13 +527,13 @@ export async function cancelOpenTender(p: Payment): Promise<OpenTenderOutcome> {
  * An online order is now fully covered by settled money: any other tender still
  * open on it is no longer needed, so close it (STRICT, see `cancelOpenTender`: a
  * tender the provider will not release is left open and alerted, never marked
- * canceled). Online orders only: an in-store split can legitimately have an open
- * tender for the rest.
+ * canceled). Runs only once settled money covers the amount due, so an in-store
+ * split (card for part, the rest still open) is left alone.
  */
 async function closeSiblingsOfSettledOrder(settled: Payment): Promise<void> {
   const driver = getPosDriver();
   const order = await driver.getOrder(settled.order_id);
-  if (!order || order.channel === "in_store") return;
+  if (!order) return;
   const payments = await listOrderCurrencyPayments(order);
   if (settledCents(payments) < orderDueCents(order)) return;
   for (const o of payments) {
@@ -978,10 +987,17 @@ async function flagLatePayment(order: Order, payments: Payment[]): Promise<void>
  * in the admin list as "Duplicate payment, refund one" via the same marker.
  */
 async function flagDuplicatePayment(order: Order, payments: Payment[]): Promise<void> {
-  if (!order.fulfillment || order.channel === "in_store") return;
-  const excess = netSettledCents(payments) - order.totals.total_cents;
+  // In-store orders carry the tip on each tender (not in the order total), so
+  // their excess is measured on base amounts; online orders fold the tip in.
+  const inStore = order.channel === "in_store";
+  const held = inStore
+    ? payments
+        .filter((p) => p.status === "captured" || p.status === "authorized")
+        .reduce((n, p) => n + Math.max(0, p.amount_cents - p.refunded_cents), 0)
+    : netSettledCents(payments);
+  const excess = held - (inStore ? orderDueCents(order) : order.totals.total_cents);
   if (excess <= 0) return;
-  const prior = order.fulfillment.late_payment;
+  const prior = order.fulfillment?.late_payment;
   if (prior && (prior.kind !== "duplicate" || prior.resolved || prior.amount_cents === excess)) {
     return;
   }

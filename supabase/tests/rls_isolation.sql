@@ -718,6 +718,29 @@ begin
   assert n = 2, 'one captured + one open stripe_terminal tender expected';
 end $$;
 
+-- 23) merge_order_fulfillment (20261103000100) also works on an IN-STORE order
+--     with no fulfillment blob (a duplicate-payment flag creates it).
+do $$
+begin
+  insert into public.orders
+    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+  values
+    ('0ada0077-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+     'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'paid', 'in_store', 'USD', 0,
+     '{"total_cents":1000}'::jsonb, 'A-0077');
+  assert (select fulfillment from public.orders where id = '0ada0077-0000-0000-0000-000000000001') is null,
+    'an in-store order starts with no fulfillment';
+  perform public.merge_order_fulfillment('0ada0077-0000-0000-0000-000000000001',
+    '{"late_payment":{"kind":"duplicate","payment_id":"p","amount_cents":1000,"flagged_at":"t"}}'::jsonb);
+  assert (select fulfillment -> 'late_payment' ->> 'kind' from public.orders
+           where id = '0ada0077-0000-0000-0000-000000000001') = 'duplicate',
+    'merge creates the blob on an in-store order';
+  perform public.update_late_payment('0ada0077-0000-0000-0000-000000000001', '{"amount_cents":500}'::jsonb);
+  assert (select fulfillment -> 'late_payment' ->> 'amount_cents' from public.orders
+           where id = '0ada0077-0000-0000-0000-000000000001') = '500',
+    'update_late_payment works on the created marker';
+end $$;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;
