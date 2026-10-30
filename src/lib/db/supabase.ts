@@ -2798,45 +2798,51 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return r ? mapStaff(r, { includePin: true }) : null;
     },
 
-    async getPinLockState(tenantId, staffId) {
-      const r = unwrap(
-        await sb
-          .from("staff")
-          .select("pin_failed_attempts, pin_locked_until")
-          .eq("id", staffId)
-          .eq("tenant_id", tenantId)
-          .maybeSingle(),
-      ) as Row | null;
-      const until = (r?.pin_locked_until as string | null) ?? null;
-      const locked = until !== null && new Date(until).getTime() > Date.now();
-      return {
-        attempts: locked || until === null ? Number(r?.pin_failed_attempts ?? 0) : 0,
-        lockedUntil: locked ? until : null,
-      };
-    },
-
-    async recordPinFailure(tenantId, staffId) {
+    async beginPinAttempt(tenantId, staffId) {
       const res = unwrap(
-        await sb.rpc("record_pin_failure", {
+        await sb.rpc("begin_pin_attempt", {
           p_tenant_id: tenantId,
           p_staff_id: staffId,
         }),
-      ) as { attempts?: number; locked_until?: string | null };
+      ) as {
+        allowed?: boolean;
+        just_locked?: boolean;
+        attempts?: number;
+        locked_until?: string | null;
+      } | null;
       return {
+        allowed: res?.allowed === true,
+        justLocked: res?.just_locked === true,
         attempts: Number(res?.attempts ?? 0),
         lockedUntil: res?.locked_until ?? null,
       };
     },
 
-    async clearPinFailures(tenantId, staffId) {
+    async clearPinAttempts(tenantId, staffId) {
+      // Conditional single-statement update: never clears a lock set by a
+      // concurrent attempt burst.
       unwrap(
         await sb
           .from("staff")
-          .update({ pin_failed_attempts: 0, pin_locked_until: null })
+          .update({ pin_failed_attempts: 0 })
           .eq("id", staffId)
           .eq("tenant_id", tenantId)
+          .is("pin_locked_until", null)
           .select("id"),
       );
+    },
+
+    async tenantHasStaffPins(tenantId) {
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .select("id")
+          .eq("tenant_id", tenantId)
+          .eq("active", true)
+          .not("pin_hash", "is", null)
+          .limit(1),
+      ) as Row[];
+      return rows.length > 0;
     },
 
     async createStaffSession(session) {

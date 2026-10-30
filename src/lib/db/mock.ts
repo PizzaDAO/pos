@@ -77,7 +77,7 @@ import type {
   ShiftCashEvent,
   SizeInput,
   Staff,
-  PinLockState,
+  PinAttempt,
   StaffSession,
 } from "./backoffice-types";
 import type {
@@ -1886,42 +1886,50 @@ export const mockDriver: PosDriver = {
     return { ...s };
   },
 
-  async getPinLockState(tenantId, staffId): Promise<PinLockState> {
+  // Mirrors begin_pin_attempt(): single-threaded JS makes this atomic.
+  async beginPinAttempt(tenantId, staffId): Promise<PinAttempt> {
     const s = staffById.get(staffId);
-    if (!s || s.tenant_id !== tenantId) return { attempts: 0, lockedUntil: null };
-    const l = pinLocks.get(staffId);
-    if (!l) return { attempts: 0, lockedUntil: null };
-    const locked = l.lockedUntil !== null && l.lockedUntil > Date.now();
-    return {
-      attempts: locked ? l.attempts : l.lockedUntil !== null ? 0 : l.attempts,
-      lockedUntil: locked ? new Date(l.lockedUntil as number).toISOString() : null,
-    };
-  },
-
-  async recordPinFailure(tenantId, staffId): Promise<PinLockState> {
-    const s = staffById.get(staffId);
-    if (!s || s.tenant_id !== tenantId) return { attempts: 0, lockedUntil: null };
+    if (!s || s.tenant_id !== tenantId) {
+      return { allowed: false, justLocked: false, attempts: 0, lockedUntil: null };
+    }
     const now = Date.now();
-    const l = pinLocks.get(staffId) ?? { attempts: 0, lockedUntil: null };
+    let l = pinLocks.get(staffId) ?? { attempts: 0, lockedUntil: null };
     if (l.lockedUntil !== null && l.lockedUntil > now) {
-      return { attempts: l.attempts, lockedUntil: new Date(l.lockedUntil).toISOString() };
+      return {
+        allowed: false,
+        justLocked: false,
+        attempts: l.attempts,
+        lockedUntil: new Date(l.lockedUntil).toISOString(),
+      };
     }
-    let attempts = (l.lockedUntil !== null ? 0 : l.attempts) + 1;
-    let lockedUntil: number | null = null;
-    if (attempts >= PIN_MAX_FAILURES) {
-      lockedUntil = now + PIN_LOCK_MS;
-      attempts = 0;
+    if (l.lockedUntil !== null) l = { attempts: 0, lockedUntil: null };
+    if (l.attempts >= PIN_MAX_FAILURES) {
+      const lockedUntil = now + PIN_LOCK_MS;
+      pinLocks.set(staffId, { attempts: 0, lockedUntil });
+      return {
+        allowed: false,
+        justLocked: true,
+        attempts: 0,
+        lockedUntil: new Date(lockedUntil).toISOString(),
+      };
     }
-    pinLocks.set(staffId, { attempts, lockedUntil });
-    return {
-      attempts,
-      lockedUntil: lockedUntil ? new Date(lockedUntil).toISOString() : null,
-    };
+    const attempts = l.attempts + 1;
+    pinLocks.set(staffId, { attempts, lockedUntil: null });
+    return { allowed: true, justLocked: false, attempts, lockedUntil: null };
   },
 
-  async clearPinFailures(tenantId, staffId): Promise<void> {
+  async clearPinAttempts(tenantId, staffId): Promise<void> {
     const s = staffById.get(staffId);
-    if (s && s.tenant_id === tenantId) pinLocks.delete(staffId);
+    if (!s || s.tenant_id !== tenantId) return;
+    const l = pinLocks.get(staffId);
+    // Only if no lock was set meanwhile.
+    if (l && l.lockedUntil === null) pinLocks.delete(staffId);
+  },
+
+  async tenantHasStaffPins(tenantId): Promise<boolean> {
+    return [...staffById.values()].some(
+      (s) => s.tenant_id === tenantId && s.active && Boolean(s.pin_hash),
+    );
   },
 
   async createStaffSession(session: StaffSession): Promise<StaffSession> {

@@ -13,8 +13,10 @@
  *   - The PIN is verified SERVER-SIDE against `staff.pin_hash`; the hash never
  *     leaves the server.
  *   - Brute force: a strict per-IP rate limit PLUS a persisted per-staff
- *     lockout (5 failures → 15-minute lock; staff.pin_failed_attempts /
- *     pin_locked_until, atomic in record_pin_failure()).
+ *     lockout (5 attempts without a success → 15-minute lock;
+ *     staff.pin_failed_attempts / pin_locked_until). Each attempt is counted
+ *     atomically BEFORE the PIN is checked (begin_pin_attempt, row lock), so
+ *     concurrent guesses cannot race past the budget.
  *   - A generic 401 is returned for a wrong PIN / unknown staff (no
  *     enumeration); a locked staff member gets 423 with the unlock time.
  *   - Success opens a server-side staff session and sets a signed httpOnly
@@ -111,31 +113,34 @@ export async function POST(request: Request) {
   }
   if (!matched || !matched.active) return incorrect();
 
-  // Per-staff lockout (persisted): refuse while locked, BEFORE checking.
-  const lock = await driver.getPinLockState(matched.tenant_id, matched.id);
-  if (lock.lockedUntil) {
+  // Per-staff lockout (persisted), ATOMIC: begin_pin_attempt counts this
+  // attempt under a row lock BEFORE the PIN is checked, so N concurrent
+  // guesses can't all slip past a "not locked yet" read. Refused while locked.
+  const attemptState = await driver.beginPinAttempt(
+    matched.tenant_id,
+    matched.id,
+  );
+  if (!attemptState.allowed) {
+    if (attemptState.justLocked) {
+      await recordAudit({
+        actor: { id: user.id, label: user.email },
+        action: "staff_pin_switch",
+        tenantId: matched.tenant_id,
+        detail: `PIN locked for ${matched.name} after repeated failures (until ${attemptState.lockedUntil}).`,
+      });
+    }
     return NextResponse.json(
       {
         error: "Too many incorrect PINs. Try again later.",
-        lockedUntil: lock.lockedUntil,
+        lockedUntil: attemptState.lockedUntil,
       },
       { status: 423 },
     );
   }
 
-  if (!verifyPin(body.pin, matched.pin_hash)) {
-    const after = await driver.recordPinFailure(matched.tenant_id, matched.id);
-    if (after.lockedUntil) {
-      await recordAudit({
-        actor: { id: user.id, label: user.email },
-        action: "staff_pin_switch",
-        tenantId: matched.tenant_id,
-        detail: `PIN locked for ${matched.name} after repeated failures (until ${after.lockedUntil}).`,
-      });
-    }
-    return incorrect();
-  }
-  await driver.clearPinFailures(matched.tenant_id, matched.id);
+  if (!verifyPin(body.pin, matched.pin_hash)) return incorrect();
+  // Reset the count — unless a concurrent burst set a lock meanwhile.
+  await driver.clearPinAttempts(matched.tenant_id, matched.id);
 
   // Replace any previous switch-in on this device (revoke it server-side).
   await revokeRequestStaffSession(request);

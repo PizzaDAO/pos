@@ -199,6 +199,16 @@ export interface PinLockState {
   lockedUntil: string | null;
 }
 
+/**
+ * Result of atomically starting a PIN attempt (begin_pin_attempt): `allowed`
+ * false = the staff member is locked (`lockedUntil`); `justLocked` = this call
+ * set the lock (the attempt budget was already spent).
+ */
+export interface PinAttempt extends PinLockState {
+  allowed: boolean;
+  justLocked: boolean;
+}
+
 /** A staff member of a tenant. Role reuses the tenancy membership roles. */
 export interface Staff {
   id: string;

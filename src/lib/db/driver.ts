@@ -43,7 +43,7 @@ import type {
   MovementReason,
   OverrideInput,
   SalesReport,
-  PinLockState,
+  PinAttempt,
   Shift,
   ShiftCashEvent,
   Staff,
@@ -638,10 +638,20 @@ export interface PosDriver {
   getStaffById(tenantId: string, staffId: string): Promise<Staff | null>;
 
   // -- PIN lockout (per staff member, persisted) -----------------------------
-  getPinLockState(tenantId: string, staffId: string): Promise<PinLockState>;
-  /** Atomically count a failed PIN; locks after 5 failures for 15 minutes. */
-  recordPinFailure(tenantId: string, staffId: string): Promise<PinLockState>;
-  clearPinFailures(tenantId: string, staffId: string): Promise<void>;
+  /**
+   * ATOMICALLY start a PIN attempt BEFORE verifying it (row lock): refuses
+   * while locked; otherwise counts the attempt. Once 5 attempts are spent
+   * without a success, the next one sets a 15-minute lock and is refused — so
+   * concurrent guesses can never exceed the budget.
+   */
+  beginPinAttempt(tenantId: string, staffId: string): Promise<PinAttempt>;
+  /**
+   * A verified PIN: reset the attempt count — only if no lock was set in the
+   * meantime (a concurrent burst that tripped the lock keeps it).
+   */
+  clearPinAttempts(tenantId: string, staffId: string): Promise<void>;
+  /** Does the tenant have any ACTIVE staff member with a PIN set? */
+  tenantHasStaffPins(tenantId: string): Promise<boolean>;
 
   // -- Terminal staff sessions (server-side revocation of PIN switch-ins) ----
   createStaffSession(session: StaffSession): Promise<StaffSession>;

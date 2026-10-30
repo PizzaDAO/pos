@@ -50,7 +50,7 @@ describe("PIN lockout", () => {
     for (let i = 0; i < 4; i++) {
       expect((await attempt(tony.id, "9999")).status).toBe(401);
     }
-    // 5th failure locks.
+    // 5th failure spends the budget; the next attempt locks.
     expect((await attempt(tony.id, "9999")).status).toBe(401);
     const locked = await attempt(tony.id, "1111");
     expect(locked.status).toBe(423);
@@ -71,6 +71,50 @@ describe("PIN lockout", () => {
     expect((await attempt(staff.id, "2222")).status).toBe(200);
     for (let i = 0; i < 4; i++) await attempt(staff.id, "9999");
     expect((await attempt(staff.id, "2222")).status).toBe(200);
+  });
+});
+
+describe("PIN lockout is race-free (begin_pin_attempt)", () => {
+  it("20 concurrent wrong guesses check at most 5 PINs; the rest are locked out", async () => {
+    const staff = (await getPosDriver().listStaff(DEMO_TENANT_ID)).find((s) =>
+      s.name.startsWith("Christopher"),
+    )!;
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => attempt(staff.id, "9999")),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 401).length).toBeLessThanOrEqual(5);
+    expect(statuses.filter((s) => s === 423).length).toBeGreaterThanOrEqual(15);
+    // Locked: even the right PIN is refused now.
+    expect((await attempt(staff.id, "3333")).status).toBe(423);
+    const spy = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(Date.now() + 16 * 60_000);
+    expect((await attempt(staff.id, "3333")).status).toBe(200);
+    spy.mockRestore();
+  });
+
+  it("a success never clears a lock set meanwhile", async () => {
+    const driver = getPosDriver();
+    const staff = (await driver.listStaff(DEMO_TENANT_ID)).find((s) =>
+      s.name.startsWith("Furio"),
+    )!;
+    // A verified PIN's attempt was counted, then a burst locks the staff…
+    expect((await driver.beginPinAttempt(DEMO_TENANT_ID, staff.id)).allowed).toBe(true);
+    for (let i = 0; i < 4; i++) await driver.beginPinAttempt(DEMO_TENANT_ID, staff.id);
+    const locked = await driver.beginPinAttempt(DEMO_TENANT_ID, staff.id);
+    expect(locked.justLocked).toBe(true);
+    // … and the (earlier) success's reset arrives late: the lock stays.
+    await driver.clearPinAttempts(DEMO_TENANT_ID, staff.id);
+    const after = await driver.beginPinAttempt(DEMO_TENANT_ID, staff.id);
+    expect(after.allowed).toBe(false);
+    expect(after.lockedUntil).toBeTruthy();
+    const spy = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(Date.now() + 16 * 60_000);
+    expect((await driver.beginPinAttempt(DEMO_TENANT_ID, staff.id)).allowed).toBe(true);
+    await driver.clearPinAttempts(DEMO_TENANT_ID, staff.id);
+    spy.mockRestore();
   });
 });
 
