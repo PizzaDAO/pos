@@ -9,6 +9,7 @@
  *  6. a released (failed) refund retracts its payment.refunded, no payment.captured
  *  7. order.updated ignores checkout bookkeeping and never-announced orders
  *  8. /v1 cancel closes open card intents and the delivery like main's cancel
+ *  9. /v1 release counts settled BASE money (tips excluded) against the due
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Principal } from "@openpizza/core";
@@ -390,6 +391,61 @@ describe("8. /v1 cancel mirrors main's storefront cancel", () => {
     const r = await callV1("POST", `/orders/${id}/cancel`, { body: { reason: "x" } });
     expect(r.status).toBe(409);
     expect(r.json.code).toBe("CANCEL_NOT_ALLOWED");
+  });
+});
+
+describe("9. /v1 release counts base money, not tips", () => {
+  const agent: Principal = {
+    kind: "service",
+    id: "t",
+    tenant_id: DEMO_TENANT_ID,
+    location_ids: null,
+    scopes: ["orders:read", "orders:write"],
+    module: "guests",
+  };
+  const held = (id: string) =>
+    order(id, "draft", { channel: "in_store", hold: { reason: "manual", expires_at: null } });
+
+  it("an 800 tender + 200 tip does not pay a 1000 order", async () => {
+    const d = getPosDriver();
+    const id = "c9000000-0000-4000-8000-000000000001";
+    await d.createOrder(held(id));
+    await d.upsertPayment(payment(id, "captured", { amount_cents: 800, tip_cents: 200 }));
+    const r = await callV1("POST", `/orders/${id}/release`, { body: {}, p: agent });
+    expect(r.status).toBe(402);
+    expect(r.json.code).toBe("PAYMENT_REQUIRED");
+    expect(r.json.details.amount_due_cents).toBe(200);
+    expect((await d.getOrder(id))?.status).toBe("draft");
+  });
+
+  it("a refund of the tip leaves the base paid; a refund beyond it does not", async () => {
+    const d = getPosDriver();
+    const tipOnly = "c9000000-0000-4000-8000-000000000002";
+    await d.createOrder(held(tipOnly));
+    await d.upsertPayment(
+      payment(tipOnly, "captured", { amount_cents: 1000, tip_cents: 200, refunded_cents: 200 }),
+    );
+    const ok = await callV1("POST", `/orders/${tipOnly}/release`, { body: {}, p: agent });
+    expect(ok.status).toBe(200);
+    expect(ok.json.fulfillment_status).toBe("placed");
+
+    const intoBase = "c9000000-0000-4000-8000-000000000003";
+    await d.createOrder(held(intoBase));
+    await d.upsertPayment(
+      payment(intoBase, "captured", { amount_cents: 1000, tip_cents: 200, refunded_cents: 300 }),
+    );
+    const refused = await callV1("POST", `/orders/${intoBase}/release`, { body: {}, p: agent });
+    expect(refused.status).toBe(402);
+    expect(refused.json.details.amount_due_cents).toBe(100);
+  });
+
+  it("a tender in another currency never pays the order", async () => {
+    const d = getPosDriver();
+    const id = "c9000000-0000-4000-8000-000000000004";
+    await d.createOrder(held(id));
+    await d.upsertPayment(payment(id, "captured", { currency: "EUR" }));
+    const r = await callV1("POST", `/orders/${id}/release`, { body: {}, p: agent });
+    expect(r.status).toBe(402);
   });
 });
 

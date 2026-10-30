@@ -45,11 +45,15 @@ import {
   type CreateOrderInput,
   type PosDriver,
   type OrderFulfillment,
+  type Payment,
 } from "@/lib/db";
 import { isGuid, isIsoTimestamp } from "@/lib/db/paging";
 import { cancelDeliveryForOrder } from "@/lib/delivery/service";
 import { captureError } from "@/lib/observability";
-import { cancelOpenOnlineIntents } from "@/lib/payments/service";
+import {
+  cancelOpenOnlineIntents,
+  orderDueCents,
+} from "@/lib/payments/service";
 import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError, maxTipCents } from "@/lib/reprice";
 import { getPlan } from "@/lib/saas/plans";
@@ -176,6 +180,30 @@ function decodeCursor(c: string): [string, string] {
     /* fallthrough */
   }
   throw ProblemError.of("VALIDATION_FAILED", { detail: "Invalid cursor." });
+}
+
+/**
+ * Base money (tips excluded) still held on SETTLED tenders — captured or
+ * authorized, as main's settledCents — in the order's currency, net of refunds
+ * beyond the tip: sum(max(0, amount - max(0, refunded - tip))).
+ */
+export function netSettledBaseCents(
+  payments: Payment[],
+  currency: string,
+): number {
+  const cur = currency.toUpperCase();
+  return payments
+    .filter(
+      (p) =>
+        (p.status === "captured" || p.status === "authorized") &&
+        p.currency.toUpperCase() === cur,
+    )
+    .reduce(
+      (n, p) =>
+        n +
+        Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
+      0,
+    );
 }
 
 /**
@@ -578,18 +606,17 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     // the caller holds the explicit scope (e.g. a terminal taking cash).
     if (!hasLiteralScope(ctx.principal, "orders:release_unpaid")) {
       const payments = await ctx.driver.listPaymentsForOrder(order.id);
-      // Net of refunds (refunded_cents covers amount + tip): a refunded
-      // tender no longer pays for the order.
-      const covered = payments
-        .filter((p) => p.status === "captured")
-        .reduce(
-          (sum, p) => sum + Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents),
-          0,
-        );
-      if (covered < order.totals.total_cents) {
+      // Like main's settlement (settledCents vs orderDueCents): only the BASE
+      // amount of settled tenders in the order's currency pays for the order —
+      // a terminal tender's tip is not part of the order total, so it can't
+      // cover unpaid food. Refunds are netted off the base once they exceed
+      // the tip (refunded_cents spans amount + tip).
+      const due = orderDueCents(order);
+      const covered = netSettledBaseCents(payments, order.currency);
+      if (covered < due) {
         throw ProblemError.of("PAYMENT_REQUIRED", {
           detail: "The order is not fully paid; it cannot be released yet.",
-          details: { amount_due_cents: order.totals.total_cents - covered },
+          details: { amount_due_cents: due - covered },
         });
       }
     }
