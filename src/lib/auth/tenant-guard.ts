@@ -127,6 +127,30 @@ async function grantFor(
 }
 
 /**
+ * Layer for routes that already authorize the tenant with main's
+ * `requireTenantRole` / `requireTenantMember`: the client-supplied
+ * `locationId` must belong to that (already authorized) tenant. Returns a 403
+ * failure, or null when it does.
+ */
+export async function requireLocationInTenant(
+  tenantId: string,
+  locationId: string,
+): Promise<GuardFailure | null> {
+  const locations = await getPosDriver().listLocations(tenantId);
+  return locations.some((l) => l.id === locationId)
+    ? null
+    : deny(403, "Location is not part of this tenant.");
+}
+
+/** The caller's role in `tenantId` (null when not a member). */
+export function sessionRoleIn(
+  user: Pick<SessionUser, "memberships"> | null | undefined,
+  tenantId: string,
+): MembershipRole | null {
+  return user?.memberships?.find((m) => m.tenant_id === tenantId)?.role ?? null;
+}
+
+/**
  * Resolve an order by id and require `access` on ITS tenant (the tenant is
  * taken from the stored order, never the client). 404 when it doesn't exist.
  */

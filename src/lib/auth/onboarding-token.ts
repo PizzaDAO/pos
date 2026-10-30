@@ -20,6 +20,7 @@ import { signingSecret } from "./signing-secret";
 import { getPosDriver } from "@/lib/db";
 import type { SessionUser } from "./session";
 import { requireTenantAccess, type GuardFailure } from "./tenant-guard";
+import { requireTenantRole } from "./api";
 
 export const ONBOARDING_TOKEN_HEADER = "x-onboarding-token";
 
@@ -117,6 +118,13 @@ export async function requireTenantAdminOrOnboarding(
   if (tenantId && (await hasOnboardingAccess(request, tenantId))) {
     return { ok: true, tenantId, user: null, via: "onboarding" };
   }
+  if (tenantId) {
+    // Same session gate main uses for tenant-admin routes (owner|manager).
+    const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+    if (!auth.ok) return auth;
+    return { ok: true, tenantId, user: auth.user, via: "session" };
+  }
+  // No tenant named: the caller's single owner|manager tenant (400 if several).
   const auth = await requireTenantAccess(tenantId, "admin");
   if (!auth.ok) return auth;
   return { ok: true, tenantId: auth.tenantId, user: auth.user, via: "session" };

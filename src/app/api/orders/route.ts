@@ -18,7 +18,11 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
+import {
+  requireLocationInTenant,
+  sessionRoleIn,
+} from "@/lib/auth/tenant-guard";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError } from "@/lib/reprice";
@@ -81,12 +85,25 @@ export async function POST(request: Request) {
   // Only till roles create orders (the kitchen display never does), and the
   // location must belong to that tenant (no writing into another tenant's
   // location under your own tenant id).
-  const auth = await requireTenantAccess(
+  const roleAuth = await requireTenantRole(body.tenant_id, [
+    "owner",
+    "manager",
+    "cashier",
+  ]);
+  if (!roleAuth.ok) return roleAuth.res;
+  const locationDenied = await requireLocationInTenant(
     body.tenant_id,
-    ["owner", "manager", "cashier"],
-    { locationId: body.location_id, requireLocation: true },
+    body.location_id,
   );
-  if (!auth.ok) return auth.res;
+  if (locationDenied) return locationDenied.res;
+  const auth = {
+    user: roleAuth.user,
+    tenantId: body.tenant_id,
+    locationId: body.location_id,
+    // requireTenantRole guarantees one of the till roles; default to the
+    // least privileged one if the session shape doesn't carry it.
+    role: sessionRoleIn(roleAuth.user, body.tenant_id) ?? ("cashier" as const),
+  };
 
   try {
     const driver = getPosDriver();
@@ -132,7 +149,7 @@ export async function POST(request: Request) {
     try {
       priced = await priceOrder({
         tenantId: auth.tenantId,
-        locationId: auth.locationId as string,
+        locationId: auth.locationId,
         items: body.items,
         discountCents,
         tipCents: 0,
@@ -157,7 +174,7 @@ export async function POST(request: Request) {
     const input: CreateOrderInput = {
       id: body.id,
       tenant_id: auth.tenantId,
-      location_id: auth.locationId as string,
+      location_id: auth.locationId,
       channel: "in_store",
       currency: priced.settings.currency,
       items: priced.items,
@@ -206,12 +223,11 @@ export async function GET(request: Request) {
   }
   // Order lists carry customer details: tenant members only, and the location
   // must belong to that tenant.
-  const auth = await requireTenantAccess(tenantId, "terminal", { locationId });
+  const auth = await requireTenantMember(tenantId);
   if (!auth.ok) return auth.res;
+  const locationDenied = await requireLocationInTenant(tenantId, locationId);
+  if (locationDenied) return locationDenied.res;
   const driver = getPosDriver();
-  const orders = await driver.listOrders(
-    auth.tenantId,
-    auth.locationId as string,
-  );
+  const orders = await driver.listOrders(tenantId, locationId);
   return NextResponse.json({ orders });
 }

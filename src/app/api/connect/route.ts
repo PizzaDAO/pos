@@ -33,10 +33,16 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAdminOrOnboarding(
-    request,
-    searchParams.get("tenantId"),
-  );
+  const requestedTenantId = searchParams.get("tenantId");
+  if (!requestedTenantId) {
+    return NextResponse.json(
+      { error: "tenantId is required." },
+      { status: 400 },
+    );
+  }
+  // Same gate as POST: an owner/manager session of the tenant, or the signup
+  // wizard's onboarding token while the tenant is still onboarding.
+  const auth = await requireTenantAdminOrOnboarding(request, requestedTenantId);
   if (!auth.ok) return auth.res;
   const tenantId = auth.tenantId;
   const driver = getPosDriver();
