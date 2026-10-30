@@ -12,6 +12,12 @@ const PUBLIC_RAW_KEYS = [
   "token",
   "usdcUnits",
   "hostedUrl",
+  // Card-present (reader) tenders: what the till shows and the receipt prints.
+  // Truncated card data only (brand, last4, EMV fields); never a PAN or a secret.
+  "card_receipt",
+  "last_error",
+  "reader_action_status",
+  "reader_id",
 ] as const;
 
 export function publicTender(p: Payment): Payment {

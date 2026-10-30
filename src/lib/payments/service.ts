@@ -32,6 +32,7 @@ import { deriveTenderId } from "./ids";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
+import { cancelReaderAction } from "./providers/stripe-terminal-api";
 import { railChargesApplicationFee } from "./fees";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
@@ -295,7 +296,10 @@ export async function takePaymentDetailed(
     // A different live card/Coinbase tender already holds this order's slot
     // (payments_one_live_card_or_cb). The intent we just created is an orphan:
     // cancel it so it can never be confirmed.
-    if (err instanceof LiveTenderConflictError && isRealIntentTender(payment)) {
+    if (
+      err instanceof LiveTenderConflictError &&
+      (isRealIntentTender(payment) || isRealTerminalTender(payment))
+    ) {
       await stripeRequest(
         `/payment_intents/${payment.charge_id}/cancel`,
         {},
@@ -321,7 +325,14 @@ export async function takePaymentDetailed(
 export async function applyRailStatus(
   paymentId: string,
   status: PaymentStatus,
-  opts: { raw?: Record<string, unknown> } = {},
+  opts: {
+    raw?: Record<string, unknown>;
+    /**
+     * Gratuity the rail learned AFTER the tender was created (a card-present tip
+     * typed on the reader). Base `amount_cents` is never touched.
+     */
+    tipCents?: number;
+  } = {},
 ): Promise<Payment | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(paymentId);
@@ -331,10 +342,16 @@ export async function applyRailStatus(
   const locked =
     payment.status === "refunded" ||
     (payment.status === "captured" && status !== "refunded");
-  if (!locked && (status !== payment.status || opts.raw)) {
+  if (
+    !locked &&
+    (status !== payment.status ||
+      opts.raw ||
+      (opts.tipCents !== undefined && opts.tipCents !== payment.tip_cents))
+  ) {
     const next: Payment = {
       ...payment,
       status,
+      tip_cents: opts.tipCents ?? payment.tip_cents,
       raw: opts.raw ? { ...(payment.raw ?? {}), ...opts.raw } : payment.raw,
       updated_at: nowIso(),
     };
@@ -386,6 +403,21 @@ async function resolveLiveTenderConflict(
  * Throws when the provider refuses. Does NOT touch the local row.
  */
 export async function cancelTenderOnProvider(p: Payment): Promise<void> {
+  if (isRealTerminalTender(p)) {
+    // Clear the reader's screen first (best effort: it may be offline, idle, or
+    // mid-authorization). Canceling the PaymentIntent is what makes a late tap
+    // fail, and it throws if the card already succeeded (the caller re-syncs).
+    const readerId = typeof p.raw?.reader_id === "string" ? p.raw.reader_id : null;
+    if (readerId) {
+      await cancelReaderAction(p.connect_account_id!, readerId).catch(() => undefined);
+    }
+    await stripeRequest(
+      `/payment_intents/${p.charge_id}/cancel`,
+      {},
+      { stripeAccount: p.connect_account_id },
+    );
+    return;
+  }
   if (isRealIntentTender(p)) {
     await stripeRequest(
       `/payment_intents/${p.charge_id}/cancel`,
@@ -557,6 +589,13 @@ export async function refreshPaymentStatus(
     await maybeMarkOrderPaid(payment.order_id);
     return payment;
   }
+  // A card-present tender on a reader is settled by the terminal flow (it reads
+  // the PaymentIntent AND the reader, records the tip/receipt, and a simulated one
+  // waits for the simulated reader): never by the rail's blanket `status`.
+  if (payment.rail === "stripe_terminal" && payment.raw?.reader_id) {
+    const { syncCardTender } = await import("./terminal/flow");
+    return (await syncCardTender(paymentId)).payment;
+  }
 
   const rail = requirePaymentRail(payment.rail);
   const status = await rail.status(
@@ -576,6 +615,18 @@ export async function refreshPaymentStatus(
 export function isRealIntentTender(p: Payment): boolean {
   return (
     p.rail === "stripe_online" &&
+    !p.simulated &&
+    !!p.charge_id &&
+    !p.charge_id.startsWith("sim_") &&
+    !!p.connect_account_id &&
+    !cardRailsSimulated()
+  );
+}
+
+/** True for a real (non-simulated) card-present PaymentIntent tender. */
+export function isRealTerminalTender(p: Payment): boolean {
+  return (
+    p.rail === "stripe_terminal" &&
     !p.simulated &&
     !!p.charge_id &&
     !p.charge_id.startsWith("sim_") &&

@@ -1,0 +1,41 @@
+/**
+ * GET /api/terminal/readers?tenantId=&locationId=
+ *
+ * The card-reader list for the till: this location's registered readers merged
+ * with their live online/offline status, plus the card gate. Returns
+ * `{ mode, ready, notReadyReason, readers }`. `ready` is true only when the
+ * tenant has a charges-enabled connected account AND at least one registered
+ * reader (always true in simulated mode, which has one virtual reader).
+ *
+ * Auth: owner | manager | cashier of the tenant; the location must be the
+ * tenant's.
+ */
+import { NextResponse } from "next/server";
+import { enforceRateLimit } from "@/lib/security";
+import { getCardReadiness } from "@/lib/payments/terminal/readers";
+import {
+  TILL_ROLES,
+  authorizeLocation,
+  errorResponse,
+} from "@/lib/payments/terminal/http";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function GET(request: Request) {
+  const limited = enforceRateLimit(request, "payments");
+  if (limited) return limited;
+  const { searchParams } = new URL(request.url);
+  const auth = await authorizeLocation(
+    searchParams.get("tenantId"),
+    searchParams.get("locationId"),
+    TILL_ROLES,
+  );
+  if (!auth.ok) return auth.res;
+  try {
+    const readiness = await getCardReadiness(auth.tenantId, auth.location.id);
+    return NextResponse.json(readiness, { headers: { "Cache-Control": "no-store" } });
+  } catch (err) {
+    return errorResponse(err, "Could not load card readers.");
+  }
+}

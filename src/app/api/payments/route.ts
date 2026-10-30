@@ -47,6 +47,7 @@ import {
   isOnlineOrderRail,
   onlineRailAvailable,
 } from "@/lib/payments/online-rails";
+import { cardRailsSimulated } from "@/lib/payments/env";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -141,6 +142,20 @@ export async function POST(request: Request) {
       "cashier",
     ]);
     if (!auth.ok) return auth.res;
+
+    // Card-present tenders are server-driven: the PaymentIntent must be handed to
+    // a reader (POST /api/terminal/payments). Creating one here would leave a
+    // card_present intent nobody processes. (In simulated mode the legacy instant
+    // approval stays until the terminal UI moves to the reader flow.)
+    if (body.rail === "stripe_terminal" && !cardRailsSimulated()) {
+      return NextResponse.json(
+        {
+          error: "Card payments in store go through the card reader.",
+          code: "use_terminal_reader",
+        },
+        { status: 400 },
+      );
+    }
   }
 
   // Cash on an ONLINE order takes a till role, exactly like an in-store tender.

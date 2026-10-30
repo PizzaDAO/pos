@@ -14,6 +14,8 @@ import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { expireOnlineOrders } from "@/lib/shop/lifecycle";
 import { usingMockDriver } from "@/lib/payments/env";
+import { reconcileTerminalTenders } from "@/lib/payments/terminal/flow";
+import { captureError } from "@/lib/observability";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,5 +37,15 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const summary = await expireOnlineOrders();
-  return NextResponse.json(summary, { headers: { "Cache-Control": "no-store" } });
+  // Also sweep in-store card-reader tenders left open (tablet died mid-payment):
+  // re-read from Stripe, capture if it went through, else cancel. Failure here
+  // must not fail the online-order sweep.
+  const terminal = await reconcileTerminalTenders().catch((err) => {
+    captureError(err, { scope: "terminal-reconcile-cron" });
+    return null;
+  });
+  return NextResponse.json(
+    { ...summary, terminal },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }
