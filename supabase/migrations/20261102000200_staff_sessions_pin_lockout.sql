@@ -1,5 +1,7 @@
 -- ============================================================================
--- Migration: staff_sessions_pin_lockout
+-- Migration: staff_sessions_pin_lockout   (PR #20 rebased; was
+-- 20260612000000_staff_sessions_pin_lockout, renumbered after main's
+-- 20261101000300. Nothing in it overlaps main's schema.)
 --
 --   * terminal_staff_sessions: server-side record of each PIN switch-in. The
 --     signed `pos_active_staff` cookie carries a session id (nonce) bound to the
@@ -12,6 +14,15 @@
 --   * tenants.suspended_by_platform: an explicit flag set in the SAME update as
 --     the platform's suspend (cleared on reactivate), so self-serve go-live can
 --     refuse platform-suspended tenants without scanning the audit log.
+--   * tenants.status / suspended_by_platform are SERVER-WRITE-ONLY: the
+--     tenants_update policy lets an owner/manager update their tenant row via
+--     PostgREST, which would let a platform-suspended tenant reactivate itself
+--     (status = 'active') or clear the flag. Table-level UPDATE is revoked from
+--     authenticated and re-granted on `name` only. The app writes tenants only
+--     through the service-role server driver.
+--
+-- The server driver reads/writes these columns, so apply this migration BEFORE
+-- deploying the code that uses it.
 --
 -- SECURITY DEFINER functions pin search_path = public, pg_temp; service_role
 -- only. IDEMPOTENT.
@@ -20,6 +31,12 @@
 -- ---- Platform suspension flag ------------------------------------------------
 alter table public.tenants
   add column if not exists suspended_by_platform boolean not null default false;
+
+-- Owners/managers keep UPDATE on the display name only (column privilege);
+-- status, slug and the platform flag are written by the server alone.
+revoke update on public.tenants from authenticated;
+grant update (name) on public.tenants to authenticated;
+revoke update on public.tenants from anon;
 
 -- ---- PIN lockout ---------------------------------------------------------------
 alter table public.staff

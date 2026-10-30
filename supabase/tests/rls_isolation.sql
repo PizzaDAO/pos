@@ -740,6 +740,75 @@ begin
            where id = '0ada0077-0000-0000-0000-000000000001') = '500',
     'update_late_payment works on the created marker';
 end $$;
+reset role;
+
+-- PR #20 (20261102000100/000200): subscriptions, tenant status and the
+-- platform-suspension flag are server-write-only; terminal staff sessions and
+-- the PIN-lockout function are service_role only.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare blocked boolean;
+begin
+  blocked := false;
+  begin
+    insert into public.subscriptions (tenant_id, tier, status)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'pro', 'active');
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to insert subscriptions';
+
+  blocked := false;
+  begin
+    update public.subscriptions set tier = 'multi'
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT be able to update subscriptions (tier bypass)';
+
+  blocked := false;
+  begin
+    update public.tenants set status = 'active'
+      where id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT be able to change tenants.status';
+
+  blocked := false;
+  begin
+    update public.tenants set suspended_by_platform = false
+      where id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT be able to clear tenants.suspended_by_platform';
+
+  -- The display name stays owner-editable.
+  update public.tenants set name = name
+    where id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+
+  blocked := false;
+  begin
+    perform count(*) from public.terminal_staff_sessions;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read terminal_staff_sessions';
+
+  blocked := false;
+  begin
+    perform public.record_pin_failure('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      '57a00001-0000-0000-0000-000000000001');
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT call record_pin_failure';
+end $$;
+reset role;
+
+-- record_pin_failure locks after 5 failures (server path).
+do $$
+declare r jsonb; i int;
+begin
+  for i in 1..4 loop
+    r := public.record_pin_failure('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      (select id from public.staff where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' limit 1));
+    assert (r ->> 'locked_until') is null, format('no lock after %s failures', i);
+  end loop;
+  r := public.record_pin_failure('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    (select id from public.staff where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' limit 1));
+  assert (r ->> 'locked_until') is not null, 'the 5th failure locks the PIN';
+end $$;
 
 select 'RLS isolation test PASSED' as result;
 
