@@ -354,6 +354,8 @@ function mapSubscription(r: Row): Subscription {
     simulated: r.simulated as boolean,
     stripe_customer_id: (r.stripe_customer_id as string | null) ?? null,
     stripe_subscription_id: (r.stripe_subscription_id as string | null) ?? null,
+    last_event_created:
+      r.last_event_created == null ? null : Number(r.last_event_created),
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };

@@ -95,6 +95,12 @@ export interface Subscription {
   simulated: boolean;
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
+  /**
+   * Stripe `event.created` (unix seconds) of the last billing webhook applied
+   * to this row — older, out-of-order events are ignored. Optional/null for
+   * simulated subscriptions.
+   */
+  last_event_created?: number | null;
   created_at: string;
   updated_at: string;
 }
