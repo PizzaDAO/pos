@@ -311,7 +311,15 @@ export async function takePaymentDetailed(
   if (saved.status === "captured" || saved.status === "authorized") {
     // This tender may have just covered the order: any card-reader / card intent
     // still open on it must not stay live (it could be tapped and double charge).
-    await closeSiblingsOfSettledOrder(saved);
+    // The tender is already saved: a failure closing the others must not turn
+    // this into a 502 (alert, then still evaluate the order).
+    await closeSiblingsOfSettledOrder(saved).catch((err) =>
+      captureError(err, {
+        scope: "close-siblings",
+        paymentId: saved.id,
+        orderId: input.orderId,
+      }),
+    );
   }
   await maybeMarkOrderPaid(input.orderId);
   return { payment: saved, clientSecret: result.clientSecret };
@@ -993,7 +1001,13 @@ async function flagDuplicatePayment(order: Order, payments: Payment[]): Promise<
   const held = inStore
     ? payments
         .filter((p) => p.status === "captured" || p.status === "authorized")
-        .reduce((n, p) => n + Math.max(0, p.amount_cents - p.refunded_cents), 0)
+        // Refunds are taken off the tip first, so a tip-only refund can't hide a
+        // duplicate of the base.
+        .reduce(
+          (n, p) =>
+            n + Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
+          0,
+        )
     : netSettledCents(payments);
   const excess = held - (inStore ? orderDueCents(order) : order.totals.total_cents);
   if (excess <= 0) return;

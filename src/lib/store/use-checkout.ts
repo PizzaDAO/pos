@@ -177,7 +177,16 @@ export function useCheckout(
           balanceCents?: number;
           error?: string;
         };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        if (!res.ok) {
+          // 409: the balance changed under us (another tender landed, a card is
+          // live, ...). Reload it and drop the pending id so the next tap uses
+          // the new balance and a new tender id.
+          if (res.status === 409) {
+            pendingIds.current.clear();
+            await refresh();
+          }
+          throw new Error(data.error ?? `HTTP ${res.status}`);
+        }
         // Recorded: the next tender (even an identical one) is a new tender.
         pendingIds.current.clear();
         await refresh();

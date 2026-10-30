@@ -573,6 +573,31 @@ describe("cash (or another rail) taken while a card tender is live on the reader
     expect((await getPosDriver().getPayment(paymentId))!.status).toBe("canceled");
   });
 
+  it("in-store amounts are capped at the balance for any rail: stale balance refused, fresh balance accepted", async () => {
+    const orderId = await seedOrder();
+    // card takes part of the order
+    const { paymentId } = await startTender(orderId, 1200);
+    await simulatePOST(
+      req(`/api/terminal/payments/${paymentId}/simulate`, json({ outcome: "approve" })),
+      params(paymentId),
+    );
+    // the till still thinks 2000 is due
+    const stale = await cash(orderId, 2000);
+    expect(stale.status).toBe(409);
+    const staleBody = await stale.json();
+    expect(staleBody.code).toBe("amount_exceeds_balance");
+    expect(staleBody.balanceCents).toBe(800);
+    expect((await getPosDriver().listPaymentsForOrder(orderId)).map((p) => p.rail)).toEqual([
+      "stripe_terminal",
+    ]);
+    // refreshed balance works
+    const fresh = await cash(orderId, 800);
+    expect(fresh.status).toBe(201);
+    expect((await fresh.json()).orderStatus).toBe("paid");
+    // and a fresh order can't be over-tendered either
+    expect((await cash(await seedOrder(), 2500)).status).toBe(409);
+  });
+
   it("a partial cash tender also closes the card tender (the cashier restarts card for the rest)", async () => {
     const orderId = await seedOrder();
     const { paymentId } = await startTender(orderId, 1500);
@@ -718,6 +743,44 @@ describe("Connect webhook: card-present", () => {
     expect(all.map((p) => p.rail)).toEqual(["stripe_terminal"]);
     expect(all[0]!.status).toBe("captured");
     expect(all[0]!.id).toBe(payment.id);
+  });
+
+  it("a card tender parked for manager review blocks cash with a distinct message (not 'in progress')", async () => {
+    const { orderId, payment } = await startRealTender();
+    // The PI doesn't fit the tender: the cancel's re-sync parks it.
+    piState = { ...piState, status: "succeeded", amount: 100 };
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path.endsWith("/cancel")) {
+        const { StripeError } = await import("@/lib/payments/providers/stripe-client");
+        throw new StripeError("cannot cancel", 400, { error: { code: "payment_intent_unexpected_state" } });
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    const first = await cashReq(orderId);
+    expect(first.status).toBe(409);
+    expect((await first.json()).code).toBe("card_needs_review");
+    expect((await getPosDriver().getPayment(payment.id))!.raw?.needs_manual_review).toBe(true);
+
+    // already parked: refused again without calling Stripe
+    stripeRequest.mockClear();
+    stripeGet.mockClear();
+    const second = await cashReq(orderId);
+    const body = await second.json();
+    expect(second.status).toBe(409);
+    expect(body.code).toBe("card_needs_review");
+    expect(body.error).toMatch(/manager review/i);
+    expect(stripeRequest).not.toHaveBeenCalled();
+    expect((await getPosDriver().listPaymentsForOrder(orderId)).map((p) => p.rail)).toEqual([
+      "stripe_terminal",
+    ]);
+
+    // the cancel route says so too
+    const cancel = await cancelPOST(
+      req(`/api/terminal/payments/${payment.id}/cancel`, json({})),
+      params(payment.id),
+    );
+    expect(cancel.status).toBe(409);
+    expect((await cancel.json()).outcome).toBe("needs_review");
   });
 
   it("cash with the card tender cleanly canceled on Stripe goes through", async () => {

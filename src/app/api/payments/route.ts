@@ -321,16 +321,45 @@ export async function POST(request: Request) {
   // (409) and let the cashier re-check the balance.
   if (order.channel === "in_store" && body.rail !== "stripe_terminal") {
     const closed = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
-    if (closed === "settled" || closed === "in_flight") {
+    if (closed === "settled" || closed === "in_flight" || closed === "needs_review") {
       const current = await driver.getOrder(order.id);
+      const copy = {
+        settled: [
+          "This order was already paid by card. Check the balance.",
+          "already_paid_by_card",
+        ],
+        in_flight: [
+          "The customer is paying by card on the reader. Wait for it to finish or cancel it first.",
+          "card_in_progress",
+        ],
+        needs_review: [
+          "A card payment on this order needs manager review. Check Payments before taking another tender.",
+          "card_needs_review",
+        ],
+      }[closed];
       return NextResponse.json(
         {
-          error:
-            closed === "settled"
-              ? "This order was already paid by card. Check the balance."
-              : "The customer is paying by card on the reader. Wait for it to finish or cancel it first.",
-          code: closed === "settled" ? "already_paid_by_card" : "card_in_progress",
+          error: copy[0],
+          code: copy[1],
           balanceCents: current ? await getOrderBalance(current) : undefined,
+          orderStatus: current?.status,
+        },
+        { status: 409 },
+      );
+    }
+  }
+
+  // IN-STORE: never take more than is still owed (any rail), matching the reader
+  // path. A stale balance (another tender landed) is refused so the till refreshes.
+  if (order.channel === "in_store") {
+    const current = await driver.getOrder(order.id);
+    const balance = current ? await getOrderBalance(current) : 0;
+    if (body.amountCents > balance) {
+      return NextResponse.json(
+        {
+          error: "That is more than the balance now due on this order.",
+          code: "amount_exceeds_balance",
+          balanceCents: balance,
           orderStatus: current?.status,
         },
         { status: 409 },

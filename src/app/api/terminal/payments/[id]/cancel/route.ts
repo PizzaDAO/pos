@@ -5,6 +5,7 @@
  * PaymentIntent. `outcome`:
  *  - `canceled`: done, the balance is restored;
  *  - `in_flight`: the customer is mid-authorization on the reader, wait (409);
+ *  - `needs_review`: parked for a manager (PaymentIntent mismatch), 409;
  *  - `settled`: the card already went through (tender is `captured`; refund it
  *    if the cashier really meant to cancel).
  * Auth: owner | manager | cashier of the tender's tenant.
@@ -33,7 +34,7 @@ export async function POST(
   try {
     const { outcome, payment } = await cancelCardTender(id);
     return NextResponse.json(await tenderResponseBody(payment, { outcome }), {
-      status: outcome === "in_flight" ? 409 : 200,
+      status: outcome === "in_flight" || outcome === "needs_review" ? 409 : 200,
     });
   } catch (err) {
     return errorResponse(err, "Could not cancel the card payment.");

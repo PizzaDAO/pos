@@ -37,7 +37,7 @@ import {
   syncCardTender,
 } from "./flow";
 import { ReaderNotFoundError, simulatedReaderId } from "./readers";
-import { getOrderBalance, takePayment } from "../service";
+import { getOrderBalance, refundPayment, takePayment } from "../service";
 import { CardPaymentsNotReadyError } from "../connect";
 
 const TENANT = DEMO_TENANT_ID;
@@ -433,6 +433,49 @@ describe("simulated reader", () => {
     expect(order.fulfillment?.late_payment).toMatchObject({ kind: "duplicate", amount_cents: 2000 });
     const open = await driver.listOpenLatePayments(TENANT, LOCATION, 100);
     expect(open.map((o) => o.id)).toContain(orderId);
+  });
+
+  it("a tip-only refund can't hide a duplicate: the flag is the full duplicated base", async () => {
+    const driver = getPosDriver();
+    const orderId = await seedOrder();
+    const { payment } = await start(orderId);
+    await simulateCardTender(payment.id, { outcome: "approve", tipCents: 300 });
+    await refundPayment({ paymentId: payment.id, amountCents: 300, refundId: "tip-back" });
+    await takePayment({
+      paymentId: uuid(),
+      orderId,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash",
+      amountCents: 2000,
+      tipCents: 0,
+      currency: "USD",
+    });
+    expect((await driver.getOrder(orderId))!.fulfillment?.late_payment).toMatchObject({
+      kind: "duplicate",
+      amount_cents: 2000,
+    });
+  });
+
+  it("a failure closing sibling tenders is captured, not a 502: the tender stays saved and the order is evaluated", async () => {
+    const driver = getPosDriver();
+    const orderId = await seedOrder();
+    const spy = vi
+      .spyOn(driver, "listPaymentsForOrder")
+      .mockRejectedValueOnce(new Error("db hiccup")); // first listing = the sibling close
+    const saved = await takePayment({
+      paymentId: uuid(),
+      orderId,
+      tenantId: TENANT,
+      locationId: LOCATION,
+      rail: "cash",
+      amountCents: 2000,
+      tipCents: 0,
+      currency: "USD",
+    });
+    spy.mockRestore();
+    expect(saved.status).toBe("captured");
+    expect(await orderStatus(orderId)).toBe("paid");
   });
 
   it("a lone captured card tender with a tip is not flagged", async () => {

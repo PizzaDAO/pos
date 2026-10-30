@@ -622,7 +622,11 @@ export async function retryCardTender(
   return { payment: await reload(payment), readerAction: null };
 }
 
-export type CancelOutcome = "canceled" | "settled" | "in_flight";
+/**
+ * `needs_review`: the tender was parked for a manager (its PaymentIntent doesn't
+ * match it); it is neither settled nor safely cancelable by a machine.
+ */
+export type CancelOutcome = "canceled" | "settled" | "in_flight" | "needs_review";
 
 /**
  * Cancel an open card tender: cancel_action on the reader, then cancel the
@@ -639,6 +643,9 @@ export async function cancelCardTender(
   }
   if (payment.status === "canceled" || payment.status === "failed") {
     return { outcome: "canceled", payment };
+  }
+  if (readRaw(payment, "needs_manual_review")) {
+    return { outcome: "needs_review", payment };
   }
 
   const readerId = readRaw<string>(payment, "reader_id");
@@ -659,7 +666,13 @@ export async function cancelCardTender(
     }
   }
   const outcome = await cancelOpenTender(payment);
-  return { outcome, payment: await reload(payment) };
+  const after = await reload(payment);
+  // A sync mismatch inside the strict cancel is swallowed as "in flight" by the
+  // service; the sync parked the tender, so say so instead.
+  if (outcome === "in_flight" && readRaw(after, "needs_manual_review")) {
+    return { outcome: "needs_review", payment: after };
+  }
+  return { outcome, payment: after };
 }
 
 /** Cancel whatever the reader is doing (stuck `in_progress` after a dropped payment). */
@@ -751,12 +764,13 @@ export async function simulateCardTender(
  *  - `none`: nothing was open;
  *  - `canceled`: all open tenders are canceled, the other payment may proceed;
  *  - `settled`: a card went through (the order may be paid by card);
- *  - `in_flight`: the customer is mid-authorization on the reader.
- * Callers refuse the new tender (409) on `settled` / `in_flight`.
+ *  - `in_flight`: the customer is mid-authorization on the reader;
+ *  - `needs_review`: a tender is parked for manager review (PI mismatch).
+ * Callers refuse the new tender (409) on anything but `none` / `canceled`.
  */
 export async function closeOpenCardTender(
   orderId: string,
-): Promise<"none" | "canceled" | "settled" | "in_flight"> {
+): Promise<"none" | "canceled" | "settled" | "in_flight" | "needs_review"> {
   const open = (await getPosDriver().listPaymentsForOrder(orderId)).filter(
     (p) => p.rail === "stripe_terminal" && isOpen(p),
   );
@@ -845,6 +859,7 @@ export async function reconcileTerminalTenders(
         const { outcome } = await cancelCardTender(payment.id);
         if (outcome === "canceled") summary.canceled += 1;
         else if (outcome === "settled") summary.settled += 1;
+        else if (outcome === "needs_review") summary.flagged += 1;
         else {
           // in_flight: the customer is mid-payment; look again later.
           summary.errors += 1;
