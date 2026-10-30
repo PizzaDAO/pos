@@ -6,6 +6,7 @@ import {
   getCheckoutOrderId,
   type CheckoutSignatureInput,
 } from "./checkout-order-id";
+import { storefrontKey } from "@/lib/shop/storefront";
 
 function memoryStorage(): Storage {
   const m = new Map<string, string>();
@@ -134,5 +135,57 @@ describe("one order id per checkout", () => {
 
   it("signature is deterministic", () => {
     expect(checkoutSignature(base)).toBe(checkoutSignature({ ...base }));
+  });
+});
+
+describe("keyed by storefront (tenant + location), migrating slug-only entries", () => {
+  const keyA = storefrontKey({ tenantSlug: "tenant-a", locationSlug: "downtown" });
+  const keyB = storefrontKey({ tenantSlug: "tenant-b", locationSlug: "downtown" });
+
+  it("two tenants' same-slug locations never share or supersede a checkout", () => {
+    const s = memoryStorage();
+    const mint = counter();
+    const a = getCheckoutOrderId({ ...base, slug: keyA }, mint, s);
+    const b = getCheckoutOrderId({ ...base, slug: keyB }, mint, s);
+    expect(b.id).not.toBe(a.id);
+    expect(b.superseded).toBeNull(); // tenant A's unpaid order is not cancelled
+    // Same cart, different tenant → different signature too.
+    expect(checkoutSignature({ ...base, slug: keyA })).not.toBe(
+      checkoutSignature({ ...base, slug: keyB }),
+    );
+    expect(getCheckoutOrderId({ ...base, slug: keyA }, mint, s).id).toBe(a.id);
+    // forget for B leaves A alone.
+    forgetCheckoutOrderId(keyB, s);
+    expect(getCheckoutOrderId({ ...base, slug: keyA }, mint, s).id).toBe(a.id);
+  });
+
+  it("a mid-checkout legacy entry (same checkout) is migrated: same order id", () => {
+    const s = memoryStorage();
+    const mint = counter();
+    // Written by the old build: key + signature by location slug alone.
+    const legacy = getCheckoutOrderId({ ...base, slug: "downtown" }, () => "legacy-1", s);
+    expect(legacy.id).toBe("legacy-1");
+    const now = getCheckoutOrderId({ ...base, slug: keyA }, mint, s);
+    expect(now).toEqual({ id: "legacy-1", superseded: null });
+    expect(s.getItem("openpizza.checkout.downtown")).toBeNull(); // moved
+    expect(getCheckoutOrderId({ ...base, slug: keyA }, mint, s).id).toBe("legacy-1");
+  });
+
+  it("a legacy entry for a different checkout is superseded (cancelled best-effort), not orphaned", () => {
+    const s = memoryStorage();
+    getCheckoutOrderId({ ...base, slug: "downtown", tipCents: 300 }, () => "legacy-2", s);
+    const now = getCheckoutOrderId({ ...base, slug: keyA }, counter(), s);
+    expect(now.superseded).toBe("legacy-2");
+    expect(now.id).not.toBe("legacy-2");
+    expect(s.getItem("openpizza.checkout.downtown")).toBeNull();
+  });
+
+  it("forget also clears the legacy entry (a paid pre-deploy order can't resurface)", () => {
+    const s = memoryStorage();
+    getCheckoutOrderId({ ...base, slug: "downtown" }, () => "legacy-paid", s);
+    forgetCheckoutOrderId(keyA, s);
+    expect(s.getItem("openpizza.checkout.downtown")).toBeNull();
+    const next = getCheckoutOrderId({ ...base, slug: keyA }, counter(), s);
+    expect(next.superseded).toBeNull();
   });
 });
