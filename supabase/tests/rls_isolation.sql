@@ -566,17 +566,17 @@ begin
   insert into public.payments
     (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
   values
-    ('0aea0003-0000-0000-0000-000000000001', '0ada0002-0000-0000-0000-000000000001',
+    ('0aea0099-0000-0000-0000-000000000001', '0ada0002-0000-0000-0000-000000000001',
      'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
      'crypto_coinbase', 'captured', 1099, 'USD'),
-    ('0aea0003-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
+    ('0aea0099-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
      'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
      'crypto_coinbase', 'pending', 1099, 'USD');
   begin
     insert into public.payments
       (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
     values
-      ('0aea0003-0000-0000-0000-000000000003', '0ada0002-0000-0000-0000-000000000001',
+      ('0aea0099-0000-0000-0000-000000000003', '0ada0002-0000-0000-0000-000000000001',
        'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
        'crypto_coinbase', 'pending', 1099, 'USD');
   exception when unique_violation then blocked := true; end;
@@ -623,6 +623,100 @@ begin
   assert blocked, 'authenticated users must NOT be able to call claim_late_payment';
 end $$;
 reset role;
+
+-- 22) Terminal readers/locations (20261103000000): a tenant member reads ONLY their
+--     own tenant's rows; nobody on the user path (owner included) can write them
+--     (they route card-present money; the service-role server writes them); both
+--     tables are FORCE RLS; and only ONE open card-present tender may exist per
+--     order (a settled/canceled one frees the slot).
+set session_replication_role = replica;
+insert into public.terminal_locations (location_id, tenant_id, connect_account_id, stripe_location_id, livemode)
+values
+  ('a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'acct_fixture_a', 'tml_a', false),
+  ('b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'acct_fixture_b', 'tml_b', false);
+insert into public.terminal_readers (id, tenant_id, location_id, connect_account_id, label)
+values
+  ('tmr_a', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'acct_fixture_a', 'A reader'),
+  ('tmr_b', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1', 'acct_fixture_b', 'B reader');
+set session_replication_role = origin;
+
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare n int; m int; blocked boolean;
+begin
+  select count(*) into n from public.terminal_readers;
+  select count(*) into m from public.terminal_locations;
+  assert n = 1, format('owner A must see only tenant A readers, saw %s', n);
+  assert m = 1, format('owner A must see only tenant A terminal locations, saw %s', m);
+
+  blocked := false;
+  begin
+    insert into public.terminal_readers (id, tenant_id, location_id, connect_account_id)
+    values ('tmr_evil', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'acct_evil');
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT insert terminal_readers (service-role only)';
+
+  blocked := false;
+  begin
+    update public.terminal_locations set connect_account_id = 'acct_evil';
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT update terminal_locations (service-role only)';
+
+  blocked := false;
+  begin
+    delete from public.terminal_readers;
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT delete terminal_readers (service-role only)';
+end $$;
+reset role;
+
+select pg_temp.act_as('22222222-2222-2222-2222-222222222222');
+do $$
+declare n int;
+begin
+  select count(*) into n from public.terminal_readers where id = 'tmr_a';
+  assert n = 0, 'a user of tenant B must not see tenant A readers';
+end $$;
+reset role;
+
+do $$
+declare blocked boolean := false; n int;
+begin
+  assert (select count(*) from public.terminal_readers) = 2, 'service path still holds both readers';
+  assert (select c.relforcerowsecurity from pg_class c where c.oid = 'public.terminal_readers'::regclass),
+    'terminal_readers must be FORCE RLS';
+  assert (select c.relforcerowsecurity from pg_class c where c.oid = 'public.terminal_locations'::regclass),
+    'terminal_locations must be FORCE RLS';
+
+  -- One open card-present tender per order (order from fixture 19).
+  insert into public.payments
+    (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+  values
+    ('0aea0077-0000-0000-0000-000000000001', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'stripe_terminal', 'requires_action', 500, 'USD');
+  begin
+    insert into public.payments
+      (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+    values
+      ('0aea0077-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
+       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+       'stripe_terminal', 'pending', 500, 'USD');
+  exception when unique_violation then blocked := true; end;
+  assert blocked, 'a second open stripe_terminal tender on one order must be refused';
+
+  -- A settled terminal tender does not hold the slot.
+  update public.payments set status = 'captured' where id = '0aea0077-0000-0000-0000-000000000001';
+  insert into public.payments
+    (id, order_id, tenant_id, location_id, rail, status, amount_cents, currency)
+  values
+    ('0aea0077-0000-0000-0000-000000000002', '0ada0002-0000-0000-0000-000000000001',
+     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1',
+     'stripe_terminal', 'requires_action', 500, 'USD');
+  select count(*) into n from public.payments
+    where order_id = '0ada0002-0000-0000-0000-000000000001' and rail = 'stripe_terminal';
+  assert n = 2, 'one captured + one open stripe_terminal tender expected';
+end $$;
 
 select 'RLS isolation test PASSED' as result;
 

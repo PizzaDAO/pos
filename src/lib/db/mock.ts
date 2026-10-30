@@ -42,6 +42,8 @@ import type {
   Payment,
   PaymentSettings,
   RefundReservation,
+  TerminalLocation,
+  TerminalReader,
 } from "./payment-types";
 import {
   LiveTenderConflictError,
@@ -220,6 +222,9 @@ const orders = new Map<string, Order>();
 const payments = new Map<string, Payment>();
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
+/** Stripe Terminal locations keyed by POS location id; readers keyed by tmr_ id. */
+const terminalLocations = new Map<string, TerminalLocation>();
+const terminalReaders = new Map<string, TerminalReader>();
 /** Online-ordering customers keyed by id. */
 const customers = new Map<string, Customer>();
 /** Magic-link tokens (stubbed, never emailed) keyed by token. */
@@ -1241,6 +1246,60 @@ export const mockDriver: PosDriver = {
     return merged;
   },
 
+  // -- Stripe Terminal -------------------------------------------------------
+
+  async getTerminalLocation(locationId: string) {
+    return terminalLocations.get(locationId) ?? null;
+  },
+
+  async upsertTerminalLocation(row: TerminalLocation) {
+    const existing = terminalLocations.get(row.location_id);
+    const merged: TerminalLocation = {
+      ...row,
+      created_at: existing?.created_at ?? row.created_at,
+      updated_at: nowIso(),
+    };
+    terminalLocations.set(row.location_id, merged);
+    return merged;
+  },
+
+  async listTerminalReaders(tenantId: string, locationId: string) {
+    return [...terminalReaders.values()]
+      .filter((r) => r.tenant_id === tenantId && r.location_id === locationId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+  },
+
+  async getTerminalReader(id: string) {
+    return terminalReaders.get(id) ?? null;
+  },
+
+  async upsertTerminalReader(row: TerminalReader) {
+    const existing = terminalReaders.get(row.id);
+    const merged: TerminalReader = {
+      ...row,
+      created_at: existing?.created_at ?? row.created_at,
+      updated_at: nowIso(),
+    };
+    terminalReaders.set(row.id, merged);
+    return merged;
+  },
+
+  async deleteTerminalReader(id: string) {
+    terminalReaders.delete(id);
+  },
+
+  async listStaleTerminalTenders(olderThan: string, limit: number) {
+    return [...payments.values()]
+      .filter(
+        (p) =>
+          p.rail === "stripe_terminal" &&
+          tenderHoldsOpenSlot(p.status) &&
+          p.updated_at < olderThan,
+      )
+      .sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+      .slice(0, limit);
+  },
+
   // -- Customers (Phase 4) ---------------------------------------------------
 
   async getCustomerByEmail(
@@ -1876,6 +1935,8 @@ export function resetMockOrders(): void {
 export function resetMockPayments(): void {
   payments.clear();
   connectAccounts.clear();
+  terminalLocations.clear();
+  terminalReaders.clear();
 }
 
 /** Test helper: clear customers, magic-link tokens, and deliveries. */

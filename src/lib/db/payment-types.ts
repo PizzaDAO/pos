@@ -131,7 +131,64 @@ export class LiveTenderConflictError extends Error {
 export const ONE_LIVE_TENDER_RAILS: readonly string[] = [
   "stripe_online",
   "crypto_coinbase",
+  // Card-present: one open reader tender per order (payments_one_live_terminal).
+  "stripe_terminal",
 ];
+
+// ---------------------------------------------------------------------------
+// Stripe Terminal (server-driven in-store card reader)
+// ---------------------------------------------------------------------------
+
+/** Who collects the tip on a card-present sale. */
+export type TerminalTipMode = "reader" | "pos" | "none";
+
+export const TERMINAL_TIP_MODES: readonly TerminalTipMode[] = [
+  "reader",
+  "pos",
+  "none",
+];
+
+/** Structured address a Stripe Terminal Location requires. */
+export interface TerminalAddress {
+  line1: string;
+  line2?: string;
+  city: string;
+  /** US state/territory code (e.g. "TX"). */
+  state: string;
+  postal_code: string;
+  /** ISO-3166 alpha-2 (US only in v1). */
+  country: string;
+}
+
+/** Our index of a Stripe Terminal Location (`tml_`) for one POS location. */
+export interface TerminalLocation {
+  location_id: string;
+  tenant_id: string;
+  /** Connected account + key mode the Stripe ids below were created under. */
+  connect_account_id: string | null;
+  stripe_location_id: string | null;
+  /** Terminal Configuration (`tmc_`) carrying the on-reader tip presets. */
+  configuration_id: string | null;
+  livemode: boolean;
+  address: TerminalAddress | null;
+  tip_mode: TerminalTipMode;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A registered card reader (Stripe `tmr_` id) on a tenant's connected account. */
+export interface TerminalReader {
+  id: string;
+  tenant_id: string;
+  location_id: string;
+  connect_account_id: string;
+  label: string;
+  device_type: string | null;
+  serial_number: string | null;
+  livemode: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 /**
  * Tender statuses that HOLD the one-open-tender slot (the DB index

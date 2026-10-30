@@ -45,7 +45,13 @@ import type {
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
-import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import type {
+  ConnectAccount,
+  Payment,
+  PaymentSettings,
+  TerminalLocation,
+  TerminalReader,
+} from "./payment-types";
 import { LiveTenderConflictError } from "./payment-types";
 import { isUnpaidOnlineStatus } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
@@ -398,6 +404,36 @@ function mapConnect(r: Row): ConnectAccount {
     payouts_enabled: r.payouts_enabled as boolean,
     details_submitted: r.details_submitted as boolean,
     simulated: r.simulated as boolean,
+    created_at: r.created_at as string,
+    updated_at: r.updated_at as string,
+  };
+}
+
+function mapTerminalLocation(r: Row): TerminalLocation {
+  return {
+    location_id: r.location_id as string,
+    tenant_id: r.tenant_id as string,
+    connect_account_id: (r.connect_account_id as string | null) ?? null,
+    stripe_location_id: (r.stripe_location_id as string | null) ?? null,
+    configuration_id: (r.configuration_id as string | null) ?? null,
+    livemode: (r.livemode as boolean) ?? false,
+    address: (r.address as TerminalLocation["address"]) ?? null,
+    tip_mode: r.tip_mode as TerminalLocation["tip_mode"],
+    created_at: r.created_at as string,
+    updated_at: r.updated_at as string,
+  };
+}
+
+function mapTerminalReader(r: Row): TerminalReader {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    location_id: r.location_id as string,
+    connect_account_id: r.connect_account_id as string,
+    label: (r.label as string) ?? "",
+    device_type: (r.device_type as string | null) ?? null,
+    serial_number: (r.serial_number as string | null) ?? null,
+    livemode: (r.livemode as boolean) ?? false,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -1613,7 +1649,10 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         .single();
       // A second live card/Coinbase tender for one order trips the partial
       // unique index payments_one_live_card_or_cb.
-      if (res.error?.message.includes("payments_one_live_card_or_cb")) {
+      if (
+        res.error?.message.includes("payments_one_live_card_or_cb") ||
+        res.error?.message.includes("payments_one_live_terminal")
+      ) {
         throw new LiveTenderConflictError();
       }
       return mapPayment(unwrap(res) as Row);
@@ -1715,6 +1754,91 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .single(),
         ) as Row,
       );
+    },
+
+    // -- Stripe Terminal ---------------------------------------------------
+    async getTerminalLocation(locationId) {
+      const r = unwrap(
+        await sb
+          .from("terminal_locations")
+          .select("*")
+          .eq("location_id", locationId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapTerminalLocation(r) : null;
+    },
+
+    async upsertTerminalLocation(row) {
+      const existing = await this.getTerminalLocation(row.location_id);
+      return mapTerminalLocation(
+        unwrap(
+          await sb
+            .from("terminal_locations")
+            .upsert({
+              ...row,
+              created_at: existing?.created_at ?? row.created_at,
+              updated_at: nowIso(),
+            })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async listTerminalReaders(tenantId, locationId) {
+      return (
+        unwrap(
+          await sb
+            .from("terminal_readers")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at"),
+        ) as Row[]
+      ).map(mapTerminalReader);
+    },
+
+    async getTerminalReader(id) {
+      const r = unwrap(
+        await sb.from("terminal_readers").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapTerminalReader(r) : null;
+    },
+
+    async upsertTerminalReader(row) {
+      const existing = await this.getTerminalReader(row.id);
+      return mapTerminalReader(
+        unwrap(
+          await sb
+            .from("terminal_readers")
+            .upsert({
+              ...row,
+              created_at: existing?.created_at ?? row.created_at,
+              updated_at: nowIso(),
+            })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async deleteTerminalReader(id) {
+      unwrap(await sb.from("terminal_readers").delete().eq("id", id));
+    },
+
+    async listStaleTerminalTenders(olderThan, limit) {
+      return (
+        unwrap(
+          await sb
+            .from("payments")
+            .select("*")
+            .eq("rail", "stripe_terminal")
+            .in("status", ["requires_action", "pending"])
+            .lt("updated_at", olderThan)
+            .order("updated_at")
+            .limit(limit),
+        ) as Row[]
+      ).map(mapPayment);
     },
 
     // -- Customers ---------------------------------------------------------
