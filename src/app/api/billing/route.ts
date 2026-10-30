@@ -27,6 +27,7 @@ import { getPosDriver, type PlanTier, type SubscriptionStatus } from "@/lib/db";
 import { getPlans } from "@/lib/saas/plans";
 import { resolveEntitlements } from "@/lib/saas/entitlements";
 import {
+  expireBillingCheckout,
   isBillingSimulated,
   requestStripeTierChange,
   subscribeTenant,
@@ -202,6 +203,39 @@ export async function POST(request: Request) {
       });
     }
 
+    // REAL: one open Checkout Session per tenant — never a second one that
+    // could also be paid (double subscribe). Same tier → hand back the open
+    // session; another tier → expire it at Stripe first (refuse if Stripe
+    // can't, e.g. it was just paid).
+    if (!simulated) {
+      const pending = await driver.getPendingBillingCheckout(body.tenantId);
+      if (pending && new Date(pending.expires_at).getTime() > Date.now()) {
+        if (pending.tier === body.tier) {
+          return NextResponse.json({
+            subscription: existing,
+            checkoutUrl: pending.url,
+            reused: true,
+            simulated: false,
+          });
+        }
+        try {
+          await expireBillingCheckout(pending.session_id);
+        } catch {
+          return NextResponse.json(
+            {
+              error:
+                "A checkout for another plan is already in progress. Finish or cancel it first.",
+            },
+            { status: 409 },
+          );
+        }
+        await driver.clearPendingBillingCheckout(
+          body.tenantId,
+          pending.session_id,
+        );
+      }
+    }
+
     const origin = new URL(request.url).origin;
     // Resolve the owner email for a real Stripe customer (best-effort).
     const ownerEmail = `owner+${tenant.slug}@example.com`;
@@ -213,6 +247,36 @@ export async function POST(request: Request) {
       successUrl: `${origin}/signup?tenant=${body.tenantId}&billing=success`,
       cancelUrl: `${origin}/signup?tenant=${body.tenantId}&billing=cancel`,
     });
+    if (result.checkoutSession && result.checkoutUrl) {
+      // Record it as THE open session (atomic). A concurrent request that got
+      // there first wins: expire ours and answer with theirs.
+      const claim = await driver.claimPendingBillingCheckout({
+        tenant_id: body.tenantId,
+        session_id: result.checkoutSession.id,
+        tier: body.tier,
+        url: result.checkoutUrl,
+        expires_at: result.checkoutSession.expiresAt,
+        created_at: new Date().toISOString(),
+      });
+      if (!claim.claimed) {
+        await expireBillingCheckout(result.checkoutSession.id).catch(() => null);
+        if (claim.current.tier !== body.tier) {
+          return NextResponse.json(
+            {
+              error:
+                "A checkout for another plan is already in progress. Finish or cancel it first.",
+            },
+            { status: 409 },
+          );
+        }
+        return NextResponse.json({
+          subscription: existing,
+          checkoutUrl: claim.current.url,
+          reused: true,
+          simulated: false,
+        });
+      }
+    }
     // Simulated: persist the ready subscription. REAL: nothing is persisted —
     // the billing webhook creates the row (tier + status) after checkout.
     const subscription = result.subscription

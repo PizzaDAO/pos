@@ -82,6 +82,7 @@ import type { Location, Membership, Tenant, User } from "./types";
 import type {
   AuditLogEntry,
   OnboardingStep,
+  PendingBillingCheckout,
   PlanTier,
   Subscription,
   TenantHealth,
@@ -360,6 +361,17 @@ function mapSubscription(r: Row): Subscription {
       r.last_event_created == null ? null : Number(r.last_event_created),
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
+  };
+}
+
+function mapPendingBillingCheckout(r: Row): PendingBillingCheckout {
+  return {
+    tenant_id: r.tenant_id as string,
+    session_id: r.session_id as string,
+    tier: r.tier as PlanTier,
+    url: r.url as string,
+    expires_at: r.expires_at as string,
+    created_at: r.created_at as string,
   };
 }
 
@@ -1227,6 +1239,56 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         ) as Row,
       );
       return updated;
+    },
+
+    async getPendingBillingCheckout(tenantId) {
+      const r = unwrap(
+        await sb
+          .from("billing_checkout_sessions")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPendingBillingCheckout(r) : null;
+    },
+
+    async claimPendingBillingCheckout(rec) {
+      // Drop an EXPIRED record first, then insert on the tenant_id primary
+      // key: of two concurrent claims exactly one insert wins; the loser gets
+      // a unique violation and reads the winner.
+      unwrap(
+        await sb
+          .from("billing_checkout_sessions")
+          .delete()
+          .eq("tenant_id", rec.tenant_id)
+          .lte("expires_at", nowIso())
+          .select("tenant_id"),
+      );
+      const ins = await sb
+        .from("billing_checkout_sessions")
+        .insert(rec)
+        .select()
+        .single();
+      if (!ins.error) {
+        return { claimed: true, current: mapPendingBillingCheckout(ins.data as Row) };
+      }
+      if ((ins.error as { code?: string }).code !== "23505") {
+        throw new Error(`Supabase: ${ins.error.message}`);
+      }
+      const current = await this.getPendingBillingCheckout(rec.tenant_id);
+      if (!current) throw new Error("Supabase: billing checkout claim raced");
+      return { claimed: false, current };
+    },
+
+    async clearPendingBillingCheckout(tenantId, sessionId) {
+      unwrap(
+        await sb
+          .from("billing_checkout_sessions")
+          .delete()
+          .eq("tenant_id", tenantId)
+          .eq("session_id", sessionId)
+          .select("tenant_id"),
+      );
     },
 
     // -- Platform admin + health -------------------------------------------

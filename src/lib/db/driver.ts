@@ -69,6 +69,7 @@ import type {
   CreateLocationInput,
   CreateTenantInput,
   OnboardingStep,
+  PendingBillingCheckout,
   PlanTier,
   Subscription,
   TenantHealth,
@@ -163,6 +164,21 @@ export interface PosDriver {
     tenantId: string,
     tier: PlanTier,
   ): Promise<Subscription | null>;
+
+  /** The tenant's recorded open billing Checkout Session (any expiry), or null. */
+  getPendingBillingCheckout(
+    tenantId: string,
+  ): Promise<PendingBillingCheckout | null>;
+  /**
+   * Record `rec` as the tenant's open session ATOMICALLY — only if none is
+   * recorded or the recorded one has expired. `claimed` false = another open
+   * session won (returned as `current`).
+   */
+  claimPendingBillingCheckout(
+    rec: PendingBillingCheckout,
+  ): Promise<{ claimed: boolean; current: PendingBillingCheckout }>;
+  /** Forget the recorded session — only if it is still `sessionId`. */
+  clearPendingBillingCheckout(tenantId: string, sessionId: string): Promise<void>;
 
   // -- Platform admin + health ------------------------------------------------
 

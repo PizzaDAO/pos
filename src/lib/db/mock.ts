@@ -92,6 +92,7 @@ import type {
   CreateLocationInput,
   CreateTenantInput,
   OnboardingStep,
+  PendingBillingCheckout,
   PlanTier,
   Subscription,
   TenantHealth,
@@ -154,6 +155,8 @@ const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({
 const memberships: Membership[] = seedMemberships.map((m) => ({ ...m }));
 /** Subscriptions keyed by tenant id (one per tenant). */
 const subscriptions = new Map<string, Subscription>();
+/** Open billing Checkout Session per tenant (billing_checkout_sessions). */
+const pendingBillingCheckouts = new Map<string, PendingBillingCheckout>();
 /** Onboarding state keyed by tenant id. */
 const onboardingState = new Map<string, TenantOnboarding>();
 /** Append-only audit log (impersonation + sensitive platform actions). */
@@ -779,6 +782,28 @@ export const mockDriver: PosDriver = {
     const updated: Subscription = { ...sub, tier, updated_at: nowIso() };
     subscriptions.set(tenantId, updated);
     return { ...updated };
+  },
+
+  async getPendingBillingCheckout(tenantId) {
+    const p = pendingBillingCheckouts.get(tenantId);
+    return p ? { ...p } : null;
+  },
+
+  // Single-threaded JS: check + set is atomic (mirrors the DB's conditional
+  // insert on the tenant_id primary key).
+  async claimPendingBillingCheckout(rec) {
+    const cur = pendingBillingCheckouts.get(rec.tenant_id);
+    if (cur && new Date(cur.expires_at).getTime() > Date.now()) {
+      return { claimed: false, current: { ...cur } };
+    }
+    pendingBillingCheckouts.set(rec.tenant_id, { ...rec });
+    return { claimed: true, current: { ...rec } };
+  },
+
+  async clearPendingBillingCheckout(tenantId, sessionId) {
+    if (pendingBillingCheckouts.get(tenantId)?.session_id === sessionId) {
+      pendingBillingCheckouts.delete(tenantId);
+    }
   },
 
   // -- Platform admin + health -----------------------------------------------

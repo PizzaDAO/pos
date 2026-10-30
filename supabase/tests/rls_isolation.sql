@@ -789,6 +789,19 @@ begin
 
   blocked := false;
   begin
+    perform count(*) from public.billing_checkout_sessions;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read billing_checkout_sessions';
+
+  blocked := false;
+  begin
+    insert into public.billing_checkout_sessions (tenant_id, session_id, tier, url, expires_at)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'cs_forged', 'pro', 'https://x', now() + interval '1 hour');
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'an owner must NOT record a billing checkout session (webhook gate)';
+
+  blocked := false;
+  begin
     perform public.begin_pin_attempt('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       '57a00001-0000-0000-0000-000000000001');
   exception when insufficient_privilege then blocked := true; end;

@@ -110,6 +110,14 @@ function subscriptionIdOf(type: string, obj: Obj): string | null {
   return asStr(details?.subscription);
 }
 
+/** Checkout Session events the billing webhook handles. */
+const SESSION_EVENTS = new Set([
+  "checkout.session.completed",
+  "checkout.session.async_payment_succeeded",
+  "checkout.session.async_payment_failed",
+  "checkout.session.expired",
+]);
+
 /** Fetch the CURRENT subscription from Stripe (authoritative state). */
 export type SubscriptionFetcher = (subscriptionId: string) => Promise<Obj>;
 
@@ -135,11 +143,31 @@ export async function applyBillingEvent(
   const relevant =
     type.startsWith("customer.subscription.") ||
     type.startsWith("invoice.") ||
-    type === "checkout.session.completed" ||
-    type === "checkout.session.async_payment_succeeded";
+    SESSION_EVENTS.has(type);
   if (!relevant) return null;
   const isSession = type.startsWith("checkout.session.");
-  if (isSession && !checkoutIsPaid(obj)) return null;
+
+  // checkout.session.*: accepted ONLY for the session the billing route
+  // recorded as the tenant's open one — a second (double-subscribe) or stale
+  // session can never activate or overwrite the plan.
+  let sessionTenant: string | null = null;
+  let sessionId: string | null = null;
+  if (isSession) {
+    sessionId = asStr(obj.id);
+    sessionTenant = tenantIdOf(obj);
+    if (!sessionId || !sessionTenant) return null;
+    const pending = await driver.getPendingBillingCheckout(sessionTenant);
+    if (!pending || pending.session_id !== sessionId) return null;
+    if (
+      type === "checkout.session.expired" ||
+      type === "checkout.session.async_payment_failed"
+    ) {
+      // The open session can no longer be paid: allow a new checkout.
+      await driver.clearPendingBillingCheckout(sessionTenant, sessionId);
+      return null;
+    }
+    if (!checkoutIsPaid(obj)) return null;
+  }
 
   const subscriptionId = subscriptionIdOf(type, obj);
   if (!subscriptionId) return null;
@@ -148,6 +176,8 @@ export async function applyBillingEvent(
   // Tenant: our server-set metadata on the subscription (then the event).
   const tenantId = tenantIdOf(live) ?? tenantIdOf(obj);
   if (!tenantId) return null;
+  // A recorded session must belong to the subscription's tenant.
+  if (isSession && tenantId !== sessionTenant) return null;
   const existing = await driver.getSubscription(tenantId);
   if (
     existing?.stripe_subscription_id &&
@@ -193,7 +223,9 @@ export async function applyBillingEvent(
     updated_at: now,
   };
   const saved = await driver.upsertSubscription(row);
-  if (isSession) {
+  if (isSession && sessionId) {
+    // That checkout is done: the next subscribe starts fresh.
+    await driver.clearPendingBillingCheckout(tenantId, sessionId);
     // Plan step of the signup wizard completes once Stripe confirms payment.
     await driver.completeOnboardingStep(tenantId, "plan").catch(() => null);
   }

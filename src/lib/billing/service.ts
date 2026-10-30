@@ -111,6 +111,8 @@ export interface SubscribeResult {
   /** Hosted Stripe Checkout URL in REAL mode; null when simulated. */
   checkoutUrl: string | null;
   simulated: boolean;
+  /** REAL only: the Checkout Session opened (recorded as the pending one). */
+  checkoutSession?: { id: string; expiresAt: string };
 }
 
 /**
@@ -150,7 +152,11 @@ export async function subscribeTenant(input: {
     customerId = customer.id;
   }
 
-  const session = await stripeRequest<{ id: string; url: string }>(
+  const session = await stripeRequest<{
+    id: string;
+    url: string;
+    expires_at?: number;
+  }>(
     "/checkout/sessions",
     {
       mode: "subscription",
@@ -167,7 +173,31 @@ export async function subscribeTenant(input: {
     },
   );
 
-  return { subscription: null, checkoutUrl: session.url, simulated: false };
+  return {
+    subscription: null,
+    checkoutUrl: session.url,
+    simulated: false,
+    checkoutSession: {
+      id: session.id,
+      // Stripe's default session lifetime is 24h.
+      expiresAt: new Date(
+        typeof session.expires_at === "number"
+          ? session.expires_at * 1000
+          : Date.now() + 24 * 60 * 60 * 1000,
+      ).toISOString(),
+    },
+  };
+}
+
+/**
+ * Expire an open Checkout Session at Stripe so it can no longer be paid.
+ * Throws if Stripe refuses (e.g. the session already completed).
+ */
+export async function expireBillingCheckout(sessionId: string): Promise<void> {
+  await stripeRequest(
+    `/checkout/sessions/${encodeURIComponent(sessionId)}/expire`,
+    {},
+  );
 }
 
 export { isBillingConfigured, isBillingSimulated };

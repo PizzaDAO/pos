@@ -80,6 +80,22 @@ export type SubscriptionStatus =
  * `stripe_*` ids link to a Stripe Customer + Subscription; in SIMULATED mode
  * those are deterministic `sim_*` ids and the lifecycle is advanced in-memory.
  */
+/**
+ * The ONE open Stripe Checkout Session a tenant may have for a new
+ * subscription (server-only table billing_checkout_sessions). The billing
+ * route reuses / refuses instead of opening a second one (no double
+ * subscribe), and the webhook accepts checkout.session.* only for this id.
+ */
+export interface PendingBillingCheckout {
+  tenant_id: string;
+  session_id: string;
+  tier: PlanTier;
+  url: string;
+  /** ISO time Stripe expires the session. */
+  expires_at: string;
+  created_at: string;
+}
+
 export interface Subscription {
   id: string;
   tenant_id: string;
