@@ -30,7 +30,7 @@ import {
   PAYMENT_RAIL_LABELS,
 } from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
-import { isLiveCardTender } from "@/lib/store/use-card-reader";
+import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
 import { TipSelector } from "./tip-selector";
 import { ReceiptView } from "./receipt-view";
 
@@ -88,7 +88,13 @@ export function PaymentScreen({
   // On-reader tipping (or no tipping): our tip selector is not used for card.
   const hideTip = cardRail && card.list?.tipMode !== "pos";
   const effectiveTipCents = hideTip ? 0 : tipCents;
-  const sandboxReader = card.list?.mode !== "stripe_live";
+  // Simulate buttons only where a simulator exists (never while the mode is unknown).
+  const sandboxReader =
+    card.list?.mode === "simulated" || card.list?.mode === "stripe_test";
+  // The reader the tender is actually on (it may differ from the dropdown after a switch).
+  const tenderReader =
+    card.list?.readers.find((r) => r.id === tenderReaderId(card.tender)) ??
+    selectedReader;
 
   // Cash change preview.
   const cashTenderedCents = useMemo(() => {
@@ -100,13 +106,18 @@ export function PaymentScreen({
 
   async function handleTake() {
     if (balance <= 0) return;
-    await checkout.takeTender({
+    const recorded = await checkout.takeTender({
       rail,
       amountCents: balance,
       tipCents: effectiveTipCents,
       cashTenderedCents:
         rail === "cash" ? cashTenderedCents || dueWithTip : undefined,
     });
+    // Only a tender that was actually recorded (or a card tender now on the
+    // reader) consumes the entered tip / cash amount; a failed or lost request
+    // keeps them so the cashier can simply press Charge again.
+    if (!recorded) return;
+    if (rail !== "stripe_terminal") card.clearError();
     setTipCents(0);
     setCashTendered("");
   }
@@ -158,10 +169,16 @@ export function PaymentScreen({
                 {checkout.notice}
               </div>
             )}
-            {(checkout.error ?? card.error) && (
-              <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive">
-                {checkout.error ?? card.error}
-              </div>
+            {[checkout.error, card.error].map(
+              (msg, i) =>
+                msg && (
+                  <div
+                    key={i}
+                    className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive"
+                  >
+                    {msg}
+                  </div>
+                ),
             )}
 
             {!paid && (
@@ -179,7 +196,10 @@ export function PaymentScreen({
                       <button
                         key={key}
                         type="button"
-                        onClick={() => setRail(key)}
+                        onClick={() => {
+                          setRail(key);
+                          card.clearError();
+                        }}
                         className={cn(
                           "rounded-md border px-3 py-2 text-left text-sm",
                           rail === key && "border-primary bg-primary/10",
@@ -213,7 +233,8 @@ export function PaymentScreen({
                       Card reader
                     </div>
 
-                    {card.list && card.list.readers.length > 1 && !cardLive ? (
+                    {card.list && card.list.readers.length > 1 &&
+                    (!cardLive || card.phase === "declined") ? (
                       <select
                         aria-label="Card reader"
                         value={card.selectedReaderId ?? ""}
@@ -250,7 +271,7 @@ export function PaymentScreen({
                     {card.phase === "present" && (
                       <div className="flex items-center gap-2 text-sm font-medium">
                         <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                        Present card on {selectedReader?.label ?? "the reader"}…
+                        Present card on {tenderReader?.label ?? "the reader"}…
                       </div>
                     )}
                     {card.phase === "approved" && (

@@ -95,9 +95,24 @@ export function cardPhase(p: Payment | null): CardPhase {
   return "idle"; // canceled / failed / refunded: nothing for the till to drive
 }
 
-/** Polling runs while the customer can still act on the reader. */
-export function shouldPoll(p: Payment | null): boolean {
-  return cardPhase(p) === "present";
+export const SLOW_POLL_MS = 5_000;
+
+/**
+ * How often to re-read the tender, or null to stop. Fast while the customer can
+ * still tap; slow while declined (a reader timeout can be a false negative, so a
+ * late approval still shows up) until it is canceled or captured.
+ */
+export function pollIntervalMs(p: Payment | null): number | null {
+  const phase = cardPhase(p);
+  if (phase === "present") return POLL_MS;
+  if (phase === "declined") return SLOW_POLL_MS;
+  return null;
+}
+
+/** The reader a tender was last sent to (public `raw.reader_id`), if known. */
+export function tenderReaderId(p: Payment | null): string | null {
+  const id = p?.raw?.reader_id;
+  return typeof id === "string" && id ? id : null;
 }
 
 function safeStorage(kind: "local" | "session"): Storage | null {
@@ -140,7 +155,9 @@ export interface UseCardReader {
   lastError: CardLastError | null;
   busy: boolean;
   error: string | null;
-  start: (input: { amountCents: number; tipCents: number }) => Promise<void>;
+  /** Resolves to the started (live/captured) tender, or null if it didn't start. */
+  start: (input: { amountCents: number; tipCents: number }) => Promise<Payment | null>;
+  clearError: () => void;
   retry: () => Promise<void>;
   cancel: () => Promise<void>;
   resetReader: () => Promise<void>;
@@ -315,8 +332,9 @@ export function useCardReader(opts: {
 
   // Poll while the customer can still tap.
   useEffect(() => {
-    if (!online || !shouldPoll(tender)) return;
-    const t = window.setInterval(() => void sync(), POLL_MS);
+    const every = pollIntervalMs(tender);
+    if (!online || every === null) return;
+    const t = window.setInterval(() => void sync(), every);
     return () => window.clearInterval(t);
   }, [tender, online, sync]);
 
@@ -336,43 +354,60 @@ export function useCardReader(opts: {
     [],
   );
 
+  /** Resolves to the live/captured tender, or null when nothing was started. */
   const start = useCallback(
-    (input: { amountCents: number; tipCents: number }) =>
-      act(async () => {
+    async (input: { amountCents: number; tipCents: number }): Promise<Payment | null> => {
+      let started: Payment | null = null;
+      await act(async () => {
         if (!orderId) return;
         if (!selectedReaderId) throw new Error("Pick a card reader first.");
         if (!navigator.onLine) throw new Error("Card needs internet: take cash.");
-        // Same id until the server accepts it, so a lost response can't double charge.
-        const paymentId = pendingIds.current.get(
-          tenderSignature({
+        // Same id until the server accepts it, so a lost response can't double
+        // charge. At most ONE fresh-id retry (below), never a loop.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const paymentId = pendingIds.current.get(
+            tenderSignature({
+              orderId,
+              rail: "stripe_terminal",
+              amountCents: input.amountCents,
+              tipCents: input.tipCents,
+            }),
+          );
+          const { status, body } = await post("/api/terminal/payments", {
+            paymentId,
             orderId,
-            rail: "stripe_terminal",
+            readerId: selectedReaderId,
             amountCents: input.amountCents,
             tipCents: input.tipCents,
-          }),
-        );
-        const { status, body } = await post("/api/terminal/payments", {
-          paymentId,
-          orderId,
-          readerId: selectedReaderId,
-          amountCents: input.amountCents,
-          tipCents: input.tipCents,
-        });
-        if (body.payment && (status === 201 || status === 200)) {
-          pendingIds.current.clear();
-          adopt(body.payment);
-          return;
+          });
+          if (body.payment && (status === 201 || status === 200)) {
+            pendingIds.current.clear();
+            const p = body.payment;
+            // The server handed back a dead tender (canceled/failed) for this id:
+            // it can't take a card, so start once more under a fresh id.
+            if (!isLiveCardTender(p) && p.status !== "captured") {
+              if (attempt === 0) continue;
+              throw new Error("Could not start the card payment. Try again.");
+            }
+            adopt(p);
+            started = p;
+            return;
+          }
+          // The balance moved under us (or a tender already exists): reload it.
+          if (body.code === "amount_exceeds_balance" || status === 409) {
+            pendingIds.current.clear();
+            void onSettledRef.current?.();
+          }
+          if (body.payment) adopt(body.payment);
+          throw new Error(body.error ?? `HTTP ${status}`);
         }
-        // The balance moved under us (or a tender already exists): reload it.
-        if (body.code === "amount_exceeds_balance" || status === 409) {
-          pendingIds.current.clear();
-          void onSettledRef.current?.();
-        }
-        if (body.payment) adopt(body.payment);
-        throw new Error(body.error ?? `HTTP ${status}`);
-      }),
+      });
+      return started;
+    },
     [act, orderId, selectedReaderId, post, adopt],
   );
+
+  const clearError = useCallback(() => setError(null), []);
 
   const retry = useCallback(
     () =>
@@ -457,6 +492,7 @@ export function useCardReader(opts: {
     busy,
     error,
     start,
+    clearError,
     retry,
     cancel,
     resetReader,

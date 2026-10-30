@@ -160,11 +160,10 @@ export function useCheckout(
       // Card: the reader flow owns the tender (it stays open until the customer
       // taps), so there is no Payment to hand back yet.
       if (input.rail === "stripe_terminal") {
-        await startCard({
+        return startCard({
           amountCents: input.amountCents,
           tipCents: input.tipCents,
         });
-        return null;
       }
       setLoading(true);
       setError(null);

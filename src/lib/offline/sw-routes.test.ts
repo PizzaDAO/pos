@@ -9,8 +9,13 @@ describe("service worker NetworkOnly matchers", () => {
     expect(isNetworkOnlyPath("/api/terminal/readers")).toBe(true);
     expect(isNetworkOnlyPath("/api/admin/terminal")).toBe(true);
     expect(isNetworkOnlyPath("/api/admin/terminal/readers/tmr_1")).toBe(true);
-    expect(isNetworkOnlyPath("/api/payments")).toBe(true);
     expect(isNetworkOnlyPath("/api/payments/status")).toBe(true);
+    expect(isNetworkOnlyPath("/api/payments/refund")).toBe(true);
+  });
+
+  it("keeps the staff picker and the checkout balance load on defaultCache", () => {
+    expect(isNetworkOnlyPath("/api/terminal/pin")).toBe(false);
+    expect(isNetworkOnlyPath("/api/payments")).toBe(false);
   });
 
   it("leaves the menu (StaleWhileRevalidate) and pages alone", () => {

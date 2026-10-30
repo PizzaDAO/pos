@@ -6,7 +6,8 @@ import {
   lastErrorOf,
   pickReader,
   readerStorageKey,
-  shouldPoll,
+  pollIntervalMs,
+  tenderReaderId,
   tenderStorageKey,
   type ReaderInfo,
 } from "./use-card-reader";
@@ -31,7 +32,7 @@ describe("card tender phase", () => {
   it("shows 'present card' while the reader waits", () => {
     expect(cardPhase(tender("requires_action"))).toBe("present");
     expect(cardPhase(tender("pending"))).toBe("present");
-    expect(shouldPoll(tender("requires_action"))).toBe(true);
+    expect(pollIntervalMs(tender("requires_action"))).toBe(1500);
   });
 
   it("a decline keeps the tender open with last_error, and stops polling", () => {
@@ -41,7 +42,8 @@ describe("card tender phase", () => {
     expect(cardPhase(declined)).toBe("declined");
     expect(isLiveCardTender(declined)).toBe(true);
     expect(lastErrorOf(declined)?.message).toBe("Your card was declined.");
-    expect(shouldPoll(declined)).toBe(false);
+    // Slow poll: a timeout-style decline can still be approved late.
+    expect(pollIntervalMs(declined)).toBe(5000);
   });
 
   it("captured is approved; canceled/failed are idle and not live", () => {
@@ -49,7 +51,15 @@ describe("card tender phase", () => {
     expect(isLiveCardTender(tender("captured"))).toBe(false);
     expect(cardPhase(tender("canceled"))).toBe("idle");
     expect(cardPhase(tender("failed"))).toBe("idle");
-    expect(shouldPoll(tender("captured"))).toBe(false);
+    expect(pollIntervalMs(tender("captured"))).toBeNull();
+    expect(pollIntervalMs(tender("canceled"))).toBeNull();
+    expect(pollIntervalMs(null)).toBeNull();
+  });
+
+  it("reads the reader the tender was sent to", () => {
+    expect(tenderReaderId(tender("requires_action", { reader_id: "tmr_2" }))).toBe("tmr_2");
+    expect(tenderReaderId(tender("requires_action"))).toBeNull();
+    expect(tenderReaderId(null)).toBeNull();
   });
 });
 

@@ -129,8 +129,10 @@ export const RATE_LIMIT_RULES = {
    * Till polling of a card-reader tender (`GET /api/terminal/payments/[id]`, every
    * ~1.5s = ~40/min per tablet) and the reader list. Separate from `payments` so
    * polling can neither starve charges nor trip the charge limit itself.
+   * Keyed per IP (see enforceRateLimit) and a shop's tablets share one NAT IP,
+   * so this is sized for ~10 tablets polling at once (~40/min each + readers).
    */
-  cardSync: { limit: 150, windowMs: 60_000 } satisfies RateLimitRule,
+  cardSync: { limit: 600, windowMs: 60_000 } satisfies RateLimitRule,
 } as const;
 
 export type RateLimitBucket = keyof typeof RATE_LIMIT_RULES;

@@ -14,11 +14,21 @@
 const NETWORK_ONLY_PREFIXES = [
   "/api/terminal/",
   "/api/admin/terminal",
-  "/api/payments",
+  "/api/payments/",
 ] as const;
+
+/**
+ * Paths under those prefixes that KEEP the previous defaultCache behaviour:
+ *  - `/api/terminal/pin`: the staff picker list must still load offline from the
+ *    cache (PIN verification itself is a POST, never cached);
+ *  - `/api/payments` (exactly; `?orderId=` loads the checkout balance): left as it
+ *    was. The sub-routes (`/status`, `/refund`, `/stripe/*`) are NetworkOnly.
+ */
+const CACHE_OK_PATHS = ["/api/terminal/pin", "/api/payments"] as const;
 
 /** True for a path that must always hit the network (never a cached response). */
 export function isNetworkOnlyPath(pathname: string): boolean {
+  if ((CACHE_OK_PATHS as readonly string[]).includes(pathname)) return false;
   return NETWORK_ONLY_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 }
 
