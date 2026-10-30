@@ -72,7 +72,10 @@ async function payAndGetOrderId(page: Page): Promise<string> {
 }
 
 async function kitchenOrderIds(page: Page, slug: string): Promise<string[]> {
-  const loc = await page.request.get(`/api/shop/location?slug=${slug}`);
+  const [tenantSlug, locationSlug] = slug.split("/");
+  const loc = await page.request.get(
+    `/api/shop/location?tenant=${tenantSlug}&location=${locationSlug}`,
+  );
   const { location } = (await loc.json()) as {
     location: { tenant_id: string; id: string };
   };

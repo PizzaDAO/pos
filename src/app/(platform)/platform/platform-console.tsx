@@ -448,7 +448,7 @@ function TenantDetail({
               </span>
               <Link
                 className="text-xs underline"
-                href={`/shop/${l.slug}`}
+                href={`/shop/${tenant.slug}/${l.slug}`}
                 target="_blank"
               >
                 storefront

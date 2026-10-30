@@ -626,7 +626,7 @@ export function SignupWizard() {
                   </Button>
                   {primaryLocation && (
                     <Button asChild size="sm" variant="outline">
-                      <Link href={`/shop/${primaryLocation.slug}`}>
+                      <Link href={`/shop/${tenant.slug}/${primaryLocation.slug}`}>
                         View storefront
                       </Link>
                     </Button>
