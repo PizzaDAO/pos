@@ -70,11 +70,22 @@ beforeEach(() => {
 });
 
 /** PIN-switch in; returns the cookie header + the session id. */
-async function switchIn(staffId: string, pin: string) {
+async function switchIn(
+  staffId: string,
+  pin: string,
+  opts: { cookie?: string; previousSessionId?: string } = {},
+) {
   const res = await pinPOST(
     new Request("http://localhost/api/terminal/pin", {
       method: "POST",
-      body: JSON.stringify({ staffId, pin }),
+      headers: opts.cookie ? { cookie: opts.cookie } : {},
+      body: JSON.stringify({
+        staffId,
+        pin,
+        ...(opts.previousSessionId
+          ? { previousSessionId: opts.previousSessionId }
+          : {}),
+      }),
     }),
   );
   expect(res.status).toBe(200);
@@ -85,7 +96,12 @@ async function switchIn(staffId: string, pin: string) {
 }
 
 let seq = 0;
-function order(opts: { discount: number; cookie?: string; queuedSession?: string }) {
+function order(opts: {
+  discount: number;
+  cookie?: string;
+  queuedSession?: string;
+  staffId?: string;
+}) {
   seq += 1;
   return ordersPOST(
     new Request("http://localhost/api/orders", {
@@ -112,6 +128,7 @@ function order(opts: { discount: number; cookie?: string; queuedSession?: string
           },
         ],
         discount_cents: opts.discount,
+        ...(opts.staffId ? { staff_id: opts.staffId } : {}),
         ...(opts.queuedSession
           ? { queued_staff_session_id: opts.queuedSession }
           : {}),
@@ -145,18 +162,61 @@ describe("discounts: PIN tenant", () => {
 
   it("a queued order's staff session counts only while it is still live", async () => {
     const { cookie, sessionId } = await switchIn(TONY, "1111");
+    const queued = { discount: 100, queuedSession: sessionId, staffId: TONY };
     // Cookie lost (terminal restarted) but the session is live → honoured.
-    expect((await order({ discount: 100, queuedSession: sessionId })).status).toBe(201);
+    expect((await order(queued)).status).toBe(201);
     // Another device login can't use it.
     session.user = { ...device("owner"), id: "someone-else" };
     session.user.memberships[0]!.user_id = "someone-else";
-    expect((await order({ discount: 100, queuedSession: sessionId })).status).toBe(403);
+    expect((await order(queued)).status).toBe(403);
     session.user = device("owner");
     // Switched out → revoked → refused (the queue asks staff to resolve it).
     await pinDELETE(new Request("http://localhost/api/terminal/pin", { method: "DELETE", headers: { cookie } }));
-    expect((await order({ discount: 100, queuedSession: sessionId })).status).toBe(403);
+    expect((await order(queued)).status).toBe(403);
     // Garbage session ids are just ignored.
-    expect((await order({ discount: 100, queuedSession: "nope" })).status).toBe(403);
+    expect((await order({ ...queued, queuedSession: "nope" })).status).toBe(403);
+  });
+
+  it("a queued session is honoured only for the staff member the order names", async () => {
+    const { cookie, sessionId } = await switchIn(TONY, "1111");
+    // Tony's live session attached to an order attributed to Chris → refused.
+    expect(
+      (await order({ discount: 100, queuedSession: sessionId, staffId: CHRIS })).status,
+    ).toBe(403);
+    // ...or to an order naming no staff at all.
+    expect((await order({ discount: 100, queuedSession: sessionId })).status).toBe(403);
+    // Matching staff_id → honoured.
+    expect(
+      (await order({ discount: 100, queuedSession: sessionId, staffId: TONY })).status,
+    ).toBe(201);
+    await pinDELETE(new Request("http://localhost/api/terminal/pin", { method: "DELETE", headers: { cookie } }));
+  });
+
+  it("a PIN switch-in revokes the client's last known session even without its cookie", async () => {
+    const tony = await switchIn(TONY, "1111");
+    const queued = { discount: 100, queuedSession: tony.sessionId, staffId: TONY };
+    expect((await order(queued)).status).toBe(201);
+    // Cookie lost; Chris switches in naming Tony's session → Tony's is revoked.
+    const chris = await switchIn(CHRIS, "3333", { previousSessionId: tony.sessionId });
+    expect((await getPosDriver().getStaffSession(tony.sessionId))?.revoked_at).toBeTruthy();
+    expect((await order(queued)).status).toBe(403);
+    // A switch-in with a cookie revokes the cookie's session as before.
+    const carmela = await switchIn(CARMELA, "2222", { cookie: chris.cookie });
+    expect((await getPosDriver().getStaffSession(chris.sessionId))?.revoked_at).toBeTruthy();
+    await pinDELETE(new Request("http://localhost/api/terminal/pin", { method: "DELETE", headers: { cookie: carmela.cookie } }));
+  });
+
+  it("a switch-in cannot revoke another device login's session", async () => {
+    const carmela = await switchIn(CARMELA, "2222");
+    session.user = { ...device("owner"), id: "someone-else" };
+    session.user.memberships[0]!.user_id = "someone-else";
+    await switchIn(CHRIS, "3333", { previousSessionId: carmela.sessionId });
+    session.user = device("owner");
+    expect((await getPosDriver().getStaffSession(carmela.sessionId))?.revoked_at).toBeFalsy();
+    expect(
+      (await order({ discount: 100, queuedSession: carmela.sessionId, staffId: CARMELA })).status,
+    ).toBe(201);
+    await pinDELETE(new Request("http://localhost/api/terminal/pin", { method: "DELETE", headers: { cookie: carmela.cookie } }));
   });
 });
 

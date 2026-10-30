@@ -65,7 +65,13 @@ export function useActiveStaff() {
       const res = await fetch("/api/terminal/pin", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ staffId, pin }),
+        // Name the last known session so the server revokes it even if the
+        // cookie was lost (terminal restarted mid-shift).
+        body: JSON.stringify({
+          staffId,
+          pin,
+          previousSessionId: read()?.session_id,
+        }),
       });
       if (!res.ok) return false;
       const data = (await res.json()) as { activeStaff: ActiveStaff };

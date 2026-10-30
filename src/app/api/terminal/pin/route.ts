@@ -21,7 +21,9 @@
  *     enumeration); a locked staff member gets 423 with the unlock time.
  *   - Success opens a server-side staff session and sets a signed httpOnly
  *     cookie bound to the device login (see src/lib/auth/active-staff.ts).
- *     Switching again or DELETE revokes the previous session.
+ *     Switching again or DELETE revokes the previous session (on a switch the
+ *     client also names its last known session id, revoked when it belongs
+ *     to this device login — covers a lost cookie).
  *
  * No env vars required (works on the mock driver).
  */
@@ -36,6 +38,7 @@ import {
   ACTIVE_STAFF_COOKIE,
   activeStaffCookieOptions,
   openStaffSession,
+  revokeOwnStaffSession,
   revokeRequestStaffSession,
 } from "@/lib/auth/active-staff";
 
@@ -60,6 +63,12 @@ export async function GET(request: Request) {
 interface Body {
   staffId: string;
   pin: string;
+  /**
+   * The client's last known staff-session id (from sessionStorage). Revoked
+   * along with the cookie's session, so a switch-in after the cookie was lost
+   * still ends the previous staff member's session.
+   */
+  previousSessionId?: unknown;
 }
 
 function isValid(b: unknown): b is Body {
@@ -142,8 +151,13 @@ export async function POST(request: Request) {
   // Reset the count — unless a concurrent burst set a lock meanwhile.
   await driver.clearPinAttempts(matched.tenant_id, matched.id);
 
-  // Replace any previous switch-in on this device (revoke it server-side).
+  // Replace any previous switch-in on this device (revoke it server-side):
+  // the cookie's session, and the session the client last knew about when it
+  // is bound to this device login (the cookie may have been lost).
   await revokeRequestStaffSession(request);
+  if (typeof body.previousSessionId === "string" && body.previousSessionId) {
+    await revokeOwnStaffSession(body.previousSessionId, user.id);
+  }
   const opened = await openStaffSession({
     userId: user.id,
     tenantId: matched.tenant_id,

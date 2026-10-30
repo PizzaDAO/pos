@@ -124,13 +124,16 @@ export async function POST(request: Request) {
     // Staff discounts are an explicit field, gated by the ACTIVE (PIN-switched)
     // staff member's role — not the device login's role. An order flushed from
     // the offline queue names the staff session it was queued under; that
-    // session counts only while it is still live for this device login.
+    // session counts only while it is still live for this device login, and
+    // only when it belongs to the order's staff_id.
     const queued = body as { queued_staff_session_id?: unknown };
     const active = await effectiveTerminalRole(request, auth, {
       queuedSessionId:
         typeof queued.queued_staff_session_id === "string"
           ? queued.queued_staff_session_id
           : null,
+      // Honoured only for the staff member the order is attributed to.
+      queuedStaffId: typeof body.staff_id === "string" ? body.staff_id : null,
     });
     const discountCents = body.discount_cents ?? 0;
     if (

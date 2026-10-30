@@ -141,6 +141,23 @@ export async function revokeRequestStaffSession(request: Request): Promise<void>
 }
 
 /**
+ * Revoke a session the CLIENT names (its last known session id), but only when
+ * that session is bound to THIS device login (`userId`). Covers a switch-in
+ * after the browser-session cookie was lost: the previous staff session would
+ * otherwise stay live (and usable by queued orders) until it expired.
+ */
+export async function revokeOwnStaffSession(
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  const driver = getPosDriver();
+  const session = await driver.getStaffSession(sessionId);
+  if (session && !session.revoked_at && session.user_id === userId) {
+    await driver.revokeStaffSession(sessionId);
+  }
+}
+
+/**
  * The staff member of a LIVE session row: exists, belongs to `tenantId` and to
  * THIS device login (`userId`), unexpired, not revoked, staff still active (and
  * equal to `staffId` when given).
@@ -201,7 +218,8 @@ export async function requiresPinStaff(tenantId: string): Promise<boolean> {
  *   1. the active (PIN-switched) staff member named by the signed cookie;
  *   2. else, for an order queued offline, the staff session that was active
  *      when it was queued (`queuedSessionId`) — honoured ONLY while that
- *      session is STILL live for this device login (see below);
+ *      session is STILL live for this device login (see below) and only when
+ *      its staff member is the one the order names (`queuedStaffId`);
  *   3. else the device login's role, but only when PINs aren't in use for the
  *      tenant (requiresPinStaff false);
  *   4. else null (no authority).
@@ -219,14 +237,18 @@ export async function requiresPinStaff(tenantId: string): Promise<boolean> {
 export async function effectiveTerminalRole(
   request: Request,
   auth: { tenantId: string; role: MembershipRole; user: { id: string } },
-  opts: { queuedSessionId?: string | null } = {},
+  opts: { queuedSessionId?: string | null; queuedStaffId?: string | null } = {},
 ): Promise<{ role: MembershipRole | null; staff: Staff | null }> {
   const staff = await getActiveStaff(request, auth.tenantId, auth.user.id);
   if (staff) return { role: staff.role, staff };
-  if (opts.queuedSessionId) {
+  // The queued session must belong to the staff member the order is
+  // attributed to (payload.staff_id): a live session id can't be attached to
+  // an order placed by someone else.
+  if (opts.queuedSessionId && opts.queuedStaffId) {
     const queued = await liveSessionStaff(opts.queuedSessionId, {
       tenantId: auth.tenantId,
       userId: auth.user.id,
+      staffId: opts.queuedStaffId,
     });
     if (queued) return { role: queued.role, staff: queued };
   }
