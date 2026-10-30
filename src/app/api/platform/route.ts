@@ -118,9 +118,13 @@ export async function POST(request: Request) {
 
   try {
     if (body.action === "suspend") {
-      await driver.setTenantStatus(body.tenantId, "suspended");
+      await driver.setTenantStatus(body.tenantId, "suspended", {
+        byPlatform: true,
+      });
     } else if (body.action === "reactivate") {
-      await driver.setTenantStatus(body.tenantId, "active");
+      await driver.setTenantStatus(body.tenantId, "active", {
+        byPlatform: true,
+      });
     }
 
     const detail =

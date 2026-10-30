@@ -34,20 +34,15 @@ import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
 import { signingSecret } from "@/lib/auth/signing-secret";
 
 /**
- * Whether the platform suspended this tenant: the most recent
- * tenant_suspend / tenant_reactivate audit entry is a suspend.
+ * Whether the platform suspended (or cancelled) this tenant — read from the
+ * explicit `suspended_by_platform` flag written in the same update as the
+ * platform's status change (never inferred from the audit log).
  */
 async function isPlatformSuspended(tenantId: string): Promise<boolean> {
   const tenant = await getPosDriver().getTenant(tenantId);
-  if (!tenant || tenant.status !== "suspended") {
-    return tenant?.status === "cancelled";
-  }
-  const log = await getPosDriver().listAuditLog(tenantId);
-  // listAuditLog is newest-first.
-  const last = log.find(
-    (e) => e.action === "tenant_suspend" || e.action === "tenant_reactivate",
-  );
-  return last?.action === "tenant_suspend";
+  if (!tenant) return true;
+  if (tenant.status === "cancelled") return true;
+  return tenant.status === "suspended" && tenant.suspended_by_platform === true;
 }
 
 export const runtime = "nodejs";

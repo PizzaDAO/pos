@@ -77,26 +77,21 @@ describe("go_live refuses a platform-suspended tenant", () => {
         }),
       );
 
-    await getPosDriver().appendAuditLog({
-      actor_user_id: "ops",
-      actor_label: "ops",
-      action: "tenant_suspend",
-      tenant_id: tenant.id,
-      detail: "suspended by platform",
+    // The platform suspend writes the explicit flag in the same update.
+    await getPosDriver().setTenantStatus(tenant.id, "suspended", {
+      byPlatform: true,
     });
+    expect((await getPosDriver().getTenant(tenant.id))?.suspended_by_platform).toBe(true);
     expect((await goLive()).status).toBe(403);
     expect((await getPosDriver().getTenant(tenant.id))?.status).toBe(
       "suspended",
     );
 
-    await new Promise((r) => setTimeout(r, 5));
-    await getPosDriver().appendAuditLog({
-      actor_user_id: "ops",
-      actor_label: "ops",
-      action: "tenant_reactivate",
-      tenant_id: tenant.id,
-      detail: "reactivated",
+    // Reactivation clears the flag in the same write.
+    await getPosDriver().setTenantStatus(tenant.id, "active", {
+      byPlatform: true,
     });
+    expect((await getPosDriver().getTenant(tenant.id))?.suspended_by_platform).toBe(false);
     expect((await goLive()).status).toBe(200);
   });
 });

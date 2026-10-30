@@ -77,6 +77,8 @@ import type {
   ShiftCashEvent,
   SizeInput,
   Staff,
+  PinLockState,
+  StaffSession,
 } from "./backoffice-types";
 import type {
   Location,
@@ -220,6 +222,12 @@ const businessDayCloses = new Map<string, BusinessDayClose>();
 const orders = new Map<string, Order>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
+/** Terminal PIN switch-in sessions keyed by id (server-side revocation). */
+const staffSessions = new Map<string, StaffSession>();
+/** Per-staff PIN failure counters / locks (mirrors staff.pin_* columns). */
+const pinLocks = new Map<string, { attempts: number; lockedUntil: number | null }>();
+const PIN_MAX_FAILURES = 5;
+const PIN_LOCK_MS = 15 * 60_000;
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 /** Stripe Terminal locations keyed by POS location id; readers keyed by tmr_ id. */
@@ -592,10 +600,12 @@ export const mockDriver: PosDriver = {
   async setTenantStatus(
     tenantId: string,
     status: Tenant["status"],
+    opts?: { byPlatform?: boolean },
   ): Promise<Tenant | null> {
     const t = tenants.find((x) => x.id === tenantId);
     if (!t) return null;
     t.status = status;
+    if (opts?.byPlatform) t.suspended_by_platform = status === "suspended";
     return { ...t };
   },
 
@@ -1874,6 +1884,68 @@ export const mockDriver: PosDriver = {
     const s = staffById.get(staffId);
     if (!s || s.tenant_id !== tenantId) return null;
     return { ...s };
+  },
+
+  async getPinLockState(tenantId, staffId): Promise<PinLockState> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return { attempts: 0, lockedUntil: null };
+    const l = pinLocks.get(staffId);
+    if (!l) return { attempts: 0, lockedUntil: null };
+    const locked = l.lockedUntil !== null && l.lockedUntil > Date.now();
+    return {
+      attempts: locked ? l.attempts : l.lockedUntil !== null ? 0 : l.attempts,
+      lockedUntil: locked ? new Date(l.lockedUntil as number).toISOString() : null,
+    };
+  },
+
+  async recordPinFailure(tenantId, staffId): Promise<PinLockState> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return { attempts: 0, lockedUntil: null };
+    const now = Date.now();
+    const l = pinLocks.get(staffId) ?? { attempts: 0, lockedUntil: null };
+    if (l.lockedUntil !== null && l.lockedUntil > now) {
+      return { attempts: l.attempts, lockedUntil: new Date(l.lockedUntil).toISOString() };
+    }
+    let attempts = (l.lockedUntil !== null ? 0 : l.attempts) + 1;
+    let lockedUntil: number | null = null;
+    if (attempts >= PIN_MAX_FAILURES) {
+      lockedUntil = now + PIN_LOCK_MS;
+      attempts = 0;
+    }
+    pinLocks.set(staffId, { attempts, lockedUntil });
+    return {
+      attempts,
+      lockedUntil: lockedUntil ? new Date(lockedUntil).toISOString() : null,
+    };
+  },
+
+  async clearPinFailures(tenantId, staffId): Promise<void> {
+    const s = staffById.get(staffId);
+    if (s && s.tenant_id === tenantId) pinLocks.delete(staffId);
+  },
+
+  async createStaffSession(session: StaffSession): Promise<StaffSession> {
+    staffSessions.set(session.id, { ...session });
+    return { ...session };
+  },
+
+  async getStaffSession(id: string): Promise<StaffSession | null> {
+    const s = staffSessions.get(id);
+    return s ? { ...s } : null;
+  },
+
+  async revokeStaffSession(id: string): Promise<void> {
+    const s = staffSessions.get(id);
+    if (s && !s.revoked_at) staffSessions.set(id, { ...s, revoked_at: nowIso() });
+  },
+
+  async revokeStaffSessionsForUser(userId: string): Promise<void> {
+    const now = nowIso();
+    for (const [id, s] of staffSessions) {
+      if (s.user_id === userId && !s.revoked_at) {
+        staffSessions.set(id, { ...s, revoked_at: now });
+      }
+    }
   },
 
   async upsertStaff(staff: Staff): Promise<Staff> {

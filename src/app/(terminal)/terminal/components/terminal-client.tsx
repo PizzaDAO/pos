@@ -319,6 +319,7 @@ export function TerminalClient({
 
       {showStaffSwitch && (
         <StaffSwitch
+          tenantId={menu.tenantId}
           current={activeStaff}
           onVerify={verifyPin}
           onSignOut={signOutStaff}
