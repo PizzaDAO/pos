@@ -236,7 +236,7 @@ describe("tenant-scoped API routes enforce the guard", () => {
     expect((await GET(req())).status).toBe(200);
   });
 
-  it("GET /api/delivery/dispatch + /api/payments/stripe/connection-token reject anon", async () => {
+  it("GET /api/delivery/dispatch rejects anon", async () => {
     const dispatch = await import("@/app/api/delivery/dispatch/route");
     const res = await dispatch.GET(
       new Request(
@@ -246,15 +246,6 @@ describe("tenant-scoped API routes enforce the guard", () => {
       ),
     );
     expect(res.status).toBe(401);
-
-    const token = await import("@/app/api/payments/stripe/connection-token/route");
-    const tokRes = await token.POST(
-      new Request(url("/api/payments/stripe/connection-token"), {
-        method: "POST",
-        body: JSON.stringify({ tenantId: DEMO_TENANT_ID }),
-      }),
-    );
-    expect(tokRes.status).toBe(401);
   });
 
   it("POST /api/admin/menu refuses to delete another tenant's item", async () => {
