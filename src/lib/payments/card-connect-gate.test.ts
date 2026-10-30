@@ -25,7 +25,6 @@ vi.mock("@/lib/auth/api", () => ({
 
 import { POST as paymentsPOST } from "@/app/api/payments/route";
 import { POST as webhookPOST } from "@/app/api/payments/stripe/webhook/route";
-import { NextResponse } from "next/server";
 import { takePayment } from "@/lib/payments/service";
 import { CARD_NOT_READY_MESSAGE, isCardReady } from "@/lib/payments/connect";
 
