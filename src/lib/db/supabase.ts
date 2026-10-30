@@ -78,7 +78,14 @@ import type {
   Staff,
   StaffSession,
 } from "./backoffice-types";
-import type { Location, Membership, Tenant, User } from "./types";
+import type {
+  InventoryOwner,
+  Location,
+  Membership,
+  Tenant,
+  TenantSettings,
+  User,
+} from "./types";
 import type {
   AuditLogEntry,
   OnboardingStep,
@@ -91,6 +98,7 @@ import type {
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { fetchAllPages, safeKeyset } from "./paging";
 
 // ---------------------------------------------------------------------------
 // Config + client construction (lazy; never at module load).
@@ -164,7 +172,23 @@ function mapLocation(r: Row): Location {
     slug: r.slug as string,
     timezone: r.timezone as string,
     address: (r.address as string | null) ?? null,
+    address_line1: (r.address_line1 as string | null) ?? null,
+    address_line2: (r.address_line2 as string | null) ?? null,
+    city: (r.city as string | null) ?? null,
+    region: (r.region as string | null) ?? null,
+    postal_code: (r.postal_code as string | null) ?? null,
+    country: (r.country as string | null) ?? null,
+    lat: (r.lat as number | null) ?? null,
+    lng: (r.lng as number | null) ?? null,
     created_at: r.created_at as string,
+  };
+}
+
+function mapTenantSettings(r: Row): TenantSettings {
+  return {
+    tenant_id: r.tenant_id as string,
+    inventory_owner: (r.inventory_owner as InventoryOwner) ?? "pos_basic",
+    updated_at: r.updated_at as string,
   };
 }
 
@@ -216,6 +240,9 @@ function mapOrder(r: Row, items: OrderItem[]): Order {
     customer_id: (r.customer_id as string | null) ?? null,
     staff_id: (r.staff_id as string | null) ?? null,
     fulfillment: (r.fulfillment as Order["fulfillment"]) ?? undefined,
+    source: (r.source as Order["source"] | null) ?? undefined,
+    hold: (r.hold as Order["hold"] | null) ?? null,
+    version: (r.version as number | null) ?? 1,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -289,6 +316,8 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
     pin_hash: opts?.includePin
       ? ((r.pin_hash as string | null) ?? null)
       : undefined,
+    user_id: (r.user_id as string | null) ?? null,
+    location_ids: (r.location_ids as string[] | null) ?? [],
     created_at: r.created_at as string,
   };
 }
@@ -605,38 +634,70 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
   // -- Order graph read (orders + items + modifiers) --------------------------
   async function readOrderRow(orderRow: Row): Promise<Order> {
-    const orderId = orderRow.id as string;
-    const itemRows = unwrap(
-      await sb
-        .from("order_items")
-        .select("*")
-        .eq("order_id", orderId)
-        .order("sort_order"),
-    ) as Row[];
-    const itemIds = itemRows.map((r) => r.id as string);
-    const modRows =
-      itemIds.length === 0
-        ? []
-        : (unwrap(
-            await sb
-              .from("order_item_modifiers")
-              .select("*")
-              .in("order_item_id", itemIds)
-              .order("sort_order"),
-          ) as Row[]);
+    return (await readOrderRows([orderRow]))[0] as Order;
+  }
 
-    const items: OrderItem[] = itemRows.map((ir) => {
-      const mods: OrderItemModifier[] = modRows
-        .filter((m) => m.order_item_id === ir.id)
-        .map((m) => ({
-          group_id: m.group_id as string,
-          group_name: m.group_name as string,
-          modifier_id: m.modifier_id as string,
-          modifier_name: m.modifier_name as string,
-          price_cents: m.price_cents as number,
-          placement: m.placement as OrderItemModifier["placement"],
-        }));
-      return {
+  /**
+   * Chunked `in` query that PAGES each chunk with `.range()` over a stable total
+   * order (parent column, then id), so nothing past PostgREST's row cap is lost.
+   * Callers re-sort in memory when they need a business order (sort_order, ...).
+   */
+  async function selectIn(
+    table: string,
+    column: string,
+    ids: string[],
+  ): Promise<Row[]> {
+    const out: Row[] = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      out.push(
+        ...(await fetchAllPages<Row>(async (from, to) =>
+          unwrap(
+            await sb
+              .from(table)
+              .select("*")
+              .in(column, chunk)
+              .order(column)
+              .order("id")
+              .range(from, to),
+          ) as Row[],
+        )),
+      );
+    }
+    return out;
+  }
+
+  /** Batch order-graph read: 2 queries per 100 orders, not 2 per order. */
+  async function readOrderRows(orderRows: Row[]): Promise<Order[]> {
+    if (orderRows.length === 0) return [];
+    const itemRows = await selectIn(
+      "order_items",
+      "order_id",
+      orderRows.map((r) => r.id as string),
+    );
+    itemRows.sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
+    const modRows = await selectIn(
+      "order_item_modifiers",
+      "order_item_id",
+      itemRows.map((r) => r.id as string),
+    );
+    modRows.sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
+    const modsByItem = new Map<string, Row[]>();
+    for (const m of modRows) {
+      const k = m.order_item_id as string;
+      if (!modsByItem.has(k)) modsByItem.set(k, []);
+      modsByItem.get(k)!.push(m);
+    }
+    const itemsByOrder = new Map<string, Row[]>();
+    for (const r of itemRows) {
+      const k = r.order_id as string;
+      if (!itemsByOrder.has(k)) itemsByOrder.set(k, []);
+      itemsByOrder.get(k)!.push(r);
+    }
+    return orderRows.map((orderRow) => {
+      const items: OrderItem[] = (
+        itemsByOrder.get(orderRow.id as string) ?? []
+      ).map((ir) => ({
         id: ir.id as string,
         item_id: ir.item_id as string,
         item_name: ir.item_name as string,
@@ -645,15 +706,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         size_name: (ir.size_name as string | null) ?? null,
         base_price_cents: ir.base_price_cents as number,
         quantity: ir.quantity as number,
-        modifiers: mods,
+        modifiers: (modsByItem.get(ir.id as string) ?? []).map((m) => ({
+          group_id: m.group_id as string,
+          group_name: m.group_name as string,
+          modifier_id: m.modifier_id as string,
+          modifier_name: m.modifier_name as string,
+          price_cents: m.price_cents as number,
+          placement: m.placement as OrderItemModifier["placement"],
+        })),
         notes: (ir.notes as string | null) ?? null,
         voided: ir.voided as boolean,
         unit_price_cents: ir.unit_price_cents as number,
         line_total_cents: ir.line_total_cents as number,
-      };
+      }));
+      return mapOrder(orderRow, items);
     });
-
-    return mapOrder(orderRow, items);
   }
 
   /** Write an order's line items + modifiers (delete-then-insert children). */
@@ -778,6 +845,15 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
   }
 
   async function depleteForOrder(order: Order): Promise<void> {
+    // Back-of-house owns inventory for this tenant: POS must not deplete.
+    const settingsRow = unwrap(
+      await sb
+        .from("tenant_settings")
+        .select("*")
+        .eq("tenant_id", order.tenant_id)
+        .maybeSingle(),
+    ) as Row | null;
+    if (settingsRow && settingsRow.inventory_owner === "backofhouse") return;
     const links = (
       unwrap(
         await sb
@@ -1498,6 +1574,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             customer_id: input.customer_id ?? null,
             staff_id: input.staff_id ?? null,
             fulfillment: input.fulfillment ?? null,
+            source: input.source ?? null,
+            hold: input.hold ?? null,
             created_at: now,
             updated_at: now,
           })
@@ -1533,8 +1611,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       }
       const order = await readOrderRow(orderRow);
       // An online order awaiting payment (or abandoned) consumes nothing: it is
-      // depleted by `depleteInventoryForOrder` once payment finalizes.
-      if (order.status !== "voided" && !isUnpaidOnlineStatus(order.status)) {
+      // depleted by `depleteInventoryForOrder` once payment finalizes. Held
+      // (draft) orders deplete when released (updateOrderStatus).
+      if (
+        order.status !== "voided" &&
+        order.status !== "draft" &&
+        !isUnpaidOnlineStatus(order.status)
+      ) {
         await depleteForOrder(order);
       }
       return order;
@@ -1547,28 +1630,175 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return r ? readOrderRow(r) : null;
     },
 
-    async listOrders(tenantId, locationId) {
+    async listOrders(tenantId, locationId, opts) {
+      const limit = Math.min(Math.max(opts?.limit ?? 500, 1), 1000);
+      const offset = opts?.offset ?? 0;
+      let q = sb
+        .from("orders")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .eq("location_id", locationId);
+      if (opts?.from) q = q.gte("created_at", opts.from);
+      if (opts?.to) q = q.lte("created_at", opts.to);
+      // Explicit range: never rely on PostgREST's implicit row cap.
       const rows = unwrap(
+        await q
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: false })
+          .range(offset, offset + limit - 1),
+      ) as Row[];
+      return readOrderRows(rows);
+    },
+
+    async listOrdersPage(tenantId, locationId, opts) {
+      const limit = Math.min(Math.max(opts.limit, 1), 500);
+      let q = sb
+        .from("orders")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .eq("location_id", locationId);
+      if (opts.createdFrom) q = q.gte("created_at", opts.createdFrom);
+      if (opts.createdTo) q = q.lte("created_at", opts.createdTo);
+      if (opts.updatedSince) q = q.gte("updated_at", opts.updatedSince);
+      if (opts.after) {
+        const { created_at: c, id } = safeKeyset(opts.after);
+        q = q.or(`created_at.gt.${c},and(created_at.eq.${c},id.gt.${id})`);
+      }
+      const rows = unwrap(
+        await q
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(limit),
+      ) as Row[];
+      return readOrderRows(rows);
+    },
+
+    async casOrderStatus(id, from, to) {
+      const leavingHold = from.includes("draft") && to !== "draft";
+      // Compare-and-set in ONE statement: only the caller that still sees a
+      // `from` status updates the row (and so owns the side effects).
+      const updated = unwrap(
         await sb
           .from("orders")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId)
-          .order("created_at", { ascending: false }),
+          .update({
+            status: to,
+            updated_at: nowIso(),
+            ...(leavingHold ? { hold: null } : {}),
+          })
+          .eq("id", id)
+          .in("status", from)
+          .select(),
       ) as Row[];
-      return Promise.all(rows.map((r) => readOrderRow(r)));
+      const row = updated[0];
+      if (row) {
+        const order = await readOrderRow(row);
+        // Only the winner of a draft -> live transition depletes inventory.
+        if (leavingHold && to !== "voided") await depleteForOrder(order);
+        return { ok: true, order } as const;
+      }
+      const current = unwrap(
+        await sb.from("orders").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      if (!current) return { ok: false, reason: "not_found" } as const;
+      return {
+        ok: false,
+        reason: "conflict",
+        order: await readOrderRow(current),
+      } as const;
+    },
+
+    async cancelOrder(id, tenantId) {
+      // One SQL function: lock the order row, check in-flight/captured tenders,
+      // void abandoned ones, transition to voided. All or nothing.
+      const res = unwrap(
+        await sb.rpc("core_cancel_order", { p_order_id: id, p_tenant_id: tenantId }),
+      ) as { ok: boolean; reason?: string } | null;
+      const row = unwrap(
+        await sb.from("orders").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      if (!row || row.tenant_id !== tenantId) return { ok: false, reason: "not_found" } as const;
+      const order = await readOrderRow(row);
+      if (res?.ok) return { ok: true, order } as const;
+      return {
+        ok: false,
+        reason: (res?.reason ?? "not_cancelable") as "not_cancelable" | "in_flight" | "captured",
+        order,
+      } as const;
+    },
+
+    async listPaymentsForOrders(orderIds) {
+      const out = new Map<string, Payment[]>();
+      const payRows = await selectIn("payments", "order_id", orderIds);
+      payRows.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+      for (const r of payRows) {
+        const p = mapPayment(r);
+        const list = out.get(p.order_id) ?? [];
+        list.push(p);
+        out.set(p.order_id, list);
+      }
+      return out;
+    },
+
+    async getCustomers(ids) {
+      return (await selectIn("customers", "id", ids)).map(mapCustomer);
+    },
+
+    async customerOrderStats(tenantId, customerIds) {
+      const out = new Map<
+        string,
+        { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
+      >();
+      for (let i = 0; i < customerIds.length; i += 100) {
+        const chunk = customerIds.slice(i, i + 100);
+        const rows = await fetchAllPages<Row>(async (from, to) =>
+          unwrap(
+            await sb
+              .from("orders")
+              .select("id,customer_id,totals,created_at,status")
+              .eq("tenant_id", tenantId)
+              .in("customer_id", chunk)
+              .not("status", "in", "(voided,draft)")
+              .order("customer_id")
+              .order("id")
+              .range(from, to),
+          ) as Row[],
+        );
+        for (const r of rows) {
+          const id = r.customer_id as string;
+          const st = out.get(id) ?? { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 };
+          st.order_count += 1;
+          st.lifetime_spend_cents += (r.totals as { total_cents?: number })?.total_cents ?? 0;
+          const at = r.created_at as string;
+          if (!st.last_order_at || at > st.last_order_at) st.last_order_at = at;
+          out.set(id, st);
+        }
+      }
+      return out;
+    },
+
+    async listStaffWithPin(tenantId) {
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .select("id")
+          .eq("tenant_id", tenantId)
+          .not("pin_hash", "is", null),
+      ) as Row[];
+      return new Set(rows.map((r) => r.id as string));
     },
 
     async updateOrderStatus(id, status) {
-      const r = unwrap(
-        await sb
-          .from("orders")
-          .update({ status, updated_at: nowIso() })
-          .eq("id", id)
-          .select()
-          .maybeSingle(),
+      const before = unwrap(
+        await sb.from("orders").select("status").eq("id", id).maybeSingle(),
       ) as Row | null;
-      return r ? readOrderRow(r) : null;
+      if (!before) return null;
+      const prior = before.status as OrderStatus;
+      // CAS on the status we read: a concurrent writer that already moved the
+      // order makes this a no-op returning the current row (and, crucially,
+      // does NOT deplete inventory a second time).
+      const res = await this.casOrderStatus(id, [prior], status);
+      if (res.ok) return res.order;
+      return res.reason === "conflict" ? res.order : null;
     },
 
     async transitionOrderStatus(id, from, to, patch) {
@@ -1962,6 +2192,55 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         await sb.from("customers").select("*").eq("id", id).maybeSingle(),
       ) as Row | null;
       return r ? mapCustomer(r) : null;
+    },
+
+    async listCustomers(tenantId, opts) {
+      let q = sb.from("customers").select("*").eq("tenant_id", tenantId);
+      if (opts?.after) {
+        const { created_at: c, id } = safeKeyset(opts.after);
+        q = q.or(`created_at.gt.${c},and(created_at.eq.${c},id.gt.${id})`);
+      }
+      return (
+        unwrap(
+          await q
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true })
+            .limit(Math.min(opts?.limit ?? 1000, 1000)),
+        ) as Row[]
+      ).map(mapCustomer);
+    },
+
+    async getTenantSettings(tenantId) {
+      const r = unwrap(
+        await sb
+          .from("tenant_settings")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      if (r) return mapTenantSettings(r);
+      return {
+        tenant_id: tenantId,
+        inventory_owner: "pos_basic",
+        updated_at: new Date(0).toISOString(),
+      };
+    },
+
+    async setTenantSettings(tenantId, patch) {
+      const current = await this.getTenantSettings(tenantId);
+      return mapTenantSettings(
+        unwrap(
+          await sb
+            .from("tenant_settings")
+            .upsert({
+              tenant_id: tenantId,
+              inventory_owner: patch.inventory_owner ?? current.inventory_owner,
+              updated_at: nowIso(),
+            })
+            .select()
+            .single(),
+        ) as Row,
+      );
     },
 
     async upsertCustomer(customer) {

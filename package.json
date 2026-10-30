@@ -18,9 +18,11 @@
     "format:check": "prettier --check .",
     "db:apply": "bash supabase/apply.sh",
     "db:test:rls": "bash supabase/tests/run-rls-isolation.sh",
-    "auth:bootstrap": "node supabase/bootstrap-auth.mjs"
+    "auth:bootstrap": "node supabase/bootstrap-auth.mjs",
+    "core:vendor": "bash scripts/vendor-core.sh"
   },
   "dependencies": {
+    "@openpizza/core": "file:vendor/openpizza-core-0.1.0.tgz",
     "@radix-ui/react-slot": "^1.1.1",
     "@sentry/nextjs": "^11.9.0",
     "@supabase/ssr": "^0.5.2",

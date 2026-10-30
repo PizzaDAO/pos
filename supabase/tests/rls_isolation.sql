@@ -964,6 +964,47 @@ begin
   assert f, 'a live tenant that is now suspended → platform-suspended';
 end $$;
 
+-- PR #21 (20261102000300/000400): the core outbox does not announce an online
+-- order while it is awaiting_payment; paying it emits one order.placed, and an
+-- abandoned checkout emits nothing. (Runs only once the core migrations exist.)
+do $$
+declare n int;
+begin
+  if to_regclass('public.core_outbox') is null then
+    return;
+  end if;
+  perform public.core_set_outbox_enabled(true);
+  insert into public.orders
+    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+  values
+    ('0adac001-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+     'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'awaiting_payment', 'online_pickup', 'USD', 0,
+     '{"total_cents":1099}'::jsonb, 'A-C001'),
+    ('0adac002-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+     'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'awaiting_payment', 'online_pickup', 'USD', 0,
+     '{"total_cents":1099}'::jsonb, 'A-C002');
+  select count(*) into n from public.core_outbox
+   where subject_id in ('0adac001-0000-0000-0000-000000000001', '0adac002-0000-0000-0000-000000000001');
+  assert n = 0, format('awaiting_payment inserts must not be announced, saw %s rows', n);
+
+  update public.orders set fulfillment = '{"checkout_mode":"test"}'::jsonb
+   where id = '0adac001-0000-0000-0000-000000000001';
+  update public.orders set status = 'paid'
+   where id = '0adac001-0000-0000-0000-000000000001';
+  update public.orders set status = 'abandoned'
+   where id = '0adac002-0000-0000-0000-000000000001';
+
+  select count(*) into n from public.core_outbox
+   where subject_id = '0adac001-0000-0000-0000-000000000001';
+  assert n = 1, format('paying a checkout emits exactly one event, saw %s', n);
+  assert (select event_type from public.core_outbox
+           where subject_id = '0adac001-0000-0000-0000-000000000001') = 'order.placed',
+    'paying a checkout announces it as order.placed';
+  select count(*) into n from public.core_outbox
+   where subject_id = '0adac002-0000-0000-0000-000000000001';
+  assert n = 0, format('an abandoned checkout emits nothing, saw %s', n);
+end $$;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;

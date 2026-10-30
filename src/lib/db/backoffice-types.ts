@@ -225,6 +225,10 @@ export interface Staff {
    * `src/lib/auth/pin.ts`.
    */
   pin_hash?: string | null;
+  /** Linked login (auth user id), null until linked (POS-7). */
+  user_id?: string | null;
+  /** Locations this person works at; empty/absent = all (POS-7). */
+  location_ids?: string[];
   created_at: string;
 }
 

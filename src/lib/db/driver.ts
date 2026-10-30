@@ -62,6 +62,7 @@ import type {
   Membership,
   PlatformAdmin,
   Tenant,
+  TenantSettings,
   User,
 } from "./types";
 import type {
@@ -83,6 +84,28 @@ export type MenuEntityKind =
   | "size"
   | "modifierGroup"
   | "modifier";
+
+/** Bounds for `listOrders` (newest first). Explicit so no default row cap applies. */
+export interface OrderListOptions {
+  /** Max rows (default 500, hard max 1000). */
+  limit?: number;
+  offset?: number;
+  /** Inclusive ISO created_at range. */
+  from?: string;
+  to?: string;
+}
+
+export interface OrderPageOptions {
+  /** Exclusive keyset cursor. */
+  after?: { created_at: string; id: string };
+  /** Page size (1..500). */
+  limit: number;
+  /** Inclusive ISO created_at bounds. */
+  createdFrom?: string;
+  createdTo?: string;
+  /** Only rows updated at/after this ISO instant. */
+  updatedSince?: string;
+}
 
 export interface PosDriver {
   /** Stable id of the active driver implementation (for diagnostics/UX). */
@@ -275,7 +298,72 @@ export interface PosDriver {
   getOrder(id: string): Promise<Order | null>;
 
   /** List recent orders for a location (newest first). */
-  listOrders(tenantId: string, locationId: string): Promise<Order[]>;
+  listOrders(
+    tenantId: string,
+    locationId: string,
+    opts?: OrderListOptions,
+  ): Promise<Order[]>;
+
+  /**
+   * Keyset page of a location's orders, OLDEST first by (created_at, id), with
+   * the order graph batch-loaded (no per-order queries). The core `/v1` feed.
+   */
+  listOrdersPage(
+    tenantId: string,
+    locationId: string,
+    opts: OrderPageOptions,
+  ): Promise<Order[]>;
+
+  /**
+   * Atomic compare-and-set status transition: moves the order to `to` only if
+   * its CURRENT status is in `from`. `transitioned` is true for exactly one
+   * concurrent caller; side effects (inventory depletion on release) run only
+   * then. Never throws for a lost race: `{ok:false, reason:"conflict"}`.
+   */
+  casOrderStatus(
+    id: string,
+    from: OrderStatus[],
+    to: OrderStatus,
+  ): Promise<
+    | { ok: true; order: Order }
+    | { ok: false; reason: "not_found" }
+    | { ok: false; reason: "conflict"; order: Order }
+  >;
+
+  /**
+   * Atomically cancel an order: lock the order row, refuse while a tender is in
+   * flight (abandoned unsettled tenders past the stale TTL are voided) or money
+   * is still captured, then transition to `voided`. Idempotent for voided.
+   */
+  cancelOrder(
+    id: string,
+    tenantId: string,
+    opts?: { nowMs?: number },
+  ): Promise<
+    | { ok: true; order: Order }
+    | { ok: false; reason: "not_found" }
+    | { ok: false; reason: "not_cancelable" | "in_flight" | "captured"; order: Order }
+  >;
+
+  /** Batch read: tenders for several orders (one query), grouped by order id. */
+  listPaymentsForOrders(orderIds: string[]): Promise<Map<string, Payment[]>>;
+
+  /** Batch read: customers by id (one query). */
+  getCustomers(ids: string[]): Promise<Customer[]>;
+
+  /** Aggregate order stats for the given customers (bounded; no full scans). */
+  customerOrderStats(
+    tenantId: string,
+    customerIds: string[],
+  ): Promise<
+    Map<
+      string,
+      { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
+    >
+  >;
+
+  /** Ids of staff that have a quick-switch PIN set (hashes never leave the driver). */
+  listStaffWithPin(tenantId: string): Promise<Set<string>>;
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
@@ -483,6 +571,23 @@ export interface PosDriver {
   /** Fetch a single customer by id, or null. */
   getCustomer(id: string): Promise<Customer | null>;
 
+  /** All of a tenant's customers (newest first) — the core `/v1/customers` feed. */
+  listCustomers(
+    tenantId: string,
+    opts?: { after?: { created_at: string; id: string }; limit?: number },
+  ): Promise<Customer[]>;
+
+  // -- Per-tenant POS settings (core v1) ---------------------------------------
+
+  /** Tenant POS settings (defaults when no row: inventory_owner = pos_basic). */
+  getTenantSettings(tenantId: string): Promise<TenantSettings>;
+
+  /** Upsert tenant POS settings (e.g. hand inventory to backofhouse). */
+  setTenantSettings(
+    tenantId: string,
+    patch: Partial<Pick<TenantSettings, "inventory_owner">>,
+  ): Promise<TenantSettings>;
+
   /**
    * Upsert a customer. Re-using an id merges mutable fields; a new id with an
    * email that already exists for the tenant returns the existing row (so guest
@@ -640,7 +745,8 @@ export interface PosDriver {
   ): Promise<BusinessDayClose>;
 
   // --------------------------------------------------------------------------
-  // Staff & shifts (clock in/out + drawer reconciliation).
+  // Staff & cash-drawer sessions (open/close drawer + reconciliation; the
+  // time clock belongs to workforce).
   // --------------------------------------------------------------------------
 
   listStaff(tenantId: string): Promise<Staff[]>;
@@ -689,7 +795,7 @@ export interface PosDriver {
     staffId: string,
   ): Promise<Shift | null>;
 
-  /** Clock in: open a shift with an opening float. */
+  /** Open a drawer: start a cash session with an opening float. */
   openShift(input: {
     tenantId: string;
     locationId: string;
@@ -707,7 +813,7 @@ export interface PosDriver {
   getDrawerReconciliation(shiftId: string): Promise<DrawerReconciliation>;
 
   /**
-   * Clock out + reconcile: closes the shift, records the counted drawer, and
+   * Close the drawer + reconcile: closes the session, records the counted drawer, and
    * computes over/short. Returns the closed shift.
    */
   closeShift(input: {

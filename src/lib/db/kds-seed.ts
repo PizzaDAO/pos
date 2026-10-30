@@ -34,6 +34,13 @@ interface SeedLine {
 }
 
 let seedLineSeq = 0;
+
+/** Real seed modifier-group ids (see seed-data), so lines reference real groups. */
+const SEED_GROUP_IDS: Record<string, string> = {
+  Crust: "50000000-0000-0000-0000-000000000001",
+  Sauce: "50000000-0000-0000-0000-000000000002",
+  Toppings: "50000000-0000-0000-0000-000000000003",
+};
 function seedLine(line: SeedLine): OrderItem {
   seedLineSeq += 1;
   const raw: OrderItem = {
@@ -46,9 +53,12 @@ function seedLine(line: SeedLine): OrderItem {
     base_price_cents: line.basePrice,
     quantity: line.quantity ?? 1,
     modifiers: (line.modifiers ?? []).map((m, i) => ({
-      group_id: `seed-grp-${m.group}`,
+      group_id: SEED_GROUP_IDS[m.group] ?? SEED_GROUP_IDS.Toppings!,
       group_name: m.group,
-      modifier_id: `seed-mod-${seedLineSeq}-${i}`,
+      // GUID-shaped so the seed also validates against the core contract.
+      modifier_id: `a0000000-0000-4000-8000-${(seedLineSeq * 100 + i)
+        .toString(16)
+        .padStart(12, "0")}`,
       modifier_name: m.name,
       price_cents: m.price,
       placement: m.placement ?? "whole",
@@ -188,7 +198,7 @@ export function seedKitchenOrders(): Order[] {
     });
     const createdAt = new Date(now - seed.ageSeconds * 1000).toISOString();
     return {
-      id: `kds-seed-${seed.suffix}`,
+      id: `b0000000-0000-4000-8000-0000000000${seed.suffix}`,
       tenant_id: DEMO_TENANT_ID,
       location_id: DEMO_LOCATION_DOWNTOWN_ID,
       status: seed.status,
