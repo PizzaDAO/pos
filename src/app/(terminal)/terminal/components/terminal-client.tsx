@@ -24,6 +24,8 @@ import { useCartStore } from "@/lib/store/cart";
 import { useMenu } from "@/lib/store/use-menu";
 import { useActiveStaff } from "@/lib/store/use-active-staff";
 import { useOfflineSync } from "@/lib/offline/use-offline-sync";
+import type { QueuedStaff } from "@/lib/offline/queue";
+import { OfflineQueuePanel } from "./offline-queue-panel";
 import { MenuBrowse } from "./menu-browse";
 import { StaffSwitch } from "./staff-switch";
 import { CartPanel } from "./cart-panel";
@@ -84,7 +86,15 @@ export function TerminalClient({
   const sync = useOfflineSync();
   const { activeStaff, signOut: signOutStaff, verifyPin } = useActiveStaff();
   const [showStaffSwitch, setShowStaffSwitch] = useState(false);
+  const [showQueue, setShowQueue] = useState(false);
   const toast = useToast();
+  const queuedStaff: QueuedStaff | null = activeStaff
+    ? {
+        id: activeStaff.id,
+        role: activeStaff.role,
+        sessionId: activeStaff.session_id,
+      }
+    : null;
 
   const items = useCartStore((s) => s.items);
   const discountCents = useCartStore((s) => s.discountCents);
@@ -94,8 +104,9 @@ export function TerminalClient({
   const updateLine = useCartStore((s) => s.updateLine);
   const clear = useCartStore((s) => s.clear);
 
-  // Who may discount: the active staff member's role (or, in the zero-env demo
-  // only, the device login's role) must be owner|manager.
+  // Who may discount: the active staff member's role (or, when the tenant has
+  // not set up staff PINs / the zero-env demo, the device login's role) must
+  // be owner|manager. The server enforces the same rule.
   const effectiveRole =
     activeStaff?.role ?? (requireActiveStaff ? null : (deviceRole ?? null));
   const canDiscount = effectiveRole === "owner" || effectiveRole === "manager";
@@ -209,7 +220,10 @@ export function TerminalClient({
         staff_id: activeStaff?.id ?? null,
       };
 
-      const outcome = await sync.placeOrderOffline(payload);
+      // Record who was at the till (and their staff session) with the queued
+      // order: a later flush sends it, so a discount they authorized can still
+      // be honoured while their session is live.
+      const outcome = await sync.placeOrderOffline(payload, queuedStaff);
 
       if (outcome.status === "rejected") {
         // The server REFUSED the order (e.g. forbidden discount, 86'd item):
@@ -260,6 +274,8 @@ export function TerminalClient({
         locationName={"Tony's Downtown"}
         online={sync.online}
         pendingCount={sync.pendingCount}
+        attentionCount={sync.attentionCount}
+        onOpenQueue={() => setShowQueue(true)}
         driverName={data.driver}
         onFlush={() => void sync.flushNow()}
         activeStaffName={activeStaff?.name ?? null}
@@ -314,6 +330,18 @@ export function TerminalClient({
           cardReady={cardReady}
           onClose={() => setPayOrderId(null)}
           onPaid={() => setPayOrderId(null)}
+        />
+      )}
+
+      {showQueue && (
+        <OfflineQueuePanel
+          entries={sync.attention}
+          activeStaff={queuedStaff}
+          onRetry={sync.retryOrder}
+          onRetryWithoutDiscount={sync.retryWithoutDiscount}
+          onDiscard={sync.discard}
+          onSwitchStaff={() => setShowStaffSwitch(true)}
+          onClose={() => setShowQueue(false)}
         />
       )}
 
