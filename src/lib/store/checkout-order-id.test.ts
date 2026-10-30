@@ -171,11 +171,11 @@ describe("keyed by storefront (tenant + location), migrating slug-only entries",
     expect(getCheckoutOrderId({ ...base, slug: keyA }, mint, s).id).toBe("legacy-1");
   });
 
-  it("a legacy entry for a different checkout is superseded (cancelled best-effort), not orphaned", () => {
+  it("a legacy entry for a different checkout is dropped, never superseded (it may be another tenant's order)", () => {
     const s = memoryStorage();
     getCheckoutOrderId({ ...base, slug: "downtown", tipCents: 300 }, () => "legacy-2", s);
     const now = getCheckoutOrderId({ ...base, slug: keyA }, counter(), s);
-    expect(now.superseded).toBe("legacy-2");
+    expect(now.superseded).toBeNull();
     expect(now.id).not.toBe("legacy-2");
     expect(s.getItem("openpizza.checkout.downtown")).toBeNull();
   });

@@ -130,7 +130,7 @@ export function getCheckoutOrderId(
   storage: Storage | null = defaultCheckoutStorage(),
 ): { id: string; superseded: string | null } {
   const sig = checkoutSignature(input);
-  let stored = read(storage, input.slug);
+  const stored = read(storage, input.slug);
   if (!stored) {
     // Migrate an entry written by a build that keyed by the location slug
     // alone (a customer mid-checkout across the deploy).
@@ -143,9 +143,9 @@ export function getCheckoutOrderId(
         write(storage, input.slug, { sig, id: old.id });
         return { id: old.id, superseded: null };
       }
-      // A different checkout: superseded (cancel best-effort), exactly as the
-      // old slug-keyed build would have done.
-      stored = old;
+      // A different checkout: drop it but never supersede (cancel) it. A
+      // slug-only entry can't prove which tenant it belonged to, so it may be
+      // another tenant's unpaid order; the sweeper abandons it after its window.
     }
   }
   if (stored && stored.sig === sig) return { id: stored.id, superseded: null };
