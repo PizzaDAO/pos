@@ -125,6 +125,12 @@ export const RATE_LIMIT_RULES = {
    * Its own bucket so polling can never starve (or be starved by) charge capture.
    */
   paySync: { limit: 90, windowMs: 60_000 } satisfies RateLimitRule,
+  /**
+   * Till polling of a card-reader tender (`GET /api/terminal/payments/[id]`, every
+   * ~1.5s = ~40/min per tablet) and the reader list. Separate from `payments` so
+   * polling can neither starve charges nor trip the charge limit itself.
+   */
+  cardSync: { limit: 150, windowMs: 60_000 } satisfies RateLimitRule,
 } as const;
 
 export type RateLimitBucket = keyof typeof RATE_LIMIT_RULES;

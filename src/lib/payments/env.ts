@@ -101,6 +101,31 @@ export function cardRailsSimulated(): boolean {
   return !isStripeConfigured() || isTrainingFlagSet() || usingMockDriver();
 }
 
+/**
+ * How the in-store card reader runs (plans/terminal-card-reader.md):
+ *  - `simulated`: no Stripe key, OR training mode / mock driver (whatever key is
+ *    set, so a training env can never reach a real reader or charge). One virtual
+ *    reader per location, no Stripe call ever.
+ *  - `stripe_test`: an `sk_test_` key: the real Stripe sandbox, with simulated
+ *    (`simulated-wpe`) or physical test readers.
+ *  - `stripe_live`: a live key: real money.
+ */
+export type CardReaderMode = "simulated" | "stripe_test" | "stripe_live";
+
+export function cardReaderMode(): CardReaderMode {
+  if (cardRailsSimulated()) return "simulated";
+  return isStripeTestKey() ? "stripe_test" : "stripe_live";
+}
+
+/**
+ * Demo helper: when set (ms > 0), a SIMULATED reader tender approves itself that
+ * long after it starts, with no cashier click. Default off.
+ */
+export function terminalSimAutoApproveMs(): number {
+  const v = Number.parseInt(process.env.TERMINAL_SIM_AUTO_APPROVE_MS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
 /** Coinbase Commerce is "configured" once an API key is present. */
 export function getCoinbaseConfig(): {
   apiKey: string;

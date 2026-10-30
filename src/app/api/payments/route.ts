@@ -47,6 +47,8 @@ import {
   isOnlineOrderRail,
   onlineRailAvailable,
 } from "@/lib/payments/online-rails";
+import { cardRailsSimulated } from "@/lib/payments/env";
+import { closeOpenCardTender } from "@/lib/payments/terminal/flow";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -141,6 +143,20 @@ export async function POST(request: Request) {
       "cashier",
     ]);
     if (!auth.ok) return auth.res;
+
+    // Card-present tenders are server-driven: the PaymentIntent must be handed to
+    // a reader (POST /api/terminal/payments). Creating one here would leave a
+    // card_present intent nobody processes. (In simulated mode the legacy instant
+    // approval stays until the terminal UI moves to the reader flow.)
+    if (body.rail === "stripe_terminal" && !cardRailsSimulated()) {
+      return NextResponse.json(
+        {
+          error: "Card payments in store go through the card reader.",
+          code: "use_terminal_reader",
+        },
+        { status: 400 },
+      );
+    }
   }
 
   // Cash on an ONLINE order takes a till role, exactly like an in-store tender.
@@ -294,6 +310,58 @@ export async function POST(request: Request) {
     if (amountCents <= 0) {
       return NextResponse.json(
         { error: "This order has nothing left to pay." },
+        { status: 409 },
+      );
+    }
+  }
+
+  // IN-STORE: a card tender may be live on the reader (the customer can still tap).
+  // Taking cash / crypto now would double charge, so close it first, STRICTLY. If
+  // the card already went through, or the customer is mid-authorization, refuse
+  // (409) and let the cashier re-check the balance.
+  if (order.channel === "in_store" && body.rail !== "stripe_terminal") {
+    const closed = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
+    if (closed === "settled" || closed === "in_flight" || closed === "needs_review") {
+      const current = await driver.getOrder(order.id);
+      const copy = {
+        settled: [
+          "This order was already paid by card. Check the balance.",
+          "already_paid_by_card",
+        ],
+        in_flight: [
+          "The customer is paying by card on the reader. Wait for it to finish or cancel it first.",
+          "card_in_progress",
+        ],
+        needs_review: [
+          "A card payment on this order needs manager review. Check Payments before taking another tender.",
+          "card_needs_review",
+        ],
+      }[closed];
+      return NextResponse.json(
+        {
+          error: copy[0],
+          code: copy[1],
+          balanceCents: current ? await getOrderBalance(current) : undefined,
+          orderStatus: current?.status,
+        },
+        { status: 409 },
+      );
+    }
+  }
+
+  // IN-STORE: never take more than is still owed (any rail), matching the reader
+  // path. A stale balance (another tender landed) is refused so the till refreshes.
+  if (order.channel === "in_store") {
+    const current = await driver.getOrder(order.id);
+    const balance = current ? await getOrderBalance(current) : 0;
+    if (body.amountCents > balance) {
+      return NextResponse.json(
+        {
+          error: "That is more than the balance now due on this order.",
+          code: "amount_exceeds_balance",
+          balanceCents: balance,
+          orderStatus: current?.status,
+        },
         { status: 409 },
       );
     }

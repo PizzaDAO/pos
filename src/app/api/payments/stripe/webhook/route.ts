@@ -20,6 +20,13 @@
  *   payment_intent.payment_failed  -> requires_action (+ raw.last_error)
  *   payment_intent.canceled        -> canceled
  *
+ * Card-present (stripe_terminal) tenders are NOT settled from the event payload:
+ * the event only says "look at this PaymentIntent", and `syncCardTender` re-reads
+ * it (and the reader) from Stripe, verifies it against the tender, records the
+ * on-reader tip and receipt fields, and settles through `applyRailStatus`. This
+ * also covers `terminal.reader.action_succeeded|action_failed` (the reader
+ * object carries the PaymentIntent id in `action.process_payment_intent`).
+ *
  * Also handles the Connect event `account.updated`: the connected account's
  * onboarding/charges status is synced onto our connect_accounts row (matched by
  * Stripe account id) so card payments unlock as soon as KYC completes.
@@ -36,6 +43,7 @@ import { applyRailStatus } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
 import { deriveStatus, fetchConnectStatus } from "@/lib/payments/connect";
 import { captureError } from "@/lib/observability";
+import { TerminalFlowError, syncCardTender } from "@/lib/payments/terminal/flow";
 
 export const runtime = "nodejs";
 
@@ -73,6 +81,10 @@ export async function POST(request: Request) {
         currency?: string;
         metadata?: Record<string, string>;
         last_payment_error?: { message?: string } | null;
+        /** terminal.reader.* events: the reader's last action. */
+        action?: {
+          process_payment_intent?: { payment_intent?: string } | null;
+        } | null;
         charges_enabled?: boolean;
         payouts_enabled?: boolean;
         details_submitted?: boolean;
@@ -120,6 +132,28 @@ export async function POST(request: Request) {
     return NextResponse.json({ received: true });
   }
 
+  // Terminal reader events: find the PaymentIntent the reader acted on and sync.
+  if (
+    event.type === "terminal.reader.action_succeeded" ||
+    event.type === "terminal.reader.action_failed"
+  ) {
+    const piId = event.data?.object?.action?.process_payment_intent?.payment_intent;
+    if (!piId || !event.account) return NextResponse.json({ received: true });
+    const tender = await getPosDriver().getPaymentByChargeId(piId);
+    if (!tender || tender.rail !== "stripe_terminal") {
+      return NextResponse.json({ received: true, ignored: "unknown_payment" });
+    }
+    if (event.account !== tender.connect_account_id) {
+      captureError(new Error("stripe webhook account mismatch"), {
+        scope: "stripe-webhook",
+        paymentId: tender.id,
+        eventAccount: event.account,
+      });
+      return NextResponse.json({ received: true, ignored: "account_mismatch" });
+    }
+    return syncTerminalFromWebhook(tender.id);
+  }
+
   const INTENT_STATUS: Record<string, PaymentStatus> = {
     "payment_intent.succeeded": "captured",
     "payment_intent.processing": "pending",
@@ -158,6 +192,12 @@ export async function POST(request: Request) {
     return NextResponse.json({ received: true, ignored: "account_mismatch" });
   }
 
+  // Card-present: the amount can legitimately exceed the tender's (an on-reader
+  // tip), so settle by re-reading the PaymentIntent, not from this payload.
+  if (matched.rail === "stripe_terminal") {
+    return syncTerminalFromWebhook(matched.id);
+  }
+
   const expectedAmount = matched.amount_cents + matched.tip_cents;
   if (
     intent.amount !== expectedAmount ||
@@ -188,5 +228,26 @@ export async function POST(request: Request) {
     return NextResponse.json({ received: true, flagged: "live_tender_conflict" });
   }
 
+  return NextResponse.json({ received: true });
+}
+
+/**
+ * Sync a card-present tender after a webhook. A mismatch (PI does not fit the
+ * tender) is alerted and acknowledged, never retried forever; a transient Stripe
+ * failure throws so Stripe redelivers.
+ */
+async function syncTerminalFromWebhook(paymentId: string) {
+  try {
+    await syncCardTender(paymentId);
+  } catch (err) {
+    if (err instanceof TerminalFlowError && err.code === "mismatch") {
+      return NextResponse.json({ received: true, ignored: "amount_mismatch" });
+    }
+    if (err instanceof LiveTenderConflictError) {
+      captureError(err, { scope: "stripe-webhook", paymentId });
+      return NextResponse.json({ received: true, flagged: "live_tender_conflict" });
+    }
+    throw err;
+  }
   return NextResponse.json({ received: true });
 }

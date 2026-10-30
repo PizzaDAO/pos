@@ -32,6 +32,7 @@ import { deriveTenderId } from "./ids";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
+import { cancelReaderActionForIntent } from "./providers/stripe-terminal-api";
 import { railChargesApplicationFee } from "./fees";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
@@ -295,7 +296,10 @@ export async function takePaymentDetailed(
     // A different live card/Coinbase tender already holds this order's slot
     // (payments_one_live_card_or_cb). The intent we just created is an orphan:
     // cancel it so it can never be confirmed.
-    if (err instanceof LiveTenderConflictError && isRealIntentTender(payment)) {
+    if (
+      err instanceof LiveTenderConflictError &&
+      (isRealIntentTender(payment) || isRealTerminalTender(payment))
+    ) {
       await stripeRequest(
         `/payment_intents/${payment.charge_id}/cancel`,
         {},
@@ -303,6 +307,19 @@ export async function takePaymentDetailed(
       ).catch(() => undefined);
     }
     throw err;
+  }
+  if (saved.status === "captured" || saved.status === "authorized") {
+    // This tender may have just covered the order: any card-reader / card intent
+    // still open on it must not stay live (it could be tapped and double charge).
+    // The tender is already saved: a failure closing the others must not turn
+    // this into a 502 (alert, then still evaluate the order).
+    await closeSiblingsOfSettledOrder(saved).catch((err) =>
+      captureError(err, {
+        scope: "close-siblings",
+        paymentId: saved.id,
+        orderId: input.orderId,
+      }),
+    );
   }
   await maybeMarkOrderPaid(input.orderId);
   return { payment: saved, clientSecret: result.clientSecret };
@@ -321,7 +338,14 @@ export async function takePaymentDetailed(
 export async function applyRailStatus(
   paymentId: string,
   status: PaymentStatus,
-  opts: { raw?: Record<string, unknown> } = {},
+  opts: {
+    raw?: Record<string, unknown>;
+    /**
+     * Gratuity the rail learned AFTER the tender was created (a card-present tip
+     * typed on the reader). Base `amount_cents` is never touched.
+     */
+    tipCents?: number;
+  } = {},
 ): Promise<Payment | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(paymentId);
@@ -331,10 +355,16 @@ export async function applyRailStatus(
   const locked =
     payment.status === "refunded" ||
     (payment.status === "captured" && status !== "refunded");
-  if (!locked && (status !== payment.status || opts.raw)) {
+  if (
+    !locked &&
+    (status !== payment.status ||
+      opts.raw ||
+      (opts.tipCents !== undefined && opts.tipCents !== payment.tip_cents))
+  ) {
     const next: Payment = {
       ...payment,
       status,
+      tip_cents: opts.tipCents ?? payment.tip_cents,
       raw: opts.raw ? { ...(payment.raw ?? {}), ...opts.raw } : payment.raw,
       updated_at: nowIso(),
     };
@@ -386,6 +416,25 @@ async function resolveLiveTenderConflict(
  * Throws when the provider refuses. Does NOT touch the local row.
  */
 export async function cancelTenderOnProvider(p: Payment): Promise<void> {
+  if (isRealTerminalTender(p)) {
+    // Clear the reader's screen first (best effort: it may be offline, idle, or
+    // mid-authorization). Canceling the PaymentIntent is what makes a late tap
+    // fail, and it throws if the card already succeeded (the caller re-syncs).
+    const readerId = typeof p.raw?.reader_id === "string" ? p.raw.reader_id : null;
+    if (readerId) {
+      await cancelReaderActionForIntent(
+        p.connect_account_id!,
+        readerId,
+        p.charge_id!,
+      ).catch(() => undefined);
+    }
+    await stripeRequest(
+      `/payment_intents/${p.charge_id}/cancel`,
+      {},
+      { stripeAccount: p.connect_account_id },
+    );
+    return;
+  }
   if (isRealIntentTender(p)) {
     await stripeRequest(
       `/payment_intents/${p.charge_id}/cancel`,
@@ -486,13 +535,13 @@ export async function cancelOpenTender(p: Payment): Promise<OpenTenderOutcome> {
  * An online order is now fully covered by settled money: any other tender still
  * open on it is no longer needed, so close it (STRICT, see `cancelOpenTender`: a
  * tender the provider will not release is left open and alerted, never marked
- * canceled). Online orders only: an in-store split can legitimately have an open
- * tender for the rest.
+ * canceled). Runs only once settled money covers the amount due, so an in-store
+ * split (card for part, the rest still open) is left alone.
  */
 async function closeSiblingsOfSettledOrder(settled: Payment): Promise<void> {
   const driver = getPosDriver();
   const order = await driver.getOrder(settled.order_id);
-  if (!order || order.channel === "in_store") return;
+  if (!order) return;
   const payments = await listOrderCurrencyPayments(order);
   if (settledCents(payments) < orderDueCents(order)) return;
   for (const o of payments) {
@@ -557,6 +606,13 @@ export async function refreshPaymentStatus(
     await maybeMarkOrderPaid(payment.order_id);
     return payment;
   }
+  // A card-present tender on a reader is settled by the terminal flow (it reads
+  // the PaymentIntent AND the reader, records the tip/receipt, and a simulated one
+  // waits for the simulated reader): never by the rail's blanket `status`.
+  if (payment.rail === "stripe_terminal" && payment.raw?.reader_id) {
+    const { syncCardTender } = await import("./terminal/flow");
+    return (await syncCardTender(paymentId)).payment;
+  }
 
   const rail = requirePaymentRail(payment.rail);
   const status = await rail.status(
@@ -576,6 +632,18 @@ export async function refreshPaymentStatus(
 export function isRealIntentTender(p: Payment): boolean {
   return (
     p.rail === "stripe_online" &&
+    !p.simulated &&
+    !!p.charge_id &&
+    !p.charge_id.startsWith("sim_") &&
+    !!p.connect_account_id &&
+    !cardRailsSimulated()
+  );
+}
+
+/** True for a real (non-simulated) card-present PaymentIntent tender. */
+export function isRealTerminalTender(p: Payment): boolean {
+  return (
+    p.rail === "stripe_terminal" &&
     !p.simulated &&
     !!p.charge_id &&
     !p.charge_id.startsWith("sim_") &&
@@ -927,10 +995,23 @@ async function flagLatePayment(order: Order, payments: Payment[]): Promise<void>
  * in the admin list as "Duplicate payment, refund one" via the same marker.
  */
 async function flagDuplicatePayment(order: Order, payments: Payment[]): Promise<void> {
-  if (!order.fulfillment || order.channel === "in_store") return;
-  const excess = netSettledCents(payments) - order.totals.total_cents;
+  // In-store orders carry the tip on each tender (not in the order total), so
+  // their excess is measured on base amounts; online orders fold the tip in.
+  const inStore = order.channel === "in_store";
+  const held = inStore
+    ? payments
+        .filter((p) => p.status === "captured" || p.status === "authorized")
+        // Refunds are taken off the tip first, so a tip-only refund can't hide a
+        // duplicate of the base.
+        .reduce(
+          (n, p) =>
+            n + Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
+          0,
+        )
+    : netSettledCents(payments);
+  const excess = held - (inStore ? orderDueCents(order) : order.totals.total_cents);
   if (excess <= 0) return;
-  const prior = order.fulfillment.late_payment;
+  const prior = order.fulfillment?.late_payment;
   if (prior && (prior.kind !== "duplicate" || prior.resolved || prior.amount_cents === excess)) {
     return;
   }

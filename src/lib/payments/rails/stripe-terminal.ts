@@ -1,27 +1,28 @@
 /**
- * Stripe Terminal rail — in-store card-present payments via Stripe Connect.
+ * Stripe Terminal rail -- in-store card-present payments via Stripe Connect,
+ * SERVER-DRIVEN (plans/terminal-card-reader.md).
  *
- * REAL path (when STRIPE_SECRET_KEY is set):
- *  - `quote` computes the platform application fee for the tender.
- *  - `createCharge` creates a PaymentIntent on the tenant's CONNECTED account
- *    (`Stripe-Account` header) with `payment_method_types: ['card_present']`,
- *    `application_fee_amount` (our platform fee), and `capture_method` =
- *    automatic|manual. In a real terminal the reader collects the card and
- *    `process_payment_intent` is called from the Terminal SDK on the device;
- *    here we create the intent and (for capture=true) confirm it server-side.
- *  - Connection tokens for the reader SDK are minted by
- *    `/api/payments/stripe/connection-token`.
+ * REAL path (a Stripe key and not training mode):
+ *  - `createCharge` creates the PaymentIntent on the tenant's CONNECTED account
+ *    (`Stripe-Account`, direct charge) with `payment_method_types: ['card_present']`
+ *    and `capture_method: automatic`. It does NOT confirm it: the PI is handed to
+ *    the reader by `process_payment_intent` (see `terminal/flow.ts`), and the READER
+ *    collects the card and confirms. Stripe says never to confirm card_present
+ *    server-side.
+ *  - `application_fee_amount` is computed on the PRE-TIP amount in EVERY tip mode
+ *    (product decision): the platform takes no fee on tips. (An on-reader tip is
+ *    not even known when the PI is created.)
+ *  - Reader tips arrive in `amount_details.tip.amount`; flow.ts records them.
  *
- * OFFLINE store-and-forward (documented stub): Stripe Terminal readers queue
- * card-present transactions in the reader's secure element when the network is
- * down and forward them on reconnect. Constraints: per-transaction cap +
- * forwarding window, card-present only, NO offline refunds, and the MERCHANT
- * carries decline risk. In this codebase the offline queue (IndexedDB) records
- * the intended tender; on reconnect the same idempotency-keyed `createCharge`
- * runs, mirroring the reader's forward-on-reconnect semantics. Real reader
- * store-and-forward is configured on the physical device in the field phase.
+ * OFFLINE: card needs internet. Stripe's offline mode requires the native iOS /
+ * Android / React Native Terminal SDK and is NOT supported by server-driven or
+ * Terminal JS (docs.stripe.com/terminal/features/operate-offline/overview), so a
+ * web POS is cash-only while offline. There is no store-and-forward here.
  *
- * SIMULATED path (no key, incl. preview): approves instantly with a `sim_` id.
+ * SIMULATED path (no key, training mode, or the mock driver): no Stripe call
+ * ever. With a `reader_id` in the metadata (the reader flow) the tender is created
+ * `requires_action` and settled by the simulated reader buttons; without one
+ * (legacy direct `takePayment`) it approves instantly with a `sim_` id.
  */
 import type {
   CaptureRequest,
@@ -49,10 +50,15 @@ import { simId, simRaw } from "./simulate";
 
 const KEY = "stripe_terminal" as const;
 
-function feeForTender(amount: number, tip: number): number {
+/**
+ * Platform fee for a tender: ALWAYS on the pre-tip amount, whatever the tip mode
+ * (a reader tip is unknown at PaymentIntent creation, and the decision is that
+ * tips carry no platform fee anywhere).
+ */
+function feeForTender(amount: number): number {
   const { bps, flatCents } = getDefaultPlatformFee();
   return computeApplicationFeeCents({
-    amountCents: amount + tip,
+    amountCents: amount,
     feeBps: bps,
     feeFlatCents: flatCents,
   });
@@ -67,7 +73,7 @@ export const stripeTerminalRail: PaymentRail = {
       amount: req.amount.amount + tip,
       currency: req.amount.currency,
     };
-    const fee = feeForTender(req.amount.amount, tip);
+    const fee = feeForTender(req.amount.amount);
     return {
       rail: KEY,
       total,
@@ -81,10 +87,29 @@ export const stripeTerminalRail: PaymentRail = {
       amount: req.amount.amount + tip,
       currency: req.amount.currency,
     };
-    const fee = feeForTender(req.amount.amount, tip);
+    const tipMode = req.metadata?.tip_mode;
+    const readerId = req.metadata?.reader_id;
+    const fee = feeForTender(req.amount.amount);
 
     if (cardRailsSimulated()) {
-      // Simulated approval — reader present, instant capture.
+      if (readerId) {
+        // Reader flow: waits for the simulated reader (approve / decline).
+        return {
+          rail: KEY,
+          chargeId: simId("pi_terminal"),
+          status: "requires_action",
+          amount,
+          raw: simRaw(KEY, {
+            applicationFeeCents: fee,
+            tipCents: tip,
+            reader_id: readerId,
+            tip_mode: tipMode ?? null,
+            stripeStatus: "requires_payment_method",
+            process_attempts: 0,
+          }),
+        };
+      }
+      // Legacy direct call without a reader: instant simulated approval.
       return {
         rail: KEY,
         chargeId: simId("pi_terminal"),
@@ -96,6 +121,7 @@ export const stripeTerminalRail: PaymentRail = {
 
     // Real Connect charge on the tenant's connected account.
     assertLiveKeyAllowed();
+    const { description, ...piMetadata } = req.metadata ?? {};
     const intent = await stripeRequest<{ id: string; status: string }>(
       "/payment_intents",
       {
@@ -104,8 +130,9 @@ export const stripeTerminalRail: PaymentRail = {
         payment_method_types: ["card_present"],
         capture_method: req.capture === false ? "manual" : "automatic",
         application_fee_amount: fee > 0 ? fee : undefined,
+        description: description || undefined,
         metadata: {
-          ...req.metadata,
+          ...piMetadata,
           tip_cents: String(tip),
           payment_id: req.context.idempotencyKey,
           tenant_id: req.context.tenantId,
@@ -122,7 +149,14 @@ export const stripeTerminalRail: PaymentRail = {
       chargeId: intent.id,
       status: mapIntentStatus(intent.status),
       amount,
-      raw: { applicationFeeCents: fee, tipCents: tip, stripeStatus: intent.status },
+      raw: {
+        applicationFeeCents: fee,
+        tipCents: tip,
+        stripeStatus: intent.status,
+        reader_id: readerId ?? null,
+        tip_mode: tipMode ?? null,
+        process_attempts: 0,
+      },
     };
   },
 

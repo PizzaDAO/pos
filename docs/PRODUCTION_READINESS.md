@@ -219,10 +219,16 @@ reference; verify webhook handlers are idempotent on the charge id.
 - The terminal **always-queues** placed orders in IndexedDB (Dexie) keyed by the
   order UUID, then flushes idempotently — safe across reconnect + interval +
   manual triggers (the flush is re-entrant-guarded).
-- **Offline card** uses Stripe Terminal **store-and-forward** (reader secure
-  element queues the txn, forwards on reconnect). Known trade-offs, surface them
-  in UX: per-txn cap + time window, **card-present only**, **no offline refunds**,
-  and the **merchant carries decline risk**. Crypto + online card need connectivity.
+- **Offline card is not supported.** The in-store reader is driven server-side
+  (`process_payment_intent`); Stripe's offline mode needs the native iOS / Android
+  / React Native Terminal SDK and is not available to a web POS (server-driven or
+  Terminal JS). **Offline means cash-only**; card needs internet (the reader talks
+  to Stripe over its own WiFi/Ethernet/cellular, the tablet talks to our server).
+  Mitigations: a phone hotspot, or an S710 (cellular) reader. In-store card
+  tenders are never queued offline: they are created online and settle by polling
+  plus the Connect webhook; an open tender left behind (tablet died) is reconciled
+  from Stripe by the cron sweep (`reconcileTerminalTenders`). Crypto + online card
+  also need connectivity.
 - Mitigations in place: idempotent upsert end-to-end (no dupes on replay), clear
   pending-sync count in the terminal, and a balance model that won't ask a
   cashier to collect twice while a tender is in flight.
@@ -370,6 +376,7 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 | Delivery | `DOORDASH_DEVELOPER_ID`, `DOORDASH_KEY_ID`, `DOORDASH_SIGNING_SECRET`, `DOORDASH_BASE_URL` | In-house real, DoorDash simulated |
 | Observability | `LOG_LEVEL`, `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT` | info logs, Sentry fully inert, no source-map upload |
 | Training | `TRAINING_MODE` | Mock driver or no `STRIPE_SECRET_KEY` ⇒ training on |
+| In-store card reader | `TERMINAL_SIM_AUTO_APPROVE_MS` (demo: a SIMULATED reader tender approves itself after N ms) | Off: the cashier taps Simulate approve/decline. Mode (`simulated` / `stripe_test` / `stripe_live`) follows the Stripe key and `TRAINING_MODE`, not an env flag |
 | Online checkout lifecycle | `CRON_SECRET`, `ONLINE_CHECKOUT_WINDOW_CARD_MIN` / `_COINBASE_MIN` / `_USDC_MIN` | Sweeper callable only on the mock driver; windows 30 / 60 / 60 min |
 | App | `NEXT_PUBLIC_APP_URL` | Request origin |
 
@@ -396,6 +403,12 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 - [ ] DoorDash Drive keys (optional); confirm in-house dispatch.
 - [ ] Observability: Sentry behind `SENTRY_DSN`; log drain; alerts on `/api/ready`.
 - [ ] Flip `TRAINING_MODE` off for real stores; confirm the training badge clears.
+- [ ] Stripe Terminal: the Connect webhook endpoint must also be subscribed to
+      `terminal.reader.action_succeeded` and `terminal.reader.action_failed` (plus
+      `payment_intent.*`). Per location, set the street address in Admin, then
+      register each reader by its pairing code (S700: Settings > Generate pairing
+      code). The `/api/cron/expire-online-orders` cron also reconciles open
+      card-reader tenders.
 - [ ] Hardware field test (reader, printer, drawer, tablet) — separate from this
       code phase.
 - [ ] Re-run the full Vitest suite + production build with the live env; both green.

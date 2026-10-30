@@ -53,6 +53,11 @@ function encodeForm(
 }
 
 export class StripeError extends Error {
+  /** Stripe `error.code` (e.g. `terminal_reader_offline`), when present. */
+  readonly code: string | null;
+  /** Stripe `error.decline_code`, for card errors. */
+  readonly declineCode: string | null;
+
   constructor(
     message: string,
     readonly status: number,
@@ -60,6 +65,11 @@ export class StripeError extends Error {
   ) {
     super(message);
     this.name = "StripeError";
+    const err = ((raw ?? {}) as { error?: { code?: unknown; decline_code?: unknown } })
+      .error;
+    this.code = typeof err?.code === "string" ? err.code : null;
+    this.declineCode =
+      typeof err?.decline_code === "string" ? err.decline_code : null;
   }
 }
 
@@ -87,6 +97,32 @@ export async function stripeRequest<T = Record<string, unknown>>(
     body: encodeForm(body).join("&"),
   });
 
+  const json = (await res.json()) as Record<string, unknown>;
+  if (!res.ok) {
+    const err = (json.error ?? {}) as { message?: string };
+    throw new StripeError(
+      err.message ?? `Stripe request failed (HTTP ${res.status})`,
+      res.status,
+      json,
+    );
+  }
+  return json as T;
+}
+
+/** DELETE a Stripe resource (e.g. a Terminal reader). Throws on non-2xx. */
+export async function stripeDelete<T = Record<string, unknown>>(
+  path: string,
+  opts: StripeRequestOptions = {},
+): Promise<T> {
+  const config = getStripeConfig();
+  if (!config) {
+    throw new StripeError("Stripe is not configured.", 500, null);
+  }
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${config.secretKey}`,
+  };
+  if (opts.stripeAccount) headers["Stripe-Account"] = opts.stripeAccount;
+  const res = await fetch(`${STRIPE_API}${path}`, { method: "DELETE", headers });
   const json = (await res.json()) as Record<string, unknown>;
   if (!res.ok) {
     const err = (json.error ?? {}) as { message?: string };

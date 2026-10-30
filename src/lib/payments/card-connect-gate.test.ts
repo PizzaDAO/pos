@@ -8,7 +8,7 @@ import {
 import type { ConnectAccount } from "@/lib/db/payment-types";
 import { resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 
-// Capture Stripe calls from the card rails + terminal connection-token route.
+// Capture Stripe calls from the card rails.
 const stripeRequest = vi.fn();
 const stripeGet = vi.fn();
 vi.mock("@/lib/payments/providers/stripe-client", async (orig) => ({
@@ -24,9 +24,7 @@ vi.mock("@/lib/auth/api", () => ({
 }));
 
 import { POST as paymentsPOST } from "@/app/api/payments/route";
-import { POST as tokenPOST } from "@/app/api/payments/stripe/connection-token/route";
 import { POST as webhookPOST } from "@/app/api/payments/stripe/webhook/route";
-import { NextResponse } from "next/server";
 import { takePayment } from "@/lib/payments/service";
 import { CARD_NOT_READY_MESSAGE, isCardReady } from "@/lib/payments/connect";
 
@@ -113,13 +111,6 @@ function payReq(orderId: string, rail: string, n: string) {
   });
 }
 
-function tokenReq(tenantId?: string) {
-  return new Request("http://localhost/api/payments/stripe/connection-token", {
-    method: "POST",
-    body: JSON.stringify({ tenantId }),
-  });
-}
-
 beforeEach(async () => {
   resetMockOrders();
   resetMockPayments();
@@ -144,7 +135,9 @@ afterEach(() => {
 });
 
 describe("real mode: card rails refuse tenants without a usable account", () => {
-  for (const rail of ["stripe_online", "stripe_terminal"]) {
+  // (Card-present is gated in the reader flow: see terminal/flow.test.ts. The
+  // generic route refuses it outright in real mode, tested below.)
+  for (const rail of ["stripe_online"]) {
     it(`${rail}: 409 when charges_enabled is false`, async () => {
       await getPosDriver().upsertConnectAccount(
         acct({ charges_enabled: false, status: "pending" }),
@@ -203,32 +196,20 @@ describe("real mode: card rails refuse tenants without a usable account", () => 
     expect((await paymentsPOST(req)).status).toBe(409);
     expect(stripeRequest).not.toHaveBeenCalled();
   });
+});
 
-  it("connection-token: refuses without a usable account (409) and without a tenantId (400)", async () => {
-    await getPosDriver().upsertConnectAccount(acct({ charges_enabled: false }));
+describe("real mode: stripe_terminal goes through the reader flow", () => {
+  it("POST /api/payments refuses an in-store stripe_terminal tender (400, no Stripe call)", async () => {
+    await getPosDriver().upsertConnectAccount(acct({ account_id: "acct_real_9" }));
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
-    const a = await tokenPOST(tokenReq(TENANT));
-    expect(a.status).toBe(409);
-    const b = await tokenPOST(tokenReq(undefined));
-    expect(b.status).toBe(400);
+    const res = await paymentsPOST(payReq(await seedOrder(), "stripe_terminal", "t"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).code).toBe("use_terminal_reader");
     expect(stripeRequest).not.toHaveBeenCalled();
   });
 });
 
 describe("real mode: connected account proceeds", () => {
-  it("connection-token mints with stripeAccount set", async () => {
-    await getPosDriver().upsertConnectAccount(acct({ account_id: "acct_real_9" }));
-    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
-    stripeRequest.mockResolvedValue({ secret: "tok_1" });
-    const res = await tokenPOST(tokenReq(TENANT));
-    expect(res.status).toBe(200);
-    expect(stripeRequest).toHaveBeenCalledWith(
-      "/terminal/connection_tokens",
-      {},
-      { stripeAccount: "acct_real_9" },
-    );
-  });
-
   it("stripe_online charge is created on the connected account", async () => {
     await getPosDriver().upsertConnectAccount(acct({ account_id: "acct_real_9" }));
     vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
@@ -362,34 +343,6 @@ describe("stale charges_enabled is refreshed from Stripe once", () => {
     const res = await paymentsPOST(payReq(await seedOrder(), "stripe_online", "s"));
     expect(res.status).toBe(409);
     expect(stripeGet).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("connection-token requires staff on the tenant", () => {
-  it("returns 401/403 from the auth helper without minting", async () => {
-    await getPosDriver().upsertConnectAccount(acct({ account_id: "acct_real_9" }));
-    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_x");
-    requireTenantRole.mockResolvedValue({
-      ok: false,
-      res: NextResponse.json({ error: "Not authorized for this tenant." }, { status: 403 }),
-    });
-    const res = await tokenPOST(tokenReq(TENANT));
-    expect(res.status).toBe(403);
-    expect(stripeRequest).not.toHaveBeenCalled();
-  });
-
-  it("checks owner|manager|cashier for the body tenant", async () => {
-    await tokenPOST(tokenReq(TENANT));
-    expect(requireTenantRole).toHaveBeenCalledWith(TENANT, [
-      "owner",
-      "manager",
-      "cashier",
-    ]);
-  });
-
-  it("is 400 without a tenantId (before auth)", async () => {
-    expect((await tokenPOST(tokenReq(undefined))).status).toBe(400);
-    expect(requireTenantRole).not.toHaveBeenCalled();
   });
 });
 

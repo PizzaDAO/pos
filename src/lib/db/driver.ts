@@ -20,6 +20,8 @@ import type {
   Payment,
   PaymentSettings,
   RefundReservation,
+  TerminalLocation,
+  TerminalReader,
 } from "./payment-types";
 import type {
   Customer,
@@ -391,6 +393,37 @@ export interface PosDriver {
 
   /** Upsert (persist) a tenant's Connect account status. */
   upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount>;
+
+  // --------------------------------------------------------------------------
+  // Stripe Terminal (server-driven card readers). Written by the server only.
+  // --------------------------------------------------------------------------
+
+  /** The Terminal Location + tip mode for a POS location, or null. */
+  getTerminalLocation(locationId: string): Promise<TerminalLocation | null>;
+
+  /** Upsert a location's Terminal Location row (keeps `created_at`). */
+  upsertTerminalLocation(row: TerminalLocation): Promise<TerminalLocation>;
+
+  /** Registered readers at a location (any account/mode; callers filter). */
+  listTerminalReaders(
+    tenantId: string,
+    locationId: string,
+  ): Promise<TerminalReader[]>;
+
+  /** One registered reader by Stripe id (`tmr_`), or null. */
+  getTerminalReader(id: string): Promise<TerminalReader | null>;
+
+  /** Upsert a registered reader (keeps `created_at`). */
+  upsertTerminalReader(row: TerminalReader): Promise<TerminalReader>;
+
+  /** Remove a registered reader row. */
+  deleteTerminalReader(id: string): Promise<void>;
+
+  /**
+   * Card-present tenders still open (`requires_action`/`pending`) and last
+   * touched before `olderThan` (ISO), oldest first, for the reconcile sweep.
+   */
+  listStaleTerminalTenders(olderThan: string, limit: number): Promise<Payment[]>;
 
   // --------------------------------------------------------------------------
   // Customers (Phase 4 — guest checkout + magic-link account stub)
