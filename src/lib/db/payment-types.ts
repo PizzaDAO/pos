@@ -114,3 +114,35 @@ export interface PaymentSettings {
   /** Tip preset percentages, in basis points (e.g. 1800 = 18%). */
   tip_presets_bps: number[];
 }
+
+/**
+ * A second LIVE card (`stripe_online`) or Coinbase tender was written for an
+ * order that already has one (the `payments_one_live_card_or_cb` partial unique
+ * index; the mock driver enforces the same rule). Maps to HTTP 409.
+ */
+export class LiveTenderConflictError extends Error {
+  constructor() {
+    super("This order already has a payment in progress.");
+    this.name = "LiveTenderConflictError";
+  }
+}
+
+/** Rails limited to one live tender per order (mirrors the unique index). */
+export const ONE_LIVE_TENDER_RAILS: readonly string[] = [
+  "stripe_online",
+  "crypto_coinbase",
+];
+
+/**
+ * Tender statuses that HOLD the one-open-tender slot (the DB index
+ * `payments_one_live_card_or_cb` covers only these). Settled tenders do not, so
+ * a settlement can always be recorded.
+ */
+export function tenderHoldsOpenSlot(status: PaymentStatus): boolean {
+  return status === "requires_action" || status === "pending";
+}
+
+/** Tender statuses that free the one-live-tender slot. */
+export function tenderFreesSlot(status: PaymentStatus): boolean {
+  return status === "canceled" || status === "failed";
+}

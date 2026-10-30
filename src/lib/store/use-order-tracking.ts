@@ -25,6 +25,13 @@ export interface TrackedOrder {
   currency: string;
   totals: OrderTotals;
   fulfillment: OrderFulfillment | null;
+  /** Payment settled after the checkout expired (null when none). */
+  late_payment:
+    | "unresolved"
+    | "accepted"
+    | "refunded"
+    | "refund_owed_manual"
+    | null;
   created_at: string;
   updated_at: string;
 }

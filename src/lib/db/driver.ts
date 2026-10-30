@@ -9,7 +9,9 @@
 import type {
   CreateOrderInput,
   Menu,
+  LatePaymentMarker,
   Order,
+  OrderFulfillment,
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
@@ -227,6 +229,108 @@ export interface PosDriver {
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
+
+  /**
+   * [SHARED: online checkout + terminal card reader] Compare-and-set status
+   * transition: `UPDATE ... WHERE id = ? AND status IN (from) RETURNING`. Returns
+   * the updated order, or null when the order is missing or no longer in one of
+   * the `from` statuses (someone else won the race). Only the winner of a
+   * transition may run its side effects. An optional `patch.fulfillment`
+   * replaces the order's fulfillment in the SAME atomic update.
+   */
+  transitionOrderStatus(
+    id: string,
+    from: OrderStatus[],
+    to: OrderStatus,
+    patch?: { fulfillment?: OrderFulfillment },
+  ): Promise<Order | null>;
+
+  /**
+   * Deplete linked inventory for an order. `createOrder` calls this itself for
+   * orders created live; an `awaiting_payment` online order skips it and the
+   * finalize step (`finalizeOnlinePayment`) calls it once payment settles.
+   * IDEMPOTENT: an order that already has `depletion` movements is not depleted
+   * again, so the crash-recovery sweep can safely re-run the post-payment steps.
+   */
+  depleteInventoryForOrder(orderId: string): Promise<void>;
+
+  /**
+   * `awaiting_payment` orders created before `createdBefore` (ISO), oldest first
+   * (all tenants), ordered by (created_at, id). Input to the abandonment sweeper.
+   * Keyset-paged: `after` is the (created_at, id) of the last order already seen,
+   * `limit` the page size. `checkoutMode` keeps
+   * only orders created by that deployment kind (plus legacy orders with no
+   * marker), so a prod sweeper never scans staging/test-mode orders that share
+   * the database.
+   */
+  listAwaitingPaymentOrders(
+    createdBefore: string,
+    opts?: {
+      limit?: number;
+      after?: { created_at: string; id: string };
+      checkoutMode?: "live" | "test" | "sim";
+      /**
+       * Instead: orders stamped with a mode OTHER than this one that have not been
+       * alerted on yet (`foreign_alerted_at` unset). For the long-grace pass that
+       * keeps a mode flip from stranding orders.
+       */
+      foreignOf?: "live" | "test" | "sim";
+    },
+  ): Promise<Order[]>;
+
+  /**
+   * Online orders promoted to paid (`fulfillment.paid_at` set) before `paidBefore`
+   * whose post-payment steps never completed (`fulfillment.finalized_at` unset),
+   * oldest first. Input to the crash-recovery sweep.
+   */
+  listUnfinalizedPaidOrders(
+    paidBefore: string,
+    limit?: number,
+    /** Orders whose `recovery_next_at` is later than this are backing off and skipped. */
+    nowIso?: string,
+  ): Promise<Order[]>;
+
+  /**
+   * Atomically claim an unresolved (or refund-owed) late-payment marker for one
+   * actor: sets `late_payment.claim` only if no live claim exists (a claim older
+   * than `staleBeforeIso` is treated as abandoned). Returns the order, or null if
+   * someone else holds it / there is nothing to claim.
+   */
+  claimLatePayment(
+    orderId: string,
+    claim: "accepting" | "refunding" | "marking_refunded",
+    staleBeforeIso: string,
+  ): Promise<Order | null>;
+
+  /**
+   * Atomic nested merge into `fulfillment.late_payment` (null removes a key).
+   * Returns null when the order has no marker.
+   */
+  updateLatePayment(
+    orderId: string,
+    patch: Partial<Record<keyof LatePaymentMarker, unknown>>,
+  ): Promise<Order | null>;
+
+  /**
+   * Orders at a location whose late-payment marker is still open (unresolved or
+   * refund owed), newest first, capped by `limit`. A dedicated query, not a scan
+   * of every order.
+   */
+  listOpenLatePayments(
+    tenantId: string,
+    locationId: string,
+    limit?: number,
+  ): Promise<Order[]>;
+
+  /**
+   * Shallow-merge keys into an order's `fulfillment` WITHOUT touching its status
+   * (lifecycle markers: finalized_at, late_payment). Returns null if the order
+   * does not exist or has no fulfillment (not an online order).
+   */
+  mergeOrderFulfillment(
+    id: string,
+    patch: Partial<OrderFulfillment>,
+  ): Promise<Order | null>;
 
   // --------------------------------------------------------------------------
   // Payments (Phase 2)

@@ -7,13 +7,20 @@
  * existing online rails (stripe_online card / crypto, simulated when unkeyed) +
  * optional tip; (4) confirmation with a tracking link. The server re-validates
  * everything in /api/shop/orders.
+ *
+ * LIFECYCLE: the order is created `awaiting_payment` and only becomes a real
+ * (kitchen) order once the server reports it `paid`. "Order confirmed" is shown
+ * ONLY then; a tender that is still pending (crypto confirming) parks the flow in
+ * a "waiting" step that polls the server. One order id is kept per checkout
+ * (sessionStorage), so a retry or reload reuses the same order.
  */
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, Loader2, X } from "lucide-react";
 import type { DeliveryAddress, Order } from "@/lib/db";
+import { hasProgressedPastPayment } from "@/lib/shop/order-status";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -24,13 +31,17 @@ import {
   type DeliveryQuoteResult,
 } from "@/lib/store/use-shop-checkout";
 import {
+  forgetCheckoutOrderId,
+  getCheckoutOrderId,
+} from "@/lib/store/checkout-order-id";
+import {
   asapAvailability,
   generateSlots,
 } from "@/lib/shop/scheduling";
 import type { ShopResponse } from "@/lib/store/use-shop";
 
 type Fulfillment = "pickup" | "delivery";
-type Step = "fulfillment" | "identity" | "payment" | "done";
+type Step = "fulfillment" | "identity" | "payment" | "waiting" | "done";
 
 const ONLINE_RAILS: { key: PaymentRailKey; label: string }[] = [
   { key: "stripe_online", label: "Card" },
@@ -143,20 +154,67 @@ export function CheckoutFlow({
     (when === "asap" ? asap.available : Boolean(when)) &&
     (fulfillment === "pickup" || (Boolean(quote) && Boolean(address.line1)));
 
+  /** Leave the checkout as paid: the only path to the confirmation screen. */
+  function finishPaid(order: Order) {
+    forgetCheckoutOrderId(slug);
+    setPlacedOrderId(order.id);
+    setPlacedOrderNumber(order.order_number);
+    setPriceChange(null);
+    clearCart();
+    setStep("done");
+  }
+
   async function handlePlaceAndPay() {
-    const orderId = checkout.newUuid();
-    const placed = await checkout.placeOrder({
-      orderId,
-      locationSlug: slug,
+    // One order id per checkout: a retry / reload reuses it. A material change
+    // (cart, time, address, tip...) mints a new one and cancels the old unpaid
+    // order best-effort.
+    const input = {
+      slug,
       items,
       fulfillmentType: fulfillment,
       scheduledFor: when,
-      customer: { email, name: name || undefined, phone: phone || undefined },
       address: fulfillment === "delivery" ? address : undefined,
+      email,
+      name,
+      phone,
       notes: undefined,
+      deliveryNotes: undefined,
       tipCents,
-    });
+    };
+    let placed: Awaited<ReturnType<typeof checkout.placeOrder>> = null;
+    for (let attempt = 0; attempt < 2 && !placed; attempt += 1) {
+      const { id: orderId, superseded } = getCheckoutOrderId(
+        input,
+        checkout.newUuid,
+      );
+      if (superseded) checkout.cancelQuietly(superseded);
+      placed = await checkout.placeOrder({
+        orderId,
+        locationSlug: slug,
+        items,
+        fulfillmentType: fulfillment,
+        scheduledFor: when,
+        customer: { email, name: name || undefined, phone: phone || undefined },
+        address: fulfillment === "delivery" ? address : undefined,
+        notes: undefined,
+        tipCents,
+      });
+      // The stored order was abandoned (expired / cancelled): start a new one.
+      if (!placed && checkout.lastCode.current === "checkout_abandoned") {
+        forgetCheckoutOrderId(slug);
+        continue;
+      }
+      break;
+    }
     if (!placed) return;
+    // A retry after a lost response (or a reload): the order may already have
+    // progressed past payment (paid, in the kitchen, ready...). It exists and is
+    // not waiting for money, so confirm it instead of paying again. (An
+    // abandoned order never gets here: the server answers 409 and we start over.)
+    if (hasProgressedPastPayment(placed.order.status)) {
+      finishPaid(placed.order);
+      return;
+    }
     // The server reprices from the menu. If its total differs from what the
     // customer saw, STOP and let them confirm the new total before any charge.
     if (placed.order.totals.total_cents !== grandTotal) {
@@ -167,12 +225,13 @@ export function CheckoutFlow({
   }
 
   /**
-   * The customer declined the changed total: void the placed order (so it does
-   * not sit on the KDS / get dispatched), then adopt the server's repriced lines
+   * The customer declined the changed total: cancel the unpaid order (it was never
+   * on the KDS; the server abandons it), then adopt the server's repriced lines
    * and delivery fee so the next attempt matches and the prompt can't loop.
    */
   async function declinePriceChange(order: Order) {
     if (!(await checkout.cancelOrder(order.id))) return;
+    forgetCheckoutOrderId(slug);
     replaceCartItems(order.items);
     if (order.fulfillment?.type === "delivery") {
       const fee = order.fulfillment.delivery_fee_cents ?? 0;
@@ -186,18 +245,70 @@ export function CheckoutFlow({
     // separately, so base = total - tip (charging total + tip would double-count
     // it). The server re-derives both from the order anyway.
     const orderTip = order.totals.tip_cents;
-    const pay = await checkout.pay({
+    const result = await checkout.pay({
       order,
       rail,
       amountCents: order.totals.total_cents - orderTip,
       tipCents: orderTip,
     });
-    if (!pay) return;
+    if (!result) {
+      if (checkout.lastCode.current === "payment_pending") {
+        // A payment already exists and is still being confirmed: keep waiting on it.
+        setPlacedOrderId(order.id);
+        setPlacedOrderNumber(order.order_number);
+        setPriceChange(null);
+        checkout.setError(null);
+        setStep("waiting");
+        return;
+      }
+      if (checkout.lastCode.current === "checkout_abandoned") {
+        forgetCheckoutOrderId(slug);
+        setPriceChange(null);
+        checkout.setError("Your checkout expired. Please try again.");
+      }
+      return;
+    }
     setPlacedOrderId(order.id);
     setPlacedOrderNumber(order.order_number);
     setPriceChange(null);
-    clearCart();
-    setStep("done");
+    // "Confirmed" only when the server says paid; otherwise (a crypto payment
+    // still confirming) wait for it.
+    if (result.orderStatus === "paid") finishPaid(order);
+    else setStep("waiting");
+  }
+
+  // WAITING step: ask the server to re-check the open tender until it settles.
+  useEffect(() => {
+    if (step !== "waiting" || !placedOrderId) return;
+    let cancelled = false;
+    const tick = async () => {
+      const res = await checkout.sync(placedOrderId);
+      if (cancelled || !res) return;
+      if (res.orderStatus === "paid") {
+        forgetCheckoutOrderId(slug);
+        clearCart();
+        setStep("done");
+      } else if (res.orderStatus === "abandoned") {
+        forgetCheckoutOrderId(slug);
+        checkout.setError("Your checkout expired. Please try again.");
+        setStep("payment");
+      }
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, placedOrderId, slug]);
+
+  async function handleCancelWaiting() {
+    if (!placedOrderId) return;
+    if (!(await checkout.cancelOrder(placedOrderId))) return;
+    forgetCheckoutOrderId(slug);
+    setPlacedOrderId(null);
+    setStep("payment");
   }
 
   async function handleMagicLink() {
@@ -586,6 +697,31 @@ export function CheckoutFlow({
                 Payments are simulated in this preview (no live keys).
               </p>
             </>
+          )}
+
+          {/* STEP 3b — Waiting for the payment to settle (e.g. crypto confirming) */}
+          {step === "waiting" && placedOrderId && (
+            <div
+              className="space-y-4 py-6 text-center"
+              data-testid="waiting-for-payment"
+            >
+              <Loader2 className="mx-auto h-12 w-12 animate-spin text-primary" />
+              <div>
+                <h3 className="text-xl font-bold">Waiting for payment</h3>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Order {placedOrderNumber} is held until your payment is
+                  confirmed. It is not sent to the kitchen before that.
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                className="w-full"
+                disabled={checkout.loading}
+                onClick={() => void handleCancelWaiting()}
+              >
+                Cancel and choose another way to pay
+              </Button>
+            </div>
           )}
 
           {/* STEP 4 — Confirmation */}

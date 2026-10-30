@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import {
+  AlertTriangle,
   BarChart3,
   Boxes,
   ClipboardList,
@@ -70,6 +71,10 @@ const LocationsManager = dynamic(
   () => import("./locations-manager").then((m) => m.LocationsManager),
   { loading: PanelFallback },
 );
+const LatePayments = dynamic(
+  () => import("./late-payments").then((m) => m.LatePayments),
+  { loading: PanelFallback },
+);
 const PlanBilling = dynamic(
   () => import("./plan-billing").then((m) => m.PlanBilling),
   { loading: PanelFallback },
@@ -92,6 +97,7 @@ type Tab =
   | "locations"
   | "plan"
   | "payments"
+  | "late"
   | "delivery";
 
 function readTenantParam(fallbackTenantId: string): {
@@ -170,6 +176,7 @@ export function AdminShell({
       { id: "locations", label: "Locations", icon: MapPin },
       { id: "plan", label: "Plan", icon: Wallet },
       { id: "payments", label: "Payments", icon: CreditCard },
+      { id: "late", label: "Late payments", icon: AlertTriangle },
       { id: "delivery", label: "Delivery", icon: Truck },
     ];
     return base;
@@ -278,6 +285,9 @@ export function AdminShell({
               locations.find((l) => l.id === locationId)?.name ?? locationId
             }
           />
+        )}
+        {tab === "late" && locationId && (
+          <LatePayments tenantId={tenantId} locationId={locationId} />
         )}
         {tab === "locations" && (
           <LocationsManager

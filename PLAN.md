@@ -111,7 +111,7 @@
 
 **Config:** `tax_rates` (per location), `store_settings` (hours, prep time, delivery zones/fees)
 
-Order status: `draft → placed → in_kitchen → ready → (out_for_delivery) → completed` (+ `voided`, `refunded`).
+Order status: `draft → placed → in_kitchen → ready → (out_for_delivery) → completed` (+ `voided`, `refunded`). Online orders start `awaiting_payment` and become `paid` (then `in_kitchen` ...) only once payment settles, or `abandoned` if the checkout expires or is cancelled; they never reach the KDS, inventory or delivery dispatch before that.
 
 ---
 

@@ -46,6 +46,8 @@ import type {
   StoreSettings,
 } from "./menu-types";
 import type { ConnectAccount, Payment, PaymentSettings } from "./payment-types";
+import { LiveTenderConflictError } from "./payment-types";
+import { isUnpaidOnlineStatus } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
   BusinessDayClose,
@@ -773,8 +775,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       }
     }
 
+    // Per-item idempotent: skip inventory rows this order already depleted.
+    const already = new Set(
+      (
+        unwrap(
+          await sb
+            .from("inventory_movements")
+            .select("inventory_item_id")
+            .eq("order_id", order.id)
+            .eq("reason", "depletion"),
+        ) as Row[]
+      ).map((r) => r.inventory_item_id as string),
+    );
     for (const [invId, qty] of consumption) {
       if (qty <= 0) continue;
+      if (already.has(invId)) continue;
       await applyMovementInternal({
         inventoryItemId: invId,
         reason: "depletion",
@@ -1229,7 +1244,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .from("orders")
             .select("totals,status")
             .eq("tenant_id", t.id)
-            .neq("status", "voided")
+            .not("status", "in", "(voided,awaiting_payment,abandoned)")
             .gte("created_at", since),
         ) as Row[];
         const connect = await this.getConnectAccount(t.id);
@@ -1379,7 +1394,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         throw err;
       }
       const order = await readOrderRow(orderRow);
-      if (order.status !== "voided") await depleteForOrder(order);
+      // An online order awaiting payment (or abandoned) consumes nothing: it is
+      // depleted by `depleteInventoryForOrder` once payment finalizes.
+      if (order.status !== "voided" && !isUnpaidOnlineStatus(order.status)) {
+        await depleteForOrder(order);
+      }
       return order;
     },
 
@@ -1412,6 +1431,134 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .maybeSingle(),
       ) as Row | null;
       return r ? readOrderRow(r) : null;
+    },
+
+    async transitionOrderStatus(id, from, to, patch) {
+      // Compare-and-set: the WHERE clause is the lock. Zero rows back means
+      // another caller already moved the order out of `from`.
+      const r = unwrap(
+        await sb
+          .from("orders")
+          .update({
+            status: to,
+            ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+            updated_at: nowIso(),
+          })
+          .eq("id", id)
+          .in("status", from)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? readOrderRow(r) : null;
+    },
+
+    async depleteInventoryForOrder(orderId) {
+      const r = unwrap(
+        await sb.from("orders").select("*").eq("id", orderId).maybeSingle(),
+      ) as Row | null;
+      if (!r) return;
+      await depleteForOrder(await readOrderRow(r)); // per-item idempotent
+    },
+
+    async listAwaitingPaymentOrders(createdBefore, opts) {
+
+      let q = sb
+        .from("orders")
+        .select("*")
+        .eq("status", "awaiting_payment")
+        .lt("created_at", createdBefore);
+      if (opts?.after) {
+        q = q.or(
+          `created_at.gt.${opts.after.created_at},and(created_at.eq.${opts.after.created_at},id.gt.${opts.after.id})`,
+        );
+      }
+      if (opts?.checkoutMode) {
+        // Filter in SQL: other deployments' orders are never even scanned.
+        q = q.or(
+          `fulfillment->>checkout_mode.eq.${opts.checkoutMode},fulfillment->>checkout_mode.is.null`,
+        );
+      }
+      if (opts?.foreignOf) {
+        q = q
+          .not("fulfillment->>checkout_mode", "is", null)
+          .neq("fulfillment->>checkout_mode", opts.foreignOf)
+          .is("fulfillment->>foreign_alerted_at", null);
+      }
+      const rows = unwrap(
+        await q
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(opts?.limit ?? 1000),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
+    },
+
+    async listUnfinalizedPaidOrders(paidBefore, limit = 100, asOf = nowIso()) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .in("status", ["paid", "in_kitchen", "ready", "recall", "out_for_delivery"])
+          .not("fulfillment->>paid_at", "is", null)
+          .lt("fulfillment->>paid_at", paidBefore)
+          .is("fulfillment->>finalized_at", null)
+          .or(`fulfillment->>recovery_next_at.is.null,fulfillment->>recovery_next_at.lte.${asOf}`)
+          .order("fulfillment->>paid_at", { ascending: true })
+          .limit(limit),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
+    },
+
+    // Atomic (one UPDATE inside the RPC): no read-modify-write window.
+    async mergeOrderFulfillment(id, patch) {
+      const rows = unwrap(
+        await sb.rpc("merge_order_fulfillment", {
+          p_order_id: id,
+          p_patch: patch,
+        }),
+      ) as Row[] | null;
+      const r = rows?.[0];
+      return r ? readOrderRow(r) : null;
+    },
+
+    async claimLatePayment(orderId, claim, staleBeforeIso) {
+      const rows = unwrap(
+        await sb.rpc("claim_late_payment", {
+          p_order_id: orderId,
+          p_claim: claim,
+          p_stale_before: staleBeforeIso,
+        }),
+      ) as Row[] | null;
+      const r = rows?.[0];
+      return r ? readOrderRow(r) : null;
+    },
+
+    async updateLatePayment(orderId, patch) {
+      const rows = unwrap(
+        await sb.rpc("update_late_payment", {
+          p_order_id: orderId,
+          p_patch: patch,
+        }),
+      ) as Row[] | null;
+      const r = rows?.[0];
+      return r ? readOrderRow(r) : null;
+    },
+
+    async listOpenLatePayments(tenantId, locationId, limit = 100) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .not("fulfillment->late_payment", "is", null)
+          .or(
+            "fulfillment->late_payment->>resolved.is.null,fulfillment->late_payment->>resolved.eq.refund_owed_manual",
+          )
+          .order("updated_at", { ascending: false })
+          .limit(limit),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
     // -- Payments ----------------------------------------------------------
@@ -1454,21 +1601,22 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       } = payment;
       void _rc;
       void _ri;
-      const row = mapPayment(
-        unwrap(
-          await sb
-            .from("payments")
-            .upsert({
-              ...(existing ? writable : payment),
-              created_at:
-                (existing?.created_at as string) ?? payment.created_at ?? now,
-              updated_at: now,
-            })
-            .select()
-            .single(),
-        ) as Row,
-      );
-      return row;
+      const res = await sb
+        .from("payments")
+        .upsert({
+          ...(existing ? writable : payment),
+          created_at:
+            (existing?.created_at as string) ?? payment.created_at ?? now,
+          updated_at: now,
+        })
+        .select()
+        .single();
+      // A second live card/Coinbase tender for one order trips the partial
+      // unique index payments_one_live_card_or_cb.
+      if (res.error?.message.includes("payments_one_live_card_or_cb")) {
+        throw new LiveTenderConflictError();
+      }
+      return mapPayment(unwrap(res) as Row);
     },
 
     async reservePaymentRefund(paymentId, amountCents, refundId) {

@@ -67,6 +67,27 @@ export async function getCoinbaseCharge(id: string): Promise<CoinbaseCharge> {
 }
 
 /**
+ * Cancel an unpaid Coinbase Commerce charge (only possible while it is still
+ * NEW; Coinbase refuses once a payment was detected). Throws on any refusal.
+ */
+export async function cancelCoinbaseCharge(id: string): Promise<void> {
+  const config = getCoinbaseConfig();
+  if (!config) throw new Error("Coinbase Commerce is not configured.");
+  const res = await fetch(`${COINBASE_API}/charges/${id}/cancel`, {
+    method: "POST",
+    headers: { "X-CC-Api-Key": config.apiKey, "X-CC-Version": "2018-03-22" },
+  });
+  if (!res.ok) {
+    const json = (await res.json().catch(() => ({}))) as {
+      error?: { message?: string };
+    };
+    throw new Error(
+      json.error?.message ?? `Coinbase cancel failed (HTTP ${res.status})`,
+    );
+  }
+}
+
+/**
  * Verify a Coinbase Commerce webhook signature (HMAC-SHA256 of the raw body
  * with the shared webhook secret). Returns false when no secret is configured.
  */

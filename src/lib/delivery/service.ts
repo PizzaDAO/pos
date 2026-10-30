@@ -186,7 +186,21 @@ export async function dispatchDelivery(
     created_at: nowIso(),
     updated_at: nowIso(),
   };
-  return driver.upsertDelivery(record);
+  try {
+    return await driver.upsertDelivery(record);
+  } catch (err) {
+    // One delivery per order is a DB constraint (deliveries_order_id_uidx): a
+    // concurrent dispatch (e.g. the crash-recovery sweep racing a late finalize)
+    // lost the insert. The winner's record is THE delivery.
+    if (
+      err instanceof Error &&
+      err.message.includes("deliveries_order_id_uidx")
+    ) {
+      const winner = await driver.getDeliveryForOrder(input.orderId);
+      if (winner) return winner;
+    }
+    throw err;
+  }
 }
 
 /**

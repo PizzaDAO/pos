@@ -31,7 +31,9 @@ import type {
   MenuModifierGroup,
   Modifier,
   ModifierGroup,
+  LatePaymentMarker,
   Order,
+  OrderFulfillment,
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
@@ -41,6 +43,12 @@ import type {
   PaymentSettings,
   RefundReservation,
 } from "./payment-types";
+import {
+  LiveTenderConflictError,
+  ONE_LIVE_TENDER_RAILS,
+  tenderHoldsOpenSlot,
+} from "./payment-types";
+import { isUnpaidOnlineStatus } from "./menu-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -440,6 +448,18 @@ function depleteForOrder(order: Order): void {
 
   for (const [invId, qty] of consumption) {
     if (qty <= 0) continue;
+    // Per-item idempotent: an inventory row this order already depleted is
+    // skipped, so re-running after a crash never double-counts any item.
+    if (
+      inventoryMovements.some(
+        (m) =>
+          m.order_id === order.id &&
+          m.inventory_item_id === invId &&
+          m.reason === "depletion",
+      )
+    ) {
+      continue;
+    }
     applyMovementInternal({
       inventoryItemId: invId,
       reason: "depletion",
@@ -773,6 +793,7 @@ export const mockDriver: PosDriver = {
         (o) =>
           o.tenant_id === t.id &&
           o.status !== "voided" &&
+          !isUnpaidOnlineStatus(o.status) &&
           new Date(o.created_at).getTime() >= since,
       );
       const connect = connectAccounts.get(t.id);
@@ -869,7 +890,11 @@ export const mockDriver: PosDriver = {
     orders.set(order.id, order);
     // Phase 5: deplete linked inventory on the single order funnel (terminal +
     // shop both land here), unless the order was created already voided.
-    if (order.status !== "voided") depleteForOrder(order);
+    // An online order awaiting payment (or abandoned) consumes nothing: it is
+    // depleted by `depleteInventoryForOrder` once payment finalizes.
+    if (order.status !== "voided" && !isUnpaidOnlineStatus(order.status)) {
+      depleteForOrder(order);
+    }
     return order;
   },
 
@@ -897,6 +922,171 @@ export const mockDriver: PosDriver = {
     return updated;
   },
 
+  // Single synchronous block (no awaits): an atomic compare-and-set in the mock.
+  async transitionOrderStatus(
+    id: string,
+    from: OrderStatus[],
+    to: OrderStatus,
+    patch?: { fulfillment?: OrderFulfillment },
+  ): Promise<Order | null> {
+    ensureKitchenSeed();
+    const order = orders.get(id);
+    if (!order || !from.includes(order.status)) return null;
+    const updated: Order = {
+      ...order,
+      status: to,
+      ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+      updated_at: nowIso(),
+    };
+    orders.set(id, updated);
+    return updated;
+  },
+
+  async depleteInventoryForOrder(orderId: string): Promise<void> {
+    const order = orders.get(orderId);
+    if (!order) return;
+    depleteForOrder(order); // per-item idempotent (see depleteForOrder)
+  },
+
+  async listAwaitingPaymentOrders(
+    createdBefore: string,
+    opts?: {
+      limit?: number;
+      after?: { created_at: string; id: string };
+      checkoutMode?: "live" | "test" | "sim";
+      foreignOf?: "live" | "test" | "sim";
+    },
+  ): Promise<Order[]> {
+    ensureKitchenSeed();
+    const after = opts?.after;
+    return [...orders.values()]
+      .filter(
+        (o) =>
+          o.status === "awaiting_payment" &&
+          o.created_at < createdBefore &&
+          (after === undefined ||
+            o.created_at > after.created_at ||
+            (o.created_at === after.created_at && o.id > after.id)) &&
+          (opts?.checkoutMode === undefined ||
+            o.fulfillment?.checkout_mode === undefined ||
+            o.fulfillment.checkout_mode === opts.checkoutMode) &&
+          (opts?.foreignOf === undefined ||
+            (o.fulfillment?.checkout_mode !== undefined &&
+              o.fulfillment.checkout_mode !== opts.foreignOf &&
+              o.fulfillment.foreign_alerted_at === undefined)),
+      )
+      .sort(
+        (a, b) =>
+          a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
+      )
+      .slice(0, opts?.limit ?? Number.MAX_SAFE_INTEGER);
+  },
+
+  async listUnfinalizedPaidOrders(
+    paidBefore: string,
+    limit = 100,
+    asOf: string = nowIso(),
+  ): Promise<Order[]> {
+    ensureKitchenSeed();
+    const live = new Set<OrderStatus>([
+      "paid",
+      "in_kitchen",
+      "ready",
+      "recall",
+      "out_for_delivery",
+    ]);
+    return [...orders.values()]
+      .filter(
+        (o) =>
+          live.has(o.status) &&
+          o.fulfillment?.paid_at !== undefined &&
+          o.fulfillment.paid_at < paidBefore &&
+          o.fulfillment.finalized_at === undefined &&
+          (o.fulfillment.recovery_next_at === undefined ||
+            o.fulfillment.recovery_next_at <= asOf),
+      )
+      .sort((a, b) =>
+        (a.fulfillment!.paid_at ?? "").localeCompare(b.fulfillment!.paid_at ?? ""),
+      )
+      .slice(0, limit);
+  },
+
+  // Single synchronous block (no awaits): an atomic claim in the mock.
+  async claimLatePayment(
+    orderId: string,
+    claim: "accepting" | "refunding" | "marking_refunded",
+    staleBeforeIso: string,
+  ): Promise<Order | null> {
+    const order = orders.get(orderId);
+    const m = order?.fulfillment?.late_payment;
+    if (!order || !m) return null;
+    if (m.resolved !== undefined && m.resolved !== "refund_owed_manual") return null;
+    if (m.claim !== undefined && (m.claim_at ?? "") >= staleBeforeIso) return null;
+    const updated: Order = {
+      ...order,
+      fulfillment: {
+        ...order.fulfillment!,
+        late_payment: { ...m, claim, claim_at: nowIso() },
+      },
+      updated_at: nowIso(),
+    };
+    orders.set(orderId, updated);
+    return updated;
+  },
+
+  async updateLatePayment(
+    orderId: string,
+    patch: Partial<Record<keyof LatePaymentMarker, unknown>>,
+  ): Promise<Order | null> {
+    const order = orders.get(orderId);
+    const m = order?.fulfillment?.late_payment;
+    if (!order || !m) return null;
+    const next = { ...m, ...patch } as Record<string, unknown>;
+    for (const k of Object.keys(next)) if (next[k] === null) delete next[k];
+    const updated: Order = {
+      ...order,
+      fulfillment: { ...order.fulfillment!, late_payment: next as unknown as LatePaymentMarker },
+      updated_at: nowIso(),
+    };
+    orders.set(orderId, updated);
+    return updated;
+  },
+
+  async listOpenLatePayments(
+    tenantId: string,
+    locationId: string,
+    limit = 100,
+  ): Promise<Order[]> {
+    return [...orders.values()]
+      .filter((o) => {
+        const m = o.fulfillment?.late_payment;
+        return (
+          o.tenant_id === tenantId &&
+          o.location_id === locationId &&
+          !!m &&
+          (m.resolved === undefined || m.resolved === "refund_owed_manual")
+        );
+      })
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+      .slice(0, limit);
+  },
+
+  async mergeOrderFulfillment(
+    id: string,
+    patch: Partial<OrderFulfillment>,
+  ): Promise<Order | null> {
+    ensureKitchenSeed();
+    const order = orders.get(id);
+    if (!order || !order.fulfillment) return null;
+    const updated: Order = {
+      ...order,
+      fulfillment: { ...order.fulfillment, ...patch },
+      updated_at: nowIso(),
+    };
+    orders.set(id, updated);
+    return updated;
+  },
+
   // -- Payments --------------------------------------------------------------
 
   async getPaymentSettings(tenantId, locationId): Promise<PaymentSettings> {
@@ -916,6 +1106,21 @@ export const mockDriver: PosDriver = {
 
   async upsertPayment(payment: Payment): Promise<Payment> {
     const existing = payments.get(payment.id);
+    // Mirror payments_one_live_card_or_cb: one live card/Coinbase tender per
+    // order (a canceled/failed one frees the slot).
+    if (
+      ONE_LIVE_TENDER_RAILS.includes(payment.rail) &&
+      tenderHoldsOpenSlot(payment.status) &&
+      [...payments.values()].some(
+        (p) =>
+          p.id !== payment.id &&
+          p.order_id === payment.order_id &&
+          p.rail === payment.rail &&
+          tenderHoldsOpenSlot(p.status),
+      )
+    ) {
+      throw new LiveTenderConflictError();
+    }
     if (existing) {
       const merged: Payment = {
         ...existing,
@@ -1102,6 +1307,13 @@ export const mockDriver: PosDriver = {
 
   async upsertDelivery(delivery: DeliveryRecord): Promise<DeliveryRecord> {
     const existing = deliveries.get(delivery.id);
+    // Mirror deliveries_order_id_uidx: one delivery per order.
+    if (
+      !existing &&
+      [...deliveries.values()].some((d) => d.order_id === delivery.order_id)
+    ) {
+      throw new Error("duplicate key value violates unique constraint \"deliveries_order_id_uidx\"");
+    }
     const now = nowIso();
     const merged: DeliveryRecord = {
       ...existing,

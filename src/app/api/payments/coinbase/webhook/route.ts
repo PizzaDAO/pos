@@ -17,6 +17,8 @@ import {
 } from "@/lib/payments/providers/coinbase-client";
 import { isCoinbaseConfigured } from "@/lib/payments/env";
 import { applyRailStatus } from "@/lib/payments/service";
+import { LiveTenderConflictError } from "@/lib/db/payment-types";
+import { captureError } from "@/lib/observability";
 
 export const runtime = "nodejs";
 
@@ -51,7 +53,15 @@ export async function POST(request: Request) {
   const matched = await driver.getPaymentByChargeId(chargeId);
   if (matched) {
     // Persist (never downgrading a captured tender) and re-evaluate the order.
-    await applyRailStatus(matched.id, mapped);
+    try {
+      await applyRailStatus(matched.id, mapped);
+    } catch (err) {
+      // `applyRailStatus` resolves the one-live-tender conflict itself; never
+      // let it 500 (Coinbase would retry forever).
+      if (!(err instanceof LiveTenderConflictError)) throw err;
+      captureError(err, { scope: "coinbase-webhook", paymentId: matched.id });
+      return NextResponse.json({ received: true, flagged: "live_tender_conflict" });
+    }
   }
 
   return NextResponse.json({ received: true });

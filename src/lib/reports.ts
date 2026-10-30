@@ -7,6 +7,7 @@
  * All money is integer cents.
  */
 import type { Order, OrderChannel, Payment } from "@/lib/db";
+import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import type {
   DateRange,
   PaymentMixSlice,
@@ -113,7 +114,9 @@ export interface BuildReportInput {
  * payment mix sums tenders that aren't failed/canceled.
  */
 export function buildSalesReport(input: BuildReportInput): SalesReport {
-  const { orders, payments, range } = input;
+  const { payments, range } = input;
+  // Unpaid online checkouts (awaiting_payment / abandoned) are not sales.
+  const orders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
 
   const byDay = new Map<string, SalesBucket>();
   const byItem = new Map<string, SalesBucket>();

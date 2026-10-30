@@ -33,6 +33,7 @@ import {
 } from "@/lib/payments/providers/stripe-client";
 import { isStripeConfigured } from "@/lib/payments/env";
 import { applyRailStatus } from "@/lib/payments/service";
+import { LiveTenderConflictError } from "@/lib/db/payment-types";
 import { deriveStatus, fetchConnectStatus } from "@/lib/payments/connect";
 import { captureError } from "@/lib/observability";
 
@@ -171,13 +172,21 @@ export async function POST(request: Request) {
     return NextResponse.json({ received: true, ignored: "amount_mismatch" });
   }
 
-  await applyRailStatus(
-    matched.id,
-    mapped,
-    mapped === "requires_action"
-      ? { raw: { last_error: intent.last_payment_error?.message ?? null } }
-      : {},
-  );
+  try {
+    await applyRailStatus(
+      matched.id,
+      mapped,
+      mapped === "requires_action"
+        ? { raw: { last_error: intent.last_payment_error?.message ?? null } }
+        : {},
+    );
+  } catch (err) {
+    // `applyRailStatus` resolves the one-live-card-tender conflict itself; this is
+    // the last line of defence so Stripe never retries a webhook forever on it.
+    if (!(err instanceof LiveTenderConflictError)) throw err;
+    captureError(err, { scope: "stripe-webhook", paymentId: matched.id });
+    return NextResponse.json({ received: true, flagged: "live_tender_conflict" });
+  }
 
   return NextResponse.json({ received: true });
 }

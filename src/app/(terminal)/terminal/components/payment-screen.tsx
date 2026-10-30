@@ -123,6 +123,15 @@ export function PaymentScreen({
         <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-y-auto p-4 md:grid-cols-2">
           {/* Left: take payment / done */}
           <div className="space-y-4">
+            {checkout.notice && (
+              <div
+                role="alert"
+                data-testid="manual-refund-notice"
+                className="rounded-md border border-amber-500/60 bg-amber-500/10 p-2 text-sm"
+              >
+                {checkout.notice}
+              </div>
+            )}
             {checkout.error && (
               <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive">
                 {checkout.error}

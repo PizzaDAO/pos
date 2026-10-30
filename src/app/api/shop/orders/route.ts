@@ -7,13 +7,19 @@
  *     (ASAP) or the scheduling window (scheduled) — server-side, never trusting
  *     the client.
  *  3. For DELIVERY: re-quotes the address through the DeliveryProvider (the zone
- *     GATE — out-of-zone/below-minimum is rejected here too), folds the delivery
- *     fee into the order, then dispatches the delivery and persists a record.
+ *     GATE — out-of-zone/below-minimum is rejected here too) and folds the
+ *     delivery fee into the order. The quote (provider, quote id, ETA) is
+ *     PERSISTED on the order; the delivery is dispatched only after payment.
  *  4. Creates the order with the correct CHANNEL (online_pickup/online_delivery)
- *     and status `placed` so it lands on the Phase 3 KDS board.
+ *     and status `awaiting_payment`: it is invisible to the KDS, inventory is not
+ *     depleted and nothing is dispatched until payment settles
+ *     (`finalizeOnlinePayment`, src/lib/shop/finalize.ts). An unpaid order is
+ *     abandoned by the sweeper (src/lib/shop/lifecycle.ts) or the cancel route.
  *
- * Idempotent on the client order UUID (createOrder upserts by id). No env vars
- * required — payments + delivery providers run simulated with none.
+ * Idempotent on the client order UUID (the client keeps ONE id per checkout, so
+ * retries reuse the same order): an existing `awaiting_payment`/paid order is
+ * returned unchanged; an `abandoned` one is 409 and the client mints a new id.
+ * No env vars required — payments + delivery providers run simulated with none.
  */
 import { NextResponse } from "next/server";
 import {
@@ -31,7 +37,8 @@ import {
   asapAvailability,
   checkScheduledTime,
 } from "@/lib/shop/scheduling";
-import { quoteDelivery, dispatchDelivery } from "@/lib/delivery/service";
+import { quoteDelivery } from "@/lib/delivery/service";
+import { deploymentCheckoutMode } from "@/lib/payments/env";
 import { DeliveryUnavailableError } from "@/lib/delivery";
 import {
   canUseOnlineOrdering,
@@ -91,6 +98,17 @@ export async function POST(request: Request) {
   // Idempotency: if this order id was already placed, return it unchanged.
   const existing = await driver.getOrder(body.id);
   if (existing) {
+    // An abandoned checkout can never be revived: the client must start again
+    // with a fresh order id.
+    if (existing.status === "abandoned") {
+      return NextResponse.json(
+        {
+          error: "This checkout expired. Please start again.",
+          code: "checkout_abandoned",
+        },
+        { status: 409 },
+      );
+    }
     const delivery = await driver.getDeliveryForOrder(existing.id);
     return NextResponse.json({ order: existing, delivery }, { status: 200 });
   }
@@ -216,6 +234,7 @@ export async function POST(request: Request) {
   let quotedProvider: import("@/lib/delivery").DeliveryProviderKey | null = null;
   let zoneId: string | null = null;
   let etaMinutes: number | null = null;
+  let quoteExpiresAt: string | undefined;
   const pickupAddress: DeliveryAddress = {
     line1: fulfillment.pickup_address ?? "Pickup",
     city: "",
@@ -246,6 +265,7 @@ export async function POST(request: Request) {
       deliveryFeeCents = quote.fee.amount;
       zoneId = quote.quoteId ?? null;
       etaMinutes = quote.etaMinutes ?? null;
+      quoteExpiresAt = quote.expiresAt;
     } catch (err) {
       if (err instanceof DeliveryUnavailableError) {
         return NextResponse.json(
@@ -275,10 +295,15 @@ export async function POST(request: Request) {
     type: body.fulfillmentType,
     scheduled_for: body.scheduledFor,
     promised_at: promisedAt,
+    // Which deployment kind owns this order's sweeping (prod vs staging).
+    checkout_mode: deploymentCheckoutMode(),
     ...(body.fulfillmentType === "delivery"
       ? {
           address: body.address,
           zone_id: zoneId ?? undefined,
+          delivery_provider: quotedProvider ?? undefined,
+          eta_minutes: etaMinutes,
+          ...(quoteExpiresAt ? { quote_expires_at: quoteExpiresAt } : {}),
           delivery_fee_cents: deliveryFeeCents,
           delivery_notes: body.deliveryNotes,
         }
@@ -296,31 +321,15 @@ export async function POST(request: Request) {
     discount_cents: 0,
     totals,
     notes: body.notes?.trim() ? body.notes.trim() : null,
-    status: "placed",
+    // Unpaid until a tender settles: off the KDS, no depletion, no dispatch.
+    status: "awaiting_payment",
     customer_id: customer.id,
     fulfillment: orderFulfillment,
   };
 
   const order = await driver.createOrder(payload);
 
-  // ---- Dispatch the delivery (queues in-house for manual assignment) --------
-  let delivery = null;
-  if (body.fulfillmentType === "delivery" && quotedProvider && body.address) {
-    delivery = await dispatchDelivery({
-      orderId: order.id,
-      tenantId,
-      locationId,
-      provider: quotedProvider,
-      pickup: pickupAddress,
-      dropoff: body.address,
-      zoneId,
-      feeCents: deliveryFeeCents,
-      currency: settings.currency,
-      etaMinutes,
-      scheduledFor:
-        body.scheduledFor === "asap" ? undefined : body.scheduledFor,
-    });
-  }
-
+  // Delivery is dispatched by finalizeOnlinePayment once the order is paid.
+  const delivery = null;
   return NextResponse.json({ order, customer, delivery }, { status: 201 });
 }

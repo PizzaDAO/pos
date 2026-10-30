@@ -3,9 +3,14 @@
  * through the order lifecycle (placed/paid → in_kitchen → ready →
  * out_for_delivery → completed) via the realtime polling seam, plus delivery
  * driver/ETA when applicable.
+ *
+ * Online-checkout states: `awaiting_payment` shows "Waiting for payment" (with
+ * Resume + Cancel, and the server re-checks the open tender while it is shown);
+ * `abandoned` shows "Checkout expired". Neither is on the kitchen timeline.
  */
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, Circle, Loader2, Truck } from "lucide-react";
 import type { OrderStatus } from "@/lib/db";
@@ -47,6 +52,42 @@ export function TrackClient({
   orderId: string;
 }) {
   const { data, loading } = useOrderTracking(orderId);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const awaiting = data?.order.status === "awaiting_payment";
+
+  // While the order waits for payment, have the server re-check its open tenders
+  // (a crypto payment confirming); the tracking poll then picks up `paid`.
+  useEffect(() => {
+    if (!awaiting) return;
+    const sync = () =>
+      void fetch(`/api/shop/orders/${orderId}/pay/sync`, {
+        method: "POST",
+      }).catch(() => undefined);
+    sync();
+    const timer = setInterval(sync, 4000);
+    return () => clearInterval(timer);
+  }, [awaiting, orderId]);
+
+  async function cancelCheckout() {
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      const res = await fetch("/api/shop/orders/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        setCancelError(body.error ?? "Could not cancel the order.");
+      }
+    } catch {
+      setCancelError("Could not cancel the order.");
+    } finally {
+      setCancelling(false);
+    }
+  }
 
   if (loading && !data) {
     return (
@@ -71,6 +112,83 @@ export function TrackClient({
   const timeline = steps(isDelivery);
   const cur = currentIndex(order.status, timeline);
   const promised = order.fulfillment?.promised_at;
+
+  if (order.status === "awaiting_payment" || order.status === "abandoned") {
+    const expired = order.status === "abandoned";
+    return (
+      <main id="main-content" className="mx-auto min-h-screen max-w-md p-4">
+        <header className="mb-6 text-center">
+          <p className="text-xs font-medium uppercase tracking-wide text-primary">
+            {isDelivery ? "Delivery" : "Pickup"}
+          </p>
+          <h1 className="text-2xl font-bold">Order {order.order_number}</h1>
+        </header>
+        <div
+          className="space-y-4 rounded-xl border p-6 text-center"
+          data-testid={expired ? "checkout-expired" : "awaiting-payment"}
+        >
+          {expired ? (
+            <>
+              <h2 className="text-lg font-semibold">Checkout expired</h2>
+              {order.late_payment === null ? (
+                <p className="text-sm text-muted-foreground">
+                  This order was not paid in time, so it was never sent to the
+                  kitchen. Nothing was charged.
+                </p>
+              ) : order.late_payment === "refund_owed_manual" ? (
+                <p className="text-sm text-muted-foreground" data-testid="late-refund-processing">
+                  This order was not paid in time, so it was never sent to the
+                  kitchen. Your refund is being processed.
+                </p>
+              ) : order.late_payment === "refunded" ? (
+                <p className="text-sm text-muted-foreground" data-testid="late-refunded">
+                  This order was not paid in time, so it was never sent to the
+                  kitchen. Your late payment has been refunded.
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground" data-testid="late-payment-notice">
+                  We received your payment after this checkout expired. The
+                  restaurant has been alerted and will either make your order or
+                  refund you in full.
+                </p>
+              )}
+              <Link href={`/shop/${slug}`}>
+                <Button className="w-full">Start a new order</Button>
+              </Link>
+            </>
+          ) : (
+            <>
+              <Loader2 className="mx-auto h-8 w-8 animate-spin text-primary" />
+              <h2 className="text-lg font-semibold">Waiting for payment</h2>
+              <p className="text-sm text-muted-foreground">
+                We will send your order to the kitchen as soon as your payment
+                is confirmed.
+              </p>
+              <Link href={`/shop/${slug}`}>
+                <Button className="w-full">Resume checkout</Button>
+              </Link>
+              <Button
+                variant="outline"
+                className="w-full"
+                disabled={cancelling}
+                onClick={() => void cancelCheckout()}
+              >
+                Cancel order
+              </Button>
+              {cancelError && (
+                <p role="alert" className="text-sm text-destructive">
+                  {cancelError}
+                </p>
+              )}
+            </>
+          )}
+          <div className="text-sm text-muted-foreground">
+            Total {formatMoney(order.totals.total_cents, order.currency)}
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main id="main-content" className="mx-auto min-h-screen max-w-md p-4">

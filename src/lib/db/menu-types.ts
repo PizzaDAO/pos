@@ -187,6 +187,10 @@ export interface StoreSettings {
 
 export type OrderStatus =
   | "draft"
+  // Online checkout lifecycle: created `awaiting_payment`, becomes `paid` once
+  // tenders settle (finalizeOnlinePayment) or `abandoned` if it expires/cancels.
+  | "awaiting_payment"
+  | "abandoned"
   | "placed"
   | "paid"
   | "in_kitchen"
@@ -218,6 +222,20 @@ export const KDS_ACTIVE_STATUSES: readonly OrderStatus[] = [
   "out_for_delivery",
 ] as const;
 
+/**
+ * Pre-payment online-checkout states. Such an order is invisible to the KDS,
+ * inventory, delivery dispatch, reports, EOD and tenant health: it only becomes
+ * real once it is `paid`.
+ */
+export const UNPAID_ONLINE_STATUSES: readonly OrderStatus[] = [
+  "awaiting_payment",
+  "abandoned",
+] as const;
+
+export function isUnpaidOnlineStatus(status: OrderStatus): boolean {
+  return (UNPAID_ONLINE_STATUSES as readonly string[]).includes(status);
+}
+
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
 
 /** How an online order is fulfilled (Phase 4). */
@@ -237,12 +255,71 @@ export interface OrderFulfillment {
   promised_at: string;
   /** Delivery address (delivery only). */
   address?: DeliveryAddress;
-  /** Resolved delivery zone id (delivery only). */
+  /** Resolved delivery zone / quote id (delivery only). Also the quote id. */
   zone_id?: string;
+  /**
+   * Delivery provider + ETA from the quote taken at order creation (delivery
+   * only). Persisted so `finalizeOnlinePayment` can dispatch the delivery AFTER
+   * payment without re-quoting.
+   */
+  delivery_provider?: string;
+  eta_minutes?: number | null;
+  /** When the delivery quote (`zone_id` is its handle) stops being valid, if the provider says. */
+  quote_expires_at?: string;
+  /**
+   * Online-checkout lifecycle markers (server-owned; written by the lifecycle
+   * code, never the client):
+   *  - `checkout_mode`: which deployment kind created the order ("live" | "test"
+   *    | "sim"), so the sweeper of another mode (prod vs staging on a shared DB)
+   *    never scans it.
+   *  - `paid_at` / `finalized_at`: set when the order is promoted to paid /
+   *    after inventory depletion and delivery dispatch completed. A paid order
+   *    with `paid_at` but no `finalized_at` crashed mid-finalize and is recovered
+   *    by the sweeper.
+   *  - `late_payment`: money settled on an order that was already abandoned. The
+   *    order stays abandoned; this durable marker puts it in the admin "late
+   *    payments" list until accepted or refunded.
+   */
+  checkout_mode?: "live" | "test" | "sim";
+  paid_at?: string;
+  finalized_at?: string;
+  late_payment?: LatePaymentMarker;
+  /** Crash-recovery backoff (see `recoverUnfinalizedOrders`). */
+  recovery_attempts?: number;
+  recovery_next_at?: string;
+  /** Set once an order of another deployment mode was alerted on (not swept again). */
+  foreign_alerted_at?: string;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */
   delivery_notes?: string;
+}
+
+/**
+ * See `OrderFulfillment.late_payment`. One marker type serves two admin items:
+ *  - `late` (default): money settled on an order that was already abandoned/voided.
+ *  - `duplicate`: more money settled on an order than it is worth (two tenders
+ *    both settled); one of them must be refunded.
+ */
+export interface LatePaymentMarker {
+  kind?: "late" | "duplicate";
+  payment_id: string;
+  /** Late: settled amount (base + tip). Duplicate: the EXCESS, in cents. */
+  amount_cents: number;
+  flagged_at: string;
+  /**
+   * `accepted` (promoted to paid) and `refunded` (money returned) are final.
+   * `refund_owed_manual`: a refund is owed but could not be sent by the system
+   * (crypto rails): the tender stays captured and staff return the money
+   * themselves, then "Mark refunded". Still listed until then.
+   */
+  resolved?: "accepted" | "refunded" | "refund_owed_manual";
+  resolved_at?: string;
+  /** Transient exclusive claim so concurrent Accept/Refund cannot both act. */
+  claim?: "accepting" | "refunding" | "marking_refunded";
+  claim_at?: string;
+  /** Crypto money owed back by hand (`refund_owed_manual`): per tender, in cents. */
+  manual_refunds?: { payment_id: string; amount_cents: number }[];
 }
 
 /** A structured delivery address (Phase 4). */

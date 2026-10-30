@@ -28,6 +28,11 @@ row and one upstream charge.
 
 | Path | Guarantee | Where | Test |
 |---|---|---|---|
+| Online checkout order id | One order id per checkout (client `sessionStorage`, keyed by cart/fulfillment/tip signature); retries, reloads and returns reuse the order. `POST /api/shop/orders` returns an existing order unchanged, 409 for an abandoned one. | `store/checkout-order-id.ts`, `api/shop/orders/route.ts` | `store/checkout-order-id.test.ts` |
+| Online tender id | Derived server-side from `(orderId, rail, seq)` (UUIDv5): it is both the payments PK and the provider idempotency key; a repeat `/api/payments` call is the same tender. | `payments/ids.ts`, `nextOnlineTenderId` | `shop/lifecycle.test.ts` |
+| One live card tender | Partial unique index `payments_one_live_card_or_cb`; the orphan intent is canceled on conflict. | migration `20261101000100`, `takePaymentDetailed` | `shop/lifecycle.test.ts`, `supabase/tests/rls_isolation.sql` |
+| `finalizeOnlinePayment` | Compare-and-set `awaiting_payment -> paid`; only the winner depletes inventory / dispatches delivery, so webhook + sync + sweeper race safely. | `shop/finalize.ts`, `driver.transitionOrderStatus` | `shop/lifecycle.test.ts` (concurrent finalize) |
+| Abandonment sweeper | Compare-and-set `awaiting_payment -> abandoned` after closing provider state; a payment that landed finalizes instead. | `shop/lifecycle.ts` | `shop/lifecycle.test.ts` |
 | `takePayment` | Repeat `paymentId` returns the existing tender → **no second charge** (checked **before** calling the rail). | `src/lib/payments/service.ts` | `payments/service.test.ts` (idempotency, one tender) |
 | Settlement | Order → `paid` only when **settled** (captured/authorized) tenders cover the total; never downgrades a paid order. | `maybeMarkOrderPaid` | `payments/service.test.ts` (settled-covers, split) |
 | Split payment | Balance driven to zero across multiple tenders/rails; `getOrderBalance` never negative. | `getOrderBalance` / `coveredCents` | `payments/service.test.ts` (split) |

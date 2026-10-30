@@ -370,6 +370,7 @@ secrets**). Everything is optional; the app builds + the suite passes with none.
 | Delivery | `DOORDASH_DEVELOPER_ID`, `DOORDASH_KEY_ID`, `DOORDASH_SIGNING_SECRET`, `DOORDASH_BASE_URL` | In-house real, DoorDash simulated |
 | Observability | `LOG_LEVEL`, `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT` | info logs, Sentry fully inert, no source-map upload |
 | Training | `TRAINING_MODE` | Mock driver or no `STRIPE_SECRET_KEY` ⇒ training on |
+| Online checkout lifecycle | `CRON_SECRET`, `ONLINE_CHECKOUT_WINDOW_CARD_MIN` / `_COINBASE_MIN` / `_USDC_MIN` | Sweeper callable only on the mock driver; windows 30 / 60 / 60 min |
 | App | `NEXT_PUBLIC_APP_URL` | Request origin |
 
 ---
@@ -547,6 +548,118 @@ domain-level validation (scheduling, zone gates, idempotency) is unchanged.
 
 ### 11f. Payments hardening (payments-security-fixes)
 
+**Online order lifecycle (checkout-lifecycle, slice 1).** Every online order is
+created `awaiting_payment` and becomes a real order only when it is paid:
+
+```
+awaiting_payment --(settled tenders cover the due amount)--> paid --> in_kitchen --> ...
+        +--(expired / cancelled)--> abandoned
+in-store: unchanged (placed -> paid)
+```
+
+- `awaiting_payment` and `abandoned` are not in `KDS_ACTIVE_STATUSES`, so such an
+  order is off the kitchen board and the realtime feed; inventory is NOT depleted
+  (`createOrder` skips it) and delivery is NOT dispatched. Reports, the EOD/Z
+  report and tenant health exclude both statuses.
+- `finalizeOnlinePayment` (`src/lib/shop/finalize.ts`, **shared with the terminal
+  card-reader plan**) is the single promotion point, called from
+  `maybeMarkOrderPaid`: compare-and-set `awaiting_payment -> paid`
+  (`driver.transitionOrderStatus`, also shared), then (winner only) recompute an
+  ASAP order's `promised_at` from payment time, deplete inventory
+  (`driver.depleteInventoryForOrder`) and dispatch the delivery from the quote
+  persisted on the order (`fulfillment.delivery_provider`, `zone_id`,
+  `eta_minutes`). A failed dispatch leaves the order paid and on the KDS and
+  writes a `failed` delivery record so it shows in admin dispatch. A settlement
+  that arrives for an `abandoned`/`voided` order is NOT promoted; it is logged for
+  a manual accept-or-refund.
+- **Retries reuse the order.** The storefront mints the order id once per checkout
+  and keeps it in `sessionStorage`, keyed by a signature of cart + fulfillment +
+  time + address + email + tip (`src/lib/store/checkout-order-id.ts`). A material
+  change mints a new id and cancels the old unpaid order best-effort.
+  `POST /api/shop/orders` returns an existing order unchanged and answers 409
+  (`checkout_abandoned`) for an abandoned one.
+- **Expiry** (env, minutes): `ONLINE_CHECKOUT_WINDOW_CARD_MIN` (30),
+  `_COINBASE_MIN` (60), `_USDC_MIN` (60), measured from `created_at` by the rail
+  of the order's live tender. `POST /api/payments` refuses (409) after the window
+  of the rail being paid, and re-checks ASAP availability.
+- **Sweeper**: Vercel Cron `*/5 * * * *` calls `GET /api/cron/expire-online-orders`
+  with `Authorization: Bearer $CRON_SECRET` (**set `CRON_SECRET` in production**;
+  without it the route is only open on the mock driver). For each expired order it
+  re-checks real tenders, cancels open card intents (a PaymentIntent that had
+  succeeded finalizes the order instead; `processing` is skipped), cancels pending
+  crypto, then moves the order to `abandoned` by compare-and-set. Real card
+  tenders carry `raw.livemode`; a deployment never touches tenders of the other
+  Stripe mode, nor real tenders when it simulates cards (prod and staging share a
+  database, and Vercel crons run only on production).
+- `POST /api/shop/orders/[id]/pay/sync` lets the shop and the tracking page ask the
+  SERVER to re-check an order's open tenders (a crypto payment confirming). The
+  UI treats only `orderStatus === 'paid'` as money received.
+- Gaps in order numbers (abandoned orders consume one) are accepted.
+- **Review hardening.**
+  - *Race:* after a tender is written, `/api/payments` re-reads the order; if the
+    sweeper/cancel abandoned it meanwhile, the PaymentIntent/Coinbase charge is
+    canceled, the tender canceled, and the client gets 409 `checkout_abandoned`
+    with no secret/URL. `checkout_abandoned` is only returned when the order really
+    is abandoned; if a payment is in flight the code is `payment_pending` (keep
+    waiting). The route and the sweeper share `orderExpiresAt` (earliest window of
+    the live tenders).
+  - *Late payments:* money settling on an `abandoned`/`voided` order does not
+    promote it. It sets `fulfillment.late_payment` (durable, no schema change),
+    alerts (`captureError`), writes an audit row (`late_payment_flagged`), and the
+    order appears under Admin -> Late payments (owner/manager) where Accept
+    (`finalizeOnlinePayment` from `abandoned`, compare-and-set) or Refund
+    (`refundPayment`) resolves it. The tracking page says so instead of "Nothing
+    was charged". `refundPayment` never turns an abandoned order into `refunded`.
+    Closing a pending Coinbase tender cancels the charge at Coinbase (best effort,
+    logged). Webhooks cannot 500 on the one-live-tender index: a settling flip
+    cancels the newer unsettled tender and records the money; a double settlement
+    is alerted.
+  - *Crash recovery:* promotion stamps `fulfillment.paid_at`; inventory +
+    dispatch (both idempotent) then stamp `finalized_at`. The sweeper re-runs the
+    steps for paid orders with no `finalized_at` older than 2 minutes. A failed
+    delivery dispatch is surfaced as a `failed` delivery record and does not block
+    `finalized_at`.
+  - *Sweeper:* keyset paging (100 x 20 per run), orders carry
+    `fulfillment.checkout_mode` (live/test/sim) and a deployment only queries its
+    own mode (unmarked legacy orders included), settled-but-uncovering expired
+    orders raise `checkout.in_flight` alerts, `maxDuration = 60`.
+  - *Switching rails* cancels the other open tender (card intent, pending USDC
+    locally, pending Coinbase with the provider; a USDC tender with a reported tx
+    hash and a processing card are never canceled). Several cash tenders (client
+    ids) may split an online bill. `/pay/sync` has its own `paySync` rate bucket.
+  - *Second review round.*
+    - Crypto refunds never claim to move money: `refundPayment` only records the
+      intent for USDC/Coinbase, so the refund API returns `manualRefund` + a note,
+      the terminal shows it, and the admin late-payment Refund leaves crypto
+      tenders `captured` with the item `refund_owed_manual` (listed with amounts,
+      return address if known and a Coinbase link) until staff press Mark refunded
+      (audited). The tracking page says "Your refund is being processed" until then.
+    - Accept/Refund/Mark refunded first CLAIM the marker with an atomic
+      compare-and-set (`claim_late_payment`), so concurrent actions cannot both
+      act; marker updates are atomic RPCs (`update_late_payment`,
+      `merge_order_fulfillment`), not read-modify-write.
+    - The one-open-tender index now covers only `requires_action`/`pending`, so a
+      settlement can always be recorded (never captured money stored as canceled).
+      When an online order ends up with more settled money than it is worth, a
+      `duplicate` marker ("Duplicate payment, refund one") appears in the same tab.
+      Cancels are STRICT: a provider that refuses (Coinbase payment detected, card
+      confirming) is re-synced, never marked canceled; the sweeper leaves such an
+      order `awaiting_payment`.
+    - Cash on an online order: till-role check first; partial cash carries no tip
+      (the final covering tender does); a racing overpaying cash tender is voided
+      deterministically. A REAL pending USDC tender is never auto-canceled (TODO
+      slice 3).
+    - Recovery: grace 6 min (> the cron's 60 s maxDuration), per-item idempotent
+      depletion, one delivery per order (`deliveries_order_id_uidx`), exponential
+      backoff on failing orders, oldest-`paid_at` first, expired delivery quotes
+      re-quoted. Orders stamped with another deployment mode are swept/recovered
+      after 24 h if they hold no real tender, otherwise alerted once.
+    - Late payments come from a dedicated capped query (`listOpenLatePayments`).
+    - Migration `20261101000300_late_payment_and_idempotency.sql`.
+  - Migration `20261101000200_audit_action_values.sql` adds the late-payment audit
+    actions and the Phase 7 actions (`payment_refund`, `payment_void`, ...) that
+    were never in the DB enum, so those audit rows had been silently dropped.
+
 - **Shop orders are repriced server-side.** `POST /api/shop/orders` rebuilds every
   line from `driver.getMenu` (location overrides applied, 86'd items excluded) via
   `src/lib/shop/reprice.ts`; client prices, names and stations are ignored.
@@ -584,19 +697,27 @@ domain-level validation (scheduling, zone gates, idempotency) is unchanged.
   `requires_action` are canceled on the connected account.
 - **Order lines** get server-minted ids; the Supabase `createOrder` deletes the
   order row if writing its lines fails (no item-less `placed` order).
-- **Known gap: concurrent intent creation.** Two simultaneous `POST /api/payments`
-  calls for the same online order with DIFFERENT `paymentId`s can each create a
-  `stripe_online` intent (the cancel-earlier-intents step runs before creation,
-  not under a lock). It is latent today because no client confirms a
-  `stripe_online` intent yet (the shop only records the tender; Stripe.js
-  confirmation lands with the checkout redesign), so an extra open intent can
-  never be paid. The redesign closes it with a partial unique index (one open
-  `stripe_online` tender per order).
-- **Unpaid-order cancel.** If the customer declines a repriced total, the shop
-  calls `POST /api/shop/orders/cancel`, which only voids an ONLINE, still
-  `placed` order with no pending/authorized/captured tender, within 10 minutes of
-  creation (and cancels its open card intent and delivery). Inventory depleted at
-  placement is not restocked by the void (no existing restock path).
+- **Concurrent intent creation is closed.** Two simultaneous `POST /api/payments`
+  calls for one online order could each create a `stripe_online` intent (the
+  cancel-earlier-intents step runs before creation, not under a lock). Two layers
+  now close it: (1) an ONLINE order's tender id is DERIVED from the order id +
+  rail (`deriveTenderId`, UUIDv5; the client's `paymentId` is ignored), so
+  concurrent calls are the same tender and the same Stripe idempotency key; and
+  (2) the partial unique index `payments_one_live_card_or_cb`
+  (`(order_id, rail) where rail in ('stripe_online','crypto_coinbase') and status
+  not in ('canceled','failed')`, migration `20261101000100_online_checkout.sql`)
+  makes the database refuse a second live card/Coinbase tender for an order. On
+  that conflict `takePayment` cancels the orphan PaymentIntent it just created and
+  the route answers 409. A canceled/failed tender frees the slot (rail switch,
+  retry after a decline). The mock driver enforces the same rule.
+- **Unpaid-order cancel** (`POST /api/shop/orders/cancel`). An `awaiting_payment`
+  order (see "Online order lifecycle" below) is moved to `abandoned` after its open
+  card intents are canceled, by compare-and-set; a settled or in-flight tender
+  refuses it (409). `abandoned` (not `voided`) is deliberate: the order never rang,
+  so it must not show in the void tallies. The previous rule (void a `placed`
+  online order within 10 minutes with no live tender, and cancel its delivery) is
+  kept ONLY for legacy `placed` orders created before the lifecycle shipped; delete
+  that branch once none can exist.
 - **Refund bookkeeping is atomic** (`reserve_payment_refund` /
   `release_payment_refund`, migration `20261030000100_payment_refund_atomic.sql`,
   new `payments.refund_ids` column): cash/crypto reserve before calling the rail

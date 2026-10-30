@@ -192,8 +192,20 @@ describe("S4/S6: online tip is charged once, derived from the order", () => {
     await paymentsPOST(
       payReq(orderId, { paymentId: "p-a", rail: "stripe_online", amountCents: 1 }),
     );
-    const again = await paymentsPOST(
+    // Same rail again: the tender id is derived from the order, so this is the
+    // SAME tender (an idempotent replay), never a second charge.
+    const replay = await paymentsPOST(
       payReq(orderId, { paymentId: "p-b", rail: "stripe_online", amountCents: 1 }),
+    );
+    expect(replay.status).toBe(201);
+    expect(
+      (await getPosDriver().listPaymentsForOrder(orderId)).filter(
+        (p) => p.rail === "stripe_online",
+      ),
+    ).toHaveLength(1);
+    // Another rail on a paid order is refused.
+    const again = await paymentsPOST(
+      payReq(orderId, { paymentId: "p-c", rail: "crypto_onchain_usdc", amountCents: 1 }),
     );
     expect(again.status).toBe(409);
   });

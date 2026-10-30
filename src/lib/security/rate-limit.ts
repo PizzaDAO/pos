@@ -119,6 +119,12 @@ export const RATE_LIMIT_RULES = {
   orders: { limit: 60, windowMs: 60_000 } satisfies RateLimitRule,
   /** Payment capture / refund — moderate. */
   payments: { limit: 30, windowMs: 60_000 } satisfies RateLimitRule,
+  /**
+   * Customer payment-status polling (`/pay/sync`): the checkout waiting step and
+   * the tracking page each poll every 3-4s, from possibly two tabs behind one IP.
+   * Its own bucket so polling can never starve (or be starved by) charge capture.
+   */
+  paySync: { limit: 90, windowMs: 60_000 } satisfies RateLimitRule,
 } as const;
 
 export type RateLimitBucket = keyof typeof RATE_LIMIT_RULES;
