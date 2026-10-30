@@ -18,27 +18,81 @@ import type {
   Shift,
   Staff,
 } from "@/lib/db";
+// Direct module (not the barrel): @/lib/db/client imports this file.
+import { NOT_LIVE_ORDER_STATUSES } from "@/lib/db/menu-types";
 import { memoryOutbox, type MemoryOutbox } from "./outbox";
 
 /**
- * Statuses an order is NOT yet announced in: a terminal hold (`draft`) and an
- * online checkout still `awaiting_payment`. Leaving one announces
- * `order.placed` once; leaving it to `voided` / `abandoned` emits nothing (the
- * order never existed for the kitchen). Mirrors public.core_trg_orders().
+ * Statuses that are NOT live: an order in one of these is not on the KDS and,
+ * unless it was live before, the hub has never heard of it. The first time an
+ * order is in a live status it is "announced" (`order.placed`, once).
+ * Mirrors `orders.core_announced` + public.core_trg_orders():
+ *  - never announced -> live: `order.placed` (a hold released/paid, a checkout
+ *    paid, an ABANDONED checkout whose late payment is accepted);
+ *  - never announced -> not live: nothing (a canceled hold, an abandoned
+ *    checkout, a draft refunded);
+ *  - announced: `order.status_changed` (+ aliases), `order.updated`.
  */
-const UNANNOUNCED: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+const NOT_LIVE: ReadonlySet<OrderStatus> = new Set<OrderStatus>(NOT_LIVE_ORDER_STATUSES);
+/** No `order.updated` while an order sits in one of these (same as SQL). */
+const NO_UPDATES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
   "draft",
   "awaiting_payment",
-]);
-const NEVER_PLACED: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
-  "draft",
-  "awaiting_payment",
-  "voided",
   "abandoned",
 ]);
+/**
+ * Checkout bookkeeping inside `fulfillment`: changing only these is not an
+ * order change for the hub (same key list as public.core_trg_orders()).
+ */
+const BOOKKEEPING_KEYS = [
+  "paid_at",
+  "finalized_at",
+  "late_payment",
+  "recovery_attempts",
+  "recovery_next_at",
+  "foreign_alerted_at",
+  "checkout_mode",
+] as const;
+
+function stableJson(v: unknown): string {
+  if (v === undefined || v === null) return "null";
+  if (typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o)
+    .filter((k) => o[k] !== undefined)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`)
+    .join(",")}}`;
+}
+
+function contentFulfillment(f: Order["fulfillment"]): string {
+  if (!f) return "null";
+  const copy: Record<string, unknown> = { ...f };
+  for (const k of BOOKKEEPING_KEYS) delete copy[k];
+  return stableJson(copy);
+}
+
+/**
+ * Which orders have been announced (the mock's `orders.core_announced`). An
+ * order in a live status is always announced; the set remembers the ones that
+ * were live once and have since left it (voided, refunded).
+ */
+export class AnnouncedOrders {
+  private ids = new Set<string>();
+  has(o: Pick<Order, "id" | "status">): boolean {
+    return !NOT_LIVE.has(o.status) || this.ids.has(o.id);
+  }
+  /** Record `o` after a write; `fresh` = a newly created row (forget a reused id). */
+  note(o: Pick<Order, "id" | "status">, fresh = false): void {
+    if (fresh) this.ids.delete(o.id);
+    if (!NOT_LIVE.has(o.status)) this.ids.add(o.id);
+  }
+}
 
 function orderEvents(
   box: MemoryOutbox,
+  announced: AnnouncedOrders,
   order: Order,
   before: Order | null,
 ): void {
@@ -51,18 +105,21 @@ function orderEvents(
     row_snapshot: { id: order.id, status: order.status },
   };
   if (!before) {
-    if (!NEVER_PLACED.has(order.status)) {
+    announced.note(order, true);
+    if (announced.has(order)) {
       box.append({ ...base, event_type: "order.placed", changes: null });
     }
     return;
   }
+  const wasAnnounced = announced.has(before);
+  announced.note(before);
+  announced.note(order);
   if (before.status !== order.status) {
     const changes = { status: [before.status, order.status] as [unknown, unknown] };
-    if (UNANNOUNCED.has(before.status)) {
-      // Leaving a hold / an unpaid online checkout: announce the order as
-      // placed (once). One that is canceled or abandoned was never announced,
-      // so nothing is emitted.
-      if (!NEVER_PLACED.has(order.status)) {
+    if (!wasAnnounced) {
+      // Never announced: the first live status announces it (once); a
+      // canceled/abandoned/refunded one was never on the hub, so nothing.
+      if (announced.has(order)) {
         box.append({ ...base, event_type: "order.placed", changes });
       }
       return;
@@ -75,6 +132,18 @@ function orderEvents(
     };
     const a = alias[order.status];
     if (a) box.append({ ...base, event_type: a, changes });
+    return;
+  }
+  if (
+    wasAnnounced &&
+    !NO_UPDATES.has(order.status) &&
+    (stableJson(order.totals) !== stableJson(before.totals) ||
+      (order.notes ?? null) !== (before.notes ?? null) ||
+      contentFulfillment(order.fulfillment) !== contentFulfillment(before.fulfillment) ||
+      order.discount_cents !== before.discount_cents ||
+      (order.customer_id ?? null) !== (before.customer_id ?? null))
+  ) {
+    box.append({ ...base, event_type: "order.updated", changes: null });
   }
 }
 
@@ -93,10 +162,46 @@ function paymentType(status: string): string | null {
   }
 }
 
-function paymentEvents(box: MemoryOutbox, after: Payment, before: Payment | null): void {
+/**
+ * Same rules as public.core_trg_payments(): nothing for an order the hub has not
+ * seen (its later order.placed is hydrated with the tenders); a released refund
+ * reservation (refunded_cents goes down) retracts its unclaimed
+ * payment.refunded row, or, when a worker already claimed that row, emits a
+ * correction for the restored status.
+ */
+function paymentEvents(
+  box: MemoryOutbox,
+  orderAnnounced: boolean,
+  after: Payment,
+  before: Payment | null,
+): void {
+  if (!orderAnnounced) return;
   let type: string | null = null;
   let changes: Record<string, [unknown, unknown]> | null = null;
-  if (!before) {
+  if (before && after.refunded_cents < before.refunded_cents) {
+    const open = [...box.rows]
+      .reverse()
+      .find(
+        (r) =>
+          r.tenant_id === after.tenant_id &&
+          r.subject_type === "payment" &&
+          r.subject_id === after.id &&
+          r.event_type === "payment.refunded" &&
+          r.status === "pending" &&
+          r.attempts === 0,
+      );
+    if (open) {
+      open.status = "dead";
+      open.last_error = "retracted: refund released";
+      return;
+    }
+    changes = { refunded_cents: [before.refunded_cents, after.refunded_cents] };
+    if (before.status !== after.status) changes.status = [before.status, after.status];
+    type =
+      after.status === "authorized" || after.status === "captured"
+        ? paymentType(after.status)
+        : null;
+  } else if (!before) {
     type = paymentType(after.status);
   } else if (before.status !== after.status) {
     changes = { status: [before.status, after.status] };
@@ -121,6 +226,13 @@ export function withOutbox(
   inner: PosDriver,
   box: MemoryOutbox = memoryOutbox,
 ): PosDriver {
+  const announced = new AnnouncedOrders();
+  const orderAnnounced = async (orderId: string): Promise<boolean> => {
+    const o = await inner.getOrder(orderId);
+    if (!o) return false;
+    announced.note(o);
+    return announced.has(o);
+  };
   const emitMenuUpdated = (tenantId: string, itemId: string | null) => {
     // Coalesce into a pending row that has NOT been claimed yet; once a worker
     // has claimed it (attempts > 0) further edits get their own row.
@@ -155,21 +267,21 @@ export function withOutbox(
     async createOrder(input) {
       const before = await inner.getOrder(input.id);
       const order = await inner.createOrder(input);
-      if (!before) orderEvents(box, order, null);
+      if (!before) orderEvents(box, announced, order, null);
       return order;
     },
 
     async updateOrderStatus(id, status) {
       const before = await inner.getOrder(id);
       const order = await inner.updateOrderStatus(id, status);
-      if (order && before) orderEvents(box, order, before);
+      if (order && before) orderEvents(box, announced, order, before);
       return order;
     },
 
     async upsertPayment(payment) {
       const before = await inner.getPayment(payment.id);
       const after = await inner.upsertPayment(payment);
-      paymentEvents(box, after, before);
+      paymentEvents(box, await orderAnnounced(after.order_id), after, before);
       return after;
     },
 
@@ -178,7 +290,16 @@ export function withOutbox(
     async transitionOrderStatus(id, from, to, patch) {
       const before = await inner.getOrder(id);
       const order = await inner.transitionOrderStatus(id, from, to, patch);
-      if (order && before) orderEvents(box, order, before);
+      if (order && before) orderEvents(box, announced, order, before);
+      return order;
+    },
+
+    // Fulfillment merges: requotes are content (order.updated); checkout
+    // bookkeeping (paid_at, finalized_at, late_payment, ...) is not.
+    async mergeOrderFulfillment(id, patch) {
+      const before = await inner.getOrder(id);
+      const order = await inner.mergeOrderFulfillment(id, patch);
+      if (order && before) orderEvents(box, announced, order, before);
       return order;
     },
 
@@ -187,8 +308,19 @@ export function withOutbox(
     async reservePaymentRefund(paymentId, amountCents, refundId) {
       const before = await inner.getPayment(paymentId);
       const res = await inner.reservePaymentRefund(paymentId, amountCents, refundId);
-      if (res.ok && before) paymentEvents(box, res.payment, before);
+      if (res.ok && before) {
+        paymentEvents(box, await orderAnnounced(res.payment.order_id), res.payment, before);
+      }
       return res;
+    },
+
+    async releasePaymentRefund(paymentId, amountCents, refundId) {
+      const before = await inner.getPayment(paymentId);
+      await inner.releasePaymentRefund(paymentId, amountCents, refundId);
+      const after = await inner.getPayment(paymentId);
+      if (before && after) {
+        paymentEvents(box, await orderAnnounced(after.order_id), after, before);
+      }
     },
 
     async upsertOverride(input) {

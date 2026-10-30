@@ -50,7 +50,7 @@ import {
   ONE_LIVE_TENDER_RAILS,
   tenderHoldsOpenSlot,
 } from "./payment-types";
-import { isUnpaidOnlineStatus } from "./menu-types";
+import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -1005,7 +1005,7 @@ export const mockDriver: PosDriver = {
 
   async listOrders(tenantId, locationId, opts): Promise<Order[]> {
     ensureKitchenSeed();
-    const limit = Math.min(Math.max(opts?.limit ?? 500, 1), 1000);
+    const limit = Math.min(Math.max(opts?.limit ?? 1000, 1), 1000);
     return [...orders.values()]
       .filter(
         (o) =>
@@ -1158,7 +1158,7 @@ export const mockDriver: PosDriver = {
       updated_at: nowIso(),
     };
     orders.set(id, updated);
-    if (leavingHold && status !== "voided") depleteForOrder(updated);
+    if (leavingHold && isLiveOrderStatus(status)) depleteForOrder(updated);
     return updated;
   },
 
@@ -1172,14 +1172,20 @@ export const mockDriver: PosDriver = {
     ensureKitchenSeed();
     const order = orders.get(id);
     if (!order || !from.includes(order.status)) return null;
+    // Leaving a hold (e.g. main's settlement `["draft","placed"] -> "paid"`):
+    // the hold is over, and a held order consumed no stock yet, so a move to a
+    // live status depletes it (per-item idempotent) -- same as casOrderStatus.
+    const leavingHold = order.status === "draft" && to !== "draft";
     const updated: Order = {
       ...order,
       status: to,
       ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+      ...(leavingHold ? { hold: null } : {}),
       version: (order.version ?? 1) + 1,
       updated_at: nowIso(),
     };
     orders.set(id, updated);
+    if (leavingHold && isLiveOrderStatus(to)) depleteForOrder(updated);
     return updated;
   },
 

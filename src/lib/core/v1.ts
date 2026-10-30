@@ -47,6 +47,9 @@ import {
   type OrderFulfillment,
 } from "@/lib/db";
 import { isGuid, isIsoTimestamp } from "@/lib/db/paging";
+import { cancelDeliveryForOrder } from "@/lib/delivery/service";
+import { captureError } from "@/lib/observability";
+import { cancelOpenOnlineIntents } from "@/lib/payments/service";
 import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError, maxTipCents } from "@/lib/reprice";
 import { getPlan } from "@/lib/saas/plans";
@@ -69,7 +72,7 @@ import {
   type LocationBundle,
 } from "./loaders";
 import { toContractCustomer, toContractPayment, toContractTenant } from "./mappers";
-import { buildDailySales, buildSalesSummary } from "./sales";
+import { buildDailySales, buildSalesSummary, isSalesRow } from "./sales";
 
 export interface V1Deps {
   auth?: AuthDeps;
@@ -499,11 +502,47 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         detail: `Order is ${order.status}; it can no longer be canceled here.`,
       });
     }
+    // Same order of steps as main's storefront cancel
+    // (src/app/api/shop/orders/cancel/route.ts): close any open card intent
+    // first so it cannot be confirmed after the void. If one turns out to have
+    // succeeded, that syncs the tender, so re-check before canceling.
+    try {
+      await cancelOpenOnlineIntents(order.id);
+    } catch (err) {
+      captureError(err, { scope: "v1.orders.cancel.intents", orderId: order.id });
+      throw ProblemError.of("UPSTREAM_UNAVAILABLE", {
+        detail: "Could not close the order's open card payment; try again.",
+      });
+    }
+    const tenders = await ctx.driver.listPaymentsForOrder(order.id);
+    if (tenders.some((p) => p.status === "authorized")) {
+      throw ProblemError.of("CANCEL_NOT_ALLOWED", {
+        detail: "Order has payments in flight; wait for them to settle or void them first.",
+      });
+    }
+    if (
+      tenders.some(
+        (p) => p.status === "captured" && p.amount_cents + p.tip_cents > p.refunded_cents,
+      )
+    ) {
+      throw ProblemError.of("CANCEL_NOT_ALLOWED", {
+        detail: "Order has captured payments; refund them first.",
+      });
+    }
     // Tender check + status transition happen atomically under a row lock
     // (core_cancel_order): a payment cannot slip in between the two.
     const res = await ctx.driver.cancelOrder(order.id, ctx.principal.tenant_id, {
       nowMs: ctx.now().getTime(),
     });
+    if (res.ok) {
+      // A voided order must not keep a courier on the way. A provider error
+      // does not undo the cancel (the order IS voided); it is surfaced.
+      try {
+        await cancelDeliveryForOrder(order.id);
+      } catch (err) {
+        captureError(err, { scope: "v1.orders.cancel.delivery", orderId: order.id });
+      }
+    }
     if (!res.ok) {
       if (res.reason === "not_found") throw notFound("Order");
       throw ProblemError.of("CANCEL_NOT_ALLOWED", {
@@ -539,9 +578,14 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     // the caller holds the explicit scope (e.g. a terminal taking cash).
     if (!hasLiteralScope(ctx.principal, "orders:release_unpaid")) {
       const payments = await ctx.driver.listPaymentsForOrder(order.id);
+      // Net of refunds (refunded_cents covers amount + tip): a refunded
+      // tender no longer pays for the order.
       const covered = payments
         .filter((p) => p.status === "captured")
-        .reduce((sum, p) => sum + p.amount_cents, 0);
+        .reduce(
+          (sum, p) => sum + Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents),
+          0,
+        );
       if (covered < order.totals.total_cents) {
         throw ProblemError.of("PAYMENT_REQUIRED", {
           detail: "The order is not fully paid; it cannot be released yet.",
@@ -693,6 +737,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     const orders = await loadTenantOrders(ctx.principal.tenant_id, {
       locationIds: [bundle.location.id],
       ...paddedRange(from, to),
+      rowFilter: isSalesRow,
       driver: ctx.driver,
     });
     const dates = [...new Set(orders.map((o) => o.business_date))]
@@ -742,6 +787,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     const orders = await loadTenantOrders(ctx.principal.tenant_id, {
       locationIds: ids,
       ...paddedRange(q.from, q.to),
+      rowFilter: isSalesRow,
       driver: ctx.driver,
     });
     let categories: Map<string, { id: string; name: string }> | undefined;

@@ -93,6 +93,20 @@ sends it to the kitchen (idempotent; an expired hold voids the order). Inventory
 depletes on release, not on hold. Replays are idempotent on the order `id` (or on
 `Idempotency-Key`); reuse with different lines -> `IDEMPOTENCY_CONFLICT`.
 Cancel is allowed before the kitchen and only when no captured money remains.
+Only `draft` (held), `placed` and `paid` orders are cancelable here; an online checkout still
+`awaiting_payment` (main's storefront lifecycle) answers **409 `CANCEL_NOT_ALLOWED`** (the
+storefront's own cancel abandons it). Cancel follows main's storefront order of steps: open
+`stripe_online` intents are closed first (`cancelOpenOnlineIntents`; a provider failure is
+`UPSTREAM_UNAVAILABLE`), the tenders are re-checked, `core_cancel_order` voids, and then the
+order's delivery is canceled (`cancelDeliveryForOrder`; a provider error there is logged, the
+order stays voided). A held order that main's payment path moves to `paid`
+(`transitionOrderStatus(["draft","placed"], "paid")`) drops its `hold` and depletes then
+(per-item idempotent, so a later `release` is a no-op). `release` counts captured tenders net
+of `refunded_cents`.
+
+Sales rollups (`/sales/summary`, `/locations/{id}/sales/daily`) drop unpaid online checkouts
+(`awaiting_payment`, `abandoned`) before mapping, like main's reports: they are neither orders
+nor voids.
 
 ## Event outbox (src/lib/core/outbox.ts, migrations `20261102000300_core_v1.sql` … `20261102000500_core_cancel_and_prune.sql`)
 
@@ -108,6 +122,27 @@ cron  GET|POST /api/core/outbox  -> claim (SKIP LOCKED) -> hydrate contract payl
   structure (`menu.updated`, debounced 1/min/tenant), locations + store settings
   (`location.updated`), customers, staff (`created|updated|deactivated`, PIN hash never
   stored), shifts (`drawer_session.opened|closed`), business day closes, deliveries.
+* **Announcement.** `orders.core_announced` is set (BEFORE trigger, never reset) the first time
+  an order is in a live status (anything but `draft`, `awaiting_payment`, `voided`,
+  `abandoned`, `refunded`). Leaving a never-announced state for a live one emits
+  `order.placed` once (a released/paid hold, a paid checkout, and a late-payment Accept
+  `abandoned -> paid`); ending a never-announced order (`voided`, `abandoned`, `refunded`)
+  emits nothing. Only announced orders get `status_changed` / `updated` / `canceled`.
+* `order.updated` fires for totals, notes, discount, customer and fulfillment changes, NOT for
+  checkout bookkeeping inside `fulfillment` (`paid_at`, `finalized_at`, `late_payment`,
+  `recovery_*`, `foreign_alerted_at`, `checkout_mode`).
+* **Payment events only for announced orders.** While the order is `draft`,
+  `awaiting_payment`, `abandoned`, or voided/refunded without ever being announced, tender
+  changes are suppressed. A normal online payment is recorded BEFORE finalize moves the order
+  to `paid`, so its `payment.captured` is suppressed; the `order.placed` that follows is hydrated
+  from current state and its `tenders[]` (payment id, status, amount, tip, refunded) already
+  carry it.
+* **Failed refunds.** Cash/crypto refunds reserve first (`reserve_payment_refund` emits
+  `payment.refunded`) and release on a rail failure (`release_payment_refund`: refunded_cents
+  goes down, `refunded -> captured`). The release emits nothing and marks the still-unclaimed
+  `payment.refunded` row `dead` (`last_error = 'retracted: refund released'`); only if a worker
+  already claimed that row does it emit a corrective `payment.captured|authorized` with
+  `changes.refunded_cents`. A retracted row's `sequence` is never delivered (like a dead row).
 * `sequence` is per tenant and gap-free (allocated in the same transaction).
 * Event id `evt_<ULID>` is derived from the outbox row, so **retries carry the same
   id** (at-least-once; consumers dedupe on `id`).

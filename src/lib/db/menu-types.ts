@@ -236,6 +236,23 @@ export function isUnpaidOnlineStatus(status: OrderStatus): boolean {
   return (UNPAID_ONLINE_STATUSES as readonly string[]).includes(status);
 }
 
+/**
+ * Statuses in which an order is NOT live (not on the KDS, consumes no stock): a
+ * hold, an unpaid/abandoned checkout, and the two terminal non-sale outcomes.
+ * Every other status is live. Same list as orders.core_announced (SQL).
+ */
+export const NOT_LIVE_ORDER_STATUSES: readonly OrderStatus[] = [
+  "draft",
+  "awaiting_payment",
+  "voided",
+  "abandoned",
+  "refunded",
+] as const;
+
+export function isLiveOrderStatus(status: OrderStatus): boolean {
+  return !(NOT_LIVE_ORDER_STATUSES as readonly string[]).includes(status);
+}
+
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
 
 /**

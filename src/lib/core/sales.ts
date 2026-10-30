@@ -5,6 +5,11 @@
  *
  * Voided orders count only toward `void_count`. Held (unpaid, unreleased)
  * orders are excluded. Refunds come from tender `refunded_cents`.
+ *
+ * Online checkouts that were never paid (`awaiting_payment`, `abandoned`) are
+ * not sales at all, not even voids: callers drop them from the POS rows BEFORE
+ * mapping with {@link isSalesRow}, the same rule as main's reports
+ * (src/lib/reports.ts). (After mapping, `abandoned` would look like a void.)
  */
 import type {
   DailySales,
@@ -13,6 +18,12 @@ import type {
   SalesGroupBy,
   SalesSummary,
 } from "@openpizza/core";
+import { isUnpaidOnlineStatus, type Order as PosOrder } from "@/lib/db/menu-types";
+
+/** Pre-mapping row filter for every sales rollup: no unpaid online checkouts. */
+export function isSalesRow(o: Pick<PosOrder, "status">): boolean {
+  return !isUnpaidOnlineStatus(o.status);
+}
 
 type Bucket = SalesFigures & { key: string; label: string };
 

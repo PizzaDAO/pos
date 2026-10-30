@@ -53,7 +53,7 @@ import type {
   TerminalReader,
 } from "./payment-types";
 import { LiveTenderConflictError } from "./payment-types";
-import { isUnpaidOnlineStatus } from "./menu-types";
+import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
   BusinessDayClose,
@@ -1631,7 +1631,9 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async listOrders(tenantId, locationId, opts) {
-      const limit = Math.min(Math.max(opts?.limit ?? 500, 1), 1000);
+      // Default 1000 = main's behavior (PostgREST's implicit cap) for callers
+      // that pass no limit (reports, EOD); explicit limits are clamped to it.
+      const limit = Math.min(Math.max(opts?.limit ?? 1000, 1), 1000);
       const offset = opts?.offset ?? 0;
       let q = sb
         .from("orders")
@@ -1693,7 +1695,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       if (row) {
         const order = await readOrderRow(row);
         // Only the winner of a draft -> live transition depletes inventory.
-        if (leavingHold && to !== "voided") await depleteForOrder(order);
+        if (leavingHold && isLiveOrderStatus(to)) await depleteForOrder(order);
         return { ok: true, order } as const;
       }
       const current = unwrap(
@@ -1804,19 +1806,38 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     async transitionOrderStatus(id, from, to, patch) {
       // Compare-and-set: the WHERE clause is the lock. Zero rows back means
       // another caller already moved the order out of `from`.
-      const r = unwrap(
-        await sb
-          .from("orders")
-          .update({
-            status: to,
-            ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
-            updated_at: nowIso(),
-          })
-          .eq("id", id)
-          .in("status", from)
-          .select()
-          .maybeSingle(),
-      ) as Row | null;
+      const cas = async (statuses: OrderStatus[], extra: Row) =>
+        unwrap(
+          await sb
+            .from("orders")
+            .update({
+              status: to,
+              ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+              ...extra,
+              updated_at: nowIso(),
+            })
+            .eq("id", id)
+            .in("status", statuses)
+            .select()
+            .maybeSingle(),
+        ) as Row | null;
+      // Leaving a hold (main's settlement moves `["draft","placed"] -> "paid"`):
+      // try the `draft` CAS first so the winner KNOWS it left a hold. It clears
+      // `hold` and, for a live target, depletes the stock a held order never
+      // consumed (per-item idempotent), exactly like casOrderStatus.
+      if (from.includes("draft") && to !== "draft") {
+        const r = await cas(["draft"], { hold: null });
+        if (r) {
+          const order = await readOrderRow(r);
+          if (isLiveOrderStatus(to)) await depleteForOrder(order);
+          return order;
+        }
+        const rest = from.filter((s) => s !== "draft");
+        if (rest.length === 0) return null;
+        const r2 = await cas(rest, {});
+        return r2 ? readOrderRow(r2) : null;
+      }
+      const r = await cas(from, {});
       return r ? readOrderRow(r) : null;
     },
 

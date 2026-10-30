@@ -14,7 +14,9 @@
 --   * Snapshots are MINIMAL (ids/status only): no customer/staff/address PII is
 --     stored in the outbox; payloads are hydrated at delivery time.
 --   * order.placed on leaving a hold (no status_changed); a never-announced hold
---     that is canceled emits nothing.
+--     that is canceled emits nothing (orders.core_announced, see below).
+--   * payment events only for announced orders; a released refund reservation
+--     retracts its unclaimed payment.refunded row.
 --   * menu.updated coalesces into an UNCLAIMED pending row (all changed item ids
 --     are kept; edits made while a row is claimed get a new row).
 --   * Dedupe/lookup index; explicit grants.
@@ -142,6 +144,20 @@ create index if not exists core_outbox_pending_subject_idx
   where status = 'pending';
 
 -- ---- orders: draft semantics + minimal snapshot --------------------------------
+-- "Announced" = orders.core_announced (see 20261102000300): set the first time
+-- the order is in a live status. Rules:
+--   * INSERT live                      -> order.placed
+--   * never announced -> live          -> order.placed (once; this covers a hold
+--     released/paid, a checkout paid, and an ABANDONED checkout whose late
+--     payment is accepted: abandoned -> paid)
+--   * never announced -> not live      -> nothing (canceled hold, abandoned
+--     checkout, a draft/abandoned order refunded)
+--   * announced, status change         -> order.status_changed (+ ready/completed/
+--     canceled aliases)
+--   * announced, content change        -> order.updated, where content = totals,
+--     notes, discount, customer, and fulfillment MINUS checkout bookkeeping
+--     (paid_at, finalized_at, late_payment, recovery_*, foreign_alerted_at,
+--     checkout_mode). Mirrored by src/lib/core/mock-events.ts.
 create or replace function public.core_trg_orders()
 returns trigger
 language plpgsql
@@ -151,9 +167,12 @@ as $$
 declare
   v_row jsonb := jsonb_build_object('id', new.id, 'status', new.status);
   v_changes jsonb;
+  v_bookkeeping constant text[] := array[
+    'paid_at', 'finalized_at', 'late_payment', 'recovery_attempts',
+    'recovery_next_at', 'foreign_alerted_at', 'checkout_mode'];
 begin
   if tg_op = 'INSERT' then
-    if new.status not in ('draft', 'awaiting_payment', 'voided', 'abandoned') then
+    if new.core_announced then
       perform public.core_emit(new.tenant_id, new.location_id, 'order.placed',
         'order', new.id, new.version, null, v_row);
     end if;
@@ -162,11 +181,8 @@ begin
 
   if new.status is distinct from old.status then
     v_changes := jsonb_build_object('status', jsonb_build_array(old.status, new.status));
-    if old.status in ('draft', 'awaiting_payment') then
-      -- Leaving a hold / an unpaid online checkout: announce the order once,
-      -- as placed. A canceled hold or an abandoned checkout was never
-      -- announced, so it emits nothing.
-      if new.status not in ('draft', 'awaiting_payment', 'voided', 'abandoned') then
+    if not old.core_announced then
+      if new.core_announced then
         perform public.core_emit(new.tenant_id, new.location_id, 'order.placed',
           'order', new.id, new.version, v_changes, v_row);
       end if;
@@ -184,10 +200,11 @@ begin
       perform public.core_emit(new.tenant_id, new.location_id, 'order.canceled',
         'order', new.id, new.version, v_changes, v_row);
     end if;
-  elsif new.status not in ('draft', 'awaiting_payment', 'abandoned') and (
+  elsif old.core_announced
+     and new.status::text not in ('draft', 'awaiting_payment', 'abandoned') and (
         new.totals is distinct from old.totals
      or new.notes is distinct from old.notes
-     or new.fulfillment is distinct from old.fulfillment
+     or (new.fulfillment - v_bookkeeping) is distinct from (old.fulfillment - v_bookkeeping)
      or new.discount_cents is distinct from old.discount_cents
      or new.customer_id is distinct from old.customer_id) then
     perform public.core_emit(new.tenant_id, new.location_id, 'order.updated',
@@ -198,6 +215,19 @@ end;
 $$;
 
 -- ---- payments --------------------------------------------------------------------
+-- Payment events go out only for orders the hub has seen (core_announced).
+-- While an order is draft / awaiting_payment / abandoned, or voided/refunded
+-- without ever being announced, its tender changes are SUPPRESSED: a normal
+-- online payment is upserted BEFORE finalize moves the order to paid, and the
+-- order.placed that follows is hydrated from current state, so its `tenders`
+-- already carry those payments.
+--
+-- Refund reservation (reserve_payment_refund, cash/crypto) runs BEFORE the rail
+-- call; when the rail fails, release_payment_refund undoes it (refunded_cents
+-- goes DOWN, refunded -> captured). That release emits no payment.captured:
+-- it retracts the still-unclaimed payment.refunded row instead (dead,
+-- 'retracted'). Only if that row was already claimed by a worker (it may have
+-- reached the hub) is a corrective event emitted for the restored status.
 create or replace function public.core_trg_payments()
 returns trigger
 language plpgsql
@@ -207,8 +237,42 @@ as $$
 declare
   v_type text;
   v_changes jsonb;
+  v_announced boolean;
+  v_retract uuid;
 begin
-  if tg_op = 'INSERT' then
+  select o.core_announced into v_announced from public.orders o where o.id = new.order_id;
+  if not coalesce(v_announced, false) then
+    return new;
+  end if;
+
+  if tg_op = 'UPDATE' and new.refunded_cents < old.refunded_cents then
+    -- A released (failed) refund reservation.
+    if public.core_outbox_enabled() then
+      select id into v_retract from public.core_outbox
+       where tenant_id = new.tenant_id and subject_type = 'payment'
+         and subject_id = new.id and event_type = 'payment.refunded'
+         and status = 'pending' and attempts = 0
+       order by sequence desc
+       limit 1
+       for update skip locked;
+      if v_retract is not null then
+        update public.core_outbox
+           set status = 'dead', last_error = 'retracted: refund released'
+         where id = v_retract;
+        return new;
+      end if;
+    end if;
+    v_changes := jsonb_build_object('refunded_cents',
+      jsonb_build_array(old.refunded_cents, new.refunded_cents));
+    if new.status is distinct from old.status then
+      v_changes := v_changes || jsonb_build_object('status',
+        jsonb_build_array(old.status, new.status));
+    end if;
+    v_type := case new.status::text
+      when 'authorized' then 'payment.authorized'
+      when 'captured' then 'payment.captured'
+      else null end;
+  elsif tg_op = 'INSERT' then
     v_type := case new.status::text
       when 'authorized' then 'payment.authorized'
       when 'captured' then 'payment.captured'

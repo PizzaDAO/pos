@@ -564,7 +564,10 @@ export function toContractOrder(input: {
   };
 
   const t = order.totals;
-  const canceled = order.status === "voided";
+  // An abandoned checkout maps to fulfillment `canceled` (toPosOrderStatus), so
+  // it carries a canceled_at too: its last update, the abandonment (POS keeps
+  // no separate abandoned-at stamp).
+  const canceled = order.status === "voided" || order.status === "abandoned";
   const created = ts(order.created_at);
   const updated = ts(order.updated_at);
 

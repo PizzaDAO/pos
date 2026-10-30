@@ -87,7 +87,7 @@ export type MenuEntityKind =
 
 /** Bounds for `listOrders` (newest first). Explicit so no default row cap applies. */
 export interface OrderListOptions {
-  /** Max rows (default 500, hard max 1000). */
+  /** Max rows (default and hard max 1000). */
   limit?: number;
   offset?: number;
   /** Inclusive ISO created_at range. */

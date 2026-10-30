@@ -65,7 +65,43 @@ create index if not exists staff_user_id_idx on public.staff (user_id);
 alter table public.orders
   add column if not exists source jsonb,
   add column if not exists hold jsonb,
-  add column if not exists version integer not null default 1;
+  add column if not exists version integer not null default 1,
+  -- True once the order has ever been in a LIVE status (anything but draft /
+  -- awaiting_payment / voided / abandoned / refunded), i.e. once the outbox
+  -- announced it with order.placed. Maintained by orders_core_announced (BEFORE
+  -- trigger, never reset). The outbox triggers use it so a never-announced
+  -- order (a canceled hold, an abandoned checkout, a draft refunded) emits no
+  -- order/payment events at all.
+  add column if not exists core_announced boolean not null default false;
+
+-- Backfill before any core trigger exists (fresh apply). Idempotent: on a
+-- re-run every live row is already marked, so nothing matches. Legacy
+-- voided/refunded rows stay unannounced (the hub never saw them).
+update public.orders
+   set core_announced = true
+ where not core_announced
+   and status::text not in ('draft', 'awaiting_payment', 'voided', 'abandoned', 'refunded');
+
+create or replace function public.core_mark_order_announced()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.status::text not in ('draft', 'awaiting_payment', 'voided', 'abandoned', 'refunded') then
+    new.core_announced := true;
+  elsif tg_op = 'UPDATE' then
+    new.core_announced := coalesce(old.core_announced, false);
+  else
+    new.core_announced := false;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists orders_core_announced on public.orders;
+create trigger orders_core_announced
+  before insert or update on public.orders
+  for each row execute function public.core_mark_order_announced();
 
 create or replace function public.core_bump_order_version()
 returns trigger

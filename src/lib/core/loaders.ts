@@ -143,6 +143,8 @@ export interface OrdersPageQuery {
   updatedSince?: string;
   /** Post-mapping filter (status/channel/...). Scanning continues until enough match. */
   filter?: (o: CoreOrder) => boolean;
+  /** Pre-mapping filter on the POS row (e.g. drop unpaid checkouts from rollups). */
+  rowFilter?: (o: Order) => boolean;
   driver?: PosDriver;
 }
 
@@ -201,7 +203,11 @@ export async function loadOrdersPage(
         exhausted = true;
         break;
       }
-      const mapped = await mapOrders(rows, (l) => tz.get(l) ?? "UTC", d);
+      const mapped = await mapOrders(
+        q.rowFilter ? rows.filter(q.rowFilter) : rows,
+        (l) => tz.get(l) ?? "UTC",
+        d,
+      );
       for (const m of mapped) {
         if (!q.filter || q.filter(m)) {
           merged.push(m);
@@ -238,6 +244,7 @@ export async function loadTenantOrders(
     createdFrom?: string;
     createdTo?: string;
     maxRows?: number;
+    rowFilter?: (o: Order) => boolean;
     driver?: PosDriver;
   } = {},
 ): Promise<CoreOrder[]> {
@@ -252,6 +259,7 @@ export async function loadTenantOrders(
       after: cursor,
       createdFrom: opts.createdFrom,
       createdTo: opts.createdTo,
+      rowFilter: opts.rowFilter,
       driver: opts.driver,
     });
     const take = rows.slice(0, size);

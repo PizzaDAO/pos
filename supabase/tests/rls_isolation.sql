@@ -1005,6 +1005,143 @@ begin
   assert n = 0, format('an abandoned checkout emits nothing, saw %s', n);
 end $$;
 
+-- Core review round (20261102000300/000400): announcement (orders.core_announced),
+-- payment suppression, refund release, order.updated bookkeeping.
+do $$
+declare
+  n int;
+  t text[];
+  v_t uuid := 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  v_l uuid := 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1';
+  o_late uuid := '0adac101-0000-0000-0000-000000000001';
+  o_ckout uuid := '0adac102-0000-0000-0000-000000000001';
+  o_draft_ref uuid := '0adac103-0000-0000-0000-000000000001';
+  o_live uuid := '0adac104-0000-0000-0000-000000000001';
+  o_held uuid := '0adac105-0000-0000-0000-000000000001';
+  o_void uuid := '0adac106-0000-0000-0000-000000000001';
+  p_ckout uuid := '0adac202-0000-0000-0000-000000000001';
+  p_live uuid := '0adac204-0000-0000-0000-000000000001';
+  p_live2 uuid := '0adac204-0000-0000-0000-000000000002';
+  p_held uuid := '0adac205-0000-0000-0000-000000000001';
+  p_void uuid := '0adac206-0000-0000-0000-000000000001';
+  r jsonb;
+begin
+  if to_regclass('public.core_outbox') is null then
+    return;
+  end if;
+  perform public.core_set_outbox_enabled(true);
+
+  insert into public.orders
+    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number, fulfillment)
+  values
+    (o_late, v_t, v_l, 'awaiting_payment', 'online_pickup', 'USD', 0, '{"total_cents":1000}', 'A-R101',
+     '{"type":"pickup","checkout_mode":"test"}'),
+    (o_ckout, v_t, v_l, 'awaiting_payment', 'online_pickup', 'USD', 0, '{"total_cents":1000}', 'A-R102',
+     '{"type":"pickup","checkout_mode":"test"}'),
+    (o_draft_ref, v_t, v_l, 'draft', 'in_store', 'USD', 0, '{"total_cents":1000}', 'A-R103', null),
+    (o_live, v_t, v_l, 'placed', 'in_store', 'USD', 0, '{"total_cents":1000}', 'A-R104',
+     '{"type":"pickup"}'),
+    (o_held, v_t, v_l, 'draft', 'in_store', 'USD', 0, '{"total_cents":1000}', 'A-R105', null),
+    (o_void, v_t, v_l, 'draft', 'in_store', 'USD', 0, '{"total_cents":1000}', 'A-R106',
+     '{"type":"pickup"}');
+
+  -- (1) late-payment Accept: awaiting_payment -> abandoned -> paid = ONE order.placed.
+  update public.orders set status = 'abandoned' where id = o_late;
+  update public.orders set status = 'paid' where id = o_late;
+  select array_agg(event_type order by sequence) into t from public.core_outbox where subject_id = o_late;
+  assert t = array['order.placed'], format('abandoned -> paid must emit only order.placed, saw %s', t);
+  assert (select changes from public.core_outbox where subject_id = o_late)
+         = '{"status":["abandoned","paid"]}'::jsonb, 'order.placed records abandoned -> paid';
+  update public.orders set status = 'in_kitchen' where id = o_late;
+  select array_agg(event_type order by sequence) into t from public.core_outbox where subject_id = o_late;
+  assert t = array['order.placed', 'order.status_changed'],
+    format('once announced, moves are status_changed, saw %s', t);
+
+  -- (2) payments for a checkout are silent until the order is announced.
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents)
+  values (p_ckout, o_ckout, v_t, v_l, 'stripe_online', 'requires_action', 1000);
+  update public.payments set status = 'captured' where id = p_ckout;
+  select count(*) into n from public.core_outbox where subject_id = p_ckout;
+  assert n = 0, format('payments on an awaiting_payment order are suppressed, saw %s', n);
+  update public.orders set status = 'paid' where id = o_ckout;
+  select count(*) into n from public.core_outbox where subject_id = o_ckout and event_type = 'order.placed';
+  assert n = 1, 'the checkout is announced once when paid';
+  select count(*) into n from public.core_outbox where subject_id = p_ckout;
+  assert n = 0, 'the captured payment rides on order.placed (hydrated), not its own event';
+
+  -- (2) held draft / never-announced void: no payment events either.
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents)
+  values (p_held, o_held, v_t, v_l, 'cash', 'captured', 1000);
+  update public.orders set status = 'voided' where id = o_void;
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents)
+  values (p_void, o_void, v_t, v_l, 'cash', 'captured', 1000);
+  update public.payments set refunded_cents = 1000, status = 'refunded' where id = p_void;
+  select count(*) into n from public.core_outbox where subject_id in (p_held, p_void, o_void);
+  assert n = 0, format('a held / never-announced voided order emits nothing, saw %s', n);
+  -- (7) ...not even order.updated for a fulfillment change on that void.
+  update public.orders set fulfillment = fulfillment || '{"eta_minutes":5}' where id = o_void;
+  select count(*) into n from public.core_outbox where subject_id = o_void;
+  assert n = 0, format('a never-announced void gets no order.updated, saw %s', n);
+
+  -- (3) draft -> refunded emits nothing.
+  update public.orders set status = 'refunded' where id = o_draft_ref;
+  select count(*) into n from public.core_outbox where subject_id = o_draft_ref;
+  assert n = 0, format('draft -> refunded must not emit order.placed, saw %s', n);
+  assert not (select core_announced from public.orders where id = o_draft_ref),
+    'a refunded hold is not announced';
+
+  -- (6) refund reserved, rail failed, reservation released: the payment.refunded
+  -- row is retracted and no payment.captured goes out.
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents)
+  values (p_live, o_live, v_t, v_l, 'cash', 'captured', 1000);
+  r := public.reserve_payment_refund(p_live, 1000, 'rf-1');
+  assert r ->> 'outcome' = 'ok', format('reserve ok, got %s', r);
+  perform public.release_payment_refund(p_live, 1000, 'rf-1');
+  assert (select status from public.payments where id = p_live) = 'captured', 'release restores captured';
+  select array_agg(event_type order by sequence) into t from public.core_outbox where subject_id = p_live;
+  assert t = array['payment.captured', 'payment.refunded'],
+    format('release must not emit payment.captured again, saw %s', t);
+  assert (select status from public.core_outbox where subject_id = p_live and event_type = 'payment.refunded') = 'dead',
+    'the released refund event is retracted (dead)';
+  assert (select last_error from public.core_outbox where subject_id = p_live and event_type = 'payment.refunded')
+         = 'retracted: refund released', 'retracted rows say why';
+  -- (6) ...but once a worker claimed the refund row, the release emits a correction.
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents)
+  values (p_live2, o_live, v_t, v_l, 'cash', 'captured', 1000);
+  r := public.reserve_payment_refund(p_live2, 400, 'rf-2');
+  update public.core_outbox set attempts = 1
+   where subject_id = p_live2 and event_type = 'payment.refunded';
+  perform public.release_payment_refund(p_live2, 400, 'rf-2');
+  select array_agg(event_type order by sequence) into t from public.core_outbox where subject_id = p_live2;
+  assert t = array['payment.captured', 'payment.refunded', 'payment.captured'],
+    format('a claimed refund row gets a corrective event, saw %s', t);
+  assert (select changes from public.core_outbox where subject_id = p_live2 order by sequence desc limit 1)
+         = '{"refunded_cents":[400,0]}'::jsonb, 'the correction records the restored refunded_cents';
+
+  -- (7) order.updated ignores checkout bookkeeping inside fulfillment.
+  delete from public.core_outbox where subject_id = o_live;
+  update public.orders set fulfillment = fulfillment || '{"finalized_at":"2026-06-04T00:00:00Z"}' where id = o_live;
+  update public.orders set fulfillment = fulfillment || '{"paid_at":"2026-06-04T00:00:00Z","recovery_attempts":1,"recovery_next_at":"x","foreign_alerted_at":"x"}' where id = o_live;
+  update public.orders set fulfillment = fulfillment || '{"late_payment":{"kind":"duplicate","amount_cents":1}}' where id = o_live;
+  select count(*) into n from public.core_outbox where subject_id = o_live;
+  assert n = 0, format('bookkeeping-only fulfillment changes emit nothing, saw %s', n);
+  update public.orders set fulfillment = fulfillment || '{"eta_minutes":25}' where id = o_live;
+  update public.orders set notes = 'extra napkins' where id = o_live;
+  select array_agg(event_type order by sequence) into t from public.core_outbox where subject_id = o_live;
+  assert t = array['order.updated', 'order.updated'],
+    format('content changes emit order.updated, saw %s', t);
+  -- an abandoned checkout flagged with a late payment: nothing at all.
+  insert into public.orders
+    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number, fulfillment)
+  values ('0adac107-0000-0000-0000-000000000001', v_t, v_l, 'awaiting_payment', 'online_pickup', 'USD', 0,
+          '{"total_cents":1000}', 'A-R107', '{"type":"pickup"}');
+  update public.orders set status = 'abandoned' where id = '0adac107-0000-0000-0000-000000000001';
+  update public.orders set fulfillment = fulfillment || '{"late_payment":{"kind":"late"},"eta_minutes":3}'
+   where id = '0adac107-0000-0000-0000-000000000001';
+  select count(*) into n from public.core_outbox where subject_id = '0adac107-0000-0000-0000-000000000001';
+  assert n = 0, format('an abandoned checkout emits nothing, saw %s', n);
+end $$;
+
 select 'RLS isolation test PASSED' as result;
 
 rollback;
