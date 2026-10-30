@@ -236,7 +236,44 @@ export function isUnpaidOnlineStatus(status: OrderStatus): boolean {
   return (UNPAID_ONLINE_STATUSES as readonly string[]).includes(status);
 }
 
+/**
+ * Statuses in which an order is NOT live (not on the KDS, consumes no stock): a
+ * hold, an unpaid/abandoned checkout, and the two terminal non-sale outcomes.
+ * Every other status is live. Same list as orders.core_announced (SQL).
+ */
+export const NOT_LIVE_ORDER_STATUSES: readonly OrderStatus[] = [
+  "draft",
+  "awaiting_payment",
+  "voided",
+  "abandoned",
+  "refunded",
+] as const;
+
+export function isLiveOrderStatus(status: OrderStatus): boolean {
+  return !(NOT_LIVE_ORDER_STATUSES as readonly string[]).includes(status);
+}
+
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
+
+/**
+ * Where an order came from (core contract `OrderSource`, minus defaults).
+ * Absent on legacy rows: the mappers derive it from `channel`.
+ */
+export interface OrderSource {
+  /** pos_terminal | web | kiosk | agent_api | agent_mcp | integration ... */
+  type: string;
+  /**
+   * Contract channel the caller asked for (in_store | online | kiosk | agent |
+   * phone | catering | marketplace). POS's own `channel` enum is coarser.
+   */
+  channel?: string;
+  /** Module that created it ("pos", "kiosk", "pizza_mcp" ...). */
+  module?: string | null;
+  agent_client_id?: string | null;
+  external_ref?: string | null;
+  offline_synced?: boolean;
+  device_id?: string | null;
+}
 
 /** How an online order is fulfilled (Phase 4). */
 export type FulfillmentType = "pickup" | "delivery";
@@ -411,6 +448,12 @@ export interface Order {
   staff_id?: string | null;
   /** Online-order fulfillment details (Phase 4); absent on in-store orders. */
   fulfillment?: OrderFulfillment;
+  /** Order origin (core). Absent on legacy rows. */
+  source?: OrderSource;
+  /** Monotonic change counter (bumped by DB trigger / mock). Absent = 1. */
+  version?: number;
+  /** Set when the order is held (awaiting payment) and not yet released. */
+  hold?: { reason: string; expires_at: string | null } | null;
   created_at: string;
   updated_at: string;
 }
@@ -436,4 +479,8 @@ export interface CreateOrderInput {
   staff_id?: string | null;
   /** Online-order fulfillment details (Phase 4). */
   fulfillment?: OrderFulfillment;
+  /** Order origin (core). */
+  source?: OrderSource;
+  /** Hold (awaiting payment) metadata for core-created held orders. */
+  hold?: { reason: string; expires_at: string | null } | null;
 }

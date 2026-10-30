@@ -47,6 +47,20 @@ npm run lint         # next lint
 npm run format       # prettier --write .
 ```
 
+### Open Pizza core (`@openpizza/core`)
+
+POS is the commerce source for the Open Pizza hub: it serves the `/v1` contract at
+`/api/v1/*` and emits contract events through a transactional outbox. Full notes in
+[`docs/OPENPIZZA_CORE.md`](./docs/OPENPIZZA_CORE.md).
+
+`@openpizza/core` is **vendored** as a tarball in [`vendor/`](./vendor) (the lockfile resolves
+`file:vendor/openpizza-core-<ver>.tgz`, nothing outside this repo), so `npm ci` and Vercel
+builds work. To update it from a core checkout:
+
+```bash
+npm run core:vendor -- ../core/packages/core
+```
+
 ### Surfaces (placeholders in Phase 0)
 
 `/` landing · `/api/health` (`{ ok: true }`) · `/terminal` · `/kitchen` · `/admin` · `/shop/[tenant]/[location]` · `/platform`

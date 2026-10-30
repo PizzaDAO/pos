@@ -1,8 +1,8 @@
 /**
- * Staff & shifts (Phase 5, /admin → Staff & shifts).
+ * Staff & drawer (Phase 5, /admin → Staff & drawer). Time clocks belong to workforce.
  *
- * Staff roster (role-tagged), clock in/out, the shift drawer (opening float +
- * cash tenders/payouts during the shift), and drawer RECONCILIATION at clock-out
+ * Staff roster (role-tagged), open/close drawer, the cash drawer session (opening float +
+ * cash tenders/payouts during the shift), and drawer RECONCILIATION at drawer close
  * (expected vs counted → over/short). No real auth — this is a demo switcher for
  * staff views. Talks to /api/admin/staff. No env vars.
  */
@@ -79,7 +79,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
     <div className="space-y-8">
       <div className="flex items-center gap-2">
         <Users className="h-5 w-5" />
-        <h2 className="text-base font-semibold">Staff &amp; shifts</h2>
+        <h2 className="text-base font-semibold">Staff &amp; drawer</h2>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
@@ -102,7 +102,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
                       : "bg-muted text-muted-foreground",
                   )}
                 >
-                  {open ? "Clocked in" : "Off"}
+                  {open ? "Drawer open" : "Drawer closed"}
                 </span>
               </div>
 
@@ -134,7 +134,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
                       })
                     }
                   >
-                    <LogIn className="h-4 w-4" /> Clock in
+                    <LogIn className="h-4 w-4" /> Open drawer
                   </Button>
                 </div>
               )}
@@ -143,14 +143,14 @@ export function StaffShifts({ tenantId, locationId }: Props) {
         })}
       </div>
 
-      {/* Open shifts — drawer + reconciliation */}
+      {/* Open drawers — cash session + reconciliation */}
       <section className="space-y-3">
         <h3 className="flex items-center gap-2 text-sm font-semibold">
           <Wallet className="h-4 w-4" /> Open drawers
         </h3>
         {data.shifts.filter((s) => s.status === "open").length === 0 && (
           <p className="text-sm text-muted-foreground">
-            No open shifts. Clock someone in to open a drawer.
+            No open drawers. Open a drawer for someone to start a cash session.
           </p>
         )}
         {data.shifts
@@ -171,7 +171,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
 
       {/* Closed shift history */}
       <section className="space-y-2">
-        <h3 className="text-sm font-semibold">Closed shifts</h3>
+        <h3 className="text-sm font-semibold">Closed drawers</h3>
         <div className="overflow-hidden rounded-xl border">
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground">
@@ -224,7 +224,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
               {data.shifts.filter((s) => s.status === "closed").length === 0 && (
                 <tr>
                   <td colSpan={5} className="px-3 py-4 text-muted-foreground">
-                    No closed shifts yet.
+                    No closed drawers yet.
                   </td>
                 </tr>
               )}
@@ -322,7 +322,7 @@ function OpenDrawer({
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t pt-3">
-        <span className="text-sm text-muted-foreground">Reconcile &amp; clock out:</span>
+        <span className="text-sm text-muted-foreground">Count &amp; close drawer:</span>
         <input
           className="w-32 rounded-md border bg-background px-2 py-1.5 text-sm"
           placeholder="Counted $"
@@ -341,7 +341,7 @@ function OpenDrawer({
             })
           }
         >
-          <LogOut className="h-4 w-4" /> Clock out
+          <LogOut className="h-4 w-4" /> Close drawer
         </Button>
       </div>
     </div>

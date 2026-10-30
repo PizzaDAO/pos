@@ -50,7 +50,7 @@ import {
   ONE_LIVE_TENDER_RAILS,
   tenderHoldsOpenSlot,
 } from "./payment-types";
-import { isUnpaidOnlineStatus } from "./menu-types";
+import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
 import type {
   Customer,
   DeliveryRecord,
@@ -85,6 +85,7 @@ import type {
   Membership,
   PlatformAdmin,
   Tenant,
+  TenantSettings,
   User,
 } from "./types";
 import type {
@@ -120,6 +121,20 @@ import {
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+
+/**
+ * An abandoned tender attempt: unsettled (pending / requires_action), never
+ * reached the rail (no charge id) and older than 15 minutes. Mirrors
+ * public.core_cancel_order(); such a tender never holds an order open.
+ */
+const STALE_TENDER_TTL_MS = 15 * 60_000;
+function isStaleUnsettled(p: Payment, nowMs: number): boolean {
+  return (
+    (p.status === "pending" || p.status === "requires_action") &&
+    !p.charge_id &&
+    Date.parse(p.created_at) < nowMs - STALE_TENDER_TTL_MS
+  );
+}
 
 // ---------------------------------------------------------------------------
 // MUTABLE menu state (Phase 5). Cloned from the seed so admin CRUD can mutate
@@ -223,6 +238,9 @@ const businessDayCloses = new Map<string, BusinessDayClose>();
 
 /** Process-lifetime order store, keyed by client UUID for idempotent upsert. */
 const orders = new Map<string, Order>();
+
+/** Per-tenant POS settings (core v1). Absent = defaults. */
+const tenantSettings = new Map<string, TenantSettings>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
 /** Terminal PIN switch-in sessions keyed by id (server-side revocation). */
@@ -243,16 +261,18 @@ const magicLinks = new Map<string, MagicLinkToken>();
 /** Deliveries keyed by id. */
 const deliveries = new Map<string, DeliveryRecord>();
 let orderSeq = 0;
-let idSeq = 0;
 
 function nowIso(): string {
   return new Date().toISOString();
 }
 
-/** Deterministic-enough unique id for mock-created rows. */
-function genId(prefix: string): string {
-  idSeq += 1;
-  return `${prefix}-${Date.now().toString(36)}-${idSeq}`;
+/**
+ * Unique id for mock-created rows. A real UUID (like the Supabase driver's
+ * `genUuid`) so mock data also satisfies the core contract's id format; the
+ * prefix is kept only as a readability hint in the signature.
+ */
+function genId(_prefix: string): string {
+  return globalThis.crypto.randomUUID();
 }
 
 /** Slugify a name into a URL-safe slug, made unique against `existing`. */
@@ -429,6 +449,10 @@ function resolveLocationInventory(
 }
 
 function depleteForOrder(order: Order): void {
+  // Back-of-house owns inventory for this tenant: POS must not deplete.
+  if (tenantSettings.get(order.tenant_id)?.inventory_owner === "backofhouse") {
+    return;
+  }
   // Aggregate consumption per resolved inventory row id.
   const consumption = new Map<string, number>();
 
@@ -952,6 +976,9 @@ export const mockDriver: PosDriver = {
       customer_id: input.customer_id ?? null,
       staff_id: input.staff_id ?? null,
       fulfillment: input.fulfillment,
+      source: input.source,
+      hold: input.hold ?? null,
+      version: 1,
       created_at: now,
       updated_at: now,
     };
@@ -959,8 +986,13 @@ export const mockDriver: PosDriver = {
     // Phase 5: deplete linked inventory on the single order funnel (terminal +
     // shop both land here), unless the order was created already voided.
     // An online order awaiting payment (or abandoned) consumes nothing: it is
-    // depleted by `depleteInventoryForOrder` once payment finalizes.
-    if (order.status !== "voided" && !isUnpaidOnlineStatus(order.status)) {
+    // depleted by `depleteInventoryForOrder` once payment finalizes. Held
+    // (draft) orders deplete when they are released.
+    if (
+      order.status !== "voided" &&
+      order.status !== "draft" &&
+      !isUnpaidOnlineStatus(order.status)
+    ) {
       depleteForOrder(order);
     }
     return order;
@@ -971,11 +1003,143 @@ export const mockDriver: PosDriver = {
     return orders.get(id) ?? null;
   },
 
-  async listOrders(tenantId, locationId): Promise<Order[]> {
+  async listOrders(tenantId, locationId, opts): Promise<Order[]> {
     ensureKitchenSeed();
+    const limit = Math.min(Math.max(opts?.limit ?? 1000, 1), 1000);
     return [...orders.values()]
-      .filter((o) => o.tenant_id === tenantId && o.location_id === locationId)
-      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+      .filter(
+        (o) =>
+          o.tenant_id === tenantId &&
+          o.location_id === locationId &&
+          (!opts?.from || o.created_at >= opts.from) &&
+          (!opts?.to || o.created_at <= opts.to),
+      )
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(opts?.offset ?? 0, (opts?.offset ?? 0) + limit);
+  },
+
+  async listOrdersPage(tenantId, locationId, opts): Promise<Order[]> {
+    ensureKitchenSeed();
+    const after = opts.after;
+    return [...orders.values()]
+      .filter(
+        (o) =>
+          o.tenant_id === tenantId &&
+          o.location_id === locationId &&
+          (!opts.createdFrom || o.created_at >= opts.createdFrom) &&
+          (!opts.createdTo || o.created_at <= opts.createdTo) &&
+          (!opts.updatedSince || o.updated_at >= opts.updatedSince) &&
+          (!after ||
+            o.created_at > after.created_at ||
+            (o.created_at === after.created_at && o.id > after.id)),
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+      .slice(0, Math.min(Math.max(opts.limit, 1), 500));
+  },
+
+  async casOrderStatus(id, from, to) {
+    ensureKitchenSeed();
+    const current = orders.get(id);
+    if (!current) return { ok: false, reason: "not_found" } as const;
+    if (!from.includes(current.status)) {
+      return { ok: false, reason: "conflict", order: current } as const;
+    }
+    const order = (await this.updateOrderStatus(id, to)) as Order;
+    return { ok: true, order } as const;
+  },
+
+  async cancelOrder(id, tenantId, opts) {
+    ensureKitchenSeed();
+    const current = orders.get(id);
+    if (!current || current.tenant_id !== tenantId) return { ok: false, reason: "not_found" } as const;
+    if (current.status === "voided") return { ok: true, order: current } as const;
+    if (!["draft", "placed", "paid"].includes(current.status)) {
+      return { ok: false, reason: "not_cancelable", order: current } as const;
+    }
+    const nowMs = opts?.nowMs ?? Date.now();
+    const mine = [...payments.values()].filter((p) => p.order_id === id);
+    // Same rules as public.core_cancel_order(): stale unsettled tenders (no rail
+    // charge) are voided; any other in-flight tender blocks the cancel.
+    const inFlight = mine.filter((p) =>
+      ["pending", "authorized", "requires_action"].includes(p.status),
+    );
+    for (const p of inFlight) {
+      if (!isStaleUnsettled(p, nowMs)) {
+        return { ok: false, reason: "in_flight", order: current } as const;
+      }
+    }
+    if (
+      mine.some(
+        (p) => p.status === "captured" && p.amount_cents + p.tip_cents > p.refunded_cents,
+      )
+    ) {
+      return { ok: false, reason: "captured", order: current } as const;
+    }
+    // Void the abandoned attempts (all stale, or we returned above).
+    for (const p of inFlight) {
+      payments.set(p.id, { ...p, status: "canceled", updated_at: nowIso() });
+    }
+    const order = (await this.updateOrderStatus(id, "voided")) as Order;
+    return { ok: true, order } as const;
+  },
+
+  async listPaymentsForOrders(orderIds: string[]) {
+    const out = new Map<string, Payment[]>();
+    const wanted = new Set(orderIds);
+    for (const p of [...payments.values()].sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    )) {
+      if (!wanted.has(p.order_id)) continue;
+      const list = out.get(p.order_id) ?? [];
+      list.push({ ...p });
+      out.set(p.order_id, list);
+    }
+    return out;
+  },
+
+  async getCustomers(ids: string[]): Promise<Customer[]> {
+    return ids.flatMap((id) => {
+      const c = customers.get(id);
+      return c ? [{ ...c }] : [];
+    });
+  },
+
+  async customerOrderStats(tenantId: string, customerIds: string[]) {
+    ensureKitchenSeed();
+    const wanted = new Set(customerIds);
+    const out = new Map<
+      string,
+      { order_count: number; last_order_at: string | null; lifetime_spend_cents: number }
+    >();
+    for (const o of orders.values()) {
+      if (
+        o.tenant_id !== tenantId ||
+        !o.customer_id ||
+        !wanted.has(o.customer_id) ||
+        o.status === "voided" ||
+        o.status === "draft"
+      ) {
+        continue;
+      }
+      const s = out.get(o.customer_id) ?? {
+        order_count: 0,
+        last_order_at: null,
+        lifetime_spend_cents: 0,
+      };
+      s.order_count += 1;
+      s.lifetime_spend_cents += o.totals.total_cents;
+      if (!s.last_order_at || o.created_at > s.last_order_at) s.last_order_at = o.created_at;
+      out.set(o.customer_id, s);
+    }
+    return out;
+  },
+
+  async listStaffWithPin(tenantId: string): Promise<Set<string>> {
+    return new Set(
+      [...staffById.values()]
+        .filter((s) => s.tenant_id === tenantId && s.pin_hash)
+        .map((s) => s.id),
+    );
   },
 
   async updateOrderStatus(
@@ -985,8 +1149,16 @@ export const mockDriver: PosDriver = {
     ensureKitchenSeed();
     const order = orders.get(id);
     if (!order) return null;
-    const updated: Order = { ...order, status, updated_at: nowIso() };
+    const leavingHold = order.status === "draft" && status !== "draft";
+    const updated: Order = {
+      ...order,
+      status,
+      hold: leavingHold ? null : (order.hold ?? null),
+      version: (order.version ?? 1) + 1,
+      updated_at: nowIso(),
+    };
     orders.set(id, updated);
+    if (leavingHold && isLiveOrderStatus(status)) depleteForOrder(updated);
     return updated;
   },
 
@@ -1000,13 +1172,20 @@ export const mockDriver: PosDriver = {
     ensureKitchenSeed();
     const order = orders.get(id);
     if (!order || !from.includes(order.status)) return null;
+    // Leaving a hold (e.g. main's settlement `["draft","placed"] -> "paid"`):
+    // the hold is over, and a held order consumed no stock yet, so a move to a
+    // live status depletes it (per-item idempotent) -- same as casOrderStatus.
+    const leavingHold = order.status === "draft" && to !== "draft";
     const updated: Order = {
       ...order,
       status: to,
       ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
+      ...(leavingHold ? { hold: null } : {}),
+      version: (order.version ?? 1) + 1,
       updated_at: nowIso(),
     };
     orders.set(id, updated);
+    if (leavingHold && isLiveOrderStatus(to)) depleteForOrder(updated);
     return updated;
   },
 
@@ -1381,6 +1560,44 @@ export const mockDriver: PosDriver = {
 
   async getCustomer(id: string): Promise<Customer | null> {
     return customers.get(id) ?? null;
+  },
+
+  async listCustomers(tenantId, opts): Promise<Customer[]> {
+    const after = opts?.after;
+    const rows = [...customers.values()]
+      .filter(
+        (c) =>
+          c.tenant_id === tenantId &&
+          (!after ||
+            c.created_at > after.created_at ||
+            (c.created_at === after.created_at && c.id > after.id)),
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+      .map((c) => ({ ...c }));
+    return opts?.limit ? rows.slice(0, opts.limit) : rows;
+  },
+
+  async getTenantSettings(tenantId: string): Promise<TenantSettings> {
+    return (
+      tenantSettings.get(tenantId) ?? {
+        tenant_id: tenantId,
+        inventory_owner: "pos_basic",
+        updated_at: new Date(0).toISOString(),
+      }
+    );
+  },
+
+  async setTenantSettings(tenantId, patch): Promise<TenantSettings> {
+    const current = await this.getTenantSettings(tenantId);
+    const next: TenantSettings = {
+      ...current,
+      ...(patch.inventory_owner
+        ? { inventory_owner: patch.inventory_owner }
+        : {}),
+      updated_at: nowIso(),
+    };
+    tenantSettings.set(tenantId, next);
+    return next;
   },
 
   async upsertCustomer(customer: Customer): Promise<Customer> {

@@ -31,7 +31,30 @@ export interface Location {
   slug: string;
   timezone: string;
   address: string | null;
+  /** Structured address (core contract). All optional; `address` stays the display line. */
+  address_line1?: string | null;
+  address_line2?: string | null;
+  city?: string | null;
+  region?: string | null;
+  postal_code?: string | null;
+  country?: string | null;
+  lat?: number | null;
+  lng?: number | null;
   created_at: string;
+}
+
+/** Who owns inventory depletion for a tenant. */
+export type InventoryOwner = "pos_basic" | "backofhouse";
+
+/**
+ * Per-tenant POS settings (own table so POS never alters the tenancy tables,
+ * see POS-6). Absent row = defaults.
+ */
+export interface TenantSettings {
+  tenant_id: string;
+  /** `backofhouse` => POS stops depleting inventory on sale. */
+  inventory_owner: InventoryOwner;
+  updated_at: string;
 }
 
 export interface User {
