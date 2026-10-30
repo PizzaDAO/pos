@@ -21,6 +21,8 @@ import type { CreateOrderInput } from "@/lib/db";
 import {
   enqueueOrder,
   getPendingOrders,
+  getQueuedOrder,
+  isFlushable,
   markError,
   markNeedsAttention,
   markRejected,
@@ -173,8 +175,13 @@ export async function flushQueue(): Promise<FlushResult> {
   let attention = 0;
   try {
     const pending = await getPendingOrders();
-    for (const entry of pending) {
-      if (inFlight.has(entry.id)) continue;
+    for (const snap of pending) {
+      if (inFlight.has(snap.id)) continue;
+      // Re-read right before posting: the snapshot may be stale (e.g. the
+      // cashier placed this order interactively meanwhile and acknowledged a
+      // refusal). Only still-flushable entries are posted.
+      const entry = await getQueuedOrder(snap.id);
+      if (!entry || !isFlushable(entry) || inFlight.has(entry.id)) continue;
       const outcome = await syncEntry(entry);
       if (outcome.status === "synced") synced += 1;
       else {

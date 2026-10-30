@@ -133,9 +133,17 @@ function isAutoRetryable(o: QueuedOrder): boolean {
  */
 export async function getPendingOrders(): Promise<QueuedOrder[]> {
   const all = await db().orders.orderBy("createdAt").toArray();
-  return all.filter(
-    (o) => isAutoRetryable(o) || (needsAttention(o) && o.httpStatus === 401),
-  );
+  return all.filter(isFlushable);
+}
+
+/**
+ * Should a background flush push this entry? Retryable ones, plus
+ * needs-attention entries refused with 401. Re-checked against a FRESH read
+ * right before each post, so an entry resolved meanwhile (an interactive
+ * refusal the cashier saw, or a sync) is never re-posted from a stale snapshot.
+ */
+export function isFlushable(o: QueuedOrder): boolean {
+  return isAutoRetryable(o) || (needsAttention(o) && o.httpStatus === 401);
 }
 
 /** Entries waiting on staff, oldest first. */
@@ -171,8 +179,13 @@ export async function getQueuedOrder(
   return db().orders.get(id);
 }
 
+/** No-op on resolved entries (see markNeedsAttention). */
 export async function markSyncing(id: string): Promise<void> {
-  await db().orders.update(id, { status: "syncing", updatedAt: Date.now() });
+  await db().transaction("rw", db().orders, async () => {
+    const entry = await db().orders.get(id);
+    if (!entry || isResolved(entry)) return;
+    await db().orders.update(id, { status: "syncing", updatedAt: Date.now() });
+  });
 }
 
 export async function markSynced(id: string): Promise<void> {
@@ -212,21 +225,40 @@ export async function markRejected(id: string, r: Refusal): Promise<void> {
   });
 }
 
-/** Refused during a BACKGROUND flush: keep it and surface it to staff. */
+/**
+ * Refused during a BACKGROUND flush: keep it and surface it to staff.
+ *
+ * No-op when the entry is already resolved — synced, or rejected and
+ * acknowledged (the cashier saw that refusal and kept the cart). A stale
+ * background post must never turn such an entry back into a retryable
+ * needs-attention one: a later Retry would then place the order twice.
+ */
 export async function markNeedsAttention(
   id: string,
   r: Refusal,
 ): Promise<void> {
-  const entry = await db().orders.get(id);
-  await db().orders.update(id, {
-    status: "needs_attention",
-    acknowledged: false,
-    attempts: (entry?.attempts ?? 0) + 1,
-    lastError: r.message,
-    httpStatus: r.httpStatus,
-    errorCode: r.code,
-    updatedAt: Date.now(),
+  await db().transaction("rw", db().orders, async () => {
+    const entry = await db().orders.get(id);
+    if (!entry || isResolved(entry)) return;
+    await db().orders.update(id, {
+      status: "needs_attention",
+      acknowledged: false,
+      attempts: (entry.attempts ?? 0) + 1,
+      lastError: r.message,
+      httpStatus: r.httpStatus,
+      errorCode: r.code,
+      updatedAt: Date.now(),
+    });
   });
+}
+
+/** Finished entries a background flush must leave alone. */
+function isResolved(o: QueuedOrder): boolean {
+  return (
+    o.status === "synced" ||
+    o.status === "discarded" ||
+    (o.status === "rejected" && o.acknowledged === true)
+  );
 }
 
 /**

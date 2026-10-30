@@ -22,6 +22,7 @@ import {
   getPendingOrders,
   getQueueCounts,
   getQueuedOrder,
+  markNeedsAttention,
   markSynced,
   pruneSynced,
   requeueWithoutDiscount,
@@ -232,5 +233,60 @@ describe("interactive placement (cashier present)", () => {
     expect(outcome.status).toBe("rejected");
     expect(fetch).toHaveBeenCalledTimes(1);
     expect((await getQueuedOrder("int-race"))?.status).toBe("rejected");
+  });
+
+  it("a stale background snapshot never re-posts an acknowledged interactive refusal", async () => {
+    // Flush snapshots [bg-first, int-stale]; while it is posting bg-first the
+    // cashier places int-stale interactively and acknowledges a 403. The
+    // flush must then skip int-stale (fresh re-read), not re-post it and flip
+    // it to needs_attention (a later Retry would place it twice).
+    await enqueueOrder(payload("bg-first", 0));
+    await enqueueOrder(payload("int-stale"));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const posted: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        const id = (JSON.parse(String(init!.body)) as { id: string }).id;
+        posted.push(id);
+        if (id === "bg-first") {
+          await gate;
+          return new Response(JSON.stringify({ order: {} }), { status: 201 });
+        }
+        return new Response(JSON.stringify(DISCOUNT_403), { status: 403 });
+      }),
+    );
+    const flushing = flushQueue();
+    await new Promise((r) => setTimeout(r, 10)); // flush is posting bg-first
+    const outcome = await placeOrderNow(payload("int-stale"), manager, true);
+    expect(outcome.status).toBe("rejected");
+    release();
+    const result = await flushing;
+    expect(posted).toEqual(["bg-first", "int-stale"]); // int-stale once only
+    expect(result).toMatchObject({ synced: 1, needsAttention: 0 });
+    const e = await getQueuedOrder("int-stale");
+    expect(e?.status).toBe("rejected");
+    expect(e?.acknowledged).toBe(true);
+    expect(await getAttentionOrders()).toEqual([]);
+  });
+});
+
+describe("resolved entries are never flipped back to needs_attention", () => {
+  it("markNeedsAttention is a no-op on rejected+acknowledged and synced entries", async () => {
+    respond(403, DISCOUNT_403);
+    await placeOrderNow(payload("res-rej"), null, true);
+    await enqueueOrder(payload("res-ok"));
+    await markSynced("res-ok");
+    const refusal = { httpStatus: 403, message: "late", code: "discount_forbidden" };
+    await markNeedsAttention("res-rej", refusal);
+    await markNeedsAttention("res-ok", refusal);
+    expect((await getQueuedOrder("res-rej"))?.status).toBe("rejected");
+    expect((await getQueuedOrder("res-rej"))?.acknowledged).toBe(true);
+    expect((await getQueuedOrder("res-ok"))?.status).toBe("synced");
+    // A direct stale background syncEntry also leaves them alone.
+    await syncEntry(entry("res-rej"));
+    expect((await getQueuedOrder("res-rej"))?.status).toBe("rejected");
+    expect(await getAttentionOrders()).toEqual([]);
   });
 });
