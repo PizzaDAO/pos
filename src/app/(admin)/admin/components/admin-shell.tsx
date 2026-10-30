@@ -83,6 +83,10 @@ const ConnectOnboarding = dynamic(
   () => import("../connect-onboarding").then((m) => m.ConnectOnboarding),
   { loading: PanelFallback },
 );
+const CardReaders = dynamic(
+  () => import("./card-readers").then((m) => m.CardReaders),
+  { loading: PanelFallback },
+);
 const DeliveryDispatch = dynamic(
   () => import("../delivery-dispatch").then((m) => m.DeliveryDispatch),
   { loading: PanelFallback },
@@ -304,7 +308,14 @@ export function AdminShell({
             onChanged={() => void refreshEntitlements()}
           />
         )}
-        {tab === "payments" && <ConnectOnboarding tenantId={tenantId} />}
+        {tab === "payments" && (
+          <>
+            <ConnectOnboarding tenantId={tenantId} />
+            {locationId && (
+              <CardReaders tenantId={tenantId} locationId={locationId} />
+            )}
+          </>
+        )}
         {tab === "delivery" &&
           (deliveryAllowed ? (
             <DeliveryDispatch tenantId={tenantId} locationId={locationId} />

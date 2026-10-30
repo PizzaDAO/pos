@@ -3,7 +3,7 @@
  *
  * The card-reader list for the till: this location's registered readers merged
  * with their live online/offline status, plus the card gate. Returns
- * `{ mode, ready, notReadyReason, readers }`. `ready` is true only when the
+ * `{ mode, ready, notReadyReason, readers, tipMode }`. `ready` is true only when the
  * tenant has a charges-enabled connected account AND at least one registered
  * reader (always true in simulated mode, which has one virtual reader).
  *
@@ -11,6 +11,8 @@
  * tenant's.
  */
 import { NextResponse } from "next/server";
+import { getPosDriver } from "@/lib/db";
+import { DEFAULT_TIP_MODE } from "@/lib/payments/terminal/locations";
 import { enforceRateLimit } from "@/lib/security";
 import { getCardReadiness } from "@/lib/payments/terminal/readers";
 import {
@@ -33,8 +35,15 @@ export async function GET(request: Request) {
   );
   if (!auth.ok) return auth.res;
   try {
-    const readiness = await getCardReadiness(auth.tenantId, auth.location.id);
-    return NextResponse.json(readiness, { headers: { "Cache-Control": "no-store" } });
+    const [readiness, row] = await Promise.all([
+      getCardReadiness(auth.tenantId, auth.location.id),
+      getPosDriver().getTerminalLocation(auth.location.id),
+    ]);
+    // `tipMode` lets the till hide its own tip selector when the reader tips.
+    return NextResponse.json(
+      { ...readiness, tipMode: row?.tip_mode ?? DEFAULT_TIP_MODE },
+      { headers: { "Cache-Control": "no-store" } },
+    );
   } catch (err) {
     return errorResponse(err, "Could not load card readers.");
   }

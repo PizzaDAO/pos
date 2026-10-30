@@ -5,16 +5,20 @@
  * applies to the remaining balance and the screen stays open until the balance
  * reaches zero, at which point the order is `paid` and the full receipt shows.
  * Cash captures a tendered amount and shows change due; crypto tenders show a
- * pay-to address/QR placeholder and poll until confirmed; card tenders approve
- * (simulated when no Stripe key). Completed tenders can be refunded/voided.
+ * pay-to address/QR placeholder and poll until confirmed. Card tenders go to the
+ * selected card reader (server-driven Stripe Terminal; a virtual reader when no
+ * Stripe key): the card panel shows present card / approved / declined with
+ * Try again / Cancel / Reset reader (+ Simulate in sandbox). Card needs internet,
+ * so offline the screen says to take cash. Completed tenders can be
+ * refunded/voided.
  *
- * Every tender uses a fresh client UUID as its idempotency key, so retries never
- * double-charge.
+ * Every tender uses a client UUID as its idempotency key (stable across retries),
+ * so retries never double-charge.
  */
 "use client";
 
 import { useMemo, useState } from "react";
-import { Loader2, RotateCcw, X } from "lucide-react";
+import { CreditCard, Loader2, RotateCcw, X } from "lucide-react";
 import type { PaymentSettings } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
@@ -26,6 +30,7 @@ import {
   PAYMENT_RAIL_LABELS,
 } from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
+import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
 import { TipSelector } from "./tip-selector";
 import { ReceiptView } from "./receipt-view";
 
@@ -64,23 +69,55 @@ export function PaymentScreen({
   const balance = checkout.balanceCents;
   const paid = balance === 0 && checkout.payments.length > 0;
 
+  // --- Card reader ---------------------------------------------------------
+  const card = checkout.card;
+  const cardRail = rail === "stripe_terminal";
+  const cardLive = isLiveCardTender(card.tender);
+  const selectedReader =
+    card.list?.readers.find((r) => r.id === card.selectedReaderId) ?? null;
+  // Why Card can't be used right now (null: it can).
+  const cardBlocked: string | null = !card.online
+    ? "Card needs internet: take cash."
+    : card.list?.notReadyReason === "connect_not_ready"
+      ? "Finish Stripe onboarding in Admin → Payments."
+      : card.list?.notReadyReason === "no_reader"
+        ? "Add a card reader in Admin → Payments."
+        : !cardReady
+          ? "Card isn't set up for this location."
+          : null;
+  // On-reader tipping (or no tipping): our tip selector is not used for card.
+  const hideTip = cardRail && card.list?.tipMode !== "pos";
+  const effectiveTipCents = hideTip ? 0 : tipCents;
+  // Simulate buttons only where a simulator exists (never while the mode is unknown).
+  const sandboxReader =
+    card.list?.mode === "simulated" || card.list?.mode === "stripe_test";
+  // The reader the tender is actually on (it may differ from the dropdown after a switch).
+  const tenderReader =
+    card.list?.readers.find((r) => r.id === tenderReaderId(card.tender)) ??
+    selectedReader;
+
   // Cash change preview.
   const cashTenderedCents = useMemo(() => {
     const v = parseFloat(cashTendered);
     return Number.isFinite(v) ? Math.round(v * 100) : 0;
   }, [cashTendered]);
-  const dueWithTip = balance + tipCents;
+  const dueWithTip = balance + effectiveTipCents;
   const changeDue = Math.max(0, cashTenderedCents - dueWithTip);
 
   async function handleTake() {
     if (balance <= 0) return;
-    await checkout.takeTender({
+    const recorded = await checkout.takeTender({
       rail,
       amountCents: balance,
-      tipCents,
+      tipCents: effectiveTipCents,
       cashTenderedCents:
         rail === "cash" ? cashTenderedCents || dueWithTip : undefined,
     });
+    // Only a tender that was actually recorded (or a card tender now on the
+    // reader) consumes the entered tip / cash amount; a failed or lost request
+    // keeps them so the cashier can simply press Charge again.
+    if (!recorded) return;
+    if (rail !== "stripe_terminal") card.clearError();
     setTipCents(0);
     setCashTendered("");
   }
@@ -132,10 +169,16 @@ export function PaymentScreen({
                 {checkout.notice}
               </div>
             )}
-            {checkout.error && (
-              <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive">
-                {checkout.error}
-              </div>
+            {[checkout.error, card.error].map(
+              (msg, i) =>
+                msg && (
+                  <div
+                    key={i}
+                    className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive"
+                  >
+                    {msg}
+                  </div>
+                ),
             )}
 
             {!paid && (
@@ -146,15 +189,17 @@ export function PaymentScreen({
                     Payment method
                   </div>
                   <div className="grid grid-cols-1 gap-2">
+                    {/* "Card — Stripe (online)" makes no sense at the till. */}
                     {PAYMENT_RAIL_KEYS.filter(
-                      (key) =>
-                        cardReady ||
-                        (key !== "stripe_terminal" && key !== "stripe_online"),
+                      (key) => key !== "stripe_online",
                     ).map((key) => (
                       <button
                         key={key}
                         type="button"
-                        onClick={() => setRail(key)}
+                        onClick={() => {
+                          setRail(key);
+                          card.clearError();
+                        }}
                         className={cn(
                           "rounded-md border px-3 py-2 text-left text-sm",
                           rail === key && "border-primary bg-primary/10",
@@ -166,14 +211,132 @@ export function PaymentScreen({
                   </div>
                 </div>
 
-                {/* Tip */}
-                <TipSelector
-                  baseCents={balance}
-                  presetsBps={paymentSettings.tip_presets_bps}
-                  currency={currency}
-                  tipCents={tipCents}
-                  onChange={setTipCents}
-                />
+                {/* Tip (the card reader asks the customer itself unless tip mode is POS) */}
+                {!hideTip && (
+                  <TipSelector
+                    baseCents={balance}
+                    presetsBps={paymentSettings.tip_presets_bps}
+                    currency={currency}
+                    tipCents={tipCents}
+                    onChange={setTipCents}
+                  />
+                )}
+
+                {/* Card reader panel */}
+                {(cardRail || card.phase !== "idle") && (
+                  <div
+                    data-testid="card-panel"
+                    className="space-y-3 rounded-md border p-3"
+                  >
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <CreditCard className="h-4 w-4" aria-hidden="true" />
+                      Card reader
+                    </div>
+
+                    {card.list && card.list.readers.length > 1 &&
+                    (!cardLive || card.phase === "declined") ? (
+                      <select
+                        aria-label="Card reader"
+                        value={card.selectedReaderId ?? ""}
+                        onChange={(e) => card.selectReader(e.target.value)}
+                        className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+                      >
+                        <option value="" disabled>
+                          Select a reader…
+                        </option>
+                        {card.list.readers.map((r) => (
+                          <option key={r.id} value={r.id}>
+                            {r.label} ({r.status})
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      selectedReader && (
+                        <div className="text-sm text-muted-foreground">
+                          {selectedReader.label}
+                          {" · "}
+                          {selectedReader.status === "online"
+                            ? "online"
+                            : selectedReader.status}
+                        </div>
+                      )
+                    )}
+
+                    {cardBlocked && cardRail && (
+                      <p role="alert" className="text-sm text-amber-700">
+                        {cardBlocked}
+                      </p>
+                    )}
+
+                    {card.phase === "present" && (
+                      <div className="flex items-center gap-2 text-sm font-medium">
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                        Present card on {tenderReader?.label ?? "the reader"}…
+                      </div>
+                    )}
+                    {card.phase === "approved" && (
+                      <div className="text-sm font-semibold text-emerald-700">
+                        Approved
+                      </div>
+                    )}
+                    {card.phase === "declined" && (
+                      <div role="alert" className="text-sm font-medium text-destructive">
+                        {card.lastError?.message ?? "The card did not go through."}
+                      </div>
+                    )}
+
+                    {(card.phase === "present" || card.phase === "declined") && (
+                      <div className="flex flex-wrap gap-2">
+                        {card.phase === "declined" && (
+                          <Button
+                            size="sm"
+                            disabled={card.busy || !card.online}
+                            onClick={() => void card.retry()}
+                          >
+                            Try again
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={card.busy}
+                          onClick={() => void card.cancel()}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={card.busy || !card.online}
+                          onClick={() => void card.resetReader()}
+                        >
+                          Reset reader
+                        </Button>
+                      </div>
+                    )}
+
+                    {card.phase === "present" && sandboxReader && (
+                      <div className="flex flex-wrap gap-2 border-t pt-2">
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={card.busy}
+                          onClick={() => void card.simulate("approve")}
+                        >
+                          Simulate approve
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={card.busy}
+                          onClick={() => void card.simulate("decline")}
+                        >
+                          Simulate decline
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Cash entry */}
                 {rail === "cash" && (
@@ -224,22 +387,29 @@ export function PaymentScreen({
                 <div className="flex items-center justify-between rounded-md bg-muted p-3 text-sm">
                   <span className="text-muted-foreground">This tender</span>
                   <span className="font-bold">
-                    {formatMoney(balance + tipCents, currency)}
+                    {formatMoney(balance + effectiveTipCents, currency)}
                   </span>
                 </div>
 
                 <Button
                   className="h-14 w-full text-base"
-                  disabled={checkout.loading || balance <= 0}
+                  disabled={
+                    checkout.loading ||
+                    card.busy ||
+                    balance <= 0 ||
+                    // A card tender is on the reader: finish or cancel it first.
+                    cardLive ||
+                    (cardRail && (!!cardBlocked || !card.selectedReaderId))
+                  }
                   onClick={handleTake}
                 >
-                  {checkout.loading ? (
+                  {checkout.loading || card.busy ? (
                     <>
                       <Loader2 className="mr-2 h-5 w-5 animate-spin" />{" "}
                       Processing…
                     </>
                   ) : (
-                    `Charge ${formatMoney(balance + tipCents, currency)}`
+                    `Charge ${formatMoney(balance + effectiveTipCents, currency)}`
                   )}
                 </Button>
               </>

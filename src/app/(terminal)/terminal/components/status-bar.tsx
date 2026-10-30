@@ -3,8 +3,61 @@
  */
 "use client";
 
-import { AlertTriangle, Cloud, CloudOff, RefreshCw } from "lucide-react";
+import {
+  AlertTriangle,
+  Cloud,
+  CloudOff,
+  CreditCard,
+  RefreshCw,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useCardReader } from "@/lib/store/use-card-reader";
+
+/**
+ * This device's card reader: online / offline, or "Card: cash only" when the
+ * device itself is offline (card needs internet). Hidden when no reader is set up.
+ */
+function ReaderChip({
+  tenantId,
+  locationId,
+}: {
+  tenantId: string;
+  locationId: string;
+}) {
+  const { online, list, selectedReaderId } = useCardReader({
+    tenantId,
+    locationId,
+    orderId: null,
+  });
+  if (!online) {
+    return (
+      <span
+        data-testid="reader-chip"
+        className="flex items-center gap-1 rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800"
+        title="Card needs internet: take cash"
+      >
+        <CreditCard className="h-3.5 w-3.5" />
+        Cash only
+      </span>
+    );
+  }
+  const reader = list?.readers.find((r) => r.id === selectedReaderId);
+  if (!list?.ready || !reader) return null;
+  const up = reader.status === "online";
+  return (
+    <span
+      data-testid="reader-chip"
+      className={cn(
+        "flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium",
+        up ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800",
+      )}
+      title={`Card reader ${reader.label}: ${reader.status}`}
+    >
+      <CreditCard className="h-3.5 w-3.5" />
+      {reader.label} {up ? "online" : "offline"}
+    </span>
+  );
+}
 
 export interface StatusBarProps {
   locationName: string;
@@ -21,6 +74,8 @@ export interface StatusBarProps {
   activeStaffName?: string | null;
   /** Open the staff PIN switcher. */
   onSwitchStaff?: () => void;
+  /** Show the card-reader chip for this tenant + location. */
+  readerScope?: { tenantId: string; locationId: string };
 }
 
 export function StatusBar({
@@ -33,6 +88,7 @@ export function StatusBar({
   onFlush,
   activeStaffName,
   onSwitchStaff,
+  readerScope,
 }: StatusBarProps) {
   return (
     <header className="flex items-center justify-between gap-3 border-b bg-background px-4 py-2">
@@ -56,6 +112,7 @@ export function StatusBar({
       </div>
 
       <div className="flex items-center gap-3">
+        {readerScope && <ReaderChip {...readerScope} />}
         {attentionCount > 0 && (
           <button
             type="button"

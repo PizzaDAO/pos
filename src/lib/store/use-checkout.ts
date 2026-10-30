@@ -7,6 +7,11 @@
  * upserts by it). The UUID is minted ONCE per pending tender and reused on retry
  * (lost response, double-tap) until the tender is recorded or its amount/rail
  * changes, so a retry never double-charges.
+ *
+ * Card (in-store reader) tenders are different: they are handed to a physical
+ * reader and complete later, so `takeTender` delegates that rail to
+ * `use-card-reader` (`/api/terminal/payments`), which polls the tender and
+ * reloads this balance when it settles.
  */
 "use client";
 
@@ -14,6 +19,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Order, Payment } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { createPendingTenderIds, tenderSignature } from "./pending-tender";
+import { useCardReader, type UseCardReader } from "./use-card-reader";
 
 function newUuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -30,6 +36,8 @@ export interface CheckoutState {
   error: string | null;
   /** Non-error information to show (e.g. a crypto refund that must be sent by hand). */
   notice: string | null;
+  /** The in-store card reader + this order's card tender (see use-card-reader). */
+  card: UseCardReader;
   /** Take one tender. Resolves when the tender is recorded (may be pending). */
   takeTender: (input: TakeTenderInput) => Promise<Payment | null>;
   /** Refund/void a tender (full unless amountCents given). */
@@ -102,6 +110,9 @@ export function useCheckout(
     }
   }, [orderId]);
 
+  const card = useCardReader({ tenantId, locationId, orderId, onSettled: refresh });
+  const startCard = card.start;
+
   // Initial load.
   useEffect(() => {
     if (orderId) void refresh();
@@ -146,6 +157,14 @@ export function useCheckout(
   const takeTender = useCallback(
     async (input: TakeTenderInput): Promise<Payment | null> => {
       if (!orderId) return null;
+      // Card: the reader flow owns the tender (it stays open until the customer
+      // taps), so there is no Payment to hand back yet.
+      if (input.rail === "stripe_terminal") {
+        return startCard({
+          amountCents: input.amountCents,
+          tipCents: input.tipCents,
+        });
+      }
       setLoading(true);
       setError(null);
       try {
@@ -198,7 +217,7 @@ export function useCheckout(
         setLoading(false);
       }
     },
-    [orderId, tenantId, locationId, currency, refresh],
+    [orderId, tenantId, locationId, currency, refresh, startCard],
   );
 
   const refund = useCallback(
@@ -243,6 +262,7 @@ export function useCheckout(
     loading,
     error,
     notice,
+    card,
     takeTender,
     refund,
     refresh,

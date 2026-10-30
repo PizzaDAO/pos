@@ -230,7 +230,10 @@ reference; verify webhook handlers are idempotent on the charge id.
   tenders are never queued offline: they are created online and settle by polling
   plus the Connect webhook; an open tender left behind (tablet died) is reconciled
   from Stripe by the cron sweep (`reconcileTerminalTenders`). Crypto + online card
-  also need connectivity.
+  also need connectivity. The till shows "Card needs internet: take cash" and
+  disables Charge for card while offline; the service worker serves
+  `/api/terminal/*`, `/api/payments*` and `/api/admin/terminal*` NetworkOnly so a
+  payment poll is never answered from a stale cache (`src/app/sw.ts`).
 - Mitigations in place: idempotent upsert end-to-end (no dupes on replay), clear
   pending-sync count in the terminal, and a balance model that won't ask a
   cashier to collect twice while a tender is in flight.
@@ -247,6 +250,13 @@ reference; verify webhook handlers are idempotent on the charge id.
   (Terminal hardware secure element / Stripe.js + PaymentIntents). No card number
   touches our servers or DB → **SAQ-A-level** scope. The `payments` table stores
   only rail-native ids (PaymentIntent id, charge id), amounts, and status.
+- **Card-reader receipts keep truncated data only.** After a reader payment we
+  store in `payments.raw.card_receipt` just the brand, last4, entry method and the
+  EMV receipt fields Stripe requires on a printed receipt (application preferred
+  name, AID / dedicated file name, account type, authorization response + code).
+  Never a PAN, track data or a PaymentIntent `client_secret` (server-driven needs
+  none). The till shows these on `ReceiptView`; `GET /api/payments` exposes only
+  this allow-listed slice of `raw` (`payments/public.ts`).
 - The platform fee is **disclosed to tenants at onboarding** and is **card-only**
   (cash + crypto carry no `application_fee` in v1). Fee math is clamped to the
   charge amount and proven in `payments/fees.test.ts`.

@@ -6,7 +6,7 @@
  * device is logged in (E2E_OWNER_PASSWORD), otherwise against the simulated
  * demo session (mock driver) — the terminal is usable in both.
  */
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { detectRealAuth, signInWithPassword } from "./support/auth";
 import { buildHalfAndHalf } from "./support/terminal";
 import { OWNER_EMAIL, OWNER_PASSWORD, STAFF_PIN } from "./support/env";
@@ -108,5 +108,90 @@ test.describe("terminal order → payment → receipt", () => {
     await expect(page.getByText("Order paid in full.")).toBeVisible();
     // The receipt panel should show our half-and-half line item.
     await expect(page.getByText("Pepperoni").first()).toBeVisible();
+  });
+});
+
+/**
+ * Card via the (simulated) reader, zero env: the mock driver + no Stripe key give
+ * every location one virtual reader, driven by the Simulate approve/decline
+ * buttons. Skipped on real-auth targets (a real sandbox reader needs Stripe env).
+ */
+test.describe("terminal card reader (simulated)", () => {
+  test.beforeEach(async ({ page }) => {
+    const real = await detectRealAuth(page);
+    test.skip(real, "Simulated reader flow runs against the zero-env app only.");
+    await page.goto("/terminal", { waitUntil: "domcontentloaded" });
+    await expect(page.getByRole("button", { name: "Pizzas" })).toBeVisible({
+      timeout: 30_000,
+    });
+  });
+
+  async function placeAndChooseCard(page: Page) {
+    await buildHalfAndHalf(page, {
+      itemName: "Pepperoni",
+      leftTopping: "Mushrooms",
+      rightTopping: "Onions",
+      addButtonName: "Add to order",
+    });
+    await page.getByRole("button", { name: "Place order" }).click();
+    await expect(page.getByText("Take payment")).toBeVisible({ timeout: 30_000 });
+    // Wait for the balance to load, then pick Card.
+    const charge = page.getByRole("button", { name: /^Charge / });
+    await expect(charge).toBeEnabled({ timeout: 20_000 });
+    await page.getByRole("button", { name: /^Card — Stripe Terminal/ }).click();
+    // No "Card — Stripe (online)" at the till.
+    await expect(
+      page.getByRole("button", { name: /Stripe \(online\)/ }),
+    ).toHaveCount(0);
+    // The only reader is auto-selected.
+    await expect(page.getByTestId("card-panel")).toContainText("Simulated reader");
+    await expect(charge).toBeEnabled({ timeout: 20_000 });
+    return charge;
+  }
+
+  test("charge, decline, try again, approve, receipt shows the card", async ({
+    page,
+  }) => {
+    const charge = await placeAndChooseCard(page);
+    await charge.click();
+
+    await expect(page.getByText(/Present card on/)).toBeVisible();
+    // Charge is disabled while the card tender is live.
+    await expect(charge).toBeDisabled();
+
+    await page.getByRole("button", { name: "Simulate decline" }).click();
+    await expect(page.getByText("Your card was declined.")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await page.getByRole("button", { name: "Try again" }).click();
+    await expect(page.getByText(/Present card on/)).toBeVisible();
+    await page.getByRole("button", { name: "Simulate approve" }).click();
+
+    await expect(page.getByText("Payment complete")).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(page.getByTestId("receipt-card")).toContainText("Visa •••• 4242");
+  });
+
+  test("cancel clears the reader and the order can be charged again", async ({
+    page,
+  }) => {
+    const charge = await placeAndChooseCard(page);
+    await charge.click();
+    await expect(page.getByText(/Present card on/)).toBeVisible();
+    // The in-flight tender id is remembered for this order (reload-resume).
+    const tenderId = await page.evaluate(() => {
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i)!;
+        if (k.startsWith("pos.cardTender.")) return sessionStorage.getItem(k);
+      }
+      return null;
+    });
+    expect(tenderId).toBeTruthy();
+
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(page.getByText(/Present card on/)).toBeHidden({ timeout: 15_000 });
+    await expect(page.getByRole("button", { name: /^Charge / })).toBeEnabled();
   });
 });
