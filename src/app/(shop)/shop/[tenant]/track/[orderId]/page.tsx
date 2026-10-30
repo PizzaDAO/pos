@@ -8,16 +8,22 @@
  */
 import { notFound, redirect } from "next/navigation";
 import { getPosDriver } from "@/lib/db";
-import { storefrontPath } from "@/lib/shop/storefront";
+import {
+  storefrontPath,
+  withSearchParams,
+  type PageSearchParams,
+} from "@/lib/shop/storefront";
 
 export const dynamic = "force-dynamic";
 
 export default async function LegacyTrackPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ tenant: string; orderId: string }>;
+  searchParams: Promise<PageSearchParams>;
 }) {
-  const { orderId } = await params;
+  const [{ orderId }, query] = await Promise.all([params, searchParams]);
   const driver = getPosDriver();
   const order = await driver.getOrder(orderId).catch(() => null);
   if (!order) notFound();
@@ -27,7 +33,11 @@ export default async function LegacyTrackPage({
   ]);
   const location = locations.find((l) => l.id === order.location_id);
   if (!tenant || !location) notFound();
+  // Keep the query string (e.g. a payment provider's return params).
   redirect(
-    `${storefrontPath({ tenantSlug: tenant.slug, locationSlug: location.slug })}/track/${encodeURIComponent(order.id)}`,
+    withSearchParams(
+      `${storefrontPath({ tenantSlug: tenant.slug, locationSlug: location.slug })}/track/${encodeURIComponent(order.id)}`,
+      query,
+    ),
   );
 }

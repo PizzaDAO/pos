@@ -19,7 +19,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { storefrontPath } from "@/lib/shop/storefront";
+import {
+  storefrontPath,
+  withSearchParams,
+  type PageSearchParams,
+} from "@/lib/shop/storefront";
 import { resolveLegacyShopSlug } from "@/lib/shop/resolve-location";
 
 export const metadata: Metadata = {
@@ -31,13 +35,18 @@ export const dynamic = "force-dynamic";
 
 export default async function LegacyShopPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ tenant: string }>;
+  searchParams: Promise<PageSearchParams>;
 }) {
-  const { tenant: slug } = await params;
+  const [{ tenant: slug }, query] = await Promise.all([params, searchParams]);
   const resolved = await resolveLegacyShopSlug(slug);
   if (resolved.kind === "none") notFound();
-  if (resolved.kind === "redirect") redirect(resolved.path);
+  // Keep the query string (campaign tags, ?checkout=… returns) on the redirect.
+  if (resolved.kind === "redirect") {
+    redirect(withSearchParams(resolved.path, query));
+  }
   const choices = resolved.choices;
 
   return (
@@ -51,10 +60,13 @@ export default async function LegacyShopPage({
         {choices.map(({ location, tenant }) => (
           <li key={location.id}>
             <Link
-              href={storefrontPath({
-                tenantSlug: tenant.slug,
-                locationSlug: location.slug,
-              })}
+              href={withSearchParams(
+                storefrontPath({
+                  tenantSlug: tenant.slug,
+                  locationSlug: location.slug,
+                }),
+                query,
+              )}
               className="block rounded-lg border p-4 hover:bg-muted"
             >
               <div className="font-medium">{location.name}</div>

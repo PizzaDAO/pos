@@ -1,4 +1,5 @@
 import { SignInForm } from "@/components/auth/sign-in-form";
+import { safeRedirectPath } from "@/lib/auth/safe-redirect";
 
 /**
  * Tenant app login (/admin, /terminal, /kitchen). Email magic-link primary, with
@@ -15,7 +16,7 @@ export default async function LoginPage({
   searchParams: Promise<{ redirect?: string; error?: string }>;
 }) {
   const { redirect, error } = await searchParams;
-  const dest = redirect && redirect.startsWith("/") ? redirect : "/admin";
+  const dest = safeRedirectPath(redirect, "/admin");
   return (
     <SignInForm
       redirect={dest}
