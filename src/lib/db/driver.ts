@@ -43,9 +43,11 @@ import type {
   MovementReason,
   OverrideInput,
   SalesReport,
+  PinAttempt,
   Shift,
   ShiftCashEvent,
   Staff,
+  StaffSession,
   SizeInput,
 } from "./backoffice-types";
 import type {
@@ -67,11 +69,20 @@ import type {
   CreateLocationInput,
   CreateTenantInput,
   OnboardingStep,
+  PendingBillingCheckout,
   PlanTier,
   Subscription,
   TenantHealth,
   TenantOnboarding,
 } from "./saas-types";
+
+/** Menu entity kinds addressable by the back-office menu editor. */
+export type MenuEntityKind =
+  | "category"
+  | "item"
+  | "size"
+  | "modifierGroup"
+  | "modifier";
 
 export interface PosDriver {
   /** Stable id of the active driver implementation (for diagnostics/UX). */
@@ -100,10 +111,15 @@ export interface PosDriver {
     input: CreateTenantInput,
   ): Promise<{ tenant: Tenant; owner: User }>;
 
-  /** Update a tenant's lifecycle status (active/suspended/cancelled). */
+  /**
+   * Update a tenant's lifecycle status (active/suspended/cancelled). With
+   * `byPlatform: true` the platform-suspension flag is written in the SAME
+   * update (true when suspending, false otherwise).
+   */
   setTenantStatus(
     tenantId: string,
     status: Tenant["status"],
+    opts?: { byPlatform?: boolean },
   ): Promise<Tenant | null>;
 
   /** Add a location to a tenant during/after onboarding (own slug + settings). */
@@ -149,6 +165,21 @@ export interface PosDriver {
     tier: PlanTier,
   ): Promise<Subscription | null>;
 
+  /** The tenant's recorded open billing Checkout Session (any expiry), or null. */
+  getPendingBillingCheckout(
+    tenantId: string,
+  ): Promise<PendingBillingCheckout | null>;
+  /**
+   * Record `rec` as the tenant's open session ATOMICALLY — only if none is
+   * recorded or the recorded one has expired. `claimed` false = another open
+   * session won (returned as `current`).
+   */
+  claimPendingBillingCheckout(
+    rec: PendingBillingCheckout,
+  ): Promise<{ claimed: boolean; current: PendingBillingCheckout }>;
+  /** Forget the recorded session — only if it is still `sessionId`. */
+  clearPendingBillingCheckout(tenantId: string, sessionId: string): Promise<void>;
+
   // -- Platform admin + health ------------------------------------------------
 
   /** Whether a user id is a platform (super) admin. */
@@ -190,8 +221,25 @@ export interface PosDriver {
   /** All locations for a tenant. */
   listLocations(tenantId: string): Promise<Location[]>;
 
-  /** Resolve a location by its public slug (storefront URL), or null. */
-  getLocationBySlug(slug: string): Promise<Location | null>;
+  /** Resolve a tenant by its (globally unique) public slug, or null. */
+  getTenantBySlug(slug: string): Promise<Tenant | null>;
+
+  /**
+   * Resolve a storefront location by `/shop/{tenantSlug}/{locationSlug}`.
+   * `locations.slug` is only unique WITHIN a tenant (unique (tenant_id, slug)),
+   * so a location must always be resolved together with its tenant's slug.
+   */
+  getLocationBySlugs(
+    tenantSlug: string,
+    locationSlug: string,
+  ): Promise<Location | null>;
+
+  /**
+   * Every location (across tenants) with this slug — used ONLY by the legacy
+   * `/shop/{locationSlug}` redirect, which redirects when exactly one matches
+   * and shows a chooser when several tenants share the slug.
+   */
+  listLocationsBySlug(slug: string): Promise<Location[]>;
 
   /**
    * Fully-assembled menu graph for a location (categories → items →
@@ -438,7 +486,9 @@ export interface PosDriver {
   /**
    * Upsert a customer. Re-using an id merges mutable fields; a new id with an
    * email that already exists for the tenant returns the existing row (so guest
-   * checkout is idempotent on email).
+   * checkout is idempotent on email) and only FILLS BLANK name/phone — an
+   * email match never overwrites stored contact details (anyone can type an
+   * email at checkout). Per-order contact lives on the order's fulfillment.
    */
   upsertCustomer(customer: Customer): Promise<Customer>;
 
@@ -475,6 +525,17 @@ export interface PosDriver {
   // the tenant-level menu (categories/items/sizes/modifier groups/modifiers);
   // per-location price/availability + 86 live in the override methods below.
   // --------------------------------------------------------------------------
+
+  /**
+   * The tenant that owns a menu entity (category/item/size/modifier group/
+   * modifier), or null if it doesn't exist. Lets API routes verify that a
+   * client-supplied id belongs to the authorized tenant before mutating it
+   * (the server driver bypasses RLS, so this check is the tenant boundary).
+   */
+  getMenuEntityTenant(
+    entity: MenuEntityKind,
+    id: string,
+  ): Promise<string | null>;
 
   listCategories(tenantId: string): Promise<MenuCategory[]>;
   upsertCategory(input: CategoryInput): Promise<MenuCategory>;
@@ -523,6 +584,9 @@ export interface PosDriver {
     tenantId: string,
     locationId: string,
   ): Promise<InventoryItemView[]>;
+
+  /** Fetch a single inventory item by id (any tenant), or null. */
+  getInventoryItem(id: string): Promise<InventoryItem | null>;
 
   upsertInventoryItem(item: InventoryItem): Promise<InventoryItem>;
 
@@ -588,6 +652,32 @@ export interface PosDriver {
    * PIN route — the hash never leaves the server. Returns null if unknown.
    */
   getStaffById(tenantId: string, staffId: string): Promise<Staff | null>;
+
+  // -- PIN lockout (per staff member, persisted) -----------------------------
+  /**
+   * ATOMICALLY start a PIN attempt BEFORE verifying it (row lock): refuses
+   * while locked; otherwise counts the attempt. Once 5 attempts are spent
+   * without a success, the next one sets a 15-minute lock and is refused — so
+   * concurrent guesses can never exceed the budget.
+   */
+  beginPinAttempt(tenantId: string, staffId: string): Promise<PinAttempt>;
+  /**
+   * A verified PIN: reset the attempt count — only if no lock was set in the
+   * meantime (a concurrent burst that tripped the lock keeps it).
+   */
+  clearPinAttempts(tenantId: string, staffId: string): Promise<void>;
+  /** Does the tenant have any ACTIVE staff member with a PIN set? */
+  tenantHasStaffPins(tenantId: string): Promise<boolean>;
+
+  // -- Terminal staff sessions (server-side revocation of PIN switch-ins) ----
+  createStaffSession(session: StaffSession): Promise<StaffSession>;
+  getStaffSession(id: string): Promise<StaffSession | null>;
+  revokeStaffSession(id: string): Promise<void>;
+  /** Revoke every live staff session opened by this device user. */
+  revokeStaffSessionsForUser(userId: string): Promise<void>;
+
+  /** Fetch a single shift by id (any tenant), or null. */
+  getShift(id: string): Promise<Shift | null>;
 
   /** List shifts for a location (newest first). */
   listShifts(tenantId: string, locationId: string): Promise<Shift[]>;

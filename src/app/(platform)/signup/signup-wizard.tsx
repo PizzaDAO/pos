@@ -41,10 +41,49 @@ const STEP_LABELS: { id: OnboardingStep; label: string }[] = [
   { id: "go_live", label: "Go live" },
 ];
 
+/**
+ * Capability token minted by `create_business` and bound to the new tenant.
+ * The public wizard has no login yet, so the tenant-scoped steps (location,
+ * Connect, menu, plan, go-live) authenticate with this instead of a bare
+ * tenantId. Persisted in sessionStorage (per tab) so it survives the Stripe
+ * Connect / Checkout redirects; it stops working once the tenant goes live.
+ */
+let onboardingToken: string | null = null;
+const TOKEN_KEY = "pos.onboarding";
+
+function saveOnboarding(tenantId: string, token: string | null): void {
+  onboardingToken = token;
+  try {
+    if (token) {
+      window.sessionStorage.setItem(
+        TOKEN_KEY,
+        JSON.stringify({ tenantId, token }),
+      );
+    } else {
+      window.sessionStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {
+    // storage unavailable — the in-memory token still works for this page
+  }
+}
+
+function loadSavedOnboarding(): { tenantId: string; token: string } | null {
+  try {
+    const raw = window.sessionStorage.getItem(TOKEN_KEY);
+    return raw ? (JSON.parse(raw) as { tenantId: string; token: string }) : null;
+  } catch {
+    return null;
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  return onboardingToken ? { "x-onboarding-token": onboardingToken } : {};
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   const data = (await res.json()) as T & { error?: string };
@@ -74,7 +113,8 @@ export function SignupWizard() {
 
   const loadPlans = useCallback(async (tenantId: string | null) => {
     const qs = tenantId ? `?tenantId=${tenantId}` : "";
-    const res = await fetch(`/api/billing${qs}`);
+    const res = await fetch(`/api/billing${qs}`, { headers: authHeaders() });
+    if (!res.ok) return;
     const data = (await res.json()) as {
       plans: Plan[];
       subscription: Subscription | null;
@@ -89,6 +129,38 @@ export function SignupWizard() {
     void loadPlans(null);
   }, [loadPlans]);
 
+  // Resume after a Stripe redirect (Connect onboarding / Checkout): the token
+  // for this tab's tenant comes back from sessionStorage.
+  useEffect(() => {
+    const saved = loadSavedOnboarding();
+    const wanted = new URLSearchParams(window.location.search).get("tenant");
+    if (!saved || (wanted && wanted !== saved.tenantId)) return;
+    onboardingToken = saved.token;
+    void (async () => {
+      const res = await fetch(
+        `/api/signup?tenantId=${encodeURIComponent(saved.tenantId)}`,
+        { headers: authHeaders() },
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        tenant: Tenant;
+        onboarding: { current_step: OnboardingStep; completed_steps: OnboardingStep[] } | null;
+        locations: Location[];
+        subscription: Subscription | null;
+        connect: ConnectAccount | null;
+      };
+      setTenant(data.tenant);
+      setLocations(data.locations);
+      setConnect(data.connect);
+      if (data.subscription) setSubscription(data.subscription);
+      if (data.onboarding) {
+        setCompleted(data.onboarding.completed_steps);
+        setStep(data.onboarding.current_step);
+      }
+      void loadPlans(data.tenant.id);
+    })();
+  }, [loadPlans]);
+
   function markComplete(s: OnboardingStep, next: OnboardingStep) {
     setCompleted((prev) => (prev.includes(s) ? prev : [...prev, s]));
     setStep(next);
@@ -98,11 +170,15 @@ export function SignupWizard() {
     setBusy(true);
     setError(null);
     try {
-      const data = await postJson<{ tenant: Tenant }>("/api/signup", {
+      const data = await postJson<{
+        tenant: Tenant;
+        onboardingToken?: string;
+      }>("/api/signup", {
         action: "create_business",
         businessName,
         ownerEmail,
       });
+      saveOnboarding(data.tenant.id, data.onboardingToken ?? null);
       setTenant(data.tenant);
       markComplete("business", "location");
       void loadPlans(data.tenant.id);
@@ -142,7 +218,12 @@ export function SignupWizard() {
         account: ConnectAccount;
         onboardingUrl: string;
         simulated: boolean;
-      }>("/api/connect", { tenantId: tenant.id });
+      }>("/api/connect", {
+        tenantId: tenant.id,
+        // Come back to the wizard (not /admin) after Stripe onboarding.
+        returnUrl: `${window.location.origin}/signup?tenant=${tenant.id}&connect=return`,
+        refreshUrl: `${window.location.origin}/signup?tenant=${tenant.id}&connect=refresh`,
+      });
       setConnect(data.account);
       if (!data.simulated && data.onboardingUrl) {
         window.location.href = data.onboardingUrl;
@@ -213,6 +294,8 @@ export function SignupWizard() {
         prev.includes("go_live") ? prev : [...prev, "go_live"],
       );
       setLive(true);
+      // The token is dead after go-live; drop it.
+      saveOnboarding(tenant.id, null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to go live.");
     } finally {
@@ -543,7 +626,7 @@ export function SignupWizard() {
                   </Button>
                   {primaryLocation && (
                     <Button asChild size="sm" variant="outline">
-                      <Link href={`/shop/${primaryLocation.slug}`}>
+                      <Link href={`/shop/${tenant.slug}/${primaryLocation.slug}`}>
                         View storefront
                       </Link>
                     </Button>

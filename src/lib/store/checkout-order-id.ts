@@ -18,6 +18,11 @@ import type { DeliveryAddress, OrderItem } from "@/lib/db";
 const KEY_PREFIX = "openpizza.checkout.";
 
 export interface CheckoutSignatureInput {
+  /**
+   * The storefront key — `storefrontKey({ tenantSlug, locationSlug })` — used
+   * both as the storage key and inside the signature, so two tenants'
+   * same-slug locations never share (or supersede) a checkout.
+   */
   slug: string;
   items: OrderItem[];
   fulfillmentType: "pickup" | "delivery";
@@ -126,16 +131,49 @@ export function getCheckoutOrderId(
 ): { id: string; superseded: string | null } {
   const sig = checkoutSignature(input);
   const stored = read(storage, input.slug);
+  if (!stored) {
+    // Migrate an entry written by a build that keyed by the location slug
+    // alone (a customer mid-checkout across the deploy).
+    const legacy = legacyKeyOf(input.slug);
+    const old = legacy ? read(storage, legacy) : null;
+    if (legacy && old) {
+      write(storage, legacy, null);
+      if (old.sig === checkoutSignature({ ...input, slug: legacy })) {
+        // The same checkout: keep its order id under the new key.
+        write(storage, input.slug, { sig, id: old.id });
+        return { id: old.id, superseded: null };
+      }
+      // A different checkout: drop it but never supersede (cancel) it. A
+      // slug-only entry can't prove which tenant it belonged to, so it may be
+      // another tenant's unpaid order; the sweeper abandons it after its window.
+    }
+  }
   if (stored && stored.sig === sig) return { id: stored.id, superseded: null };
   const id = newId();
   write(storage, input.slug, { sig, id });
   return { id, superseded: stored?.id ?? null };
 }
 
-/** Forget the stored id (paid, cancelled, or the server said it is abandoned). */
+/**
+ * Forget the stored id (paid, cancelled, or the server said it is abandoned).
+ * Also clears a legacy slug-only entry for the same storefront, so a paid or
+ * cancelled order from before the re-key can't resurface as "superseded".
+ */
 export function forgetCheckoutOrderId(
-  slug: string,
+  key: string,
   storage: Storage | null = defaultCheckoutStorage(),
 ): void {
-  write(storage, slug, null);
+  write(storage, key, null);
+  const legacy = legacyKeyOf(key);
+  if (legacy) write(storage, legacy, null);
+}
+
+/**
+ * The pre-re-key storage key for a storefront key (`tenant/location` →
+ * `location`): earlier builds keyed by the location slug alone. Slugs never
+ * contain `/`.
+ */
+function legacyKeyOf(key: string): string | null {
+  const i = key.lastIndexOf("/");
+  return i > 0 && i < key.length - 1 ? key.slice(i + 1) : null;
 }

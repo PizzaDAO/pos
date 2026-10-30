@@ -11,6 +11,8 @@ import { RefundExceedsError, refundPayment } from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantRole } from "@/lib/auth/api";
+import { effectiveTerminalRole } from "@/lib/auth/active-staff";
+import { sessionRoleIn } from "@/lib/auth/tenant-guard";
 import { publicTender } from "@/lib/payments/public";
 import {
   enforceRateLimit,
@@ -81,12 +83,27 @@ export async function POST(request: Request) {
   if (!existingPayment) {
     return NextResponse.json({ error: "Payment not found." }, { status: 404 });
   }
-  // Refunds move money out: owner or manager only (not cashier / kitchen).
+  // Refunds move money out: owner or manager only (not cashier / kitchen) —
+  // and on a shared terminal it is the ACTIVE (PIN-switched) staff member who
+  // must be owner|manager (the device login's role counts only while the
+  // tenant has no staff PINs set up).
   const auth = await requireTenantRole(existingPayment.tenant_id, [
     "owner",
     "manager",
   ]);
   if (!auth.ok) return auth.res;
+  const active = await effectiveTerminalRole(request, {
+    tenantId: existingPayment.tenant_id,
+    // requireTenantRole guaranteed owner|manager; least privileged default.
+    role: sessionRoleIn(auth.user, existingPayment.tenant_id) ?? "manager",
+    user: auth.user,
+  });
+  if (active.role !== "owner" && active.role !== "manager") {
+    return NextResponse.json(
+      { error: "Only an owner or manager can refund." },
+      { status: 403 },
+    );
+  }
 
   try {
     const result = await refundPayment({

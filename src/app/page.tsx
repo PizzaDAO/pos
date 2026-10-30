@@ -14,7 +14,7 @@ const surfaces = [
     desc: "Tenant back office: menu, reports, staff.",
   },
   {
-    href: "/shop/tonys-downtown",
+    href: "/shop/tonys-pizza/tonys-downtown",
     title: "Shop",
     desc: "Customer online ordering storefront.",
   },

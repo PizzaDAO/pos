@@ -77,6 +77,8 @@ import type {
   ShiftCashEvent,
   SizeInput,
   Staff,
+  PinAttempt,
+  StaffSession,
 } from "./backoffice-types";
 import type {
   Location,
@@ -90,6 +92,7 @@ import type {
   CreateLocationInput,
   CreateTenantInput,
   OnboardingStep,
+  PendingBillingCheckout,
   PlanTier,
   Subscription,
   TenantHealth,
@@ -152,6 +155,8 @@ const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({
 const memberships: Membership[] = seedMemberships.map((m) => ({ ...m }));
 /** Subscriptions keyed by tenant id (one per tenant). */
 const subscriptions = new Map<string, Subscription>();
+/** Open billing Checkout Session per tenant (billing_checkout_sessions). */
+const pendingBillingCheckouts = new Map<string, PendingBillingCheckout>();
 /** Onboarding state keyed by tenant id. */
 const onboardingState = new Map<string, TenantOnboarding>();
 /** Append-only audit log (impersonation + sensitive platform actions). */
@@ -220,6 +225,12 @@ const businessDayCloses = new Map<string, BusinessDayClose>();
 const orders = new Map<string, Order>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
+/** Terminal PIN switch-in sessions keyed by id (server-side revocation). */
+const staffSessions = new Map<string, StaffSession>();
+/** Per-staff PIN failure counters / locks (mirrors staff.pin_* columns). */
+const pinLocks = new Map<string, { attempts: number; lockedUntil: number | null }>();
+const PIN_MAX_FAILURES = 5;
+const PIN_LOCK_MS = 15 * 60_000;
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 /** Stripe Terminal locations keyed by POS location id; readers keyed by tmr_ id. */
@@ -592,16 +603,29 @@ export const mockDriver: PosDriver = {
   async setTenantStatus(
     tenantId: string,
     status: Tenant["status"],
+    opts?: { byPlatform?: boolean },
   ): Promise<Tenant | null> {
     const t = tenants.find((x) => x.id === tenantId);
     if (!t) return null;
     t.status = status;
+    if (opts?.byPlatform) t.suspended_by_platform = status === "suspended";
     return { ...t };
   },
 
   async createLocation(input: CreateLocationInput): Promise<Location> {
     const now = nowIso();
-    const slug = uniqueSlug(input.name, new Set(locations.map((l) => l.slug)));
+    // Slugs are unique WITHIN a tenant (DB: unique (tenant_id, slug)) — two
+    // tenants may both have e.g. "downtown"; storefront URLs carry the tenant
+    // slug to disambiguate. "track" is reserved by the legacy tracking route.
+    const slug = uniqueSlug(
+      input.name,
+      new Set([
+        "track",
+        ...locations
+          .filter((l) => l.tenant_id === input.tenant_id)
+          .map((l) => l.slug),
+      ]),
+    );
     const location: Location = {
       id: genId("loc"),
       tenant_id: input.tenant_id,
@@ -760,6 +784,28 @@ export const mockDriver: PosDriver = {
     return { ...updated };
   },
 
+  async getPendingBillingCheckout(tenantId) {
+    const p = pendingBillingCheckouts.get(tenantId);
+    return p ? { ...p } : null;
+  },
+
+  // Single-threaded JS: check + set is atomic (mirrors the DB's conditional
+  // insert on the tenant_id primary key).
+  async claimPendingBillingCheckout(rec) {
+    const cur = pendingBillingCheckouts.get(rec.tenant_id);
+    if (cur && new Date(cur.expires_at).getTime() > Date.now()) {
+      return { claimed: false, current: { ...cur } };
+    }
+    pendingBillingCheckouts.set(rec.tenant_id, { ...rec });
+    return { claimed: true, current: { ...rec } };
+  },
+
+  async clearPendingBillingCheckout(tenantId, sessionId) {
+    if (pendingBillingCheckouts.get(tenantId)?.session_id === sessionId) {
+      pendingBillingCheckouts.delete(tenantId);
+    }
+  },
+
   // -- Platform admin + health -----------------------------------------------
 
   async isPlatformAdmin(userId: string): Promise<boolean> {
@@ -846,8 +892,25 @@ export const mockDriver: PosDriver = {
     return locations.filter((l) => l.tenant_id === tenantId);
   },
 
-  async getLocationBySlug(slug: string): Promise<Location | null> {
-    return locations.find((l) => l.slug === slug) ?? null;
+  async getTenantBySlug(slug: string): Promise<Tenant | null> {
+    const t = tenants.find((x) => x.slug === slug);
+    return t ? { ...t } : null;
+  },
+
+  async getLocationBySlugs(
+    tenantSlug: string,
+    locationSlug: string,
+  ): Promise<Location | null> {
+    const tenant = tenants.find((t) => t.slug === tenantSlug);
+    if (!tenant) return null;
+    const loc = locations.find(
+      (l) => l.tenant_id === tenant.id && l.slug === locationSlug,
+    );
+    return loc ? { ...loc } : null;
+  },
+
+  async listLocationsBySlug(slug: string): Promise<Location[]> {
+    return locations.filter((l) => l.slug === slug).map((l) => ({ ...l }));
   },
 
   async getMenu(tenantId, locationId, opts): Promise<Menu> {
@@ -1329,14 +1392,21 @@ export const mockDriver: PosDriver = {
           (c) => c.tenant_id === customer.tenant_id && c.email === email,
         );
     const base = existingById ?? existingByEmail;
+    // Matched only by EMAIL (guest checkout with a new id): anyone can type an
+    // email, so never overwrite the stored name/phone — only fill blanks.
+    const fillBlanksOnly = !existingById && Boolean(existingByEmail);
     const now = nowIso();
     const merged: Customer = {
       ...customer,
       id: base?.id ?? customer.id,
       email,
       verified: customer.verified || base?.verified || false,
-      name: customer.name ?? base?.name ?? null,
-      phone: customer.phone ?? base?.phone ?? null,
+      name: fillBlanksOnly
+        ? (base?.name ?? customer.name ?? null)
+        : (customer.name ?? base?.name ?? null),
+      phone: fillBlanksOnly
+        ? (base?.phone ?? customer.phone ?? null)
+        : (customer.phone ?? base?.phone ?? null),
       created_at: base?.created_at ?? now,
       updated_at: now,
     };
@@ -1408,6 +1478,31 @@ export const mockDriver: PosDriver = {
   },
 
   // -- Menu management (Phase 5) ---------------------------------------------
+
+  async getMenuEntityTenant(entity, id): Promise<string | null> {
+    switch (entity) {
+      case "category":
+        return menuCategories.find((c) => c.id === id)?.tenant_id ?? null;
+      case "item":
+        return menuItems.find((i) => i.id === id)?.tenant_id ?? null;
+      case "size": {
+        const size = itemSizes.find((s) => s.id === id);
+        if (!size) return null;
+        return menuItems.find((i) => i.id === size.item_id)?.tenant_id ?? null;
+      }
+      case "modifierGroup":
+        return modifierGroups.find((g) => g.id === id)?.tenant_id ?? null;
+      case "modifier": {
+        const mod = modifiers.find((m) => m.id === id);
+        if (!mod) return null;
+        return (
+          modifierGroups.find((g) => g.id === mod.group_id)?.tenant_id ?? null
+        );
+      }
+      default:
+        return null;
+    }
+  },
 
   async listCategories(tenantId: string): Promise<MenuCategory[]> {
     return menuCategories
@@ -1667,6 +1762,11 @@ export const mockDriver: PosDriver = {
       .map((i) => ({ ...i, low: i.on_hand <= i.low_threshold }));
   },
 
+  async getInventoryItem(id: string): Promise<InventoryItem | null> {
+    const item = inventoryItems.get(id);
+    return item ? { ...item } : null;
+  },
+
   async upsertInventoryItem(item: InventoryItem): Promise<InventoryItem> {
     const existing = inventoryItems.get(item.id);
     const now = nowIso();
@@ -1811,6 +1911,76 @@ export const mockDriver: PosDriver = {
     return { ...s };
   },
 
+  // Mirrors begin_pin_attempt(): single-threaded JS makes this atomic.
+  async beginPinAttempt(tenantId, staffId): Promise<PinAttempt> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) {
+      return { allowed: false, justLocked: false, attempts: 0, lockedUntil: null };
+    }
+    const now = Date.now();
+    let l = pinLocks.get(staffId) ?? { attempts: 0, lockedUntil: null };
+    if (l.lockedUntil !== null && l.lockedUntil > now) {
+      return {
+        allowed: false,
+        justLocked: false,
+        attempts: l.attempts,
+        lockedUntil: new Date(l.lockedUntil).toISOString(),
+      };
+    }
+    if (l.lockedUntil !== null) l = { attempts: 0, lockedUntil: null };
+    if (l.attempts >= PIN_MAX_FAILURES) {
+      const lockedUntil = now + PIN_LOCK_MS;
+      pinLocks.set(staffId, { attempts: 0, lockedUntil });
+      return {
+        allowed: false,
+        justLocked: true,
+        attempts: 0,
+        lockedUntil: new Date(lockedUntil).toISOString(),
+      };
+    }
+    const attempts = l.attempts + 1;
+    pinLocks.set(staffId, { attempts, lockedUntil: null });
+    return { allowed: true, justLocked: false, attempts, lockedUntil: null };
+  },
+
+  async clearPinAttempts(tenantId, staffId): Promise<void> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return;
+    const l = pinLocks.get(staffId);
+    // Only if no lock was set meanwhile.
+    if (l && l.lockedUntil === null) pinLocks.delete(staffId);
+  },
+
+  async tenantHasStaffPins(tenantId): Promise<boolean> {
+    return [...staffById.values()].some(
+      (s) => s.tenant_id === tenantId && s.active && Boolean(s.pin_hash),
+    );
+  },
+
+  async createStaffSession(session: StaffSession): Promise<StaffSession> {
+    staffSessions.set(session.id, { ...session });
+    return { ...session };
+  },
+
+  async getStaffSession(id: string): Promise<StaffSession | null> {
+    const s = staffSessions.get(id);
+    return s ? { ...s } : null;
+  },
+
+  async revokeStaffSession(id: string): Promise<void> {
+    const s = staffSessions.get(id);
+    if (s && !s.revoked_at) staffSessions.set(id, { ...s, revoked_at: nowIso() });
+  },
+
+  async revokeStaffSessionsForUser(userId: string): Promise<void> {
+    const now = nowIso();
+    for (const [id, s] of staffSessions) {
+      if (s.user_id === userId && !s.revoked_at) {
+        staffSessions.set(id, { ...s, revoked_at: now });
+      }
+    }
+  },
+
   async upsertStaff(staff: Staff): Promise<Staff> {
     const existing = staffById.get(staff.id);
     const merged: Staff = {
@@ -1825,6 +1995,11 @@ export const mockDriver: PosDriver = {
     };
     staffById.set(merged.id, merged);
     return { ...merged, pin_hash: undefined };
+  },
+
+  async getShift(id: string): Promise<Shift | null> {
+    const shift = shifts.get(id);
+    return shift ? { ...shift } : null;
   },
 
   async listShifts(tenantId: string, locationId: string): Promise<Shift[]> {

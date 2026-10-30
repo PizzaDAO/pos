@@ -9,22 +9,41 @@
  * GET  ?tenantId=  → plans catalogue + the tenant's current subscription +
  *      resolved entitlements + simulated flag.
  * POST { action, tenantId, tier?, status? }:
- *   subscribe → start/switch a subscription (returns checkoutUrl in real mode)
+ *   subscribe → start/switch a subscription (returns checkoutUrl in real mode).
+ *     REAL billing never changes the tier locally: a new subscription goes
+ *     through Stripe Checkout and a switch is a Stripe subscription update;
+ *     the tier is applied only by the signed billing webhook. SIMULATED mode
+ *     applies the tier directly (no Stripe).
  *   set_status → advance a SIMULATED subscription's lifecycle (demo dunning)
+ *
+ * Auth: the plan catalogue (GET without tenantId) is public. Anything
+ * tenant-scoped requires an owner|manager session of the tenant, or the signup
+ * wizard's onboarding token while the tenant is still onboarding. `set_status`
+ * is session-only and only allowed while billing is simulated (real
+ * subscription state comes from the signed Stripe webhook).
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type PlanTier, type SubscriptionStatus } from "@/lib/db";
 import { getPlans } from "@/lib/saas/plans";
 import { resolveEntitlements } from "@/lib/saas/entitlements";
-import { subscribeTenant, isBillingSimulated } from "@/lib/billing/service";
-import { getCurrentUser } from "@/lib/auth/session";
+import {
+  expireBillingCheckout,
+  isBillingSimulated,
+  requestStripeTierChange,
+  subscribeTenant,
+} from "@/lib/billing/service";
+import { requireTenantAdminOrOnboarding } from "@/lib/auth/onboarding-token";
 import { recordAudit } from "@/lib/security";
+import type { SessionUser } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 
 /** Best-effort tenant-scoped audit of a subscription/billing change. */
-async function auditBilling(tenantId: string, detail: string): Promise<void> {
-  const actor = await getCurrentUser();
+async function auditBilling(
+  actor: SessionUser | null,
+  tenantId: string,
+  detail: string,
+): Promise<void> {
   await recordAudit({
     actor: {
       id: actor?.id ?? "system",
@@ -38,10 +57,15 @@ async function auditBilling(tenantId: string, detail: string): Promise<void> {
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
+  const requested = searchParams.get("tenantId");
   const driver = getPosDriver();
   const plans = getPlans();
-  const subscription = tenantId ? await driver.getSubscription(tenantId) : null;
+  let subscription = null;
+  if (requested) {
+    const auth = await requireTenantAdminOrOnboarding(request, requested);
+    if (!auth.ok) return auth.res;
+    subscription = await driver.getSubscription(auth.tenantId);
+  }
   const entitlements = resolveEntitlements(subscription);
   return NextResponse.json({
     plans,
@@ -65,16 +89,26 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
-  if (!body.tenantId) {
+  if (!body || !body.tenantId) {
     return NextResponse.json(
       { error: "tenantId is required." },
       { status: 422 },
     );
   }
+  const auth = await requireTenantAdminOrOnboarding(request, body.tenantId);
+  if (!auth.ok) return auth.res;
+  const actor = auth.user;
   const driver = getPosDriver();
 
   try {
     if (body.action === "set_status") {
+      // Demo dunning only: real subscription status comes from Stripe.
+      if (auth.via !== "session" || !isBillingSimulated()) {
+        return NextResponse.json(
+          { error: "Subscription status is managed by billing." },
+          { status: 403 },
+        );
+      }
       if (!body.status) {
         return NextResponse.json(
           { error: "status is required." },
@@ -92,12 +126,16 @@ export async function POST(request: Request) {
         );
       }
       await auditBilling(
+        actor,
         body.tenantId,
         `Subscription status advanced to ${body.status}.`,
       );
       return NextResponse.json({ subscription: updated });
     }
 
+    if (body.action !== "subscribe") {
+      return NextResponse.json({ error: "Unknown action." }, { status: 422 });
+    }
     // subscribe
     if (!body.tier) {
       return NextResponse.json({ error: "tier is required." }, { status: 422 });
@@ -108,8 +146,37 @@ export async function POST(request: Request) {
     }
     const existing = await driver.getSubscription(body.tenantId);
 
-    // Already subscribed? Switching tier is a tier change, not a new checkout.
-    if (existing && existing.tier !== body.tier) {
+    const simulated = isBillingSimulated();
+
+    // REAL billing: an existing Stripe subscription switches tier THROUGH
+    // Stripe; the local tier only changes when the verified webhook arrives.
+    if (
+      !simulated &&
+      existing &&
+      !existing.simulated &&
+      existing.stripe_subscription_id &&
+      existing.tier !== body.tier
+    ) {
+      await requestStripeTierChange({
+        tenantId: body.tenantId,
+        stripeSubscriptionId: existing.stripe_subscription_id,
+        tier: body.tier,
+      });
+      await auditBilling(
+        actor,
+        body.tenantId,
+        `Requested tier change ${existing.tier} → ${body.tier} (pending Stripe confirmation).`,
+      );
+      return NextResponse.json({
+        subscription: existing,
+        checkoutUrl: null,
+        pending: true,
+        simulated: false,
+      });
+    }
+
+    // SIMULATED: switching tier is a direct tier change, not a new checkout.
+    if (simulated && existing && existing.tier !== body.tier) {
       const switched = await driver.changeSubscriptionTier(
         body.tenantId,
         body.tier,
@@ -117,6 +184,7 @@ export async function POST(request: Request) {
       // Mark the plan step complete on the wizard if mid-onboarding.
       await driver.completeOnboardingStep(body.tenantId, "plan");
       await auditBilling(
+        actor,
         body.tenantId,
         `Subscription tier changed ${existing.tier} → ${body.tier}.`,
       );
@@ -135,6 +203,39 @@ export async function POST(request: Request) {
       });
     }
 
+    // REAL: one open Checkout Session per tenant — never a second one that
+    // could also be paid (double subscribe). Same tier → hand back the open
+    // session; another tier → expire it at Stripe first (refuse if Stripe
+    // can't, e.g. it was just paid).
+    if (!simulated) {
+      const pending = await driver.getPendingBillingCheckout(body.tenantId);
+      if (pending && new Date(pending.expires_at).getTime() > Date.now()) {
+        if (pending.tier === body.tier) {
+          return NextResponse.json({
+            subscription: existing,
+            checkoutUrl: pending.url,
+            reused: true,
+            simulated: false,
+          });
+        }
+        try {
+          await expireBillingCheckout(pending.session_id);
+        } catch {
+          return NextResponse.json(
+            {
+              error:
+                "A checkout for another plan is already in progress. Finish or cancel it first.",
+            },
+            { status: 409 },
+          );
+        }
+        await driver.clearPendingBillingCheckout(
+          body.tenantId,
+          pending.session_id,
+        );
+      }
+    }
+
     const origin = new URL(request.url).origin;
     // Resolve the owner email for a real Stripe customer (best-effort).
     const ownerEmail = `owner+${tenant.slug}@example.com`;
@@ -146,9 +247,46 @@ export async function POST(request: Request) {
       successUrl: `${origin}/signup?tenant=${body.tenantId}&billing=success`,
       cancelUrl: `${origin}/signup?tenant=${body.tenantId}&billing=cancel`,
     });
-    const subscription = await driver.upsertSubscription(result.subscription);
-    await driver.completeOnboardingStep(body.tenantId, "plan");
+    if (result.checkoutSession && result.checkoutUrl) {
+      // Record it as THE open session (atomic). A concurrent request that got
+      // there first wins: expire ours and answer with theirs.
+      const claim = await driver.claimPendingBillingCheckout({
+        tenant_id: body.tenantId,
+        session_id: result.checkoutSession.id,
+        tier: body.tier,
+        url: result.checkoutUrl,
+        expires_at: result.checkoutSession.expiresAt,
+        created_at: new Date().toISOString(),
+      });
+      if (!claim.claimed) {
+        await expireBillingCheckout(result.checkoutSession.id).catch(() => null);
+        if (claim.current.tier !== body.tier) {
+          return NextResponse.json(
+            {
+              error:
+                "A checkout for another plan is already in progress. Finish or cancel it first.",
+            },
+            { status: 409 },
+          );
+        }
+        return NextResponse.json({
+          subscription: existing,
+          checkoutUrl: claim.current.url,
+          reused: true,
+          simulated: false,
+        });
+      }
+    }
+    // Simulated: persist the ready subscription. REAL: nothing is persisted —
+    // the billing webhook creates the row (tier + status) after checkout.
+    const subscription = result.subscription
+      ? await driver.upsertSubscription(result.subscription)
+      : existing;
+    if (result.simulated) {
+      await driver.completeOnboardingStep(body.tenantId, "plan");
+    }
     await auditBilling(
+      actor,
       body.tenantId,
       `Subscribed to ${body.tier} plan${result.simulated ? " (simulated)" : ""}.`,
     );

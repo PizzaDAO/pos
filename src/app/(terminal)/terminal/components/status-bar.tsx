@@ -3,13 +3,18 @@
  */
 "use client";
 
-import { Cloud, CloudOff, RefreshCw } from "lucide-react";
+import { AlertTriangle, Cloud, CloudOff, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export interface StatusBarProps {
   locationName: string;
   online: boolean;
+  /** Every unsynced order, including those needing attention. */
   pendingCount: number;
+  /** Orders refused in the background, waiting on staff. */
+  attentionCount?: number;
+  /** Open the needs-attention queue panel. */
+  onOpenQueue?: () => void;
   driverName?: string;
   onFlush: () => void;
   /** Active staff name (PIN quick-switch), or null when none. */
@@ -22,6 +27,8 @@ export function StatusBar({
   locationName,
   online,
   pendingCount,
+  attentionCount = 0,
+  onOpenQueue,
   driverName,
   onFlush,
   activeStaffName,
@@ -49,12 +56,23 @@ export function StatusBar({
       </div>
 
       <div className="flex items-center gap-3">
+        {attentionCount > 0 && (
+          <button
+            type="button"
+            onClick={onOpenQueue ?? onFlush}
+            className="flex items-center gap-1 rounded-full bg-red-100 px-2 py-1 text-xs font-medium text-red-800"
+            title="Orders the server refused — tap to review"
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            {attentionCount} need{attentionCount === 1 ? "s" : ""} attention
+          </button>
+        )}
         {pendingCount > 0 && (
           <button
             type="button"
             onClick={onFlush}
             className="flex items-center gap-1 rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800"
-            title="Pending orders waiting to sync — tap to retry"
+            title="Unsynced orders (incl. any needing attention) — tap to retry"
           >
             <RefreshCw className="h-3.5 w-3.5" />
             {pendingCount} pending

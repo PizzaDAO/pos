@@ -166,9 +166,11 @@ In the Supabase project → **Authentication**:
 - [ ] **URL Configuration → Site URL**: the production domain
       (e.g. `https://pos.example.com`).
 - [ ] **URL Configuration → Redirect URLs**: allow
-      `https://<domain>/auth/callback` and `https://<domain>/shop/*` (the
-      customer magic-link returns to `/shop/<slug>?signedin=1`). Add the Vercel
-      preview domains too if you want auth to work on previews.
+      `https://<domain>/auth/callback` and `https://<domain>/shop/**` (the
+      customer magic-link returns to `/shop/<tenant>/<location>?signedin=1` —
+      two path segments, so the single-segment glob `/shop/*` is NOT enough;
+      Supabase's `**` matches across `/`). Add the Vercel preview domains too
+      if you want auth to work on previews.
 - [ ] Configure the **SMTP** sender (or rely on Supabase's built-in email for
       low volume) so magic links actually send.
 

@@ -13,17 +13,20 @@ import { Dialog } from "@/components/ui/dialog";
 
 interface StaffOption {
   id: string;
-  tenant_id: string;
+  tenant_id?: string;
   name: string;
   role: string;
 }
 
 export function StaffSwitch({
+  tenantId,
   current,
   onVerify,
   onSignOut,
   onClose,
 }: {
+  /** The terminal's tenant (the picker lists only its staff). */
+  tenantId?: string;
   current: ActiveStaff | null;
   onVerify: (staffId: string, pin: string) => Promise<boolean>;
   onSignOut: () => void;
@@ -37,7 +40,11 @@ export function StaffSwitch({
 
   useEffect(() => {
     let alive = true;
-    fetch("/api/terminal/pin")
+    fetch(
+      tenantId
+        ? `/api/terminal/pin?tenantId=${encodeURIComponent(tenantId)}`
+        : "/api/terminal/pin",
+    )
       .then((r) => (r.ok ? r.json() : { staff: [] }))
       .then((d: { staff?: StaffOption[] }) => {
         if (alive) setStaff(d.staff ?? []);
@@ -48,7 +55,7 @@ export function StaffSwitch({
     return () => {
       alive = false;
     };
-  }, []);
+  }, [tenantId]);
 
   async function submit() {
     setError(null);

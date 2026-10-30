@@ -14,6 +14,10 @@
  *   in-progress one is a no-op that returns the unchanged order, so double-taps
  *   / retries never corrupt state.
  *
+ * Auth: an operational role (kitchen surface) of the tenant; the location must
+ * belong to it. Bump/recall resolves the ORDER first and authorizes against the
+ * order's own tenant (never a client-supplied tenant).
+ *
  * No env vars are read — everything runs against the in-memory mock driver.
  */
 import { NextResponse } from "next/server";
@@ -21,20 +25,24 @@ import { getPosDriver } from "@/lib/db";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
+import {
+  requireOrderAccess,
+  requireTenantAccess,
+} from "@/lib/auth/tenant-guard";
 
 // In-memory mock state lives in the Node runtime; force it (not edge).
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAccess(
+    searchParams.get("tenantId"),
+    "kitchen",
+    { locationId: searchParams.get("locationId"), requireLocation: true },
+  );
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+  const locationId = auth.locationId as string;
 
   const driver = getPosDriver();
   const [orders, settings] = await Promise.all([
@@ -83,10 +91,9 @@ export async function POST(request: Request) {
   }
 
   const driver = getPosDriver();
-  const current = await driver.getOrder(id);
-  if (!current) {
-    return NextResponse.json({ error: "Order not found." }, { status: 404 });
-  }
+  const auth = await requireOrderAccess(id, "kitchen");
+  if (!auth.ok) return auth.res;
+  const current = auth.order;
 
   const next =
     action === "bump"

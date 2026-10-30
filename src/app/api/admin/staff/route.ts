@@ -9,7 +9,10 @@
  *   - "clockOut" { shiftId, countedCents, note } → close + reconcile (over/short).
  *
  * Drawer reconciliation = float + cash sales + paid-in − payouts vs counted.
- * No env vars; in-memory mock driver. (No real auth — demo staff switcher.)
+ * Auth: GET → owner|manager (admin surface). POST → any operational role of
+ * the tenant (terminal surface). Staff and shifts referenced by id are verified
+ * to belong to the authorized tenant; cash events use the SHIFT's own
+ * tenant/location, never client-supplied ones. No env vars; mock driver.
  */
 import { NextResponse } from "next/server";
 import {
@@ -18,20 +21,22 @@ import {
   type Shift,
   type ShiftCashEvent,
 } from "@/lib/db";
-import { requireTenantMember } from "@/lib/auth/api";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { isMoneyCents } from "@/lib/security";
+
+const CASH_EVENT_TYPES: CashEventType[] = ["sale", "payout", "paid_in", "drop"];
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+  const locationId = auth.locationId as string;
   const driver = getPosDriver();
   const [staff, shifts] = await Promise.all([
     driver.listStaff(tenantId),
@@ -85,9 +90,18 @@ export async function POST(request: Request) {
   if (!body.tenantId) {
     return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
   }
-  const auth = await requireTenantMember(body.tenantId);
+  const auth = await requireTenantAccess(body.tenantId, "terminal", {
+    locationId: body.locationId ?? null,
+  });
   if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
   const driver = getPosDriver();
+
+  /** A shift by id, only if it belongs to the authorized tenant. */
+  const ownShift = async (shiftId: string) => {
+    const shift = await driver.getShift(shiftId);
+    return shift && shift.tenant_id === tenantId ? shift : null;
+  };
 
   try {
     if (body.action === "clockIn") {
@@ -97,8 +111,20 @@ export async function POST(request: Request) {
           { status: 422 },
         );
       }
+      if (
+        body.openingFloatCents !== undefined &&
+        !isMoneyCents(body.openingFloatCents)
+      ) {
+        return NextResponse.json(
+          { error: "openingFloatCents must be a non-negative integer." },
+          { status: 422 },
+        );
+      }
+      if (!(await driver.getStaffById(tenantId, body.staffId))) {
+        return NextResponse.json({ error: "Staff not found." }, { status: 404 });
+      }
       const shift = await driver.openShift({
-        tenantId: body.tenantId,
+        tenantId,
         locationId: body.locationId,
         staffId: body.staffId,
         openingFloatCents: body.openingFloatCents ?? 0,
@@ -119,11 +145,24 @@ export async function POST(request: Request) {
           { status: 422 },
         );
       }
+      if (
+        !CASH_EVENT_TYPES.includes(body.type) ||
+        !isMoneyCents(Math.abs(body.amountCents))
+      ) {
+        return NextResponse.json(
+          { error: "Invalid cash event." },
+          { status: 422 },
+        );
+      }
+      const shift = await ownShift(body.shiftId);
+      if (!shift) {
+        return NextResponse.json({ error: "Shift not found." }, { status: 404 });
+      }
       const event: ShiftCashEvent = {
         id: "",
-        shift_id: body.shiftId,
-        tenant_id: body.tenantId,
-        location_id: body.locationId,
+        shift_id: shift.id,
+        tenant_id: shift.tenant_id,
+        location_id: shift.location_id,
         type: body.type,
         amount_cents: body.amountCents,
         order_id: null,
@@ -139,11 +178,14 @@ export async function POST(request: Request) {
     }
 
     if (body.action === "clockOut") {
-      if (!body.shiftId || typeof body.countedCents !== "number") {
+      if (!body.shiftId || !isMoneyCents(body.countedCents)) {
         return NextResponse.json(
           { error: "shiftId and countedCents are required." },
           { status: 422 },
         );
+      }
+      if (!(await ownShift(body.shiftId))) {
+        return NextResponse.json({ error: "Shift not found." }, { status: 404 });
       }
       const shift = await driver.closeShift({
         shiftId: body.shiftId,

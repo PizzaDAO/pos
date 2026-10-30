@@ -10,13 +10,14 @@ import { NextResponse } from "next/server";
 import { getServerSupabase } from "@/lib/auth/supabase-server";
 import { getPosDriver } from "@/lib/db";
 import { recordAudit } from "@/lib/security";
+import { safeRedirectPath } from "@/lib/auth/safe-redirect";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
-  const redirectTo = url.searchParams.get("redirect") || "/admin";
+  const redirectTo = url.searchParams.get("redirect");
 
   const supabase = await getServerSupabase();
   if (supabase && code) {
@@ -65,6 +66,6 @@ export async function GET(request: Request) {
   }
 
   // Safe-list the redirect to same-origin internal paths only.
-  const safePath = redirectTo.startsWith("/") ? redirectTo : "/admin";
+  const safePath = safeRedirectPath(redirectTo, "/admin", url.origin);
   return NextResponse.redirect(new URL(safePath, url.origin));
 }

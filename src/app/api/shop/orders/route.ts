@@ -33,6 +33,7 @@ import { computeOrderTotals } from "@/lib/pricing";
 import { RepriceError, repriceItems } from "@/lib/shop/reprice";
 import { enforceRateLimit, isMoneyCents } from "@/lib/security";
 import { ensureCustomer } from "@/lib/shop/auth";
+import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
 import {
   asapAvailability,
   checkScheduledTime,
@@ -49,6 +50,8 @@ export const runtime = "nodejs";
 
 interface ShopOrderBody {
   id: string;
+  /** Storefront tenant slug (locations.slug is only unique per tenant). */
+  tenantSlug?: string;
   locationSlug: string;
   items: OrderItem[];
   fulfillmentType: "pickup" | "delivery";
@@ -73,6 +76,11 @@ function isValid(body: unknown): body is ShopOrderBody {
     b.customer !== null &&
     typeof (b.customer as Record<string, unknown>).email === "string"
   );
+}
+
+/** A trimmed, length-bounded optional string from client input, else null. */
+function cleanText(v: unknown, max: number): string | null {
+  return typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null;
 }
 
 export async function POST(request: Request) {
@@ -113,10 +121,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ order: existing, delivery }, { status: 200 });
   }
 
-  const location = await driver.getLocationBySlug(body.locationSlug);
-  if (!location) {
-    return NextResponse.json({ error: "Location not found." }, { status: 404 });
+  // The tenant is derived from the resolved location — never the client.
+  const resolved = await resolveStorefrontLocation({
+    tenantSlug: body.tenantSlug,
+    locationSlug: body.locationSlug,
+  });
+  if (!resolved.ok) {
+    return NextResponse.json(
+      { error: resolved.error },
+      { status: resolved.status },
+    );
   }
+  const location = resolved.location;
   const tenantId = location.tenant_id;
   const locationId = location.id;
 
@@ -214,11 +230,13 @@ export async function POST(request: Request) {
   }
 
   // ---- Customer (guest upsert) ---------------------------------------------
+  const contactName = cleanText(body.customer.name, 120);
+  const contactPhone = cleanText(body.customer.phone, 40);
   const customer = await ensureCustomer({
     tenantId,
     email: body.customer.email,
-    name: body.customer.name ?? null,
-    phone: body.customer.phone ?? null,
+    name: contactName,
+    phone: contactPhone,
   });
 
   // ---- Subtotal (pre-delivery) so zone minimums are checked correctly -------
@@ -297,6 +315,9 @@ export async function POST(request: Request) {
     promised_at: promisedAt,
     // Which deployment kind owns this order's sweeping (prod vs staging).
     checkout_mode: deploymentCheckoutMode(),
+    // Per-order contact (what the customer typed now), independent of the
+    // stored customer record.
+    contact: { name: contactName, phone: contactPhone },
     ...(body.fulfillmentType === "delivery"
       ? {
           address: body.address,
@@ -331,5 +352,10 @@ export async function POST(request: Request) {
 
   // Delivery is dispatched by finalizeOnlinePayment once the order is paid.
   const delivery = null;
-  return NextResponse.json({ order, customer, delivery }, { status: 201 });
+  // Don't echo the stored customer record (name/phone/verified) back to
+  // whoever typed this email — only the id the client needs.
+  return NextResponse.json(
+    { order, customer: { id: customer.id }, delivery },
+    { status: 201 },
+  );
 }

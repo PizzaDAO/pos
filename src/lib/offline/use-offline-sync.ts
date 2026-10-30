@@ -2,26 +2,57 @@
  * React hook wiring the offline queue to the UI.
  *
  * - Tracks online/offline via the browser `online`/`offline` events.
- * - Exposes the pending-sync count (polled + refreshed after writes).
- * - Flushes the queue on reconnect, on an interval, and on demand.
+ * - Exposes the pending-sync count AND the needs-attention count (polled +
+ *   refreshed after writes); `pendingCount` includes needs-attention entries so
+ *   a refused order never disappears from the number.
+ * - Flushes the queue on reconnect, on an interval, and on demand. Background
+ *   refusals become needs-attention entries (listed in `attention`).
  * - `placeOrderOffline` is the single entry point the terminal calls to place an
- *   order: it enqueues durably (IndexedDB) then attempts an immediate flush, so
- *   the same idempotent path is used online and offline.
+ *   order: it enqueues durably (IndexedDB) then pushes it immediately, so the
+ *   same idempotent path is used online and offline.
  */
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
 import type { CreateOrderInput } from "@/lib/db";
-import { enqueueOrder, getPendingCount, pruneSynced } from "./queue";
-import { flushQueue } from "./sync";
+import {
+  discardOrder,
+  getAttentionOrders,
+  getQueueCounts,
+  pruneSynced,
+  requeueOrder,
+  requeueWithoutDiscount,
+  type QueuedOrder,
+  type QueuedStaff,
+} from "./queue";
+import { flushQueue, placeOrderNow, type SyncOutcome } from "./sync";
 
 export interface OfflineSyncState {
   online: boolean;
+  /** Every unsynced order: still retrying + needs attention. */
   pendingCount: number;
-  /** Enqueue + attempt flush. Returns once durably queued (not necessarily synced). */
-  placeOrderOffline: (payload: CreateOrderInput) => Promise<void>;
+  /** Orders refused in the background, waiting on staff. */
+  attentionCount: number;
+  /** The needs-attention entries, oldest first (for the queue UI). */
+  attention: QueuedOrder[];
+  /**
+   * Enqueue durably, then (when online) push THIS order immediately and report
+   * the server's verdict: synced, rejected (non-retryable 4xx — show it, keep
+   * the cart, don't take payment), or error (stays queued, retried later).
+   * `queuedBy` = the PIN-switched staff at the till (recorded + sent on flush).
+   */
+  placeOrderOffline: (
+    payload: CreateOrderInput,
+    queuedBy?: QueuedStaff | null,
+  ) => Promise<SyncOutcome>;
   /** Manually trigger a flush (e.g. a "retry sync" button). */
   flushNow: () => Promise<void>;
+  /** Retry a needs-attention order as-is (e.g. after a manager PIN switch). */
+  retryOrder: (id: string, queuedBy?: QueuedStaff | null) => Promise<void>;
+  /** Re-place a needs-attention order without its discount. */
+  retryWithoutDiscount: (id: string) => Promise<void>;
+  /** Staff discards a needs-attention order. */
+  discard: (id: string) => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -30,12 +61,18 @@ const POLL_MS = 5_000;
 export function useOfflineSync(): OfflineSyncState {
   const [online, setOnline] = useState(true);
   const [pendingCount, setPendingCount] = useState(0);
+  const [attention, setAttention] = useState<QueuedOrder[]>([]);
 
   const refresh = useCallback(async () => {
     try {
-      setPendingCount(await getPendingCount());
+      const [counts, list] = await Promise.all([
+        getQueueCounts(),
+        getAttentionOrders(),
+      ]);
+      setPendingCount(counts.pending + counts.attention);
+      setAttention(list);
     } catch {
-      // IndexedDB unavailable (e.g. private mode) — ignore, count stays as-is.
+      // IndexedDB unavailable (e.g. private mode) — ignore, counts stay as-is.
     }
   }, []);
 
@@ -45,13 +82,40 @@ export function useOfflineSync(): OfflineSyncState {
   }, [refresh]);
 
   const placeOrderOffline = useCallback(
-    async (payload: CreateOrderInput) => {
-      await enqueueOrder(payload);
+    async (
+      payload: CreateOrderInput,
+      queuedBy: QueuedStaff | null = null,
+    ): Promise<SyncOutcome> => {
+      const online = typeof navigator === "undefined" || navigator.onLine;
+      const outcome = await placeOrderNow(payload, queuedBy, online);
       await refresh();
-      // Fire-and-forget flush; failures stay queued for the next trigger.
-      void flushNow();
+      return outcome;
     },
-    [flushNow, refresh],
+    [refresh],
+  );
+
+  const retryOrder = useCallback(
+    async (id: string, queuedBy?: QueuedStaff | null) => {
+      await requeueOrder(id, queuedBy !== undefined ? { queuedBy } : {});
+      await flushNow();
+    },
+    [flushNow],
+  );
+
+  const retryWithoutDiscount = useCallback(
+    async (id: string) => {
+      await requeueWithoutDiscount(id);
+      await flushNow();
+    },
+    [flushNow],
+  );
+
+  const discard = useCallback(
+    async (id: string) => {
+      await discardOrder(id);
+      await refresh();
+    },
+    [refresh],
   );
 
   useEffect(() => {
@@ -80,5 +144,16 @@ export function useOfflineSync(): OfflineSyncState {
     };
   }, [flushNow, refresh]);
 
-  return { online, pendingCount, placeOrderOffline, flushNow, refresh };
+  return {
+    online,
+    pendingCount,
+    attentionCount: attention.length,
+    attention,
+    placeOrderOffline,
+    flushNow,
+    retryOrder,
+    retryWithoutDiscount,
+    discard,
+    refresh,
+  };
 }

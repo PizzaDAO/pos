@@ -1,12 +1,12 @@
 /**
  * Customer magic-link request — POST /api/shop/auth/magic-link
  *
- * Body: { locationSlug, email, name? }. The /shop stays PUBLIC (guest checkout
+ * Body: { tenantSlug, locationSlug, email, name? }. The /shop stays PUBLIC (guest checkout
  * never needs this); this lets a customer claim an OPTIONAL account so they can
  * sign in and see their orders.
  *
  * REAL MODE (Supabase auth configured): sends a REAL Supabase Auth magic link
- * (`signInWithOtp`) to the email; the link returns to /shop/<slug>?signedin=1.
+ * (`signInWithOtp`) to the email; the link returns to /shop/<tenant>/<location>?signedin=1.
  * We still ensure a per-tenant `customers` row so orders attribute correctly.
  * The token is NOT returned.
  *
@@ -18,6 +18,8 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { ensureCustomer, requestMagicLink } from "@/lib/shop/auth";
+import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
+import { storefrontPath } from "@/lib/shop/storefront";
 import {
   getServerSupabase,
   isSupabaseAuthConfigured,
@@ -27,6 +29,7 @@ import { enforceRateLimit, isEmail, readJsonBody } from "@/lib/security";
 export const runtime = "nodejs";
 
 interface Body {
+  tenantSlug?: string;
   locationSlug: string;
   email: string;
   name?: string;
@@ -59,9 +62,19 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(request, "auth", { keys: [body.email] });
   if (limited) return limited;
 
-  const driver = getPosDriver();
-  const location = await driver.getLocationBySlug(body.locationSlug);
-  if (!location) {
+  const resolved = await resolveStorefrontLocation({
+    tenantSlug: body.tenantSlug,
+    locationSlug: body.locationSlug,
+  });
+  if (!resolved.ok) {
+    return NextResponse.json(
+      { error: resolved.error },
+      { status: resolved.status },
+    );
+  }
+  const { location } = resolved;
+  const tenant = await getPosDriver().getTenant(location.tenant_id);
+  if (!tenant) {
     return NextResponse.json({ error: "Location not found." }, { status: 404 });
   }
 
@@ -77,7 +90,7 @@ export async function POST(request: Request) {
         email: body.email,
         name: body.name ?? null,
       });
-      const redirectTo = `${appUrl.replace(/\/$/, "")}/shop/${location.slug}?signedin=1`;
+      const redirectTo = `${appUrl.replace(/\/$/, "")}${storefrontPath({ tenantSlug: tenant.slug, locationSlug: location.slug })}?signedin=1`;
       const { error } = await supabase.auth.signInWithOtp({
         email: body.email.trim(),
         options: { emailRedirectTo: redirectTo },
@@ -88,7 +101,11 @@ export async function POST(request: Request) {
           { status: 502 },
         );
       }
-      return NextResponse.json({ customer, simulated: false, sent: true });
+      return NextResponse.json({
+        customer: { id: customer.id, email: customer.email },
+        simulated: false,
+        sent: true,
+      });
     }
   }
 
@@ -101,7 +118,7 @@ export async function POST(request: Request) {
   });
 
   return NextResponse.json({
-    customer: result.customer,
+    customer: { id: result.customer.id, email: result.customer.email },
     simulated: true,
     magicLinkUrl: result.magicLinkUrl,
   });

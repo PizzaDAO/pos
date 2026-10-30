@@ -8,6 +8,9 @@
  *
  * Overrides are folded into `getMenu`, so terminal/shop reads reflect them with
  * no call-site change. No env vars; in-memory mock driver.
+ *
+ * Auth: owner|manager of the tenant; the location AND the override target
+ * (item/size/modifier) must belong to that tenant.
  */
 import { NextResponse } from "next/server";
 import {
@@ -15,22 +18,24 @@ import {
   type OverrideInput,
   type OverrideTargetType,
 } from "@/lib/db";
-import { requireTenantRole } from "@/lib/auth/api";
-import { recordAudit } from "@/lib/security";
+import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { isMoneyCents, recordAudit } from "@/lib/security";
+
+const TARGET_TYPES: OverrideTargetType[] = ["item", "size", "modifier"];
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
-  const overrides = await getPosDriver().listOverrides(tenantId, locationId);
+  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
+  if (!auth.ok) return auth.res;
+  const overrides = await getPosDriver().listOverrides(
+    auth.tenantId,
+    auth.locationId as string,
+  );
   return NextResponse.json({ overrides });
 }
 
@@ -52,9 +57,40 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
-  const auth = await requireTenantRole(body.tenant_id, ["owner", "manager"]);
+  if (!TARGET_TYPES.includes(body.target_type)) {
+    return NextResponse.json({ error: "Unknown target_type." }, { status: 422 });
+  }
+  if (
+    body.price_cents !== undefined &&
+    body.price_cents !== null &&
+    !isMoneyCents(body.price_cents)
+  ) {
+    return NextResponse.json(
+      { error: "price_cents must be a non-negative integer." },
+      { status: 422 },
+    );
+  }
+  const auth = await requireTenantAccess(body.tenant_id, "admin", {
+    locationId: body.location_id,
+    requireLocation: true,
+  });
   if (!auth.ok) return auth.res;
-  const override = await getPosDriver().upsertOverride(body);
+  const driver = getPosDriver();
+  const targetOwner = await driver.getMenuEntityTenant(
+    body.target_type,
+    body.target_id,
+  );
+  if (targetOwner !== auth.tenantId) {
+    return NextResponse.json({ error: "Target not found." }, { status: 404 });
+  }
+  const override = await driver.upsertOverride({
+    tenant_id: auth.tenantId,
+    location_id: body.location_id,
+    target_type: body.target_type,
+    target_id: body.target_id,
+    price_cents: body.price_cents,
+    available: body.available,
+  });
 
   // Audit a menu "86" (availability turned off) — a sensitive, customer-visible
   // catalogue change worth a tenant-scoped trail.
@@ -84,7 +120,7 @@ export async function DELETE(request: Request) {
       { status: 400 },
     );
   }
-  const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+  const auth = await requireTenantAccess(tenantId, "admin", { locationId });
   if (!auth.ok) return auth.res;
   await getPosDriver().clearOverride(
     tenantId,

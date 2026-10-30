@@ -76,11 +76,13 @@ import type {
   ShiftCashEvent,
   SizeInput,
   Staff,
+  StaffSession,
 } from "./backoffice-types";
 import type { Location, Membership, Tenant, User } from "./types";
 import type {
   AuditLogEntry,
   OnboardingStep,
+  PendingBillingCheckout,
   PlanTier,
   Subscription,
   TenantHealth,
@@ -149,6 +151,7 @@ function mapTenant(r: Row): Tenant {
     name: r.name as string,
     slug: r.slug as string,
     status: r.status as Tenant["status"],
+    suspended_by_platform: r.suspended_by_platform === true,
     created_at: r.created_at as string,
   };
 }
@@ -354,8 +357,21 @@ function mapSubscription(r: Row): Subscription {
     simulated: r.simulated as boolean,
     stripe_customer_id: (r.stripe_customer_id as string | null) ?? null,
     stripe_subscription_id: (r.stripe_subscription_id as string | null) ?? null,
+    last_event_created:
+      r.last_event_created == null ? null : Number(r.last_event_created),
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
+  };
+}
+
+function mapPendingBillingCheckout(r: Row): PendingBillingCheckout {
+  return {
+    tenant_id: r.tenant_id as string,
+    session_id: r.session_id as string,
+    tier: r.tier as PlanTier,
+    url: r.url as string,
+    expires_at: r.expires_at as string,
+    created_at: r.created_at as string,
   };
 }
 
@@ -972,11 +988,14 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { tenant, owner };
     },
 
-    async setTenantStatus(tenantId, status) {
+    async setTenantStatus(tenantId, status, opts) {
+      // The platform flag is written in the SAME update as the status.
+      const patch: Row = { status };
+      if (opts?.byPlatform) patch.suspended_by_platform = status === "suspended";
       const r = unwrap(
         await sb
           .from("tenants")
-          .update({ status })
+          .update(patch)
           .eq("id", tenantId)
           .select()
           .maybeSingle(),
@@ -986,11 +1005,19 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     async createLocation(input) {
       const now = nowIso();
-      const existingSlugs = new Set(
-        (
-          (unwrap(await sb.from("locations").select("slug")) as Row[]) ?? []
+      // Slugs are unique per tenant (unique (tenant_id, slug)); "track" is
+      // reserved by the legacy storefront tracking route.
+      const existingSlugs = new Set([
+        "track",
+        ...(
+          (unwrap(
+            await sb
+              .from("locations")
+              .select("slug")
+              .eq("tenant_id", input.tenant_id),
+          ) as Row[]) ?? []
         ).map((r) => r.slug as string),
-      );
+      ]);
       let slug = slugify(input.name);
       if (existingSlugs.has(slug)) {
         let n = 2;
@@ -1214,6 +1241,56 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return updated;
     },
 
+    async getPendingBillingCheckout(tenantId) {
+      const r = unwrap(
+        await sb
+          .from("billing_checkout_sessions")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPendingBillingCheckout(r) : null;
+    },
+
+    async claimPendingBillingCheckout(rec) {
+      // Drop an EXPIRED record first, then insert on the tenant_id primary
+      // key: of two concurrent claims exactly one insert wins; the loser gets
+      // a unique violation and reads the winner.
+      unwrap(
+        await sb
+          .from("billing_checkout_sessions")
+          .delete()
+          .eq("tenant_id", rec.tenant_id)
+          .lte("expires_at", nowIso())
+          .select("tenant_id"),
+      );
+      const ins = await sb
+        .from("billing_checkout_sessions")
+        .insert(rec)
+        .select()
+        .single();
+      if (!ins.error) {
+        return { claimed: true, current: mapPendingBillingCheckout(ins.data as Row) };
+      }
+      if ((ins.error as { code?: string }).code !== "23505") {
+        throw new Error(`Supabase: ${ins.error.message}`);
+      }
+      const current = await this.getPendingBillingCheckout(rec.tenant_id);
+      if (!current) throw new Error("Supabase: billing checkout claim raced");
+      return { claimed: false, current };
+    },
+
+    async clearPendingBillingCheckout(tenantId, sessionId) {
+      unwrap(
+        await sb
+          .from("billing_checkout_sessions")
+          .delete()
+          .eq("tenant_id", tenantId)
+          .eq("session_id", sessionId)
+          .select("tenant_id"),
+      );
+    },
+
     // -- Platform admin + health -------------------------------------------
     async isPlatformAdmin(userId) {
       const r = unwrap(
@@ -1336,11 +1413,36 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       ).map(mapLocation);
     },
 
-    async getLocationBySlug(slug) {
+    async getTenantBySlug(slug) {
       const r = unwrap(
-        await sb.from("locations").select("*").eq("slug", slug).maybeSingle(),
+        await sb.from("tenants").select("*").eq("slug", slug).maybeSingle(),
+      ) as Row | null;
+      return r ? mapTenant(r) : null;
+    },
+
+    async getLocationBySlugs(tenantSlug, locationSlug) {
+      // tenants.slug is globally unique; locations.slug is unique per tenant
+      // (unique (tenant_id, slug)) — so the pair resolves at most one row.
+      const tenant = await this.getTenantBySlug(tenantSlug);
+      if (!tenant) return null;
+      const r = unwrap(
+        await sb
+          .from("locations")
+          .select("*")
+          .eq("tenant_id", tenant.id)
+          .eq("slug", locationSlug)
+          .maybeSingle(),
       ) as Row | null;
       return r ? mapLocation(r) : null;
+    },
+
+    async listLocationsBySlug(slug) {
+      // NOT maybeSingle(): several tenants may share a location slug.
+      return (
+        unwrap(
+          await sb.from("locations").select("*").eq("slug", slug).limit(50),
+        ) as Row[]
+      ).map(mapLocation);
     },
 
     async getMenu(tenantId, locationId, opts) {
@@ -1886,14 +1988,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         : byEmail
           ? mapCustomer(byEmail)
           : null;
+      // Matched only by EMAIL (guest checkout with a new id): anyone can type
+      // an email, so never overwrite the stored name/phone — only fill blanks.
+      const fillBlanksOnly = !byId && Boolean(byEmail);
       const now = nowIso();
       const merged: Customer = {
         ...customer,
         id: base?.id ?? customer.id,
         email,
         verified: customer.verified || base?.verified || false,
-        name: customer.name ?? base?.name ?? null,
-        phone: customer.phone ?? base?.phone ?? null,
+        name: fillBlanksOnly
+          ? (base?.name ?? customer.name ?? null)
+          : (customer.name ?? base?.name ?? null),
+        phone: fillBlanksOnly
+          ? (base?.phone ?? customer.phone ?? null)
+          : (customer.phone ?? base?.phone ?? null),
         created_at: base?.created_at ?? now,
         updated_at: now,
       };
@@ -2004,6 +2113,50 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     // -- Menu management ---------------------------------------------------
+    async getMenuEntityTenant(entity, id) {
+      const one = async (table: string, cols: string) =>
+        unwrap(
+          await sb.from(table).select(cols).eq("id", id).maybeSingle(),
+        ) as Row | null;
+      switch (entity) {
+        case "category":
+          return ((await one("menu_categories", "tenant_id"))?.tenant_id ??
+            null) as string | null;
+        case "item":
+          return ((await one("menu_items", "tenant_id"))?.tenant_id ??
+            null) as string | null;
+        case "modifierGroup":
+          return ((await one("modifier_groups", "tenant_id"))?.tenant_id ??
+            null) as string | null;
+        case "size": {
+          const size = await one("item_sizes", "item_id");
+          if (!size) return null;
+          const item = unwrap(
+            await sb
+              .from("menu_items")
+              .select("tenant_id")
+              .eq("id", size.item_id as string)
+              .maybeSingle(),
+          ) as Row | null;
+          return (item?.tenant_id ?? null) as string | null;
+        }
+        case "modifier": {
+          const mod = await one("modifiers", "group_id");
+          if (!mod) return null;
+          const group = unwrap(
+            await sb
+              .from("modifier_groups")
+              .select("tenant_id")
+              .eq("id", mod.group_id as string)
+              .maybeSingle(),
+          ) as Row | null;
+          return (group?.tenant_id ?? null) as string | null;
+        }
+        default:
+          return null;
+      }
+    },
+
     async listCategories(tenantId) {
       return (
         unwrap(
@@ -2456,6 +2609,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         );
     },
 
+    async getInventoryItem(id) {
+      const r = unwrap(
+        await sb.from("inventory_items").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapInventoryItem(r) : null;
+    },
+
     async upsertInventoryItem(item) {
       const existing = item.id
         ? (unwrap(
@@ -2700,6 +2860,95 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return r ? mapStaff(r, { includePin: true }) : null;
     },
 
+    async beginPinAttempt(tenantId, staffId) {
+      const res = unwrap(
+        await sb.rpc("begin_pin_attempt", {
+          p_tenant_id: tenantId,
+          p_staff_id: staffId,
+        }),
+      ) as {
+        allowed?: boolean;
+        just_locked?: boolean;
+        attempts?: number;
+        locked_until?: string | null;
+      } | null;
+      return {
+        allowed: res?.allowed === true,
+        justLocked: res?.just_locked === true,
+        attempts: Number(res?.attempts ?? 0),
+        lockedUntil: res?.locked_until ?? null,
+      };
+    },
+
+    async clearPinAttempts(tenantId, staffId) {
+      // Conditional single-statement update: never clears a lock set by a
+      // concurrent attempt burst.
+      unwrap(
+        await sb
+          .from("staff")
+          .update({ pin_failed_attempts: 0 })
+          .eq("id", staffId)
+          .eq("tenant_id", tenantId)
+          .is("pin_locked_until", null)
+          .select("id"),
+      );
+    },
+
+    async tenantHasStaffPins(tenantId) {
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .select("id")
+          .eq("tenant_id", tenantId)
+          .eq("active", true)
+          .not("pin_hash", "is", null)
+          .limit(1),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async createStaffSession(session) {
+      return unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .insert(session)
+          .select()
+          .single(),
+      ) as StaffSession;
+    },
+
+    async getStaffSession(id) {
+      return (unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle(),
+      ) ?? null) as StaffSession | null;
+    },
+
+    async revokeStaffSession(id) {
+      unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .update({ revoked_at: nowIso() })
+          .eq("id", id)
+          .is("revoked_at", null)
+          .select("id"),
+      );
+    },
+
+    async revokeStaffSessionsForUser(userId) {
+      unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .update({ revoked_at: nowIso() })
+          .eq("user_id", userId)
+          .is("revoked_at", null)
+          .select("id"),
+      );
+    },
+
     async upsertStaff(staff) {
       const existing = staff.id
         ? (unwrap(
@@ -2723,6 +2972,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return mapStaff(
         unwrap(await sb.from("staff").upsert(row).select().single()) as Row,
       );
+    },
+
+    async getShift(id) {
+      const r = unwrap(
+        await sb.from("shifts").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapShift(r) : null;
     },
 
     async listShifts(tenantId, locationId) {

@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { isInStoreCardReady } from "@/lib/payments/terminal/readers";
 import { TerminalClient } from "./components/terminal-client";
 import { requireLocationSurface } from "@/lib/auth/guard";
+import { roleInTenant } from "@/lib/auth/session";
+import { requiresPinStaff } from "@/lib/auth/active-staff";
 
 export const metadata: Metadata = {
   title: "Terminal",
@@ -35,6 +37,8 @@ export default async function TerminalPage({
       initialTenantId={ctx.tenantId}
       initialLocationId={ctx.locationId ?? undefined}
       cardReady={await isInStoreCardReady(ctx.tenantId, ctx.locationId)}
+      deviceRole={roleInTenant(ctx.user, ctx.tenantId) ?? undefined}
+      requireActiveStaff={await requiresPinStaff(ctx.tenantId)}
     />
   );
 }

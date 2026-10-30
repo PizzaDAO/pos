@@ -24,11 +24,19 @@ export const PLATFORM_EMAIL =
 export const OWNER_PASSWORD = process.env.E2E_OWNER_PASSWORD || "";
 export const PLATFORM_PASSWORD = process.env.E2E_PLATFORM_PASSWORD || "";
 
-/** Seeded demo storefront slugs (Tony's Pizza). Downtown = pickup+delivery. */
-export const SHOP_SLUG_PICKUP_DELIVERY =
+/**
+ * Seeded demo storefronts (Tony's Pizza). Storefronts are addressed by
+ * `/shop/{tenantSlug}/{locationSlug}` (location slugs are unique per tenant
+ * only). Downtown = pickup+delivery.
+ */
+export const SHOP_TENANT_SLUG = process.env.E2E_SHOP_TENANT || "tonys-pizza";
+export const SHOP_LOCATION_SLUG_PICKUP_DELIVERY =
   process.env.E2E_SHOP_SLUG || "tonys-downtown";
-export const SHOP_SLUG_PICKUP_ONLY =
+export const SHOP_LOCATION_SLUG_PICKUP_ONLY =
   process.env.E2E_SHOP_SLUG_PICKUP || "tonys-uptown";
+/** Storefront paths (`{tenantSlug}/{locationSlug}`) used after `/shop/`. */
+export const SHOP_SLUG_PICKUP_DELIVERY = `${SHOP_TENANT_SLUG}/${SHOP_LOCATION_SLUG_PICKUP_DELIVERY}`;
+export const SHOP_SLUG_PICKUP_ONLY = `${SHOP_TENANT_SLUG}/${SHOP_LOCATION_SLUG_PICKUP_ONLY}`;
 
 /** Demo seed staff PINs (Tony 1111 · Carmela 2222 · Christopher 3333 · Furio 4444). */
 export const STAFF_PIN = process.env.E2E_STAFF_PIN || "1111";

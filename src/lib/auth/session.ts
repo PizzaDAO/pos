@@ -80,6 +80,10 @@ export async function getCurrentUser(opts?: {
   }
 
   // ---- SIMULATED MODE: derive a deterministic session from the seed. ----
+  // ONLY with the in-memory mock driver. If the real (Supabase) driver is
+  // active but the public auth env is missing/misconfigured, there is NO user —
+  // never fall back to the seeded demo owner / platform admin against live data.
+  if (!isSimulatedSessionAllowed(driver.name)) return null;
   const email =
     opts?.simulatedAs === "platform" ? PLATFORM_ADMIN_EMAIL : DEMO_OWNER_EMAIL;
   const seedUser = await driver.getUserByEmail(email);
@@ -95,6 +99,15 @@ export async function getCurrentUser(opts?: {
     isPlatformAdmin,
     real: false,
   };
+}
+
+/**
+ * The simulated demo session is permitted only when real auth is NOT
+ * configured AND the data driver is the in-memory mock. (Pure; exported for
+ * tests.)
+ */
+export function isSimulatedSessionAllowed(driverName: string): boolean {
+  return driverName === "mock" && !isSupabaseAuthConfigured();
 }
 
 /**

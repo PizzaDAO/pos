@@ -740,6 +740,229 @@ begin
            where id = '0ada0077-0000-0000-0000-000000000001') = '500',
     'update_late_payment works on the created marker';
 end $$;
+reset role;
+
+-- PR #20 (20261102000100/000200): subscriptions, tenant status and the
+-- platform-suspension flag are server-write-only; terminal staff sessions and
+-- the PIN-lockout function are service_role only.
+select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
+do $$
+declare blocked boolean;
+begin
+  blocked := false;
+  begin
+    insert into public.subscriptions (tenant_id, tier, status)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'pro', 'active');
+  exception when others then blocked := true; end;
+  assert blocked, 'owner must NOT be able to insert subscriptions';
+
+  blocked := false;
+  begin
+    update public.subscriptions set tier = 'multi'
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT be able to update subscriptions (tier bypass)';
+
+  blocked := false;
+  begin
+    update public.tenants set status = 'active'
+      where id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT be able to change tenants.status';
+
+  blocked := false;
+  begin
+    update public.tenants set suspended_by_platform = false
+      where id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT be able to clear tenants.suspended_by_platform';
+
+  -- The display name stays owner-editable.
+  update public.tenants set name = name
+    where id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+
+  blocked := false;
+  begin
+    perform count(*) from public.terminal_staff_sessions;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read terminal_staff_sessions';
+
+  blocked := false;
+  begin
+    perform count(*) from public.billing_checkout_sessions;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read billing_checkout_sessions';
+
+  blocked := false;
+  begin
+    insert into public.billing_checkout_sessions (tenant_id, session_id, tier, url, expires_at)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'cs_forged', 'pro', 'https://x', now() + interval '1 hour');
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'an owner must NOT record a billing checkout session (webhook gate)';
+
+  blocked := false;
+  begin
+    perform public.begin_pin_attempt('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      '57a00001-0000-0000-0000-000000000001');
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT call begin_pin_attempt';
+
+  -- staff: the PIN hash and lockout state are not readable with a user JWT,
+  -- every other column still is (the staff picker / admin lists).
+  perform id, tenant_id, name, role, active, created_at from public.staff
+    where id = '57a00001-0000-0000-0000-000000000001';
+  assert found, 'a member can still read the non-secret staff columns';
+  perform 1 from public.staff where id = '57b00001-0000-0000-0000-000000000001';
+  assert not found, 'a member must NOT see another tenant''s staff';
+
+  blocked := false;
+  begin
+    perform pin_hash from public.staff;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read staff.pin_hash';
+
+  blocked := false;
+  begin
+    perform pin_failed_attempts from public.staff;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read staff.pin_failed_attempts';
+
+  blocked := false;
+  begin
+    perform pin_locked_until from public.staff;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'authenticated users must NOT read staff.pin_locked_until';
+
+  blocked := false;
+  begin
+    perform * from public.staff;
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'select * on staff must be denied (it would include pin_hash)';
+
+  -- tenant_onboarding: members read their row; writes are server-only.
+  perform 1 from public.tenant_onboarding;  -- SELECT still granted
+
+  blocked := false;
+  begin
+    insert into public.tenant_onboarding (tenant_id, live)
+    values ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', true);
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT insert tenant_onboarding';
+
+  blocked := false;
+  begin
+    update public.tenant_onboarding set live = true
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT update tenant_onboarding (go-live bypass)';
+
+  blocked := false;
+  begin
+    delete from public.tenant_onboarding
+      where tenant_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  exception when insufficient_privilege then blocked := true; end;
+  assert blocked, 'owner must NOT delete tenant_onboarding';
+end $$;
+reset role;
+
+do $$
+begin
+  assert not exists (
+    select 1 from pg_policies
+     where schemaname = 'public' and tablename = 'tenant_onboarding'
+       and policyname = 'tenant_onboarding_write'
+  ), 'tenant_onboarding_write policy must be dropped';
+end $$;
+
+-- begin_pin_attempt: atomic attempt budget (server path, service role).
+do $$
+declare r jsonb; i int;
+  t uuid := 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  st uuid := '57a00001-0000-0000-0000-000000000001';
+begin
+  update public.staff set pin_failed_attempts = 0, pin_locked_until = null where id = st;
+  for i in 1..5 loop
+    r := public.begin_pin_attempt(t, st);
+    assert (r ->> 'allowed')::boolean, format('attempt %s is allowed', i);
+    assert (r ->> 'attempts')::int = i, format('attempt %s is counted up front', i);
+  end loop;
+  -- Budget spent (no success reset it): the next attempt locks + is refused.
+  r := public.begin_pin_attempt(t, st);
+  assert not (r ->> 'allowed')::boolean, 'the 6th attempt is refused';
+  assert (r ->> 'just_locked')::boolean, 'the 6th attempt sets the lock';
+  assert (r ->> 'locked_until') is not null, 'lock time returned';
+  r := public.begin_pin_attempt(t, st);
+  assert not (r ->> 'allowed')::boolean and not (r ->> 'just_locked')::boolean,
+    'refused while locked';
+
+  -- The app's success reset is conditional: it never clears a lock.
+  update public.staff set pin_failed_attempts = 0
+   where id = st and tenant_id = t and pin_locked_until is null;
+  assert (select pin_locked_until from public.staff where id = st) is not null,
+    'a success must not clear a lock set meanwhile';
+
+  -- An expired lock gives a fresh budget.
+  update public.staff set pin_locked_until = now() - interval '1 minute' where id = st;
+  r := public.begin_pin_attempt(t, st);
+  assert (r ->> 'allowed')::boolean and (r ->> 'attempts')::int = 1,
+    'an expired lock resets the budget';
+
+  -- Wrong tenant: refused, nothing counted.
+  r := public.begin_pin_attempt('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', st);
+  assert not (r ->> 'allowed')::boolean, 'a staff id outside the tenant is refused';
+end $$;
+
+do $$
+begin
+  assert to_regprocedure('public.record_pin_failure(uuid,uuid,integer,integer)') is null,
+    'the racy record_pin_failure() draft must be gone';
+end $$;
+
+-- Backfill of tenants.suspended_by_platform (re-applies 20261102000200 over
+-- fixtures; also proves the migration is idempotent).
+set session_replication_role = replica;
+insert into public.tenants (id, name, slug, status) values
+  ('cccccccc-0000-0000-0000-000000000001', 'Susp by audit', 'susp-audit', 'suspended'),
+  ('cccccccc-0000-0000-0000-000000000002', 'Mid signup', 'mid-signup', 'suspended'),
+  ('cccccccc-0000-0000-0000-000000000003', 'Signup, re-activated audit', 'signup-react', 'suspended'),
+  ('cccccccc-0000-0000-0000-000000000004', 'Ambiguous', 'ambiguous', 'suspended'),
+  ('cccccccc-0000-0000-0000-000000000005', 'Active', 'active-one', 'active'),
+  ('cccccccc-0000-0000-0000-000000000006', 'Live then suspended', 'live-susp', 'suspended');
+insert into public.tenant_onboarding (tenant_id, live) values
+  ('cccccccc-0000-0000-0000-000000000001', false),
+  ('cccccccc-0000-0000-0000-000000000002', false),
+  ('cccccccc-0000-0000-0000-000000000003', false),
+  ('cccccccc-0000-0000-0000-000000000006', true);
+insert into public.audit_log (actor_user_id, actor_label, action, tenant_id, detail, created_at) values
+  ('33333333-3333-3333-3333-333333333333', 'admin', 'tenant_suspend',
+   'cccccccc-0000-0000-0000-000000000001', 'suspend', now() - interval '2 days'),
+  ('33333333-3333-3333-3333-333333333333', 'admin', 'tenant_reactivate',
+   'cccccccc-0000-0000-0000-000000000001', 'reactivate', now() - interval '3 days'),
+  ('33333333-3333-3333-3333-333333333333', 'admin', 'tenant_suspend',
+   'cccccccc-0000-0000-0000-000000000003', 'suspend', now() - interval '3 days'),
+  ('33333333-3333-3333-3333-333333333333', 'admin', 'tenant_reactivate',
+   'cccccccc-0000-0000-0000-000000000003', 'reactivate', now() - interval '2 days');
+set session_replication_role = origin;
+
+\ir ../migrations/20261102000200_staff_sessions_pin_lockout.sql
+
+do $$
+declare
+  f boolean;
+begin
+  select suspended_by_platform into f from public.tenants where id = 'cccccccc-0000-0000-0000-000000000001';
+  assert f, 'suspended with an un-reversed tenant_suspend audit → platform-suspended';
+  select suspended_by_platform into f from public.tenants where id = 'cccccccc-0000-0000-0000-000000000002';
+  assert not f, 'a mid-signup tenant (no suspend audit) can still go live';
+  select suspended_by_platform into f from public.tenants where id = 'cccccccc-0000-0000-0000-000000000003';
+  assert not f, 'a suspend followed by a reactivate (still in signup) is not platform-suspended';
+  select suspended_by_platform into f from public.tenants where id = 'cccccccc-0000-0000-0000-000000000004';
+  assert f, 'ambiguous (suspended, no audit, not in signup) → platform-suspended';
+  select suspended_by_platform into f from public.tenants where id = 'cccccccc-0000-0000-0000-000000000005';
+  assert not f, 'an active tenant is untouched';
+  select suspended_by_platform into f from public.tenants where id = 'cccccccc-0000-0000-0000-000000000006';
+  assert f, 'a live tenant that is now suspended → platform-suspended';
+end $$;
 
 select 'RLS isolation test PASSED' as result;
 

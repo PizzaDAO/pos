@@ -1,12 +1,17 @@
 /**
  * Per-location storefront (Phase 4). Server component: resolves the public
- * location slug via the DB abstraction, then renders the mobile-first
- * customer-facing client. A bad slug 404s. No env vars required.
+ * `/shop/{tenantSlug}/{locationSlug}` pair via the DB abstraction, then renders
+ * the mobile-first customer-facing client. Location slugs are only unique
+ * within a tenant, so the tenant slug is part of every storefront URL. A bad
+ * pair 404s. No env vars required.
  */
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { getPosDriver } from "@/lib/db";
+import { storefrontPath } from "@/lib/shop/storefront";
 import { ShopClient } from "./components/shop-client";
+
+type Params = Promise<{ tenant: string; location: string }>;
 
 /**
  * Per-storefront metadata (indexable). Resolves the location name for the title
@@ -16,10 +21,13 @@ import { ShopClient } from "./components/shop-client";
 export async function generateMetadata({
   params,
 }: {
-  params: Promise<{ location: string }>;
+  params: Params;
 }): Promise<Metadata> {
-  const { location: slug } = await params;
-  const location = await getPosDriver().getLocationBySlug(slug);
+  const { tenant: tenantSlug, location: locationSlug } = await params;
+  const location = await getPosDriver().getLocationBySlugs(
+    tenantSlug,
+    locationSlug,
+  );
   if (!location) {
     return { title: "Store not found", robots: { index: false } };
   }
@@ -28,7 +36,7 @@ export async function generateMetadata({
   // strict getByText, which would otherwise match both the title and the body.
   const title = `${location.name} — Pizza pickup & delivery`;
   const description = `Order pizza from ${location.name} for pickup or delivery. Build your own, half-and-half, and more.`;
-  const url = `/shop/${slug}`;
+  const url = storefrontPath({ tenantSlug, locationSlug });
   return {
     title,
     description,
@@ -49,15 +57,18 @@ export async function generateMetadata({
   };
 }
 
-export default async function ShopPage({
-  params,
-}: {
-  params: Promise<{ location: string }>;
-}) {
-  const { location: slug } = await params;
-  const driver = getPosDriver();
-  const location = await driver.getLocationBySlug(slug);
+export default async function ShopPage({ params }: { params: Params }) {
+  const { tenant: tenantSlug, location: locationSlug } = await params;
+  const location = await getPosDriver().getLocationBySlugs(
+    tenantSlug,
+    locationSlug,
+  );
   if (!location) notFound();
 
-  return <ShopClient slug={slug} locationName={location.name} />;
+  return (
+    <ShopClient
+      store={{ tenantSlug, locationSlug }}
+      locationName={location.name}
+    />
+  );
 }

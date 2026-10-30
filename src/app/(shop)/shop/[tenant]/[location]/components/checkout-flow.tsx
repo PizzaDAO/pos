@@ -39,6 +39,7 @@ import {
   generateSlots,
 } from "@/lib/shop/scheduling";
 import type { ShopResponse } from "@/lib/store/use-shop";
+import { storefrontKey } from "@/lib/shop/storefront";
 
 type Fulfillment = "pickup" | "delivery";
 type Step = "fulfillment" | "identity" | "payment" | "waiting" | "done";
@@ -49,15 +50,20 @@ const ONLINE_RAILS: { key: PaymentRailKey; label: string }[] = [
 ];
 
 export function CheckoutFlow({
+  tenantSlug,
   slug,
   shop,
   onClose,
 }: {
+  tenantSlug: string;
   slug: string;
   shop: ShopResponse;
   onClose: () => void;
 }) {
   const checkout = useShopCheckout();
+  // Location slugs are unique only within a tenant: key the stored checkout
+  // order id by the storefront (tenant + location), like the cart.
+  const checkoutKey = storefrontKey({ tenantSlug, locationSlug: slug });
   const items = useCustomerCart((s) => s.items);
   const subtotalCents = useCustomerCart((s) => s.subtotalCents());
   const clearCart = useCustomerCart((s) => s.clear);
@@ -156,7 +162,7 @@ export function CheckoutFlow({
 
   /** Leave the checkout as paid: the only path to the confirmation screen. */
   function finishPaid(order: Order) {
-    forgetCheckoutOrderId(slug);
+    forgetCheckoutOrderId(checkoutKey);
     setPlacedOrderId(order.id);
     setPlacedOrderNumber(order.order_number);
     setPriceChange(null);
@@ -169,7 +175,7 @@ export function CheckoutFlow({
     // (cart, time, address, tip...) mints a new one and cancels the old unpaid
     // order best-effort.
     const input = {
-      slug,
+      slug: checkoutKey,
       items,
       fulfillmentType: fulfillment,
       scheduledFor: when,
@@ -190,6 +196,7 @@ export function CheckoutFlow({
       if (superseded) checkout.cancelQuietly(superseded);
       placed = await checkout.placeOrder({
         orderId,
+        tenantSlug,
         locationSlug: slug,
         items,
         fulfillmentType: fulfillment,
@@ -201,7 +208,7 @@ export function CheckoutFlow({
       });
       // The stored order was abandoned (expired / cancelled): start a new one.
       if (!placed && checkout.lastCode.current === "checkout_abandoned") {
-        forgetCheckoutOrderId(slug);
+        forgetCheckoutOrderId(checkoutKey);
         continue;
       }
       break;
@@ -231,7 +238,7 @@ export function CheckoutFlow({
    */
   async function declinePriceChange(order: Order) {
     if (!(await checkout.cancelOrder(order.id))) return;
-    forgetCheckoutOrderId(slug);
+    forgetCheckoutOrderId(checkoutKey);
     replaceCartItems(order.items);
     if (order.fulfillment?.type === "delivery") {
       const fee = order.fulfillment.delivery_fee_cents ?? 0;
@@ -262,7 +269,7 @@ export function CheckoutFlow({
         return;
       }
       if (checkout.lastCode.current === "checkout_abandoned") {
-        forgetCheckoutOrderId(slug);
+        forgetCheckoutOrderId(checkoutKey);
         setPriceChange(null);
         checkout.setError("Your checkout expired. Please try again.");
       }
@@ -285,11 +292,11 @@ export function CheckoutFlow({
       const res = await checkout.sync(placedOrderId);
       if (cancelled || !res) return;
       if (res.orderStatus === "paid") {
-        forgetCheckoutOrderId(slug);
+        forgetCheckoutOrderId(checkoutKey);
         clearCart();
         setStep("done");
       } else if (res.orderStatus === "abandoned") {
-        forgetCheckoutOrderId(slug);
+        forgetCheckoutOrderId(checkoutKey);
         checkout.setError("Your checkout expired. Please try again.");
         setStep("payment");
       }
@@ -301,12 +308,12 @@ export function CheckoutFlow({
       clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, placedOrderId, slug]);
+  }, [step, placedOrderId, checkoutKey]);
 
   async function handleCancelWaiting() {
     if (!placedOrderId) return;
     if (!(await checkout.cancelOrder(placedOrderId))) return;
-    forgetCheckoutOrderId(slug);
+    forgetCheckoutOrderId(checkoutKey);
     setPlacedOrderId(null);
     setStep("payment");
   }
@@ -316,7 +323,7 @@ export function CheckoutFlow({
     const res = await fetch("/api/shop/auth/magic-link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ locationSlug: slug, email, name }),
+      body: JSON.stringify({ tenantSlug, locationSlug: slug, email, name }),
     });
     const data = (await res.json()) as { magicLinkUrl?: string };
     setMagicLinkUrl(data.magicLinkUrl ?? null);
@@ -739,7 +746,7 @@ export function CheckoutFlow({
                     : "We'll have it ready for pickup."}
                 </p>
               </div>
-              <Link href={`/shop/${slug}/track/${placedOrderId}`}>
+              <Link href={`/shop/${tenantSlug}/${slug}/track/${placedOrderId}`}>
                 <Button className="h-12 w-full">Track your order</Button>
               </Link>
               <Button variant="outline" className="w-full" onClick={onClose}>
