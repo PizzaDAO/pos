@@ -25,7 +25,7 @@ export async function GET(
   request: Request,
   ctx: { params: Promise<{ id: string }> },
 ) {
-  const limited = enforceRateLimit(request, "payments");
+  const limited = enforceRateLimit(request, "cardSync");
   if (limited) return limited;
   const { id } = await ctx.params;
   const auth = await authorizeTender(id, TILL_ROLES);

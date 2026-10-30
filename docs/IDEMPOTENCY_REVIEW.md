@@ -74,6 +74,23 @@ row and one upstream charge.
   pending tender (`store/pending-tender.ts`) and reuse it on retry until the
   tender is recorded or its amount/rail changes.
 
+## In-store card reader (server-driven)
+
+- The tender id (client UUID) is the `payment_intents` `Idempotency-Key`; a
+  repeat `POST /api/terminal/payments` with the same id returns the existing
+  tender, and a different id while a card tender is open returns the open one
+  (DB-backed by the partial unique index `payments_one_live_terminal`).
+- `process_payment_intent` gets a per-ATTEMPT key `<paymentId>:process:<n>`; `n`
+  (`raw.process_attempts`) is persisted BEFORE the Stripe call, so a key is never
+  reused for a different request. A `terminal_reader_timeout` is retried once with
+  the same key. A decline retries on the SAME PaymentIntent (never recreated).
+- Polling and the webhooks converge in `syncCardTender`, which re-reads the
+  PaymentIntent from Stripe (never trusting the event payload), verifies id,
+  `metadata.payment_id`, currency and amount against the tender, and settles via
+  `applyRailStatus` (never downgrades `captured`; promotes the order once).
+- Cancel and the cron reconcile re-sync first, so a card that went through is
+  never canceled away; an open tender left behind is canceled on Stripe.
+
 ## Live-wiring follow-ups
 
 - Forward the tender UUID as the Stripe `Idempotency-Key` (already wired in the

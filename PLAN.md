@@ -14,7 +14,7 @@
 | Footprint | **Multi-location** per tenant |
 | Backend | **Supabase** (Postgres + Auth + Realtime + Storage) |
 | Money routing | **Stripe Connect** (per-tenant connected accounts → their payouts) |
-| Card payments | Stripe Terminal (in-store, incl. offline) + Stripe (online) |
+| Card payments | Stripe Terminal (in-store, **online only; server-driven**, Stripe Reader S700) + Stripe (online) |
 | Crypto payments | In scope, **pluggable rail** — onchain USDC (Privy stack) *and* processor (Coinbase Commerce) |
 | Delivery | **Pluggable provider** — in-house manual dispatch *and* 3rd-party (DoorDash Drive) |
 | Subscription billing | **Stripe Billing** (we charge tenants) |
@@ -87,7 +87,7 @@
 
 ### Offline-first (terminal)
 - Per-location menu cached; orders queued in IndexedDB with client UUID; idempotent upsert-by-UUID on reconnect.
-- **Offline card** via Stripe Terminal store-and-forward (reader secure element queues txn, forwards on reconnect). Trade-offs: per-txn cap + window, card-present only, no offline refunds, merchant carries decline risk. Crypto/online need connectivity.
+- **Offline card is NOT possible from a web PWA.** Stripe's offline mode needs the native iOS/Android/React Native Terminal SDK; neither server-driven nor Terminal JS supports it. **Offline means cash-only** (the terminal shows a banner and disables Card). Mitigations: a phone hotspot for the tablet, or an S710 (cellular reader). Revisit a native wrapper only if a pilot shop's outages cost card sales. Crypto/online also need connectivity. See `plans/terminal-card-reader.md`.
 
 ---
 
@@ -129,7 +129,7 @@ Order status: `draft → placed → in_kitchen → ready → (out_for_delivery) 
 
 ### Phase 2 — Payments + money routing
 - **Stripe Connect onboarding** for a tenant; **`PaymentRail` interface**.
-- Stripe Terminal (incl. offline) + Stripe online charges on connected account; cash drawer; tips, split, refund/void; receipts.
+- Stripe Terminal (server-driven, online only) + Stripe online charges on connected account; cash drawer; tips, split, refund/void; receipts.
 - **Crypto rails (both):** onchain **USDC on Base** (Privy + confirmation watcher) and Coinbase Commerce, behind the interface.
 
 ### Phase 3 — Kitchen display / tickets

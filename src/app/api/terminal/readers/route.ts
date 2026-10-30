@@ -23,7 +23,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
-  const limited = enforceRateLimit(request, "payments");
+  const limited = enforceRateLimit(request, "cardSync");
   if (limited) return limited;
   const { searchParams } = new URL(request.url);
   const auth = await authorizeLocation(
