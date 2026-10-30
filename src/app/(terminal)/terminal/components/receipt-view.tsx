@@ -96,6 +96,23 @@ export function ReceiptView({
                     </dt>
                     <dd>{formatMoney(t.amountCents, c)}</dd>
                   </div>
+                  {t.card && (
+                    <div
+                      data-testid="receipt-card"
+                      className="pl-4 text-xs text-muted-foreground"
+                    >
+                      <div>
+                        {t.card.summary}
+                        {t.card.entryMethod && ` · ${t.card.entryMethod}`}
+                        {t.card.accountType && ` · ${t.card.accountType}`}
+                      </div>
+                      {t.card.applicationName && (
+                        <div>App: {t.card.applicationName}</div>
+                      )}
+                      {t.card.aid && <div>AID: {t.card.aid}</div>}
+                      {t.card.authCode && <div>Auth: {t.card.authCode}</div>}
+                    </div>
+                  )}
                   {t.changeCents !== null && t.changeCents > 0 && (
                     <div className="flex justify-between text-xs text-muted-foreground">
                       <dt>Change</dt>

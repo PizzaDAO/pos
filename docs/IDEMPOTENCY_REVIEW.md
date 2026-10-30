@@ -88,6 +88,13 @@ row and one upstream charge.
   PaymentIntent from Stripe (never trusting the event payload), verifies id,
   `metadata.payment_id`, currency and amount against the tender, and settles via
   `applyRailStatus` (never downgrades `captured`; promotes the order once).
+- Client (`store/use-card-reader.ts`): the tender id is minted once per
+  (order, amount, tip) via `pending-tender.ts` and reused until the server accepts
+  it (a lost response can't create a second tender). The in-flight tender id is
+  kept in `sessionStorage` per order (`pos.cardTender.<orderId>`), so a remount
+  resumes polling the same tender. The service worker serves `/api/terminal/*`,
+  `/api/payments*` and `/api/admin/terminal*` NetworkOnly, so a failed status poll
+  can never be answered with a stale cached status (`lib/offline/sw-routes.ts`).
 - Cancel and the cron reconcile re-sync first, so a card that went through is
   never canceled away; an open tender left behind is canceled on Stripe.
 

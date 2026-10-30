@@ -280,6 +280,7 @@ export function TerminalClient({
         onFlush={() => void sync.flushNow()}
         activeStaffName={activeStaff?.name ?? null}
         onSwitchStaff={() => setShowStaffSwitch(true)}
+        readerScope={{ tenantId: menu.tenantId, locationId: location }}
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[1fr_400px]">

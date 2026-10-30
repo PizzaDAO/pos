@@ -26,6 +26,61 @@ export interface ReceiptTender {
   status: string;
   changeCents: number | null;
   simulated: boolean;
+  /** Card-present details (truncated card data + EMV fields) for reader tenders. */
+  card: ReceiptCard | null;
+}
+
+/** The EMV fields a card receipt must print (Stripe: terminal/features/receipts). */
+export interface ReceiptCard {
+  /** e.g. "Visa •••• 4242". */
+  summary: string;
+  entryMethod: string | null;
+  applicationName: string | null;
+  /** Dedicated file name (AID). */
+  aid: string | null;
+  accountType: string | null;
+  authCode: string | null;
+}
+
+const BRAND_NAMES: Record<string, string> = {
+  visa: "Visa",
+  mastercard: "Mastercard",
+  amex: "Amex",
+  discover: "Discover",
+  diners: "Diners Club",
+  jcb: "JCB",
+  unionpay: "UnionPay",
+};
+
+const ENTRY_METHODS: Record<string, string> = {
+  contact_emv: "Chip",
+  contactless_emv: "Tap",
+  magnetic_stripe_track2: "Swipe",
+  magnetic_stripe_fallback: "Swipe",
+  contactless_magstripe_mode: "Tap",
+};
+
+function str(v: unknown): string | null {
+  return typeof v === "string" && v ? v : null;
+}
+
+/** Card details from a reader tender's `raw.card_receipt`, or null (cash, crypto, unsettled). */
+export function cardReceiptOf(p: Payment): ReceiptCard | null {
+  const c = p.raw?.card_receipt;
+  if (!c || typeof c !== "object") return null;
+  const r = c as Record<string, unknown>;
+  const brandKey = str(r.brand)?.toLowerCase() ?? null;
+  const brand = brandKey ? (BRAND_NAMES[brandKey] ?? brandKey) : "Card";
+  const last4 = str(r.last4);
+  const method = str(r.read_method);
+  return {
+    summary: last4 ? `${brand} •••• ${last4}` : brand,
+    entryMethod: method ? (ENTRY_METHODS[method] ?? method.replace(/_/g, " ")) : null,
+    applicationName: str(r.application_preferred_name),
+    aid: str(r.dedicated_file_name),
+    accountType: str(r.account_type),
+    authCode: str(r.authorization_code),
+  };
 }
 
 export interface Receipt {
@@ -86,6 +141,7 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
     status: p.status,
     changeCents: p.cash_change_cents,
     simulated: p.simulated,
+    card: cardReceiptOf(p),
   }));
 
   const totalTenderedCents = payments.reduce(
