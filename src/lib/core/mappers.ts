@@ -947,7 +947,8 @@ export function toContractDailySales(
       tax_cents: 0,
       tip_cents: 0,
       delivery_fee_cents: 0,
-      service_fee_cents: 0,
+      // Σ by_channel.service_fee_cents = the day's service_fee_cents.
+      service_fee_cents: b.fees_cents ?? 0,
       refund_cents: 0,
       void_count: 0,
     })),

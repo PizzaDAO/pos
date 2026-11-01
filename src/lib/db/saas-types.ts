@@ -193,7 +193,11 @@ export type AuditAction =
   // Online checkout lifecycle: money landed on an abandoned order.
   | "late_payment_flagged"
   | "late_payment_accepted"
-  | "late_payment_refunded";
+  | "late_payment_refunded"
+  // Scheduled (catering) holds: an unpaid expired order canceled by staff, no money moved.
+  | "scheduled_order_canceled"
+  // A location's country (how phone numbers are read) was changed.
+  | "location_country_change";
 
 /**
  * An append-only audit entry written when a platform operator takes a

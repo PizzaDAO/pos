@@ -340,8 +340,6 @@ export interface OrderFulfillment {
   recovery_next_at?: string;
   /** Set once an order of another deployment mode was alerted on (not swept again). */
   foreign_alerted_at?: string;
-  /** A PAID `scheduled` hold ran past its expiry unreleased and staff were alerted (once). */
-  stranded_alerted_at?: string;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */
@@ -361,7 +359,14 @@ export interface OrderFulfillment {
  *    both settled); one of them must be refunded.
  */
 export interface LatePaymentMarker {
-  kind?: "late" | "duplicate";
+  kind?: "late" | "duplicate" | "scheduled";
+  /**
+   * `scheduled` markers: why a catering hold needs a human. `paid`: fully paid but
+   * the hold ran out unreleased past the grace (never fired to the kitchen);
+   * `partial`: only partly paid; `invoice_pending`: an invoice is still owed on an
+   * expired hold (not voided automatically).
+   */
+  detail?: "paid" | "partial" | "invoice_pending";
   payment_id: string;
   /** Late: settled amount (base + tip). Duplicate: the EXCESS, in cents. */
   amount_cents: number;
@@ -372,10 +377,10 @@ export interface LatePaymentMarker {
    * (crypto rails): the tender stays captured and staff return the money
    * themselves, then "Mark refunded". Still listed until then.
    */
-  resolved?: "accepted" | "refunded" | "refund_owed_manual";
+  resolved?: "accepted" | "refunded" | "refund_owed_manual" | "released" | "canceled";
   resolved_at?: string;
   /** Transient exclusive claim so concurrent Accept/Refund cannot both act. */
-  claim?: "accepting" | "refunding" | "marking_refunded";
+  claim?: "accepting" | "refunding" | "marking_refunded" | "canceling";
   claim_at?: string;
   /** Crypto money owed back by hand (`refund_owed_manual`): per tender, in cents. */
   manual_refunds?: { payment_id: string; amount_cents: number }[];

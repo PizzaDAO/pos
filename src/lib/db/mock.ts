@@ -697,6 +697,13 @@ export const mockDriver: PosDriver = {
     return { ...t };
   },
 
+  async setLocationCountry(tenantId, locationId, country) {
+    const i = locations.findIndex((l) => l.id === locationId && l.tenant_id === tenantId);
+    if (i < 0) return null;
+    locations[i] = { ...locations[i]!, country };
+    return { ...locations[i]! };
+  },
+
   async createLocation(input: CreateLocationInput): Promise<Location> {
     const now = nowIso();
     // Slugs are unique WITHIN a tenant (DB: unique (tenant_id, slug)) — two
@@ -984,7 +991,10 @@ export const mockDriver: PosDriver = {
   },
 
   async listLocations(tenantId: string): Promise<Location[]> {
-    return locations.filter((l) => l.tenant_id === tenantId);
+    // Same order as the Supabase driver: (created_at, id).
+    return locations
+      .filter((l) => l.tenant_id === tenantId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
   },
 
   async getTenantBySlug(slug: string): Promise<Tenant | null> {

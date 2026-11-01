@@ -17,9 +17,13 @@ import { getPosDriver } from "@/lib/db";
 import type { Order, Payment } from "@/lib/db";
 import { tenderFreesSlot } from "@/lib/db/payment-types";
 import { captureError } from "@/lib/observability";
+import { netSettledBaseCents } from "@/lib/core/money";
 import {
+  SCHEDULED_PAID_GRACE_MS,
   cancelOpenOnlineIntents,
   cancelOpenTender,
+  flagStrandedScheduled,
+  orderDueCents,
   refreshPaymentStatus,
 } from "@/lib/payments/service";
 import { runPostPaymentSteps } from "./finalize";
@@ -378,12 +382,7 @@ export interface HeldExpireSummary {
   stranded: number;
 }
 
-/**
- * How long a fully PAID `scheduled` hold may sit past its expiry before staff are
- * alerted. `orders.release` still releases it (the money is real); this only
- * catches an order nobody released.
- */
-export const SCHEDULED_PAID_GRACE_MS = 6 * 60 * 60 * 1000;
+export { SCHEDULED_PAID_GRACE_MS };
 
 /**
  * The held-order sweeper (`/v1` orders): a `draft` order held for payment
@@ -545,7 +544,7 @@ async function sweepHeldOne(
     const left = await driver.listPaymentsForOrder(order.id);
     if (left.some((p) => p.status === "authorized" || p.status === "captured")) {
       if (order.hold?.reason === "scheduled") {
-        await alertStrandedScheduled(order, exp!, now, summary);
+        await alertStrandedScheduled(order, left, exp!, now, summary);
       } else {
         captureError(new Error("expired held order holds settled money"), {
           scope: "expireHeldOrders.settled",
@@ -555,10 +554,23 @@ async function sweepHeldOne(
       summary.skipped += 1;
       return;
     }
+    // A scheduled order with an invoice still owed is NEVER voided here: money was
+    // promised, so a human decides. Flagged (admin "Late payments") once the grace
+    // has passed; until then it is simply left alone.
+    if (
+      order.hold?.reason === "scheduled" &&
+      left.some((p) => p.status === "pending" && p.rail === "external")
+    ) {
+      if (now.getTime() >= exp! + SCHEDULED_PAID_GRACE_MS) {
+        if (await flagStrandedScheduled(order, left, "invoice_pending")) summary.stranded += 1;
+      }
+      summary.skipped += 1;
+      return;
+    }
     for (const p of left) {
       if (p.status !== "pending") continue;
       // A promised-but-unpaid external tender (an issued invoice) has no provider
-      // session to close; cancelOrder voids it with the order.
+      // session to close; scheduled orders carrying one are handled above.
       if (p.rail === "external") continue;
       const outcome = await cancelOpenTender(p);
       if (outcome === "in_flight") {
@@ -583,28 +595,23 @@ async function sweepHeldOne(
 }
 
 /**
- * A paid `scheduled` hold ran out unreleased. Within the grace the release is
- * still expected; past it, alert staff once (`stranded_alerted_at`) through the
- * same error sink the other sweeper alerts use.
+ * A `scheduled` hold with settled money ran out unreleased. Within the grace the
+ * release is still allowed; past it the order is flagged for staff (admin "Late
+ * payments", plus the error sink): `paid` when the money covers it, `partial`
+ * when it does not. Flagged once per state.
  */
 async function alertStrandedScheduled(
   order: Order,
+  payments: Payment[],
   expiresMs: number,
   now: Date,
   summary: HeldExpireSummary,
 ): Promise<void> {
   if (now.getTime() < expiresMs + SCHEDULED_PAID_GRACE_MS) return;
-  if (order.fulfillment?.stranded_alerted_at) return;
-  captureError(new Error("paid scheduled hold expired without being released"), {
-    scope: "expireHeldOrders.stranded",
-    orderId: order.id,
-    tenantId: order.tenant_id,
-    expiredAt: new Date(expiresMs).toISOString(),
-  });
-  await getPosDriver().mergeOrderFulfillment(order.id, {
-    stranded_alerted_at: now.toISOString(),
-  });
-  summary.stranded += 1;
+  const covered = netSettledBaseCents(payments, order.currency) >= orderDueCents(order);
+  if (await flagStrandedScheduled(order, payments, covered ? "paid" : "partial")) {
+    summary.stranded += 1;
+  }
 }
 
 /**

@@ -162,17 +162,46 @@ describe("expireHeldOrders", () => {
     const later = new Date(Date.parse(PAST) + SCHEDULED_PAID_GRACE_MS + 1000);
     out = await expireHeldOrders(later);
     expect(out).toMatchObject({ voided: 0, stranded: 1 });
-    expect((await getPosDriver().getOrder(id))!.fulfillment?.stranded_alerted_at).toBeTruthy();
+    // Admin-visible: it is in the "Late payments" list with the PAID wording.
+    expect((await getPosDriver().getOrder(id))!.fulfillment?.late_payment).toMatchObject({
+      kind: "scheduled",
+      detail: "paid",
+    });
     out = await expireHeldOrders(later);
     expect(out.stranded).toBe(0);
     expect(await status(id)).toBe("draft");
   });
 
-  it("an unpaid scheduled hold with a pending invoice tender is voided with it", async () => {
+  it("a PARTLY paid scheduled hold is flagged as partial, never voided", async () => {
+    const { SCHEDULED_PAID_GRACE_MS } = await import("./lifecycle");
+    const id = await seedOrder({ hold: { reason: "scheduled", expires_at: PAST } });
+    await seedTender(id, { status: "captured", simulated: true, amount_cents: 500 });
+    const later = new Date(Date.parse(PAST) + SCHEDULED_PAID_GRACE_MS + 1000);
+    expect(await expireHeldOrders(later)).toMatchObject({ voided: 0, stranded: 1 });
+    expect((await getPosDriver().getOrder(id))!.fulfillment?.late_payment).toMatchObject({
+      kind: "scheduled",
+      detail: "partial",
+      amount_cents: 500,
+    });
+    expect(await status(id)).toBe("draft");
+  });
+
+  it("a scheduled hold with an invoice still owed is NEVER voided; a human is flagged after the grace", async () => {
+    const { SCHEDULED_PAID_GRACE_MS } = await import("./lifecycle");
     const id = await seedOrder({ hold: { reason: "scheduled", expires_at: PAST } });
     await seedTender(id, { rail: "external", status: "pending", simulated: false, raw: null });
-    expect((await expireHeldOrders(NOW)).voided).toBe(1);
-    expect(await status(id)).toBe("voided");
+    let out = await expireHeldOrders(NOW);
+    expect(out).toMatchObject({ voided: 0, stranded: 0 });
+    expect(await status(id)).toBe("draft");
+    const later = new Date(Date.parse(PAST) + SCHEDULED_PAID_GRACE_MS + 1000);
+    out = await expireHeldOrders(later);
+    expect(out).toMatchObject({ voided: 0, stranded: 1 });
+    expect((await getPosDriver().getOrder(id))!.fulfillment?.late_payment).toMatchObject({
+      kind: "scheduled",
+      detail: "invoice_pending",
+      amount_cents: 2000,
+    });
+    expect(await status(id)).toBe("draft");
   });
 
   it("skips an order stamped by another deployment mode", async () => {

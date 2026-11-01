@@ -1138,6 +1138,19 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return r ? mapTenant(r) : null;
     },
 
+    async setLocationCountry(tenantId, locationId, country) {
+      const r = unwrap(
+        await sb
+          .from("locations")
+          .update({ country })
+          .eq("id", locationId)
+          .eq("tenant_id", tenantId)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapLocation(r) : null;
+    },
+
     async createLocation(input) {
       const now = nowIso();
       // Slugs are unique per tenant (unique (tenant_id, slug)); "track" is
@@ -1557,7 +1570,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     async listLocations(tenantId) {
       return (
         unwrap(
-          await sb.from("locations").select("*").eq("tenant_id", tenantId),
+          await sb
+            .from("locations")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true }),
         ) as Row[]
       ).map(mapLocation);
     },

@@ -28,6 +28,7 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
   });
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
+  const [country, setCountry] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -58,7 +59,12 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
       const res = await fetch("/api/admin/locations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tenantId, name, address: address || null }),
+        body: JSON.stringify({
+          tenantId,
+          name,
+          address: address || null,
+          country: country.trim() || null,
+        }),
       });
       const data = (await res.json()) as { error?: string };
       if (res.status === 402) {
@@ -69,6 +75,7 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       setName("");
       setAddress("");
+      setCountry("");
       await load();
       onLocationsChanged?.();
     } catch (e) {
@@ -76,6 +83,44 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function saveCountry(locationId: string, value: string) {
+    setError(null);
+    const first = await fetch("/api/admin/locations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenantId, locationId, country: value.trim() || null }),
+    });
+    let res = first;
+    if (first.status === 422) {
+      // The server states what changing the country does to phone numbers; the
+      // owner must confirm it explicitly before it is saved.
+      const d = (await first.clone().json().catch(() => ({}))) as { error?: string; code?: string };
+      if (d.code === "confirm_required") {
+        if (!window.confirm(`${d.error}\n\nChange the country?`)) {
+          await load();
+          return;
+        }
+        res = await fetch("/api/admin/locations", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tenantId,
+            locationId,
+            country: value.trim() || null,
+            confirmPhoneEffects: true,
+          }),
+        });
+      }
+    }
+    if (!res.ok) {
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(data.error ?? `Could not save country (HTTP ${res.status}).`);
+      return;
+    }
+    await load();
+    onLocationsChanged?.();
   }
 
   const max = entitlements?.entitlements.max_locations ?? null;
@@ -104,8 +149,21 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
               {l.name}{" "}
               <span className="text-xs text-muted-foreground">/{l.slug}</span>
             </span>
-            <span className="text-xs text-muted-foreground">
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">
               {l.address ?? "no address"}
+              <input
+                aria-label={`Country of ${l.name}`}
+                title="2-letter country code (blank = US). Phone numbers are read in this country."
+                className="w-14 rounded-md border bg-background px-2 py-1 text-center uppercase"
+                placeholder="US"
+                maxLength={2}
+                defaultValue={l.country ?? ""}
+                onBlur={(e) => {
+                  if ((e.target.value.trim().toUpperCase() || "") !== (l.country ?? "")) {
+                    void saveCountry(l.id, e.target.value);
+                  }
+                }}
+              />
             </span>
           </li>
         ))}
@@ -132,6 +190,13 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
             placeholder="Address (optional)"
             value={address}
             onChange={(e) => setAddress(e.target.value)}
+          />
+          <input
+            className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+            placeholder="Country code, e.g. US (optional; blank reads as US)"
+            maxLength={2}
+            value={country}
+            onChange={(e) => setCountry(e.target.value.toUpperCase())}
           />
           <Button onClick={addLocation} disabled={busy || !name.trim()}>
             {busy ? (

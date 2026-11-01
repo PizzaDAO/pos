@@ -316,6 +316,8 @@ export interface SalesBucket {
   count: number;
   /** Gross sales (line totals incl. mods) attributable to the bucket, cents. */
   gross_cents: number;
+  /** Custom order fee lines (channel buckets only; absent on reports closed before they existed). */
+  fees_cents?: number;
 }
 
 /** Payment-mix slice (cash / card / crypto), by rail. */

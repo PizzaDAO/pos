@@ -1163,6 +1163,69 @@ export { netSettledCents };
  * Idempotent: an unchanged settled amount does nothing, and a marker that already
  * carries a resolution is never overwritten.
  */
+/**
+ * How long past its hold EXPIRY a `scheduled` order may still be released (a paid
+ * order would otherwise fire old food at the kitchen) before staff are alerted.
+ * Shared by `orders.release` and the held-order sweeper. Measured from expiry, not
+ * from the fire time: catering's holds expire 6 h after fire_at, so the effective
+ * cutoff there is fire_at + 12 h (catering's own release window is set to match).
+ */
+export const SCHEDULED_PAID_GRACE_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * An expired `scheduled` hold needs a human: it is paid (but too stale to fire),
+ * partly paid, or still owes an invoice. Puts it in the admin "Late payments"
+ * list (`fulfillment.late_payment`, kind `scheduled`) and the error sink. Idempotent
+ * per (order, detail); returns true when it newly flagged. The item resolves itself
+ * from the list once the order leaves `draft` (refunded and voided).
+ */
+export async function flagStrandedScheduled(
+  order: Order,
+  payments: Payment[],
+  detail: "paid" | "partial" | "invoice_pending",
+): Promise<boolean> {
+  const prior = order.fulfillment?.late_payment;
+  // Any resolved marker (accepted, refunded, refund_owed_manual: money still owed
+  // back by hand, released, canceled) is staff's decision: never overwritten, never
+  // re-flagged. An unresolved one of another kind belongs to its own flow.
+  if (prior && (prior.resolved || prior.kind !== "scheduled")) return false;
+  if (prior && prior.detail === detail) return false;
+  const settled = payments.filter((p) => p.status === "captured" || p.status === "authorized");
+  const amount =
+    detail === "invoice_pending"
+      ? payments.filter((p) => p.status === "pending").reduce((n, p) => n + p.amount_cents, 0)
+      : netSettledCents(payments);
+  captureError(new Error(`scheduled hold expired: ${detail}`), {
+    scope: "scheduled-hold-stranded",
+    orderId: order.id,
+    tenantId: order.tenant_id,
+    detail,
+    amountCents: amount,
+  });
+  if (!order.fulfillment) return false;
+  await getPosDriver().mergeOrderFulfillment(order.id, {
+    late_payment: {
+      kind: "scheduled",
+      detail,
+      payment_id: (settled[0] ?? payments[0])?.id ?? "",
+      amount_cents: amount,
+      flagged_at: nowIso(),
+    },
+  });
+  await recordAudit({
+    actor: SYSTEM_ACTOR,
+    action: "late_payment_flagged",
+    tenantId: order.tenant_id,
+    detail:
+      detail === "paid"
+        ? `Scheduled order ${order.id} is fully paid (${amount}c) but its hold expired unreleased; it was not fired. Refund it or recreate it.`
+        : detail === "partial"
+          ? `Scheduled order ${order.id} is only PARTLY paid (${amount}c settled) and its hold expired. Refund it or collect the balance and recreate it.`
+          : `Scheduled order ${order.id} still owes an invoice (${amount}c) and its hold expired. Decide whether to cancel it.`,
+  });
+  return true;
+}
+
 async function flagLatePayment(order: Order, payments: Payment[]): Promise<void> {
   const settled = payments.filter(
     (p) => p.status === "captured" || p.status === "authorized",
