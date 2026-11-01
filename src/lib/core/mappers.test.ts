@@ -198,7 +198,7 @@ describe("order mapping", () => {
     expect(orderViolations(o)).toEqual([]);
     expect(o.fulfillment.type).toBe("delivery");
     expect(o.fulfillment.address?.country).toBe("US"); // "USA" is not alpha-2
-    expect(o.contact?.phone).toBeNull(); // not E.164 -> dropped, never invalid
+    expect(o.contact?.phone).toBe("+15555550123"); // national US format -> E.164 (was dropped); neverr invalid
     expect(OrderSchema.parse(o)).toBeTruthy();
   });
 

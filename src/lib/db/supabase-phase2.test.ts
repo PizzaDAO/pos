@@ -1,5 +1,5 @@
 /**
- * The Supabase driver's phase 2 methods (recordExternalTender, casPaymentStatus,
+ * The Supabase driver's phase 2 methods (recordExternalTender,
  * upsertCustomerIdentity, setStaffPinHash) against the REAL SQL: every migration
  * and the seed are applied to an in-memory PGlite, and a tiny supabase-js stand-in
  * routes `.rpc()` / `.from()` to it. Opt-in, because PGlite is not a POS
@@ -146,6 +146,7 @@ describe.skipIf(!PGLITE)("supabase driver phase 2 on PGlite", () => {
     collection: "terminal",
     staffId: null,
     expect: { n: 0, amount: 0, tip: 0, refunded: 0 },
+    recordedBy: { principal_id: "hub:kiosk-1", module: "kiosk" },
     ...over,
   });
 
@@ -169,7 +170,10 @@ describe.skipIf(!PGLITE)("supabase driver phase 2 on PGlite", () => {
       location_id: loc,
       charge_id: null,
     });
-    expect(pending.payment.raw).toEqual({ requested_status: "authorized" });
+    expect(pending.payment.raw).toEqual({
+      requested_status: "authorized",
+      recorded_by: { principal_id: "hub:kiosk-1", module: "kiosk" },
+    });
 
     // stale: the fingerprint no longer matches (a pending tender exists now)
     const stale = await driver.recordExternalTender(write());
@@ -200,17 +204,6 @@ describe.skipIf(!PGLITE)("supabase driver phase 2 on PGlite", () => {
     expect(
       (await driver.recordExternalTender(write({ tenantId: crypto.randomUUID() }))).outcome,
     ).toBe("not_found");
-  });
-
-  it("casPaymentStatus moves a tender once", async () => {
-    const r = await driver.recordExternalTender(
-      write({ orderId: ORDER, status: "pending", requestedStatus: "pending", collection: "cash_on_delivery", method: "cash", processor: "driver", expect: tenderFingerprint(await driver.listPaymentsForOrder(ORDER)) }),
-    );
-    expect(r.outcome).toBe("ok");
-    if (r.outcome !== "ok") return;
-    expect((await driver.casPaymentStatus(r.payment.id, ["captured"], "canceled"))).toBeNull();
-    expect((await driver.casPaymentStatus(r.payment.id, ["pending"], "canceled"))?.status).toBe("canceled");
-    expect((await driver.casPaymentStatus(r.payment.id, ["pending"], "canceled"))).toBeNull();
   });
 
   it("upsertCustomerIdentity: phone-only, merge-by-phone, no merge across emails, consent order", async () => {

@@ -83,7 +83,7 @@ import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError, maxTipCents } from "@/lib/reprice";
 import { getPlan } from "@/lib/saas/plans";
 import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlements";
-import { authenticateV1, type AuthDeps } from "./auth";
+import { authenticateV1, isSimulatedV1, type AuthDeps } from "./auth";
 import {
   NO_STATS,
   loadCustomer,
@@ -319,6 +319,7 @@ function isTerminal(p: Principal): boolean {
  * `*:write` do not imply them.
  */
 export const LITERAL_SCOPES = [
+  "customers:verify",
   "orders:discount",
   "orders:place_direct",
   "orders:release_unpaid",
@@ -968,9 +969,37 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
    */
   "customers.upsert": async (ctx) => {
     await requireActiveTenant(ctx);
-    const parsed = CustomerUpsertInputSchema.safeParse(await readBody(ctx.req));
+    const raw = await readBody(ctx.req);
+    const parsed = CustomerUpsertInputSchema.safeParse(raw);
     if (!parsed.success) throw zodProblem(parsed.error);
     const i = parsed.data;
+    // OTP mode: `verified_contact` names the ONE contact a one-time code reached.
+    // It is the only way to create or resolve a VERIFIED identity, so it needs the
+    // literal `customers:verify` scope (`*` and `customers:*` do not grant it).
+    const vcRaw = (raw as { verified_contact?: unknown } | null)?.verified_contact;
+    let verifiedContact: "email" | "phone" | undefined;
+    if (vcRaw !== undefined && vcRaw !== null) {
+      if (vcRaw !== "email" && vcRaw !== "phone") {
+        throw ProblemError.of("VALIDATION_FAILED", {
+          detail: "`verified_contact` must be \"email\" or \"phone\".",
+          path: "verified_contact",
+        });
+      }
+      requireHubSigned(ctx);
+      if (!hasLiteralScope(ctx.principal, "customers:verify")) {
+        throw ProblemError.of("INSUFFICIENT_SCOPE", {
+          detail: "missing scope(s): customers:verify (must be granted explicitly)",
+          details: { missing: ["customers:verify"], granted: ctx.principal.scopes },
+        });
+      }
+      if (!(vcRaw === "email" ? i.email : i.phone)) {
+        throw ProblemError.of("VALIDATION_FAILED", {
+          detail: `\`verified_contact\` is ${vcRaw} but no ${vcRaw} was sent.`,
+          path: vcRaw,
+        });
+      }
+      verifiedContact = vcRaw;
+    }
     if ((i.tags?.length ?? 0) > 100 || Object.keys(i.external_ids ?? {}).length > 50) {
       throw ProblemError.of("VALIDATION_FAILED", {
         detail: "Too many tags (max 100) or external ids (max 50).",
@@ -985,10 +1014,14 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       null;
     // Consent without an `at` is not evidence: it is not stored (and never
     // flips an existing channel).
+    // A future `at` is clamped to now: the evidence cannot be dated ahead.
     const marketing: { email?: CustomerConsent; sms?: CustomerConsent } = {};
+    const nowMs = ctx.now().getTime();
     for (const ch of ["email", "sms"] as const) {
       const c = i.marketing?.[ch];
-      if (c?.at) marketing[ch] = c;
+      if (!c?.at) continue;
+      marketing[ch] =
+        Date.parse(c.at) > nowMs ? { ...c, at: new Date(nowMs).toISOString() } : c;
     }
     const tenantId = ctx.principal.tenant_id;
     const { customer } = await ctx.driver.upsertCustomerIdentity(tenantId, {
@@ -999,6 +1032,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       marketing,
       tags: (i.tags ?? []).map((t) => t.trim()).filter(Boolean),
       externalIds: i.external_ids ?? {},
+      ...(verifiedContact ? { verifiedContact } : {}),
     });
     const body =
       (await loadCustomer(tenantId, customer.id, ctx.driver)) ??
@@ -1062,8 +1096,16 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       staff.active &&
       (!staff.location_ids?.length || staff.location_ids.includes(location_id));
     if (!eligible || !staff) {
-      // Same cost as a real check; the answer is the same generic 403.
+      // Same cost, same budget and the same answers as a real check: nothing here
+      // tells an unknown id from a known one.
       verifyPin(pin, dummyPinHash());
+      const g = ghostBegin(`${tenantId}:${staff_id}`, ctx.now().getTime());
+      if (!g.allowed) {
+        throw ProblemError.of("RATE_LIMITED", {
+          detail: "Too many incorrect PINs. Try again later.",
+          details: { locked_until: new Date(g.until).toISOString() },
+        });
+      }
       throw mismatch();
     }
 
@@ -1096,6 +1138,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
    * clears the PIN. One targeted update of `pin_hash`; the PIN is never logged.
    */
   "staff.setPin": async (ctx) => {
+    requireHubSigned(ctx);
     await requireActiveTenant(ctx);
     const parsed = StaffPinSetInputSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
@@ -1279,6 +1322,28 @@ type ExtraOperation = "staff.verifyPin";
 const EXTRA_ROUTES: Record<ExtraOperation, { method: string; path: string; scopes: readonly string[] }> = {
   "staff.verifyPin": HUB_ROUTES["staff.verifyPin"],
 };
+
+/**
+ * Best-effort twin of `begin_pin_attempt` for ids that are NOT eligible (unknown,
+ * inactive, wrong location, suspended tenant). Without it a real id would turn
+ * into 429 after five wrong PINs while an unknown id stayed 403, telling a caller
+ * which ids exist. Same policy (5 attempts, then a 15-minute lock) and the same
+ * 429 shape; per process, which is all a cache of fakes needs.
+ */
+const ghostAttempts = new Map<string, { n: number; until: number }>();
+function ghostBegin(key: string, nowMs: number): { allowed: boolean; until: number } {
+  let g = ghostAttempts.get(key) ?? { n: 0, until: 0 };
+  if (g.until > nowMs) return { allowed: false, until: g.until };
+  if (g.until) g = { n: 0, until: 0 };
+  if (g.n >= 5) {
+    const until = nowMs + 15 * 60_000;
+    ghostAttempts.set(key, { n: 0, until });
+    return { allowed: false, until };
+  }
+  if (ghostAttempts.size > 10_000) ghostAttempts.clear();
+  ghostAttempts.set(key, { n: g.n + 1, until: 0 });
+  return { allowed: true, until: 0 };
+}
 
 let dummyHash: string | null = null;
 /** A hash nobody's PIN matches (random secret), for equal-cost misses. */
@@ -1657,6 +1722,28 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
 // payments.recordExternal
 // ---------------------------------------------------------------------------
 
+/**
+ * Modules allowed to record money taken outside POS. Recording a CAPTURED tender
+ * can mark an order paid, so `payments:write` alone is not enough: an agent
+ * client (pizza-mcp) or any other module holding it could "pay" any order. The
+ * hub token carries the caller's module as `op_mod` (`principal.module`).
+ */
+export const EXTERNAL_TENDER_MODULES: readonly string[] = ["kiosk", "driver", "catering", "guests"];
+
+/**
+ * POS trusts the hub's checks (role rank, device kind, tender lock, revoked
+ * clients), so outside simulated mode a token whose `sub` is not hub-signed
+ * (`hub:<caller>`) may not reach the routes that depend on them. The simulated
+ * zero-env mode (mock driver, no JWKS, not production: the dev token) is exempt.
+ */
+function requireHubSigned(ctx: Ctx): void {
+  if (ctx.principal.id.startsWith("hub:") || isSimulatedV1(process.env)) return;
+  throw ProblemError.of("FORBIDDEN", {
+    detail: "This operation must be called through the hub.",
+    details: { reason: "not_hub_signed" },
+  });
+}
+
 /** Statuses of an order that can no longer take a tender. */
 const CLOSED_FOR_TENDERS: readonly string[] = ["voided", "abandoned", "refunded"];
 
@@ -1741,6 +1828,19 @@ async function recordExternalTender(ctx: Ctx): Promise<Reply> {
       detail:
         "payments.terminal:write only records captured card-terminal tenders (collection: terminal)",
       details: { missing: ["payments:write"], granted: ctx.principal.scopes },
+    });
+  }
+
+  requireHubSigned(ctx);
+  const callerModule = ctx.principal.module ?? null;
+  const allowed =
+    callerModule !== null
+      ? EXTERNAL_TENDER_MODULES.includes(callerModule)
+      : isSimulatedV1(process.env); // the zero-env dev token has no module
+  if (!allowed) {
+    throw ProblemError.of("FORBIDDEN", {
+      detail: "This client may not record external payments.",
+      details: { reason: "module_not_allowed" },
     });
   }
 
@@ -1863,6 +1963,8 @@ async function recordExternalTender(ctx: Ctx): Promise<Reply> {
       collection: wanted.collection,
       staffId: wanted.staffId,
       expect: tenderFingerprint(tenders),
+      // Server-derived from the verified token; never from the request body.
+      recordedBy: { principal_id: ctx.principal.id, module: ctx.principal.module ?? null },
     });
     switch (res.outcome) {
       case "stale":

@@ -381,6 +381,8 @@ function mapCustomer(r: Row): Customer {
     name: (r.name as string | null) ?? null,
     phone: (r.phone as string | null) ?? null,
     verified: r.verified as boolean,
+    email_verified_at: (r.email_verified_at as string | null) ?? null,
+    phone_verified_at: (r.phone_verified_at as string | null) ?? null,
     marketing: (r.marketing as Customer["marketing"] | null) ?? {},
     tags: (r.tags as string[] | null) ?? [],
     external_ids: (r.external_ids as Record<string, string> | null) ?? {},
@@ -2114,6 +2116,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_collection: input.collection,
           p_staff_id: input.staffId,
           p_expect: input.expect,
+          p_recorded_by: input.recordedBy,
         }),
       ) as {
         outcome: string;
@@ -2142,18 +2145,6 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         default:
           throw new Error(`core_record_external_tender: unexpected outcome ${out.outcome}`);
       }
-    },
-
-    async casPaymentStatus(paymentId, from, to) {
-      const rows = unwrap(
-        await sb
-          .from("payments")
-          .update({ status: to, updated_at: nowIso() })
-          .eq("id", paymentId)
-          .in("status", from)
-          .select(),
-      ) as Row[];
-      return rows[0] ? mapPayment(rows[0]) : null;
     },
 
     async reservePaymentRefund(paymentId, amountCents, refundId, meta) {
@@ -2615,17 +2606,23 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       // an email, so never overwrite the stored name/phone — only fill blanks.
       const fillBlanksOnly = !byId && Boolean(byEmail);
       const now = nowIso();
+      // A row with a PROVEN contact is frozen for contacts: a checkout must not
+      // plant a phone/email on it (that is how a victim's row becomes reachable
+      // by someone else's one-time code).
+      const frozen = Boolean(base?.email_verified_at || base?.phone_verified_at);
       const merged: Customer = {
         ...customer,
         id: base?.id ?? customer.id,
-        email,
+        email: frozen ? (base?.email ?? email) : email,
         verified: customer.verified || base?.verified || false,
         name: fillBlanksOnly
           ? (base?.name ?? customer.name ?? null)
           : (customer.name ?? base?.name ?? null),
-        phone: fillBlanksOnly
-          ? (base?.phone ?? customer.phone ?? null)
-          : (customer.phone ?? base?.phone ?? null),
+        phone: frozen
+          ? (base?.phone ?? null)
+          : fillBlanksOnly
+            ? (base?.phone ?? customer.phone ?? null)
+            : (customer.phone ?? base?.phone ?? null),
         created_at: base?.created_at ?? now,
         updated_at: now,
       };
@@ -2635,11 +2632,15 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         marketing: _m,
         tags: _t,
         external_ids: _e,
+        email_verified_at: _ev,
+        phone_verified_at: _pv,
         ...writable
       } = merged;
       void _m;
       void _t;
       void _e;
+      void _ev;
+      void _pv;
       return mapCustomer(
         unwrap(
           await sb.from("customers").upsert(writable).select().single(),
@@ -2658,6 +2659,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_marketing: input.marketing,
           p_tags: input.tags,
           p_external_ids: input.externalIds,
+          p_verified_contact: input.verifiedContact ?? null,
         }),
       ) as { customer: Row; created: boolean; changed: boolean };
       return {

@@ -30,6 +30,12 @@ export interface CustomerIdentityWrite {
   marketing: { email?: CustomerConsent; sms?: CustomerConsent };
   tags: string[];
   externalIds: Record<string, string>;
+  /**
+   * OTP mode: the ONE contact the caller proved (a one-time code reached it).
+   * Only that contact is used; it matches only a row where it is already
+   * verified (phone) / is the row's email, and is stamped verified.
+   */
+  verifiedContact?: "email" | "phone";
 }
 
 /**
@@ -55,6 +61,13 @@ export interface Customer {
   marketing?: { email?: CustomerConsent; sms?: CustomerConsent };
   tags?: string[];
   external_ids?: Record<string, string>;
+  /**
+   * PER-CONTACT proof of ownership. Set only by the OTP mode of
+   * `upsertCustomerIdentity` (literal `customers:verify` scope); no other path
+   * writes them. `verified` above (the shop's magic-link stub) proves nothing.
+   */
+  email_verified_at?: string | null;
+  phone_verified_at?: string | null;
   created_at: string;
   updated_at: string;
 }

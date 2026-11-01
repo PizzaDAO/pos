@@ -195,6 +195,8 @@ export interface ExternalTenderWrite {
    * since, nothing is written (`stale`) and the caller re-validates.
    */
   expect: { n: number; amount: number; tip: number; refunded: number };
+  /** Server-derived from the verified token (never caller-supplied); stored in raw. */
+  recordedBy: { principal_id: string; module: string | null };
 }
 
 /** Outcome of the atomic external-tender write (one transaction, order row locked). */

@@ -327,15 +327,6 @@ export function withOutbox(
       return res;
     },
 
-    async casPaymentStatus(paymentId, from, to) {
-      const before = await inner.getPayment(paymentId);
-      const after = await inner.casPaymentStatus(paymentId, from, to);
-      if (after && before) {
-        paymentEvents(box, await orderAnnounced(after.order_id), after, before);
-      }
-      return after;
-    },
-
     // customers.upsert: customer.created on a new row, customer.updated only when
     // something changed (the SQL function writes nothing otherwise).
     async upsertCustomerIdentity(tenantId, input) {

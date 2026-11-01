@@ -522,16 +522,6 @@ export interface PosDriver {
   recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult>;
 
   /**
-   * Compare-and-set a tender's status (`from` -> `to`). Returns the tender when
-   * it moved, null when it was not in `from` (someone else got there first).
-   */
-  casPaymentStatus(
-    paymentId: string,
-    from: Payment["status"][],
-    to: Payment["status"],
-  ): Promise<Payment | null>;
-
-  /**
    * ATOMICALLY reserve a refund on a tender: increment `refunded_cents`, append
    * `refundId` to `refund_ids`, and flip status to `refunded` when fully refunded
    * -- all in one step, refused when it would exceed amount + tip, the tender

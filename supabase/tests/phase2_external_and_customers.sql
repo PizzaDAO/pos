@@ -125,15 +125,25 @@ begin
   if c2 -> 'customer' ->> 'phone' <> '+15555550123' then raise exception 'phone overwritten: %', c2; end if;
 
   -- consent: only with an `at`, and an older `at` never beats a newer one
-  c2 := public.core_upsert_customer(t, null, 'pat@example.com', null, null,
+  c2 := public.core_upsert_customer(t, null, 'pat@example.com', '+15555550123', null,
           '{"sms":{"opt_in":true,"at":"2026-01-02T00:00:00Z"}}'::jsonb, '{}', '{}');
   if (c2 -> 'customer' -> 'marketing' -> 'sms' ->> 'opt_in')::boolean is not true then raise exception 'consent not stored'; end if;
-  c2 := public.core_upsert_customer(t, null, 'pat@example.com', null, null,
+  c2 := public.core_upsert_customer(t, null, 'pat@example.com', '+15555550123', null,
           '{"sms":{"opt_in":false,"at":"2026-01-01T00:00:00Z"}}'::jsonb, '{}', '{}');
   if (c2 -> 'customer' -> 'marketing' -> 'sms' ->> 'opt_in')::boolean is not true then raise exception 'older consent overwrote newer'; end if;
-  c2 := public.core_upsert_customer(t, null, 'pat@example.com', null, null,
+  c2 := public.core_upsert_customer(t, null, 'pat@example.com', '+15555550123', null,
           '{"sms":{"opt_in":false,"at":"2026-02-01T00:00:00Z"}}'::jsonb, '{}', '{}');
   if (c2 -> 'customer' -> 'marketing' -> 'sms' ->> 'opt_in')::boolean is not false then raise exception 'newer consent not applied'; end if;
+
+  -- consent for a contact that is NOT attached to the row is dropped; a future `at` is clamped
+  c2 := public.core_upsert_customer(t, null, 'pat@example.com', '+15555550999', null,
+          '{"sms":{"opt_in":false,"at":"2026-03-01T00:00:00Z"}}'::jsonb, '{}', '{}');
+  if (c2 -> 'customer' -> 'marketing' -> 'sms' ->> 'opt_in')::boolean is not false then raise exception 'setup'; end if;
+  c2 := public.core_upsert_customer(t, null, 'future@example.com', '+15555550666', null,
+          '{"sms":{"opt_in":true,"at":"2099-01-01T00:00:00Z"}}'::jsonb, '{}', '{}');
+  if (c2 -> 'customer' -> 'marketing' -> 'sms' ->> 'at')::timestamptz > now() + interval '1 minute' then
+    raise exception 'future consent not clamped: %', c2;
+  end if;
 
   -- verified is never touched
   update public.customers set verified = true where id = cid;
@@ -154,6 +164,58 @@ begin
   if (c1 ->> 'created')::boolean is not true then raise exception 'other tenant must create'; end if;
   select count(*) into n from public.customers where email = 'pat@example.com';
   if n <> 2 then raise exception 'expected 2 rows for the email across tenants, got %', n; end if;
+
+  -- ---------------- OTP mode ----------------
+  declare
+    v jsonb; a jsonb; b jsonb; vid uuid;
+  begin
+    -- the victim proves their email
+    v := public.core_upsert_customer(t, null, 'victim@example.com', null, null, '{}'::jsonb, '{}', '{}', 'email');
+    vid := (v -> 'customer' ->> 'id')::uuid;
+    if (v -> 'customer' ->> 'email_verified_at') is null then raise exception 'email not stamped'; end if;
+    -- A: ordinary upsert {victim email, attacker phone}: the phone is NOT planted on a verified row
+    b := public.core_upsert_customer(t, null, 'victim@example.com', '+14155550199', 'x', '{}'::jsonb, '{}', '{}');
+    if (b -> 'customer' ->> 'id')::uuid <> vid then raise exception 'victim row not matched by email'; end if;
+    if b -> 'customer' ->> 'phone' is not null then raise exception 'phone planted on a verified row: %', b; end if;
+    -- the attacker passes OTP on their phone: a NEW row, never the victim's
+    a := public.core_upsert_customer(t, null, null, '+14155550199', null, '{}'::jsonb, '{}', '{}', 'phone');
+    if (a -> 'customer' ->> 'id')::uuid = vid then raise exception 'OTP resolved the victim row'; end if;
+    if (a ->> 'created')::boolean is not true then raise exception 'phone OTP must create'; end if;
+    if (a -> 'customer' ->> 'phone_verified_at') is null then raise exception 'phone not stamped'; end if;
+    -- the same phone again resolves the same verified row
+    b := public.core_upsert_customer(t, null, null, '(415) 555-0199', null, '{}'::jsonb, '{}', '{}', 'phone');
+    if (b -> 'customer' ->> 'id') <> (a -> 'customer' ->> 'id') or (b ->> 'changed')::boolean then
+      raise exception 'verified phone not resolved: %', b;
+    end if;
+    -- an UNVERIFIED planted phone is never resolved to by OTP
+    insert into public.customers (id, tenant_id, email, phone) values (gen_random_uuid(), t, 'plain@example.com', '+14155550177');
+    a := public.core_upsert_customer(t, null, null, '+14155550177', null, '{}'::jsonb, '{}', '{}', 'phone');
+    if a -> 'customer' ->> 'email' is not null then raise exception 'OTP attached to an unverified row: %', a; end if;
+    -- B: {attacker email, victim's verified phone}: no merge, nothing planted
+    b := public.core_upsert_customer(t, null, 'attacker@example.com', '+14155550177', null, '{}'::jsonb, '{}', '{}');
+    if (b -> 'customer' ->> 'id') = (a -> 'customer' ->> 'id') then raise exception 'merged into the verified row'; end if;
+    if b -> 'customer' ->> 'phone' is not null then raise exception 'victim phone planted: %', b; end if;
+    -- only the proven contact is used in OTP mode
+    a := public.core_upsert_customer(t, null, 'solo@example.com', '+14155550311', null, '{}'::jsonb, '{}', '{}', 'email');
+    if a -> 'customer' ->> 'phone' is not null then raise exception 'other contact leaked into OTP mode'; end if;
+    -- a bad mode / a missing contact is refused
+    begin
+      perform public.core_upsert_customer(t, null, null, '+14155550312', null, '{}'::jsonb, '{}', '{}', 'email');
+      raise exception 'email OTP without an email accepted';
+    exception when raise_exception then
+      if sqlerrm like 'email OTP%' then raise; end if;
+    end;
+    -- the verified timestamps are server-only: a user-role write cannot set them
+    set local role authenticated;
+    begin
+      update public.customers set phone_verified_at = now() where id = vid;
+    exception when others then null; -- no UPDATE grant/policy is also fine
+    end;
+    reset role;
+    if (select phone_verified_at from public.customers where id = vid) is not null then
+      raise exception 'authenticated role set phone_verified_at';
+    end if;
+  end;
 
   -- email or phone is required
   begin

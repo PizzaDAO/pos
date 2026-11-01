@@ -231,3 +231,24 @@ writes nothing (no `customer.updated`) when nothing changed.
 the hub mints the session. Reuses the till's `begin_pin_attempt` lockout (5 -> 15 min, shared with
 `/api/terminal/pin`) and scrypt. `setPin` needs the literal `staff:set_pin`, stores only a hash, and
 resets the lockout. PINs are never logged or echoed.
+
+### Phase 2 review hardening
+
+* **Who may record external money.** `recordExternal` can mark an order paid, so beyond the scope
+  the caller's module (`op_mod`) must be `kiosk`, `driver`, `catering` or `guests`; anything else
+  (pizza-mcp, ...) is 403 `module_not_allowed`. The recording principal + module are stored in the
+  tender's `raw.recorded_by` (server-derived). `staff_id` in the body is attribution only (must be an
+  active member of the tenant). Outside the zero-env dev mode, `recordExternal` and `staff.setPin`
+  also refuse a `sub` without the `hub:` prefix (so the hub's rank / device-kind / tender-lock /
+  revoked-client checks cannot be skipped by a direct call).
+* **OTP identity.** `customers.email_verified_at` / `phone_verified_at` are the only proof of a
+  contact (the shop's magic-link stub proves nothing). Only `customers.upsert` with
+  `verified_contact: "email" | "phone"` sets them, and only with the literal `customers:verify` scope
+  (wildcards never grant it) through the hub. Phone: matches only a row whose phone is already
+  verified, else creates a new row. Email: the row holding that email (the unique constraint allows
+  one) is stamped verified. Ordinary upsert and the shop path never set verified state and never fill
+  a contact onto a row that has a verified contact. Consent applies only to a contact that ended up
+  attached to the row; a future `at` is clamped to now.
+* Late-payment refunds: an `external` tender cannot be sent back by POS; it is "owed by hand" and
+  `Mark refunded` records the bookkeeping, so the item is never stuck. Reports key external tenders
+  by method + processor (COD is cash, not card; gift cards are "Other").

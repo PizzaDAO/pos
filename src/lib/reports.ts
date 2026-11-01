@@ -31,6 +31,8 @@ export function channelLabel(channel: OrderChannel): string {
 
 /** Human label for a payment rail (incl. cash). */
 export function railLabel(rail: string): string {
+  const ext = parseExternalMixKey(rail);
+  if (ext) return `External (${ext.method}${ext.processor ? ` · ${ext.processor}` : ""})`;
   switch (rail) {
     case "cash":
       return "Cash";
@@ -47,8 +49,36 @@ export function railLabel(rail: string): string {
   }
 }
 
-/** Coarse payment family for the cash/card/crypto mix. */
-export function railFamily(rail: string): "cash" | "card" | "crypto" {
+/**
+ * Payment-mix key of a tender. Money recorded through `payments.recordExternal`
+ * (rail `external`) is keyed by its own method + processor, so cash on delivery is
+ * reported as cash, a kiosk card as card, a gift card as other: never lumped
+ * together as "card".
+ */
+export function mixKey(p: Pick<Payment, "rail" | "method" | "processor">): string {
+  if (p.rail !== "external") return p.rail;
+  const clean = (v: string | null | undefined) => (v ?? "").replace(/[:\s]/g, "_");
+  return `external:${clean(p.method) || "other"}:${clean(p.processor)}`;
+}
+
+/** Inverse of {@link mixKey} for external tenders (null for a normal rail). */
+export function parseExternalMixKey(
+  key: string,
+): { method: string; processor: string } | null {
+  if (!key.startsWith("external:")) return null;
+  const [, method = "other", processor = ""] = key.split(":");
+  return { method, processor };
+}
+
+/** Coarse payment family for the cash/card/crypto/other mix. */
+export function railFamily(rail: string): "cash" | "card" | "crypto" | "other" {
+  const ext = parseExternalMixKey(rail);
+  if (ext) {
+    if (ext.method === "cash") return "cash";
+    if (ext.method === "card") return "card";
+    if (ext.method === "crypto") return "crypto";
+    return "other";
+  }
   if (rail === "cash") return "cash";
   if (rail.startsWith("crypto")) return "crypto";
   return "card";
@@ -208,9 +238,10 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     if ((orderLevelTip.get(p.order_id) ?? 0) === 0) {
       tenderTipCents += p.tip_cents;
     }
-    const slice = mixMap.get(p.rail) ?? {
-      rail: p.rail,
-      label: railLabel(p.rail),
+    const key = mixKey(p);
+    const slice = mixMap.get(key) ?? {
+      rail: key,
+      label: railLabel(key),
       count: 0,
       amount_cents: 0,
       tip_cents: 0,
@@ -220,7 +251,7 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     slice.amount_cents += p.amount_cents;
     slice.tip_cents += p.tip_cents;
     slice.application_fee_cents += p.application_fee_cents;
-    mixMap.set(p.rail, slice);
+    mixMap.set(key, slice);
   }
 
   const netCents = grossCents - discountCents;

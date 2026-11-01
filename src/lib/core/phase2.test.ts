@@ -565,7 +565,10 @@ describe("2. customers.upsert", () => {
     const a = await upsert({ email: "pat@example.com" });
     const row = (await d.getCustomer(a.json.id))!;
     await d.upsertCustomer({ ...row, verified: true });
-    const sms = (opt_in: boolean, at?: string) => ({ marketing: { sms: { opt_in, ...(at ? { at } : {}) } } });
+    const sms = (opt_in: boolean, at?: string) => ({
+      phone: "+15555550111",
+      marketing: { sms: { opt_in, ...(at ? { at } : {}) } },
+    });
     expect((await upsert({ email: "pat@example.com", ...sms(true) })).json.marketing.sms.opt_in).toBe(false);
     const on = await upsert({ email: "pat@example.com", ...sms(true, "2026-01-02T00:00:00Z") });
     expect(on.json.marketing.sms.opt_in).toBe(true);
@@ -617,7 +620,7 @@ describe("2. customers.upsert", () => {
 
   it("a stale whole-customer snapshot (shop checkout path) cannot resurrect consent or tags", async () => {
     const d = getPosDriver();
-    const a = await upsert({ email: "stale@example.com", tags: ["vip"], marketing: { sms: { opt_in: true, at: "2026-01-01T00:00:00Z" } } });
+    const a = await upsert({ email: "stale@example.com", phone: "+15555550112", tags: ["vip"], marketing: { sms: { opt_in: true, at: "2026-01-01T00:00:00Z" } } });
     const stale = { ...(await d.getCustomer(a.json.id))!, marketing: {}, tags: [], external_ids: {} };
     await d.upsertCustomer(stale);
     const after = await call("GET", `/customers/${a.json.id}`, { scopes: ["customers:read"] });

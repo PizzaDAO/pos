@@ -41,6 +41,8 @@ create unique index if not exists payments_external_ref_uq
 
 -- ---- one atomic external-tender writer ----------------------------------------
 --
+-- p_recorded_by = {principal_id, module}: derived by the server from the verified
+-- token (never from the request body); kept in raw for the audit trail.
 -- p_expect = {n, amount, tip, refunded}: what the caller summed over the order's
 -- live tenders (pending, authorized, captured, refunded) when it validated the
 -- amounts. If the order changed since, nothing is written and the caller
@@ -62,7 +64,8 @@ create or replace function public.core_record_external_tender(
   p_requested_status text,
   p_collection text,
   p_staff_id uuid,
-  p_expect jsonb
+  p_expect jsonb,
+  p_recorded_by jsonb default null
 )
 returns jsonb
 language plpgsql
@@ -133,7 +136,8 @@ begin
       p_id, p_order_id, p_tenant_id, v_order.location_id, 'external',
       p_status::public.payment_status, p_amount, p_tip,
       0, v_order.currency, false,
-      jsonb_build_object('requested_status', p_requested_status),
+      jsonb_build_object('requested_status', p_requested_status,
+                         'recorded_by', coalesce(p_recorded_by, '{}'::jsonb)),
       p_method, p_processor, p_processor_ref, p_collection, p_staff_id
     ) returning * into v_new;
   exception when unique_violation then
@@ -175,23 +179,23 @@ end;
 $$;
 
 revoke all on function public.core_record_external_tender(
-  uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb
+  uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb, jsonb
 ) from public;
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
     revoke all on function public.core_record_external_tender(
-      uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb
+      uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb, jsonb
     ) from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'authenticated') then
     revoke all on function public.core_record_external_tender(
-      uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb
+      uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb, jsonb
     ) from authenticated;
   end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function public.core_record_external_tender(
-      uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb
+      uuid, uuid, uuid, text, text, text, integer, integer, text, text, text, uuid, jsonb, jsonb
     ) to service_role;
   end if;
 end

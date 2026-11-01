@@ -10,6 +10,7 @@
  * onto the two contract axes (`fromPosOrderStatus`); POS `shifts` are exposed as
  * `drawer_sessions`; ids are POS ids verbatim (the contract accepts them).
  */
+import { parseExternalMixKey } from "@/lib/reports";
 import {
   allocate,
   businessDate,
@@ -66,10 +67,18 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export const POS_SOURCE = "openpizza_pos" as const;
 
-function cleanPhone(p: string | null | undefined): string | null {
+/**
+ * E.164 for the contract. A national US/CA number as typed at checkout
+ * (`415-555-0199`, `(415) 555 0199`, `1 415 555 0199`) is normalised to
+ * `+14155550199`; anything else that is not already E.164 is null.
+ */
+export function cleanPhone(p: string | null | undefined): string | null {
   if (!p) return null;
   const compact = p.replace(/[\s().-]/g, "");
-  return PHONE_RE.test(compact) ? compact : null;
+  if (PHONE_RE.test(compact)) return compact;
+  if (/^[2-9]\d{9}$/.test(compact)) return `+1${compact}`;
+  if (/^1[2-9]\d{9}$/.test(compact)) return `+${compact}`;
+  return null;
 }
 
 function cleanEmail(e: string | null | undefined): string | null {
@@ -388,6 +397,14 @@ export function railToProcessor(rail: string): string {
   return rail;
 }
 
+/** An external tender reports what the caller recorded; a rail tender its rail's family. */
+export function tenderMethod(p: Pick<Payment, "rail" | "method">): string {
+  return p.rail === "external" ? (p.method ?? "external") : railToMethod(p.rail);
+}
+export function tenderProcessor(p: Pick<Payment, "rail" | "processor">): string {
+  return p.rail === "external" ? (p.processor ?? "external") : railToProcessor(p.rail);
+}
+
 /** Tender status with the refund variants the contract has and POS folds. */
 function tenderStatus(p: Payment): string {
   // An external `authorized` tender is STORED pending (it must never count toward
@@ -461,8 +478,8 @@ export function toContractPayment(p: Payment): CorePayment {
     tenant_id: p.tenant_id,
     location_id: p.location_id,
     order_id: p.order_id,
-    method: p.rail === "external" ? (p.method ?? "external") : railToMethod(p.rail),
-    processor: p.rail === "external" ? (p.processor ?? "external") : railToProcessor(p.rail),
+    method: tenderMethod(p),
+    processor: tenderProcessor(p),
     status: tenderStatus(p) as CorePayment["status"],
     currency: p.currency,
     amount_cents: p.amount_cents,
@@ -683,8 +700,8 @@ export function toContractOrder(input: {
     },
     tenders: payments.map((p) => ({
       payment_id: p.id,
-      method: railToMethod(p.rail),
-      processor: railToProcessor(p.rail),
+      method: tenderMethod(p),
+      processor: tenderProcessor(p),
       status: tenderStatus(p),
       amount_cents: p.amount_cents,
       tip_cents: p.tip_cents,
@@ -729,7 +746,7 @@ export function toContractCustomer(
     name,
     first_name: first || null,
     last_name: rest.length ? rest.join(" ") : null,
-    verified: c.verified,
+    verified: c.verified || Boolean(c.email_verified_at || c.phone_verified_at),
     marketing: {
       email: c.marketing?.email ?? noConsent,
       sms: c.marketing?.sms ?? noConsent,
@@ -907,7 +924,7 @@ export function toContractDailySales(
       void_count: 0,
     })),
     payment_mix: r.paymentMix.map((m) => ({
-      method: railToMethod(m.rail),
+      method: parseExternalMixKey(m.rail)?.method ?? railToMethod(m.rail),
       count: m.count,
       amount_cents: m.amount_cents,
       tip_cents: m.tip_cents,

@@ -1551,7 +1551,7 @@ export const mockDriver: PosDriver = {
       refund_ids: [],
       refunds: [],
       simulated: false,
-      raw: { requested_status: input.requestedStatus },
+      raw: { requested_status: input.requestedStatus, recorded_by: input.recordedBy },
       method: input.method,
       processor: input.processor,
       processor_ref: input.processorRef,
@@ -1578,18 +1578,6 @@ export const mockDriver: PosDriver = {
       }
     }
     return { outcome: "ok", payment: { ...created }, superseded };
-  },
-
-  async casPaymentStatus(
-    paymentId: string,
-    from: Payment["status"][],
-    to: Payment["status"],
-  ): Promise<Payment | null> {
-    const p = payments.get(paymentId);
-    if (!p || !from.includes(p.status)) return null;
-    const next = { ...p, status: to, updated_at: nowIso() };
-    payments.set(paymentId, next);
-    return { ...next };
   },
 
   // Single synchronous block (no awaits): atomic in the single-threaded mock.
@@ -1947,7 +1935,10 @@ export const mockDriver: PosDriver = {
     const merged: Customer = {
       ...customer,
       id: base?.id ?? customer.id,
-      email,
+      // A row with a PROVEN contact is frozen for contacts (see the Supabase driver).
+      email: base?.email_verified_at || base?.phone_verified_at ? (base.email ?? email) : email,
+      email_verified_at: base?.email_verified_at ?? null,
+      phone_verified_at: base?.phone_verified_at ?? null,
       // Consent / tags / external ids belong to upsertCustomerIdentity: a stale
       // snapshot passed here never overwrites them (as in the Supabase driver).
       marketing: base?.marketing ?? {},
@@ -1957,9 +1948,12 @@ export const mockDriver: PosDriver = {
       name: fillBlanksOnly
         ? (base?.name ?? customer.name ?? null)
         : (customer.name ?? base?.name ?? null),
-      phone: fillBlanksOnly
-        ? (base?.phone ?? customer.phone ?? null)
-        : (customer.phone ?? base?.phone ?? null),
+      phone:
+        base?.email_verified_at || base?.phone_verified_at
+          ? (base.phone ?? null)
+          : fillBlanksOnly
+            ? (base?.phone ?? customer.phone ?? null)
+            : (customer.phone ?? base?.phone ?? null),
       created_at: base?.created_at ?? now,
       updated_at: now,
     };
