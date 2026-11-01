@@ -41,12 +41,6 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const summary = await expireOnlineOrders();
-  // /v1 held orders whose hold ran out (draft + awaiting_payment). Failure here
-  // must not fail the online-order sweep.
-  const held = await expireHeldOrders().catch((err) => {
-    captureError(err, { scope: "expire-held-orders-cron" });
-    return null;
-  });
   // Stored /v1 quotes long past their validity window.
   const quotesPruned = await getPosDriver()
     .pruneExpiredQuotes(new Date(startedAt - 60 * 60_000).toISOString())
@@ -58,10 +52,19 @@ export async function GET(request: Request) {
   // re-read from Stripe, capture if it went through, else cancel. Failure here
   // must not fail the online-order sweep.
   const terminal = await reconcileTerminalTenders({
-    // Inside maxDuration: whatever the online sweep left, at most 40s.
-    budgetMs: Math.max(5_000, Math.min(40_000, 55_000 - (Date.now() - startedAt))),
+    // Inside maxDuration: whatever the online sweep left, at most 30s (the held sweep runs after it).
+    budgetMs: Math.max(5_000, Math.min(30_000, 55_000 - (Date.now() - startedAt))),
   }).catch((err) => {
     captureError(err, { scope: "terminal-reconcile-cron" });
+    return null;
+  });
+  // /v1 held orders whose hold ran out (draft + awaiting_payment). Failure here
+  // must not fail the online-order sweep.
+  const held = await expireHeldOrders(undefined, {
+    // Inside maxDuration, after the terminal reconcile: whatever is left (>= 3s).
+    budgetMs: Math.max(3_000, 55_000 - (Date.now() - startedAt)),
+  }).catch((err) => {
+    captureError(err, { scope: "expire-held-orders-cron" });
     return null;
   });
   return NextResponse.json(

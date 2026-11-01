@@ -12,6 +12,7 @@ import { getPosDriver } from "@/lib/db";
 import type { PaymentSessionRow } from "@/lib/db/payment-types";
 import { cardRailsSimulated } from "@/lib/payments/env";
 import { applyRailStatus } from "@/lib/payments/service";
+import { simulatedSessionsAllowed } from "./payment-sessions";
 
 /** The session, only if it is a live simulated one on a simulated deployment. */
 export async function getSimulatedSession(
@@ -19,7 +20,9 @@ export async function getSimulatedSession(
 ): Promise<PaymentSessionRow | null> {
   if (!cardRailsSimulated()) return null;
   const row = await getPosDriver().getPaymentSession(id);
-  return row && row.simulated ? row : null;
+  // Same rule as creating one: a simulated link only works on a mock deployment,
+  // or non-production for the demo tenant (see simulatedSessionsAllowed).
+  return row && row.simulated && simulatedSessionsAllowed(row.tenant_id) ? row : null;
 }
 
 export type SimulateOutcome =

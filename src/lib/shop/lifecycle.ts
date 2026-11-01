@@ -370,6 +370,10 @@ export interface HeldExpireSummary {
   /** Left alone: money in flight, another mode's tender, or cancel refused. */
   skipped: number;
   errors: number;
+  /** Holds of another deployment mode swept after the long grace (no real tender). */
+  foreignSwept: number;
+  /** Holds of another deployment mode holding real tenders (alerted once, not swept). */
+  foreignAlerted: number;
 }
 
 /**
@@ -386,30 +390,93 @@ export interface HeldExpireSummary {
  */
 export async function expireHeldOrders(
   now: Date = new Date(),
+  opts: { budgetMs?: number } = {},
 ): Promise<HeldExpireSummary> {
   const driver = getPosDriver();
+  const deadline = opts.budgetMs === undefined ? Infinity : Date.now() + opts.budgetMs;
   const summary: HeldExpireSummary = {
     checked: 0,
     voided: 0,
     finalized: 0,
     skipped: 0,
     errors: 0,
+    foreignSwept: 0,
+    foreignAlerted: 0,
   };
   const mode = deploymentCheckoutMode();
   let after: { created_at: string; id: string } | undefined;
-  for (let page = 0; page < MAX_PAGES; page += 1) {
+  for (let page = 0; page < MAX_PAGES && Date.now() < deadline; page += 1) {
     const batch = await driver.listExpiredHolds(now.toISOString(), {
       limit: PAGE_SIZE,
       after,
       checkoutMode: mode,
     });
     if (batch.length === 0) break;
-    for (const order of batch) await sweepHeldOne(order, now, summary);
+    for (const order of batch) {
+      if (Date.now() >= deadline) break;
+      await sweepHeldOne(order, now, summary);
+    }
     const last = batch[batch.length - 1]!;
     after = { created_at: last.created_at, id: last.id };
     if (batch.length < PAGE_SIZE) break;
   }
+  await sweepForeignModeHolds(now, mode, summary, deadline);
   return summary;
+}
+
+/**
+ * Holds stamped with ANOTHER deployment mode are left to that mode's sweeper for
+ * `FOREIGN_MODE_GRACE_MS` past their expiry. After that, ones with no real tender
+ * are swept here (so a mode flip, or a test-key preview in a shared database, can
+ * not strand them); ones that hold a real tender are alerted once and parked.
+ */
+async function sweepForeignModeHolds(
+  now: Date,
+  mode: "live" | "test" | "sim",
+  summary: HeldExpireSummary,
+  deadline: number,
+): Promise<void> {
+  const driver = getPosDriver();
+  const cutoff = new Date(now.getTime() - FOREIGN_MODE_GRACE_MS).toISOString();
+  let after: { created_at: string; id: string } | undefined;
+  for (let page = 0; page < 5 && Date.now() < deadline; page += 1) {
+    const batch = await driver.listExpiredHolds(cutoff, {
+      limit: PAGE_SIZE,
+      after,
+      foreignOf: mode,
+    });
+    if (batch.length === 0) break;
+    for (const order of batch) {
+      if (Date.now() >= deadline) return;
+      try {
+        const payments = await driver.listPaymentsForOrder(order.id);
+        if (hasRealTender(payments)) {
+          captureError(
+            new Error("expired held order of another deployment mode holds a real tender"),
+            {
+              scope: "expireHeldOrders.foreign",
+              orderId: order.id,
+              mode: order.fulfillment?.checkout_mode,
+            },
+          );
+          await driver.mergeOrderFulfillment(order.id, {
+            foreign_alerted_at: now.toISOString(),
+          });
+          summary.foreignAlerted += 1;
+        } else {
+          const before = summary.voided;
+          await sweepHeldOne(order, now, summary);
+          if (summary.voided > before) summary.foreignSwept += 1;
+        }
+      } catch (err) {
+        summary.errors += 1;
+        captureError(err, { scope: "sweepForeignModeHolds", orderId: order.id });
+      }
+    }
+    const last = batch[batch.length - 1]!;
+    after = { created_at: last.created_at, id: last.id };
+    if (batch.length < PAGE_SIZE) break;
+  }
 }
 
 async function sweepHeldOne(

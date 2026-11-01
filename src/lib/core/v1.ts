@@ -663,7 +663,30 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     }
     const expires = order.hold?.expires_at;
     if (expires && new Date(expires).getTime() <= ctx.now().getTime()) {
-      await ctx.driver.casOrderStatus(order.id, ["draft"], "voided");
+      // Void it the same way cancel does: close any open card session/intent on
+      // the provider FIRST (an open Checkout link must not outlive the order),
+      // then void atomically against the tender state.
+      try {
+        await cancelOpenOnlineIntents(order.id);
+      } catch (err) {
+        captureError(err, { scope: "v1.orders.release.intents", orderId: order.id });
+        throw ProblemError.of("UPSTREAM_UNAVAILABLE", {
+          status: 503,
+          detail: "The hold expired but its open card payment could not be closed; try again.",
+        });
+      }
+      const voided = await ctx.driver.cancelOrder(order.id, ctx.principal.tenant_id, {
+        nowMs: ctx.now().getTime(),
+      });
+      if (!voided.ok) {
+        // Paid or in flight meanwhile: the order is not simply expired.
+        const now = await ctx.driver.getOrder(order.id);
+        if (now && now.status !== "draft") return { body: await mapOrderFor(ctx, order.id) };
+        throw ProblemError.of("CONFLICT", {
+          detail: "The hold expired but a payment is in flight; retry shortly.",
+          details: { reason: "tender_in_progress" },
+        });
+      }
       throw ProblemError.of("INVALID_TRANSITION", {
         detail: "The hold expired and the order was canceled.",
       });
@@ -1129,6 +1152,51 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   const bundle = await ownedLocation(ctx, input.location_id);
   const terminal = isTerminal(ctx.principal);
 
+  // Order id: client id > derived from Idempotency-Key > random.
+  const idemKey = ctx.req.headers.get("idempotency-key");
+  const orderId =
+    input.id ??
+    (idemKey ? uuidv5(`${tenantId}:${idemKey}`) : globalThis.crypto.randomUUID());
+
+  // Idempotent replay, checked BEFORE anything that can age out (quote expiry or
+  // pruning, plan gate): a retry of a request that already created the order must
+  // return it. Foreign-tenant / out-of-scope ids answer exactly like a
+  // different-request conflict so id existence never leaks.
+  const existing = await ctx.driver.getOrder(orderId);
+  if (existing && (input.lines?.length || input.quote_id)) {
+    const conflict = () =>
+      ProblemError.of("IDEMPOTENCY_CONFLICT", {
+        detail: "This id is already in use or was used with a different request.",
+      });
+    if (existing.tenant_id !== tenantId || !allowedLocation(ctx.principal, existing.location_id)) {
+      throw conflict();
+    }
+    // Compare the cart. A quote_id request compares the stored quote's cart even
+    // if it has expired; if it has been pruned the id alone (same tenant and
+    // location) is the proof.
+    let sentLines: { item_id: string; quantity: number }[] | null = input.lines?.length
+      ? input.lines
+      : null;
+    if (!sentLines && input.quote_id) {
+      const q = await ctx.driver.getQuote(tenantId, input.quote_id);
+      if (q) sentLines = QuoteRequestSchema.parse(q.request).lines;
+    }
+    if (sentLines) {
+      const sent = signature(sentLines.map((l) => ({ item_id: l.item_id, quantity: l.quantity })));
+      const had = signature(
+        existing.items
+          .filter((i) => !i.voided)
+          .map((i) => ({ item_id: i.item_id, quantity: i.quantity })),
+      );
+      if (sent !== had) throw conflict();
+    }
+    return {
+      status: 200,
+      body: await mapOrderFor(ctx, existing.id),
+      headers: { "idempotent-replayed": "true" },
+    };
+  }
+
   // `quote_id` with no `lines` (pizza-mcp, kiosk): reload the stored request. The
   // cart, fulfillment and adjustments come from it; `tip` and `customer_id` from
   // the input when given, else the stored ones. Prices are NEVER taken from the
@@ -1183,37 +1251,6 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   }
   if (input.tax_exempt) throw unsupported("tax-exempt orders");
   rejectFees(input.fees);
-
-  // Order id: client id > derived from Idempotency-Key > random.
-  const idemKey = ctx.req.headers.get("idempotency-key");
-  const orderId =
-    input.id ??
-    (idemKey ? uuidv5(`${tenantId}:${idemKey}`) : globalThis.crypto.randomUUID());
-
-  // Idempotent replay. Foreign-tenant / out-of-scope ids answer exactly like a
-  // different-request conflict so id existence never leaks.
-  const existing = await ctx.driver.getOrder(orderId);
-  if (existing) {
-    const conflict = () =>
-      ProblemError.of("IDEMPOTENCY_CONFLICT", {
-        detail: "This id is already in use or was used with a different request.",
-      });
-    if (existing.tenant_id !== tenantId || !allowedLocation(ctx.principal, existing.location_id)) {
-      throw conflict();
-    }
-    const sent = signature(
-      lines.map((l) => ({ item_id: l.item_id, quantity: l.quantity })),
-    );
-    const had = signature(
-      existing.items.filter((i) => !i.voided).map((i) => ({ item_id: i.item_id, quantity: i.quantity })),
-    );
-    if (sent !== had) throw conflict();
-    return {
-      status: 200,
-      body: await mapOrderFor(ctx, existing.id),
-      headers: { "idempotent-replayed": "true" },
-    };
-  }
 
   const menu = await loadMenu(bundle, ctx.driver);
   // Only a terminal may skip the hours check, and only for counter orders.

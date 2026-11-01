@@ -2305,6 +2305,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           `fulfillment->>checkout_mode.eq.${opts.checkoutMode},fulfillment->>checkout_mode.is.null`,
         );
       }
+      if (opts?.foreignOf) {
+        q = q
+          .not("fulfillment->>checkout_mode", "is", null)
+          .neq("fulfillment->>checkout_mode", opts.foreignOf)
+          .is("fulfillment->>foreign_alerted_at", null);
+      }
       const rows = unwrap(
         await q
           .order("created_at", { ascending: true })

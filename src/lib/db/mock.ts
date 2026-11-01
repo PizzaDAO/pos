@@ -1659,7 +1659,11 @@ export const mockDriver: PosDriver = {
             (o.created_at === after.created_at && o.id > after.id)) &&
           (opts?.checkoutMode === undefined ||
             o.fulfillment?.checkout_mode === undefined ||
-            o.fulfillment.checkout_mode === opts.checkoutMode),
+            o.fulfillment.checkout_mode === opts.checkoutMode) &&
+          (opts?.foreignOf === undefined ||
+            (o.fulfillment?.checkout_mode !== undefined &&
+              o.fulfillment.checkout_mode !== opts.foreignOf &&
+              o.fulfillment.foreign_alerted_at === undefined)),
       )
       .sort(
         (a, b) =>

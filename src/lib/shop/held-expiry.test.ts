@@ -199,6 +199,50 @@ describe("expireHeldOrders", () => {
   });
 });
 
+describe("foreign-mode holds (F4) and the sweep budget (F10)", () => {
+  const LONG_AGO = new Date(NOW.getTime() - 25 * 3_600_000).toISOString();
+
+  it("sweeps a foreign-mode hold with no real tender once it is past the long grace", async () => {
+    const id = await seedOrder({
+      mode: "live",
+      hold: { reason: "awaiting_payment", expires_at: LONG_AGO },
+    });
+    const out = await expireHeldOrders(NOW);
+    expect(out.foreignSwept).toBe(1);
+    expect(await status(id)).toBe("voided");
+  });
+
+  it("leaves a recently expired foreign-mode hold to its own mode's sweeper", async () => {
+    const id = await seedOrder({ mode: "live" });
+    const out = await expireHeldOrders(NOW);
+    expect(out.foreignSwept).toBe(0);
+    expect(await status(id)).toBe("draft");
+  });
+
+  it("alerts once and parks a foreign-mode hold that holds a real tender", async () => {
+    const id = await seedOrder({
+      mode: "live",
+      hold: { reason: "awaiting_payment", expires_at: LONG_AGO },
+    });
+    await seedTender(id, {
+      simulated: false,
+      connect_account_id: ACCT,
+      raw: { checkout_session_id: "cs_live_x", livemode: true },
+    });
+    const first = await expireHeldOrders(NOW);
+    expect(first.foreignAlerted).toBe(1);
+    expect(await status(id)).toBe("draft");
+    expect((await expireHeldOrders(NOW)).foreignAlerted).toBe(0);
+  });
+
+  it("stops at its time budget", async () => {
+    const id = await seedOrder({});
+    const out = await expireHeldOrders(NOW, { budgetMs: -1 });
+    expect(out.checked).toBe(0);
+    expect(await status(id)).toBe("draft");
+  });
+});
+
 describe("a held order settled through finalizeOnlinePayment (D10)", () => {
   it("recomputes an ASAP promised_at from payment time and stamps paid/finalized", async () => {
     const id = await seedOrder({ hold: { reason: "awaiting_payment", expires_at: FUTURE } });

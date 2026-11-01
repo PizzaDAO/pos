@@ -393,10 +393,13 @@ export async function applyRailStatus(
     ) {
       await closeSiblingsOfSettledOrder(saved);
     }
-    await syncPaymentSession(saved, opts.sessionStatus).catch((err) =>
-      captureError(err, { scope: "payment-session-sync", paymentId: saved.id }),
-    );
   }
+  // ALWAYS mirror the tender onto its session row (not only on a status change):
+  // a sync that failed once, or a webhook that repeats an already-applied status,
+  // must still repair a session row left `open` after the money landed.
+  await syncPaymentSession(saved, opts.sessionStatus).catch((err) =>
+    captureError(err, { scope: "payment-session-sync", paymentId: saved.id }),
+  );
   await maybeMarkOrderPaid(payment.order_id);
   return saved;
 }
@@ -433,7 +436,7 @@ export function isRealCheckoutTender(p: Payment): boolean {
 }
 
 /** Mirror a tender's outcome onto its `payment_sessions` row (if it has one). */
-async function syncPaymentSession(
+export async function syncPaymentSession(
   payment: Payment,
   sessionStatus?: "expired" | "canceled",
 ): Promise<void> {
@@ -1153,21 +1156,20 @@ async function flagLatePayment(order: Order, payments: Payment[]): Promise<void>
  * in the admin list as "Duplicate payment, refund one" via the same marker.
  */
 async function flagDuplicatePayment(order: Order, payments: Payment[]): Promise<void> {
-  // In-store orders carry the tip on each tender (not in the order total), so
-  // their excess is measured on base amounts; online orders fold the tip in.
-  const inStore = order.channel === "in_store";
-  const held = inStore
-    ? payments
-        .filter((p) => p.status === "captured" || p.status === "authorized")
-        // Refunds are taken off the tip first, so a tip-only refund can't hide a
-        // duplicate of the base.
-        .reduce(
-          (n, p) =>
-            n + Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
-          0,
-        )
-    : netSettledCents(payments);
-  const excess = held - (inStore ? orderDueCents(order) : order.totals.total_cents);
+  // Measured on BASE amounts for every order (never base + tip): the tip rides on
+  // the tender, not the amount due, and may be added by the payer (an agent-channel
+  // order paid by session with a tip the order did not carry). Comparing money
+  // including tips to the order total would flag that tip as a duplicate payment,
+  // and the admin refund of the "duplicate" would refund the tip. Refunds are
+  // taken off the tip first, so a tip-only refund can't hide a duplicate of the base.
+  const held = payments
+    .filter((p) => p.status === "captured" || p.status === "authorized")
+    .reduce(
+      (n, p) =>
+        n + Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
+      0,
+    );
+  const excess = held - orderDueCents(order);
   if (excess <= 0) return;
   const prior = order.fulfillment?.late_payment;
   if (prior && (prior.kind !== "duplicate" || prior.resolved || prior.amount_cents === excess)) {

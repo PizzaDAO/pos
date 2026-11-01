@@ -61,6 +61,7 @@ import {
   getDefaultPlatformFee,
   isStripeLiveKey,
   isStripeTestKey,
+  usingMockDriver,
 } from "@/lib/payments/env";
 import {
   CardPaymentsNotReadyError,
@@ -71,9 +72,9 @@ import {
   applyRailStatus,
   cancelOpenOnlineIntents,
   cancelPendingTender,
-  nextOnlineTenderId,
   orderDueCents,
   refreshPaymentStatus,
+  syncPaymentSession,
 } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
 import {
@@ -81,6 +82,7 @@ import {
   expireCheckoutSession,
   feeForTender,
 } from "@/lib/payments/rails/stripe-online";
+import { deriveTenderId } from "@/lib/payments/ids";
 import { netSettledBaseCents } from "./money";
 
 // ---------------------------------------------------------------------------
@@ -103,6 +105,17 @@ export function liveSessionTenants(): Set<string> {
   );
 }
 
+/**
+ * A simulated session is a public one-click "paid" link, so it must never exist
+ * where real orders are cooked. Allowed only on the in-memory mock driver (zero-env
+ * dev/CI/preview), or on a NON-production deployment for the demo tenant. A real
+ * database with no Stripe key (or TRAINING_MODE) must answer 501 instead.
+ */
+export function simulatedSessionsAllowed(tenantId: string): boolean {
+  if (usingMockDriver()) return true;
+  return process.env.VERCEL_ENV !== "production" && tenantId === DEMO_TENANT_ID;
+}
+
 function sessionsUnsupported(detail: string): ProblemError {
   return ProblemError.of("CAPABILITY_UNSUPPORTED", { detail });
 }
@@ -114,7 +127,14 @@ function sessionsUnsupported(detail: string): ProblemError {
  * (non-demo) tenant. Returns the mode that was allowed.
  */
 export function assertSessionChargeAllowed(tenantId: string): SessionMode {
-  if (cardRailsSimulated()) return "simulated";
+  if (cardRailsSimulated()) {
+    if (!simulatedSessionsAllowed(tenantId)) {
+      throw sessionsUnsupported(
+        "Payment sessions are not enabled: simulated sessions are only available on a mock deployment.",
+      );
+    }
+    return "simulated";
+  }
   if (isStripeTestKey()) return "test";
   if (isStripeLiveKey()) {
     if (
@@ -300,11 +320,7 @@ export async function createPaymentSession(
   }
 
   // 8. The tender, with the platform fee on the BASE amount only.
-  const tenderId = await nextOnlineTenderId(order.id, "stripe_online");
-  const existingTender = await driver.getPayment(tenderId);
-  if (existingTender && existingTender.status !== "canceled" && existingTender.status !== "failed") {
-    throw conflict("tender_in_progress", "A payment on this order is already in progress.");
-  }
+  const tenderId = await nextSessionTenderId(driver, order.id);
   const fee = feeForTender(amount, tip);
   const stamp = now.toISOString();
   const tender: Payment = {
@@ -408,18 +424,59 @@ export async function createPaymentSession(
     expiresAtMs = created.expires_at * 1000;
   }
 
-  // Link the tender to its session (the webhook / reconcile path finds it by this).
+  // Link the tender to its session. RE-READ it first: it may have been closed
+  // while we talked to Stripe (cash settled the order and closed the siblings, a
+  // cancel, a supersede). Writing our stale copy back would resurrect a closed
+  // tender next to a live payable URL (double charge). If it is not still open,
+  // expire the session and fail.
+  const failSession = async (problem: ProblemError): Promise<never> => {
+    if (!simulated) {
+      await expireCheckoutSession(stripeSessionId, connectAccountId).catch((err) =>
+        captureError(err, { scope: "v1.paymentSession.expire-orphan", orderId: order.id }),
+      );
+    }
+    const cur = await driver.getPayment(tenderId);
+    if (cur && (cur.status === "requires_action" || cur.status === "pending")) {
+      await applyRailStatus(tenderId, "canceled").catch(() => undefined);
+    }
+    throw problem;
+  };
+  const current = await driver.getPayment(tenderId);
+  if (!current || current.status !== "requires_action") {
+    return failSession(
+      conflict("settled", "The order changed while the payment session was being created."),
+    );
+  }
   await driver.upsertPayment({
-    ...tender,
-    raw: { ...tender.raw, checkout_session_id: stripeSessionId },
+    ...current,
+    raw: { ...current.raw, checkout_session_id: stripeSessionId },
   });
 
-  // 10. The order may have been voided while we were talking to Stripe.
+  // 10. Re-check the ORDER now that the link exists: voided meanwhile, settled by
+  //     another tender, or no longer owing this amount -> close the tender and the
+  //     session (cancelPendingTender expires it at Stripe) and fail.
   const fresh = await driver.getOrder(order.id);
+  let recheck: ProblemError | null = null;
   if (!fresh || fresh.status === "voided" || fresh.status === "abandoned") {
+    recheck = ProblemError.of("INVALID_TRANSITION", { detail: "The order was canceled." });
+  } else {
+    try {
+      assertPayable(fresh, now);
+      const owed =
+        orderDueCents(fresh) -
+        netSettledBaseCents(await driver.listPaymentsForOrder(order.id), fresh.currency);
+      if (owed < amount) {
+        recheck = conflict("settled", "The order was paid while the session was being created.");
+      }
+    } catch (err) {
+      if (!(err instanceof ProblemError)) throw err;
+      recheck = err;
+    }
+  }
+  if (recheck) {
     const linked = await driver.getPayment(tenderId);
     if (linked) await cancelPendingTender(linked);
-    throw ProblemError.of("INVALID_TRANSITION", { detail: "The order was canceled." });
+    throw recheck;
   }
 
   // The session row. A concurrent request for the same key/order loses cleanly.
@@ -469,6 +526,24 @@ export async function createPaymentSession(
     await applyHoldExtension(driver, tenantId, order.id, holdPlan.expiresAtMs);
   }
   return { row, replayed: false };
+}
+
+/**
+ * The tender id for this session: the first derived `stripe_online` id with no row.
+ * Settled, refunded, canceled and failed tenders are history (a second session
+ * after a PARTIAL capture must work); only a tender still open means a payment is
+ * in progress (409 tender_in_progress; step 7 normally closed those already).
+ */
+async function nextSessionTenderId(driver: PosDriver, orderId: string): Promise<string> {
+  for (let seq = 0; seq < 50; seq += 1) {
+    const id = deriveTenderId(orderId, "stripe_online", seq);
+    const ex = await driver.getPayment(id);
+    if (!ex) return id;
+    if (ex.status === "requires_action" || ex.status === "pending") {
+      throw conflict("tender_in_progress", "A payment on this order is already in progress.");
+    }
+  }
+  throw conflict("tender_in_progress", "Too many payment attempts for this order.");
 }
 
 /** Order statuses a session may be created for: a live hold, or `placed` with a balance. */
@@ -589,6 +664,15 @@ export async function loadPaymentSession(
   } else if (tender && Date.parse(row.expires_at) <= now.getTime()) {
     // A simulated link past its expiry: close it locally.
     await applyRailStatus(tender.id, "canceled", { sessionStatus: "expired" });
+  }
+  // Repair a row left open after its tender settled or closed (a missed sync).
+  const settled = (await driver.listPaymentsForOrder(row.order_id)).find(
+    (p) => p.rail === "stripe_online" && p.raw?.checkout_session_id === row.stripe_session_id,
+  );
+  if (settled) {
+    await syncPaymentSession(settled).catch((err) =>
+      captureError(err, { scope: "v1.paymentSession.repair", paymentId: settled.id }),
+    );
   }
   return (await driver.getPaymentSession(row.id)) ?? row;
 }

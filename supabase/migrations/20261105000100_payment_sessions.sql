@@ -53,6 +53,15 @@ create index if not exists payment_sessions_order_idx
 alter table public.payment_sessions enable row level security;
 alter table public.payment_sessions force row level security;
 revoke all on public.payment_sessions from anon, authenticated;
+-- The app talks to this table only as the service role: say so explicitly rather
+-- than relying on default privileges.
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant select, insert, update, delete on public.payment_sessions to service_role;
+  end if;
+end
+$$;
 
 commit;
 

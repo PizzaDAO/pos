@@ -42,7 +42,7 @@ import {
 } from "./payment-sessions";
 import { completeSimulatedSession } from "./sim-session";
 import { cancelOnlineCheckout } from "@/lib/shop/lifecycle";
-import { refundPayment } from "@/lib/payments/service";
+import { applyRailStatus, refundPayment } from "@/lib/payments/service";
 
 // Thursday 2026-06-04 18:00 America/New_York (store open 11:00-22:00).
 const NOW = new Date("2026-06-04T22:00:00.000Z");
@@ -1090,6 +1090,355 @@ describe("test-mode Checkout session", () => {
     const r = await call("GET", "/payments/account");
     expect(r.json.connect_account_id).toBeNull();
     expect(r.json.charges_enabled).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes
+// ---------------------------------------------------------------------------
+
+describe("F1: the order is settled while the session is being created", () => {
+  it("expires the Stripe session, leaves no open URL or open tender, and answers 409", async () => {
+    await testMode();
+    const o = await heldOrder();
+    const driver = getPosDriver();
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path !== "/checkout/sessions") return { status: "expired" };
+      // While Stripe is "answering", the till takes cash for the full amount: it
+      // settles the order and closes the sibling (our not-yet-linked) tender.
+      await driver.upsertPayment({
+        id: "race-cash",
+        order_id: o.id,
+        tenant_id: DEMO_TENANT_ID,
+        location_id: DEMO_LOCATION_DOWNTOWN_ID,
+        rail: "cash",
+        status: "requires_action",
+        amount_cents: o.amount_due_cents,
+        tip_cents: 0,
+        application_fee_cents: 0,
+        currency: "USD",
+        charge_id: null,
+        connect_account_id: null,
+        crypto_tx_hash: null,
+        crypto_chain: null,
+        cash_tendered_cents: null,
+        cash_change_cents: null,
+        refunded_cents: 0,
+        simulated: false,
+        raw: null,
+        created_at: NOW.toISOString(),
+        updated_at: NOW.toISOString(),
+      });
+      await applyRailStatus("race-cash", "captured");
+      return stripeSession();
+    });
+    const r = await session(o.id);
+    expect(r.status).toBe(409);
+    expect(r.json.details?.reason).toBe("settled");
+    const paths = stripeRequest.mock.calls.map((c) => c[0] as string);
+    expect(paths).toContain(`/checkout/sessions/cs_test_${csSeq}/expire`);
+    expect(await driver.getOpenPaymentSessionForOrder(o.id)).toBeNull();
+    const tenders = await driver.listPaymentsForOrder(o.id);
+    expect(tenders.filter((t) => t.status === "requires_action" || t.status === "pending")).toHaveLength(0);
+    expect(tenders.find((t) => t.rail === "stripe_online")?.status).toBe("canceled");
+  });
+
+  it("an order voided during the create window is also closed and refused", async () => {
+    await testMode();
+    const o = await heldOrder();
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path !== "/checkout/sessions") return { status: "expired" };
+      await getPosDriver().casOrderStatus(o.id, ["draft"], "voided");
+      return stripeSession();
+    });
+    const r = await session(o.id);
+    expect(r.status).toBe(409);
+    expect(stripeRequest.mock.calls.map((c) => c[0] as string).some((p) => p.endsWith("/expire"))).toBe(true);
+    expect(await getPosDriver().getOpenPaymentSessionForOrder(o.id)).toBeNull();
+  });
+});
+
+describe("F2: payment events for held orders", () => {
+  const types = (orderId?: string) =>
+    memoryOutbox.rows
+      .filter(
+        (r) =>
+          (r.event_type === "payment.captured" || r.event_type === "order.placed") &&
+          (orderId === undefined ||
+            r.subject_id === orderId ||
+            r.row_snapshot?.order_id === orderId),
+      )
+      .map((r) => r.event_type);
+
+  it("a held order emits payment.captured BEFORE order.placed", async () => {
+    const o = await heldOrder();
+    const s = await session(o.id);
+    memoryOutbox.clear();
+    await completeSimulatedSession(s.json.id, NOW);
+    expect(types()).toEqual(["payment.captured", "order.placed"]);
+  });
+
+  it("a shop awaiting_payment order and a parked draft stay suppressed", async () => {
+    const driver = getPosDriver();
+    const mk = (id: string, status: "awaiting_payment" | "draft") =>
+      driver.createOrder({
+        id,
+        tenant_id: DEMO_TENANT_ID,
+        location_id: DEMO_LOCATION_DOWNTOWN_ID,
+        channel: status === "draft" ? "in_store" : "online_pickup",
+        currency: "USD",
+        items: [],
+        discount_cents: 0,
+        totals: {
+          subtotal_cents: 1000,
+          discount_cents: 0,
+          taxable_cents: 1000,
+          tax_cents: 0,
+          tip_cents: 0,
+          total_cents: 1000,
+        },
+        notes: null,
+        status,
+        hold: null,
+        fulfillment:
+          status === "awaiting_payment"
+            ? { type: "pickup", scheduled_for: "asap", promised_at: NOW.toISOString() }
+            : undefined,
+      });
+    await mk("shop-await", "awaiting_payment");
+    await mk("parked-draft", "draft");
+    memoryOutbox.clear();
+    for (const [id, orderId] of [
+      ["t-shop", "shop-await"],
+      ["t-parked", "parked-draft"],
+    ] as const) {
+      await driver.upsertPayment({
+        id,
+        order_id: orderId,
+        tenant_id: DEMO_TENANT_ID,
+        location_id: DEMO_LOCATION_DOWNTOWN_ID,
+        rail: "cash",
+        status: "captured",
+        amount_cents: 500,
+        tip_cents: 0,
+        application_fee_cents: 0,
+        currency: "USD",
+        charge_id: null,
+        connect_account_id: null,
+        crypto_tx_hash: null,
+        crypto_chain: null,
+        cash_tendered_cents: null,
+        cash_change_cents: null,
+        refunded_cents: 0,
+        simulated: false,
+        raw: null,
+        created_at: NOW.toISOString(),
+        updated_at: NOW.toISOString(),
+      });
+    }
+    expect(memoryOutbox.rows.filter((r) => r.event_type === "payment.captured")).toHaveLength(0);
+  });
+});
+
+describe("F3: a payer-added tip is not a duplicate payment", () => {
+  it("an agent-channel order paid with a tip it did not carry is not flagged", async () => {
+    const o = await heldOrder();
+    const s = await session(o.id, { tip_cents: 300 });
+    expect(s.json.tip_cents).toBe(300);
+    await completeSimulatedSession(s.json.id, NOW);
+    const order = (await getPosDriver().getOrder(o.id))!;
+    expect(order.fulfillment?.late_payment).toBeUndefined();
+  });
+
+  it("two full base payments are still flagged as a duplicate", async () => {
+    const o = await heldOrder();
+    const s = await session(o.id);
+    await completeSimulatedSession(s.json.id, NOW);
+    const driver = getPosDriver();
+    await driver.upsertPayment({
+      id: "dup-cash",
+      order_id: o.id,
+      tenant_id: DEMO_TENANT_ID,
+      location_id: DEMO_LOCATION_DOWNTOWN_ID,
+      rail: "cash",
+      status: "requires_action",
+      amount_cents: o.amount_due_cents,
+      tip_cents: 0,
+      application_fee_cents: 0,
+      currency: "USD",
+      charge_id: null,
+      connect_account_id: null,
+      crypto_tx_hash: null,
+      crypto_chain: null,
+      cash_tendered_cents: null,
+      cash_change_cents: null,
+      refunded_cents: 0,
+      simulated: false,
+      raw: null,
+      created_at: NOW.toISOString(),
+      updated_at: NOW.toISOString(),
+    });
+    await applyRailStatus("dup-cash", "captured");
+    const order = (await driver.getOrder(o.id))!;
+    expect(order.fulfillment?.late_payment?.kind).toBe("duplicate");
+    expect(order.fulfillment?.late_payment?.amount_cents).toBe(o.amount_due_cents);
+  });
+});
+
+describe("F5: simulated sessions only where they cannot cook a real order", () => {
+  const code = (fn: () => unknown) => {
+    try {
+      fn();
+    } catch (e) {
+      return (e as { code?: string }).code;
+    }
+    return "allowed";
+  };
+
+  it("mock driver: any tenant, any VERCEL_ENV", () => {
+    vi.stubEnv("VERCEL_ENV", "production");
+    expect(assertSessionChargeAllowed(OTHER_TENANT)).toBe("simulated");
+  });
+
+  it("real database + no Stripe key: refused, except the demo tenant off production", () => {
+    goLive();
+    vi.stubEnv("STRIPE_SECRET_KEY", "");
+    expect(assertSessionChargeAllowed(DEMO_TENANT_ID)).toBe("simulated");
+    vi.stubEnv("VERCEL_ENV", "preview");
+    expect(assertSessionChargeAllowed(DEMO_TENANT_ID)).toBe("simulated");
+    expect(code(() => assertSessionChargeAllowed(OTHER_TENANT))).toBe("CAPABILITY_UNSUPPORTED");
+    vi.stubEnv("VERCEL_ENV", "production");
+    expect(code(() => assertSessionChargeAllowed(DEMO_TENANT_ID))).toBe("CAPABILITY_UNSUPPORTED");
+  });
+
+  it("real database + TRAINING_MODE + live key: same rule", () => {
+    goLive();
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_live_abc");
+    vi.stubEnv("TRAINING_MODE", "true");
+    vi.stubEnv("VERCEL_ENV", "production");
+    expect(code(() => assertSessionChargeAllowed(DEMO_TENANT_ID))).toBe("CAPABILITY_UNSUPPORTED");
+  });
+
+  it("the simulate step refuses the same deployments, and creating one writes nothing", async () => {
+    const o = await heldOrder();
+    const s = await session(o.id);
+    goLive();
+    vi.stubEnv("STRIPE_SECRET_KEY", "");
+    vi.stubEnv("VERCEL_ENV", "production");
+    expect((await completeSimulatedSession(s.json.id, NOW)).ok).toBe(false);
+    const o2 = await heldOrder();
+    const r = await session(o2.id);
+    expect(r.status).toBe(501);
+    expect(await getPosDriver().listPaymentsForOrder(o2.id)).toHaveLength(0);
+  });
+});
+
+describe("F6: an order replay survives quote expiry", () => {
+  it("the same Idempotency-Key after the quote expired returns the order (200)", async () => {
+    const { lines } = await pepperoniCart();
+    const q = await call("POST", "/quotes", {
+      body: { location_id: DEMO_LOCATION_DOWNTOWN_ID, lines },
+    });
+    const body = {
+      location_id: DEMO_LOCATION_DOWNTOWN_ID,
+      quote_id: q.json.id,
+      channel: "agent",
+      source: { type: "agent" },
+    };
+    const headers = { "idempotency-key": "replay-after-expiry" };
+    const first = await call("POST", "/orders", { body, headers });
+    expect(first.status).toBe(201);
+    const later = new Date(NOW.getTime() + 11 * 60_000);
+    const again = await call("POST", "/orders", { body, headers, now: later });
+    expect(again.status).toBe(200);
+    expect(again.headers.get("idempotent-replayed")).toBe("true");
+    expect(again.json.id).toBe(first.json.id);
+    // A different request on the same key is still a conflict.
+    const other = await pepperoniCart(2);
+    const q2 = await call("POST", "/quotes", {
+      body: { location_id: DEMO_LOCATION_DOWNTOWN_ID, lines: other.lines },
+    });
+    const clash = await call("POST", "/orders", {
+      body: { ...body, quote_id: q2.json.id },
+      headers,
+    });
+    expect(clash.status).toBe(409);
+    expect(clash.json.code).toBe("IDEMPOTENCY_CONFLICT");
+  });
+});
+
+describe("F7/F8/F9", () => {
+  it("F7: a second session after a PARTIAL capture works", async () => {
+    const o = await heldOrder();
+    const a = await session(o.id, { amount_cents: 1000 });
+    expect(a.status).toBe(201);
+    await completeSimulatedSession(a.json.id, NOW);
+    const b = await session(o.id);
+    expect(b.status).toBe(201);
+    expect(b.json.amount_cents).toBe(o.amount_due_cents - 1000);
+    await completeSimulatedSession(b.json.id, NOW);
+    expect((await call("GET", `/orders/${o.id}`)).json.payment_status).toBe("paid");
+  });
+
+  it("F8: a session row left open after capture is repaired by a read", async () => {
+    const o = await heldOrder();
+    const s = await session(o.id);
+    const driver = getPosDriver();
+    const tender = (await driver.listPaymentsForOrder(o.id))[0]!;
+    // Captured behind the service's back (as if the session sync had failed).
+    await driver.upsertPayment({ ...tender, status: "captured", charge_id: "sim_pi_x" });
+    expect((await driver.getPaymentSession(s.json.id))!.status).toBe("open");
+    const got = await call("GET", `/payment-sessions/${s.json.id}`);
+    expect(got.json.status).toBe("completed");
+    expect(got.json.payment_id).toBe(tender.id);
+  });
+
+  it("F8: a repeated webhook for an already-captured tender repairs the session row", async () => {
+    await testMode();
+    const o = await heldOrder();
+    stripeRequest.mockResolvedValueOnce(stripeSession());
+    const s = await session(o.id);
+    const driver = getPosDriver();
+    const tender = (await driver.listPaymentsForOrder(o.id))[0]!;
+    await driver.upsertPayment({ ...tender, status: "captured", charge_id: "pi_cs_1" });
+    await signedWebhook({
+      type: "payment_intent.succeeded",
+      account: ACCT,
+      data: {
+        object: {
+          id: "pi_cs_1",
+          amount: o.totals.total_cents,
+          currency: "usd",
+          metadata: { payment_id: tender.id },
+        },
+      },
+    });
+    expect((await driver.getPaymentSession(s.json.id))!.status).toBe("completed");
+  });
+
+  it("F9: releasing an expired hold closes its open session and tender", async () => {
+    const o = await heldOrder();
+    const s = await session(o.id);
+    const later = new Date(NOW.getTime() + 40 * 60_000);
+    const r = await call("POST", `/orders/${o.id}/release`, { body: {}, now: later });
+    expect(r.status).toBe(409);
+    expect(r.json.code).toBe("INVALID_TRANSITION");
+    const driver = getPosDriver();
+    expect((await driver.getOrder(o.id))!.status).toBe("voided");
+    expect((await driver.getPaymentSession(s.json.id))!.status).toBe("canceled");
+    expect((await driver.listPaymentsForOrder(o.id))[0]!.status).toBe("canceled");
+  });
+
+  it("F9: with a real session, release of an expired hold expires it at Stripe", async () => {
+    await testMode();
+    const o = await heldOrder();
+    stripeRequest.mockResolvedValueOnce(stripeSession());
+    await session(o.id);
+    stripeRequest.mockResolvedValueOnce({ status: "expired" });
+    const later = new Date(NOW.getTime() + 40 * 60_000);
+    await call("POST", `/orders/${o.id}/release`, { body: {}, now: later });
+    expect(stripeRequest.mock.calls.at(-1)![0]).toBe(`/checkout/sessions/cs_test_${csSeq}/expire`);
+    expect((await getPosDriver().getOrder(o.id))!.status).toBe("voided");
   });
 });
 

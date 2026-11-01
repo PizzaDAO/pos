@@ -32,6 +32,15 @@ create index if not exists core_quotes_tenant_idx
 alter table public.core_quotes enable row level security;
 alter table public.core_quotes force row level security;
 revoke all on public.core_quotes from anon, authenticated;
+-- The app talks to this table only as the service role: say so explicitly rather
+-- than relying on default privileges.
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant select, insert, update, delete on public.core_quotes to service_role;
+  end if;
+end
+$$;
 
 commit;
 

@@ -593,6 +593,11 @@ export interface PosDriver {
       limit?: number;
       after?: { created_at: string; id: string };
       checkoutMode?: "live" | "test" | "sim";
+      /**
+       * Instead: holds stamped with a mode OTHER than this one that have not been
+       * alerted on yet (`foreign_alerted_at` unset), for the long-grace pass.
+       */
+      foreignOf?: "live" | "test" | "sim";
     },
   ): Promise<Order[]>;
 
