@@ -123,6 +123,9 @@ export function ReportsView({ tenantId, locations }: Props) {
             <Kpi label="Net (after disc.)" value={formatMoney(report.net_cents)} />
             <Kpi label="Tax" value={formatMoney(report.tax_cents)} />
             <Kpi label="Tips" value={formatMoney(report.tip_cents)} />
+            {(report.order_fees_cents ?? 0) > 0 && (
+              <Kpi label="Order fees" value={formatMoney(report.order_fees_cents ?? 0)} />
+            )}
             <Kpi label="Platform fees" value={formatMoney(report.fees_cents)} />
             <Kpi
               label="Voids"

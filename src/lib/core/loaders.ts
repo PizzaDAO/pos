@@ -301,9 +301,17 @@ export async function loadCustomer(
   return toContractCustomer(c, stats.get(c.id) ?? NO_STATS, await tenantCountry(tenantId, d));
 }
 
-/** A location's country as the contract reports it (`US` when POS has none). */
-export function countryOf(country: string | null | undefined): string {
-  return country && /^[A-Z]{2}$/.test(country) ? country : "US";
+/**
+ * A location's country as phones are read in it. A location with NO country
+ * stored (every row today: nothing wrote `locations.country`) is read as `US`,
+ * the market POS ships in; that is the documented boundary default and the only
+ * guess made. A country that IS stored but is not US/CA gets no guess (national
+ * numbers stay unnormalised and get no comparison key), and a malformed value is
+ * treated as unknown (null) rather than as US.
+ */
+export function countryOf(country: string | null | undefined): string | null {
+  if (country === null || country === undefined || country === "") return "US";
+  return /^[A-Z]{2}$/.test(country) ? country : null;
 }
 
 /**
@@ -316,7 +324,7 @@ export async function tenantCountry(
   driver?: PosDriver,
 ): Promise<string | null> {
   const first = (await driverOf(driver).listLocations(tenantId))[0];
-  return first ? countryOf(first.country) : null;
+  return first ? countryOf(first.country) : "US";
 }
 
 export const NO_STATS = {

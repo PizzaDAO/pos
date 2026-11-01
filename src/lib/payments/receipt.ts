@@ -90,6 +90,9 @@ export interface Receipt {
   subtotalCents: number;
   discountCents: number;
   taxCents: number;
+  /** Custom fee lines on the order (catering service fee, ...), shown as their own rows. */
+  fees: { label: string; amountCents: number }[];
+  feesCents: number;
   tipCents: number;
   /** Total platform application fee across card tenders. */
   applicationFeeCents: number;
@@ -164,6 +167,11 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
     subtotalCents: order.totals.subtotal_cents,
     discountCents: order.totals.discount_cents,
     taxCents: order.totals.tax_cents,
+    fees: (order.core_ext?.fees ?? []).map((f) => ({
+      label: f.label,
+      amountCents: f.amount_cents,
+    })),
+    feesCents: order.totals.fees_cents ?? 0,
     tipCents,
     applicationFeeCents,
     totalCents: grandTotalCents,

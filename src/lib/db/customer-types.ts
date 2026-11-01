@@ -36,6 +36,12 @@ export interface CustomerIdentityWrite {
    * verified (phone) / is the row's email, and is stamped verified.
    */
   verifiedContact?: "email" | "phone";
+  /**
+   * The country national-format phones are read in (`null` = unknown: national
+   * numbers get no comparison key and are never matched or merged). Omitted =
+   * "US" (legacy).
+   */
+  country?: string | null;
 }
 
 /**
@@ -112,7 +118,7 @@ export interface DeliveryRecord {
   order_id: string;
   tenant_id: string;
   location_id: string;
-  /** DeliveryProviderKey ("in_house_manual" | "doordash_drive"). */
+  /** DeliveryProviderKey ("in_house_manual" | "doordash_drive" | "openpizza_driver"). */
   provider: string;
   status: DeliveryRecordStatus;
   zone_id: string | null;

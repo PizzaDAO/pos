@@ -8,6 +8,7 @@
  */
 import {
   getPosDriver,
+  type OrderFeeLine,
   type OrderItem,
   type OrderTotals,
   type StoreSettings,
@@ -30,6 +31,10 @@ export async function priceOrder(input: {
   /** Explicit, already-bounded order-level tip. */
   tipCents?: number;
   voided?: RepriceOptions["voided"];
+  /** /v1 custom fee / gratuity lines (priced by `priceCart`). */
+  fees?: readonly OrderFeeLine[];
+  /** /v1 tax-exempt order (authorised by the caller's scope). */
+  taxExempt?: boolean;
   /** Pre-loaded settings (avoids a second read when the caller has them). */
   settings?: StoreSettings;
 }): Promise<PricedOrder> {
@@ -55,6 +60,8 @@ export async function priceOrder(input: {
     discountCents: input.discountCents ?? 0,
     taxRateBps: settings.tax_rate_bps,
     tipCents: input.tipCents ?? 0,
+    fees: input.fees,
+    taxExempt: input.taxExempt,
   });
   return { items, totals, settings };
 }

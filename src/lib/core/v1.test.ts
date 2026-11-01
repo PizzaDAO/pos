@@ -181,7 +181,7 @@ describe("read API matches the contract schemas", () => {
     expect(TenantSchema.parse((await call("GET", "/tenant")).json).source).toBe("openpizza_pos");
     const caps = CapabilitiesSchema.parse((await call("GET", "/capabilities")).json);
     expect(caps.features["orders.hold"]).toBe(true);
-    expect(caps.features["deliveries.write"]).toBe(false);
+    expect(caps.features["deliveries.write"]).toBe(true);
     const ent = EntitlementsSchema.parse((await call("GET", "/entitlements")).json);
     expect(ent.modules.pos?.config.inventory_owner).toBe("pos_basic");
     expect(ent.tenant_id).toBe(DEMO_TENANT_ID);

@@ -13,7 +13,7 @@ afterEach(() => {
 });
 
 describe("guest checkout never overwrites customer details", () => {
-  it("fills blanks but keeps existing name/phone", async () => {
+  it("keeps the existing row untouched (no name, no phone planted)", async () => {
     const email = `victim-${Date.now()}@example.com`;
     const first = await ensureCustomer({
       tenantId: DEMO_TENANT_ID,
@@ -29,16 +29,19 @@ describe("guest checkout never overwrites customer details", () => {
     });
     expect(second.id).toBe(first.id);
     expect(second.name).toBe("Real Name"); // not overwritten
-    expect(second.phone).toBe("555-0100"); // blank filled
+    // An anonymous email match writes NOTHING: a stranger's phone is not planted
+    // on the victim's row (it would reach guests via customer.updated).
+    expect(second.phone).toBeNull();
     const third = await ensureCustomer({
       tenantId: DEMO_TENANT_ID,
       email,
       phone: "555-9999",
     });
-    expect(third.phone).toBe("555-0100");
+    expect(third.phone).toBeNull();
 
     const stored = await getPosDriver().getCustomer(first.id);
-    expect(stored).toMatchObject({ name: "Real Name", phone: "555-0100" });
+    expect(stored).toMatchObject({ name: "Real Name", phone: null });
+    expect(stored!.updated_at).toBe(first.updated_at);
   });
 
   it("stores per-order contact on the order and doesn't echo the stored record", async () => {

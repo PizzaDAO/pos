@@ -552,6 +552,22 @@ export function withOutbox(
       return result;
     },
 
+    async publishAllergens(tenantId, input) {
+      const result = await inner.publishAllergens(tenantId, input);
+      // A replay or a refusal announces nothing (the SQL function's rule).
+      if (result.outcome === "ok") {
+        box.append({
+          tenant_id: tenantId,
+          location_id: null,
+          event_type: "menu.allergens.published",
+          subject_type: "allergen_publication",
+          subject_id: result.publication.id,
+          row_snapshot: { publication_id: result.publication.id },
+        });
+      }
+      return result;
+    },
+
     async clearOverride(tenantId, locationId, targetType, targetId) {
       const prior = (await inner.listOverrides(tenantId, locationId)).find(
         (o) => o.target_type === targetType && o.target_id === targetId,
@@ -577,6 +593,8 @@ export function withOutbox(
           ? await inner.getCustomerByEmail(customer.tenant_id, customer.email)
           : null);
       const result = await inner.upsertCustomer(customer);
+      // An anonymous email match writes nothing (no row change, no event).
+      if (known && !(await inner.getCustomer(customer.id))) return result;
       box.append({
         tenant_id: result.tenant_id,
         location_id: null,

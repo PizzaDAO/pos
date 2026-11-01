@@ -1086,7 +1086,9 @@ async function maybeMarkOrderPaid(
     // delivery is dispatched later. In-store drafts (no hold) keep the plain move.
     await finalizeOnlinePayment(orderId, { from: ["draft"] });
   } else if (
-    opts.respectHoldReason &&
+    // `scheduled` always: a catering order paid by card must still wait for its
+    // release time, whichever path recorded the money.
+    (opts.respectHoldReason || order.hold?.reason === "scheduled") &&
     order.status === "draft" &&
     order.hold &&
     order.hold.reason !== "awaiting_payment"

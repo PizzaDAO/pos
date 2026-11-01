@@ -133,6 +133,9 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
             <Row label="Discounts" value={formatMoney(report.discount_cents)} />
             <Row label="Net" value={formatMoney(report.net_cents)} strong />
             <Row label="Tax" value={formatMoney(report.tax_cents)} />
+            {(report.order_fees_cents ?? 0) > 0 && (
+              <Row label="Order fees" value={formatMoney(report.order_fees_cents ?? 0)} />
+            )}
             <Row label="Tips" value={formatMoney(report.tip_cents)} />
             <Row label="Platform fees" value={formatMoney(report.fees_cents)} />
           </Section>

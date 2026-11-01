@@ -6,6 +6,7 @@
  * subtotal), and the totals panel (subtotal → discount → tax → total).
  */
 import type {
+  OrderFeeLine,
   OrderItem,
   OrderItemModifier,
   OrderTotals,
@@ -55,6 +56,13 @@ export interface ComputeTotalsInput {
   taxRateBps: number;
   /** Tip in cents (Phase 1: always 0 placeholder; wired in Phase 2). */
   tipCents?: number;
+  /**
+   * Custom fee / gratuity lines (already priced: `amount_cents` is final). They
+   * add to the total; the `taxable` ones also add to the tax base.
+   */
+  fees?: readonly OrderFeeLine[];
+  /** Tax-exempt order: tax 0 and a zero taxable base (like core's `priceCart`). */
+  taxExempt?: boolean;
 }
 
 /**
@@ -64,10 +72,14 @@ export interface ComputeTotalsInput {
 export function computeOrderTotals(input: ComputeTotalsInput): OrderTotals {
   const subtotal = computeSubtotalCents(input.items);
   const discount = Math.max(0, Math.min(input.discountCents, subtotal));
-  const taxable = subtotal - discount;
+  const afterDiscount = subtotal - discount;
+  const fees = input.fees ?? [];
+  const feesTotal = fees.reduce((sum, f) => sum + f.amount_cents, 0);
+  const feesTaxable = fees.reduce((sum, f) => sum + (f.taxable ? f.amount_cents : 0), 0);
+  const taxable = input.taxExempt ? 0 : afterDiscount + feesTaxable;
   const tax = roundHalfUp((taxable * input.taxRateBps) / 10_000);
   const tip = Math.max(0, input.tipCents ?? 0);
-  const total = taxable + tax + tip;
+  const total = afterDiscount + feesTotal + tax + tip;
 
   return {
     subtotal_cents: subtotal,
@@ -76,6 +88,8 @@ export function computeOrderTotals(input: ComputeTotalsInput): OrderTotals {
     tax_cents: tax,
     tip_cents: tip,
     total_cents: total,
+    // Only with fee lines, so every fee-less order keeps its exact shape.
+    ...(fees.length ? { fees_cents: feesTotal } : {}),
   };
 }
 

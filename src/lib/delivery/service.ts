@@ -227,7 +227,13 @@ export async function cancelDeliveryForOrder(
       record.provider_delivery_id,
     );
   }
-  return driver.upsertDelivery({ ...record, status: "canceled" });
+  // Compare-and-set: a delivery that finished meanwhile (the partner reported
+  // delivered, say) is returned as it is, never overwritten from this stale copy.
+  const res = await driver.transitionDelivery(record.id, record.tenant_id, {
+    status: "canceled",
+  });
+  if (res.ok || res.reason === "terminal") return res.delivery;
+  return null;
 }
 
 /**
@@ -252,7 +258,11 @@ export async function refreshDelivery(
   // in /admin); the provider's track() returns only a SIMULATED driver, so we
   // never overlay it onto the authoritative DeliveryRecord. External providers
   // (DoorDash) own their tracking, so we pull their live state.
-  if (record.provider === "in_house_manual") return record;
+  // Partner-driven providers (the driver module) push their state through
+  // `deliveries.updateStatus`; there is nothing to pull.
+  if (record.provider === "in_house_manual" || record.provider === "openpizza_driver") {
+    return record;
+  }
   const provider = getDeliveryProvider(record.provider as DeliveryProviderKey);
   if (!provider || !record.provider_delivery_id) return record;
 
@@ -274,13 +284,14 @@ export async function refreshDelivery(
   ) {
     return record;
   }
-  return driver.upsertDelivery({
-    ...record,
+  const res = await driver.transitionDelivery(record.id, record.tenant_id, {
     status,
     driver_name: live.driverName ?? record.driver_name,
     driver_phone: live.driverPhone ?? record.driver_phone,
     tracking_ref: live.trackingRef ?? record.tracking_ref,
   });
+  if (res.ok || res.reason === "terminal") return res.delivery;
+  return null;
 }
 
 /**
@@ -296,12 +307,13 @@ export async function assignDriver(input: {
   const driver = getPosDriver();
   const record = await driver.getDelivery(input.deliveryId);
   if (!record) return null;
-  const updated = await driver.upsertDelivery({
-    ...record,
+  const res = await driver.transitionDelivery(record.id, record.tenant_id, {
     status: "assigned",
     driver_name: input.driverName,
     driver_phone: input.driverPhone ?? record.driver_phone,
   });
+  // A finished delivery cannot be assigned (nor its order moved back).
+  if (!res.ok) return null;
   await driver.updateOrderStatus(record.order_id, "out_for_delivery");
-  return updated;
+  return res.delivery;
 }

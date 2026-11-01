@@ -46,6 +46,7 @@ import {
   loadStaffList,
 } from "./loaders";
 import {
+  toContractAllergenPublication,
   toContractCustomer,
   toContractDailySales,
   toContractDrawerSession,
@@ -405,6 +406,10 @@ export async function hydrateEvent(
     }
   } else if (t === "delivery.status_changed") {
     data = await loadDelivery(tenant, row.subject_id, driver);
+  } else if (t === "menu.allergens.published") {
+    const pub = await driver.getAllergenPublication(tenant, row.subject_id);
+    data = pub ? toContractAllergenPublication(pub) : null;
+    locationId = null;
   } else {
     return null;
   }

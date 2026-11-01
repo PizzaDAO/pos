@@ -352,7 +352,8 @@ describe("per-contact verification in the contract", () => {
     const stats = { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 };
     expect(toContractCustomer(row, stats, "US").phone).toBe("+14155550199");
     expect(toContractCustomer(row, stats, "GB").phone).toBeNull();
-    expect(toContractCustomer(row, stats).phone).toBeNull();
+    expect(toContractCustomer(row, stats).phone).toBe("+14155550199"); // no stored country = US
+    expect(toContractCustomer(row, stats, null).phone).toBeNull(); // malformed/unknown = no guess
     expect(toContractCustomer({ ...row, phone: "+442071838750" }, stats, "GB").phone).toBe("+442071838750");
   });
 });

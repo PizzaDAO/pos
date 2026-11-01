@@ -13,7 +13,7 @@
 import type { Money } from "@/lib/payments/PaymentRail";
 
 /** Stable identifiers for the delivery providers the platform supports. */
-export type DeliveryProviderKey = "in_house_manual" | "doordash_drive";
+export type DeliveryProviderKey = "in_house_manual" | "doordash_drive" | "openpizza_driver";
 
 export interface Address {
   line1: string;

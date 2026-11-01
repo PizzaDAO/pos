@@ -14,6 +14,7 @@ import { parseExternalMixKey } from "@/lib/reports";
 import {
   allocate,
   businessDate,
+  calloutName,
   fromPosChannel,
   fromPosOrderStatus,
   stableHash,
@@ -81,7 +82,9 @@ export function cleanPhone(
   if (!p) return null;
   const compact = p.replace(/[\s().-]/g, "");
   if (PHONE_RE.test(compact)) return compact;
-  if (country !== "US" && country !== "CA") return null;
+  // No country at all (a location that never stored one) reads as US.
+  const c = country === undefined ? "US" : country;
+  if (c !== "US" && c !== "CA") return null;
   if (/^[2-9]\d{9}$/.test(compact)) return `+1${compact}`;
   if (/^1[2-9]\d{9}$/.test(compact)) return `+${compact}`;
   return null;
@@ -681,7 +684,7 @@ export function toContractOrder(input: {
           expires_at: order.hold?.expires_at ?? null,
         }
       : null,
-    fire_at: null,
+    fire_at: order.core_ext?.fire_at ?? null,
     currency: order.currency,
     lines: toContractLines(order),
     adjustments:
@@ -705,7 +708,9 @@ export function toContractOrder(input: {
       tax_cents: t.tax_cents,
       tip_cents: t.tip_cents,
       total_cents: t.total_cents,
+      ...(t.fees_cents ? { fees_cents: t.fees_cents } : {}),
     },
+    ...(order.core_ext?.fees?.length ? { fee_lines: order.core_ext.fees } : {}),
     tenders: payments.map((p) => ({
       payment_id: p.id,
       method: tenderMethod(p),
@@ -722,9 +727,13 @@ export function toContractOrder(input: {
     staff_id: order.staff_id ?? null,
     notes: order.notes,
     quote_id: null,
-    tax_exempt: false,
+    tax_exempt: order.core_ext?.tax_exempt ?? false,
     business_date: businessDate(order.created_at, timezone),
-    metadata: {},
+    metadata: order.core_ext?.metadata ?? {},
+    callout_name:
+      order.core_ext?.callout_name ??
+      calloutName({ name: contact.name }) ??
+      null,
     external_ids: {},
     created_at: created,
     updated_at: updated,
@@ -924,7 +933,7 @@ export function toContractDailySales(
     tax_cents: r.tax_cents,
     tip_cents: r.tip_cents,
     delivery_fee_cents: 0,
-    service_fee_cents: 0,
+    service_fee_cents: r.order_fees_cents ?? 0,
     refund_cents: r.refund_cents,
     void_count: r.void_count,
     by_channel: r.byChannel.map((b) => ({
@@ -951,5 +960,26 @@ export function toContractDailySales(
     })),
     closed: true,
     closed_at: ts(close.closed_at),
+  };
+}
+
+/** `menu.publishAllergens` reply / `menu.allergens.published` event data. */
+export function toContractAllergenPublication(pub: {
+  tenant_id: string;
+  version: string;
+  payload_hash: string;
+  location_ids: string[] | null;
+  row_count: number;
+  published_by: string | null;
+  published_at: string;
+}) {
+  return {
+    tenant_id: pub.tenant_id,
+    version: pub.version,
+    payload_hash: pub.payload_hash,
+    location_ids: pub.location_ids,
+    row_count: pub.row_count,
+    published_by: pub.published_by,
+    published_at: ts(pub.published_at),
   };
 }

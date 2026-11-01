@@ -502,21 +502,6 @@ describe("4. food-only amount_due_cents", () => {
 });
 
 describe("review fixes", () => {
-  const cartBody = async (extra: Record<string, unknown>) => ({
-    location_id: DEMO_LOCATION_DOWNTOWN_ID,
-    lines: [{ item_id: ID(77), quantity: 1 }],
-    ...extra,
-  });
-
-  it("answers 422 for custom fees on quotes and orders", async () => {
-    const fees = [{ code: "service", label: "Service", amount_cents: 100 }];
-    const q = await call("POST", "/quotes", { body: await cartBody({ fees }), scopes: ["quotes:write", "orders:write"] });
-    expect(q.status).toBe(422);
-    expect(q.json.detail).toMatch(/fees/);
-    const o = await call("POST", "/orders", { body: await cartBody({ fees }), scopes: ["orders:write"] });
-    expect(o.status).toBe(422);
-  });
-
   it("staff carry the linked login's email (batched)", async () => {
     const { loadStaffList } = await import("./loaders");
     await getPosDriver().upsertStaff({

@@ -791,6 +791,33 @@ describe("test-mode Checkout session", () => {
     expect(tender.connect_account_id).toBe(ACCT);
   });
 
+  it("shows an order's fee line as its own Checkout line; the total is unchanged", async () => {
+    await testMode();
+    const cat = principal({ module: "catering" });
+    const { lines } = await pepperoniCart();
+    const o = await call("POST", "/orders", {
+      body: {
+        location_id: DEMO_LOCATION_DOWNTOWN_ID,
+        lines,
+        fulfillment: { type: "pickup" },
+        fees: [{ code: "catering_service", label: "Catering service fee", amount_cents: 600 }],
+        channel: "agent",
+        source: { type: "agent", module: "catering" },
+      },
+      headers: { "idempotency-key": "fee-order-1" },
+      p: cat,
+    });
+    expect(o.status).toBe(201);
+    stripeRequest.mockResolvedValueOnce(stripeSession());
+    const r = await session(o.json.id, {}, undefined, cat);
+    expect(r.status).toBe(201);
+    const [, body] = stripeRequest.mock.calls[0]!;
+    const items = body.line_items as { price_data: { unit_amount: number; product_data: { name: string } } }[];
+    expect(items.map((l) => l.price_data.product_data.name)).toContain("Catering service fee");
+    expect(items.find((l) => l.price_data.product_data.name === "Catering service fee")!.price_data.unit_amount).toBe(600);
+    expect(items.reduce((n, l) => n + l.price_data.unit_amount, 0)).toBe(o.json.totals.total_cents);
+  });
+
   it("an honoured Stripe minimum: a 60 s request still expires in >= 31 minutes", async () => {
     await testMode();
     const o = await heldOrder();

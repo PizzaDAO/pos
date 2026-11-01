@@ -65,6 +65,9 @@ export function ReceiptView({
           {r.discountCents > 0 && (
             <Row label="Discount" value={`−${formatMoney(r.discountCents, c)}`} />
           )}
+          {r.fees.map((f, i) => (
+            <Row key={`fee-${i}`} label={f.label} value={formatMoney(f.amountCents, c)} />
+          ))}
           <Row label="Tax" value={formatMoney(r.taxCents, c)} />
           {r.tipCents > 0 && <Row label="Tip" value={formatMoney(r.tipCents, c)} />}
           <div className="flex justify-between border-t pt-1 font-bold">

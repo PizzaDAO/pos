@@ -8,6 +8,7 @@
  * All money is integer minor units (cents for USD) — never floats.
  */
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
+import type { DeliveryRecord, DeliveryRecordStatus } from "./customer-types";
 
 /**
  * Lifecycle of a single tender (one payment attempt on one rail). An order may
@@ -363,3 +364,54 @@ export interface StoredQuote {
   expires_at: string;
   created_at: string;
 }
+
+// ---------------------------------------------------------------------------
+// pos-v1-gaps phase 4
+// ---------------------------------------------------------------------------
+
+/** Result of {@link PosDriver.linkTenderSession} (a compare-and-set). */
+export type TenderLinkResult =
+  | { ok: true; payment: Payment }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "not_open"; status: string };
+
+/** One row of a published allergen matrix. */
+export interface AllergenRow {
+  target_type: "item" | "size" | "modifier";
+  target_id: string;
+  contains: string[];
+  may_contain: string[];
+  tags: string[];
+}
+
+/** A stored allergen publication (`menu_allergen_publications`). */
+export interface AllergenPublicationRecord {
+  id: string;
+  tenant_id: string;
+  version: string;
+  payload_hash: string;
+  location_ids: string[] | null;
+  row_count: number;
+  published_by: string | null;
+  published_at: string;
+}
+
+export type AllergenPublishResult =
+  | { outcome: "ok" | "replay"; publication: AllergenPublicationRecord }
+  | { outcome: "conflict" }
+  | { outcome: "unknown_target" | "unknown_location" | "duplicate"; ids: string[] };
+
+/** Fields a delivery status update may change. */
+export interface DeliveryPatch {
+  status: DeliveryRecordStatus;
+  driver_name?: string | null;
+  driver_phone?: string | null;
+  eta_minutes?: number | null;
+  tracking_ref?: string | null;
+  provider_delivery_id?: string | null;
+}
+
+export type DeliveryTransitionResult =
+  | { ok: true; delivery: DeliveryRecord }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "terminal"; delivery: DeliveryRecord };
