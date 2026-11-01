@@ -34,6 +34,7 @@ import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
 import { cancelReaderActionForIntent } from "./providers/stripe-terminal-api";
 import { railChargesApplicationFee } from "./fees";
+import { expireCheckoutSession, getCheckoutSession } from "./rails/stripe-online";
 import { CardPaymentsNotReadyError } from "./connect";
 import {
   cardRailsSimulated,
@@ -345,6 +346,15 @@ export async function applyRailStatus(
      * typed on the reader). Base `amount_cents` is never touched.
      */
     tipCents?: number;
+    /**
+     * Rail-native charge id learned AFTER the tender was created: a Checkout
+     * tender has no PaymentIntent until the payer confirms, so the webhook (or
+     * the session re-read) writes it on capture. Only fills an empty charge_id;
+     * refunds need it.
+     */
+    chargeId?: string;
+    /** `/v1` payment session status to record when the tender is canceled/failed. */
+    sessionStatus?: "expired" | "canceled";
   } = {},
 ): Promise<Payment | null> {
   const driver = getPosDriver();
@@ -355,15 +365,18 @@ export async function applyRailStatus(
   const locked =
     payment.status === "refunded" ||
     (payment.status === "captured" && status !== "refunded");
+  const newChargeId = !payment.charge_id && opts.chargeId ? opts.chargeId : null;
   if (
     !locked &&
     (status !== payment.status ||
       opts.raw ||
+      newChargeId ||
       (opts.tipCents !== undefined && opts.tipCents !== payment.tip_cents))
   ) {
     const next: Payment = {
       ...payment,
       status,
+      charge_id: newChargeId ?? payment.charge_id,
       tip_cents: opts.tipCents ?? payment.tip_cents,
       raw: opts.raw ? { ...(payment.raw ?? {}), ...opts.raw } : payment.raw,
       updated_at: nowIso(),
@@ -380,9 +393,103 @@ export async function applyRailStatus(
     ) {
       await closeSiblingsOfSettledOrder(saved);
     }
+    await syncPaymentSession(saved, opts.sessionStatus).catch((err) =>
+      captureError(err, { scope: "payment-session-sync", paymentId: saved.id }),
+    );
   }
   await maybeMarkOrderPaid(payment.order_id);
   return saved;
+}
+
+// ---------------------------------------------------------------------------
+// /v1 payment sessions (Stripe Checkout on the connected account)
+// ---------------------------------------------------------------------------
+
+/** The Checkout Session id a tender was created for, if it is a session tender. */
+function checkoutSessionId(p: Payment): string | null {
+  const id = p.raw?.checkout_session_id;
+  return p.rail === "stripe_online" && typeof id === "string" ? id : null;
+}
+
+/** True for a tender created by `POST /orders/{id}/payment-sessions`. */
+export function isCheckoutTender(p: Payment): boolean {
+  return checkoutSessionId(p) !== null;
+}
+
+/**
+ * True for a REAL Stripe Checkout tender: not simulated, on a connected account,
+ * and the session id is a Stripe one (never a local `cs_sim_` id).
+ */
+export function isRealCheckoutTender(p: Payment): boolean {
+  const id = checkoutSessionId(p);
+  return (
+    id !== null &&
+    !p.simulated &&
+    id.startsWith("cs_") &&
+    !id.startsWith("cs_sim_") &&
+    !!p.connect_account_id &&
+    !cardRailsSimulated()
+  );
+}
+
+/** Mirror a tender's outcome onto its `payment_sessions` row (if it has one). */
+async function syncPaymentSession(
+  payment: Payment,
+  sessionStatus?: "expired" | "canceled",
+): Promise<void> {
+  const sessionId = checkoutSessionId(payment);
+  if (!sessionId) return;
+  const driver = getPosDriver();
+  const session = await driver.getPaymentSessionByStripeId(sessionId);
+  if (!session) return;
+  if (payment.status === "captured" || payment.status === "authorized") {
+    await driver.updatePaymentSession(session.id, {
+      status: "completed",
+      payment_id: payment.id,
+    });
+  } else if (payment.status === "canceled" || payment.status === "failed") {
+    await driver.updatePaymentSession(session.id, {
+      status: sessionStatus ?? "canceled",
+    });
+  }
+}
+
+/**
+ * Re-read a REAL Checkout Session from Stripe and settle its tender: a paid
+ * session captures the tender (writing the PaymentIntent id as `charge_id`), an
+ * expired one cancels it, an open one is left alone. This is the reconcile path
+ * behind `GET /payment-sessions/{id}` and every "did it actually pay?" check.
+ * The amount is verified against the tender before anything is settled.
+ */
+export async function syncCheckoutTender(p: Payment): Promise<Payment> {
+  const sessionId = checkoutSessionId(p);
+  if (!sessionId || !isRealCheckoutTender(p)) return p;
+  const s = await getCheckoutSession(sessionId, p.connect_account_id);
+  if (s.status === "complete" && s.payment_status === "paid") {
+    if (
+      s.amount_total !== p.amount_cents + p.tip_cents ||
+      (s.currency ?? "").toLowerCase() !== p.currency.toLowerCase()
+    ) {
+      captureError(new Error("checkout session amount/currency mismatch"), {
+        scope: "checkout-sync",
+        paymentId: p.id,
+        expected: p.amount_cents + p.tip_cents,
+        got: s.amount_total,
+      });
+      return p;
+    }
+    return (
+      (await applyRailStatus(p.id, "captured", {
+        chargeId: typeof s.payment_intent === "string" ? s.payment_intent : undefined,
+      })) ?? p
+    );
+  }
+  if (s.status === "expired") {
+    return (
+      (await applyRailStatus(p.id, "canceled", { sessionStatus: "expired" })) ?? p
+    );
+  }
+  return p;
 }
 
 /**
@@ -433,6 +540,13 @@ export async function cancelTenderOnProvider(p: Payment): Promise<void> {
       {},
       { stripeAccount: p.connect_account_id },
     );
+    return;
+  }
+  if (isRealCheckoutTender(p)) {
+    // A Checkout tender whose payer never confirmed has no PaymentIntent: expire
+    // the SESSION. Stripe refuses (throws) if it already completed or expired;
+    // the strict callers then re-sync from Stripe.
+    await expireCheckoutSession(checkoutSessionId(p)!, p.connect_account_id);
     return;
   }
   if (isRealIntentTender(p)) {
@@ -614,6 +728,13 @@ export async function refreshPaymentStatus(
     return (await syncCardTender(paymentId)).payment;
   }
 
+  // A hosted-session (Checkout) tender is settled by re-reading its SESSION, never
+  // by the rail's blanket PaymentIntent `status` (it has no intent yet, and a
+  // simulated one only completes through its simulate step).
+  if (isCheckoutTender(payment)) {
+    return isRealCheckoutTender(payment) ? syncCheckoutTender(payment) : payment;
+  }
+
   const rail = requirePaymentRail(payment.rail);
   const status = await rail.status(
     {
@@ -674,6 +795,28 @@ export async function cancelOpenOnlineIntents(
       p.id !== exceptPaymentId,
   );
   for (const p of open) {
+    if (isRealCheckoutTender(p)) {
+      // STRICT, like a PaymentIntent: expire the Checkout Session first. If
+      // Stripe refuses (the payer just completed it, or it already expired) the
+      // tender is re-synced from the session; anything still open or unreadable
+      // rethrows, so no second session is created while this one can be paid.
+      try {
+        await expireCheckoutSession(checkoutSessionId(p)!, p.connect_account_id);
+      } catch (err) {
+        const synced = await syncCheckoutTender(p).catch(() => null);
+        if (
+          synced &&
+          (synced.status === "captured" ||
+            synced.status === "authorized" ||
+            synced.status === "canceled")
+        ) {
+          continue;
+        }
+        throw err;
+      }
+      await applyRailStatus(p.id, "canceled", { sessionStatus: "canceled" });
+      continue;
+    }
     if (isRealIntentTender(p)) {
       try {
         await stripeRequest(
@@ -909,7 +1052,16 @@ async function maybeMarkOrderPaid(orderId: string): Promise<void> {
   }
   if (settledCents(payments) < orderDueCents(order)) return;
 
-  if (order.status === "draft" || order.status === "placed") {
+  if (
+    order.status === "draft" &&
+    order.hold?.reason === "awaiting_payment" &&
+    order.fulfillment
+  ) {
+    // A /v1 order held for payment: settle it like an online checkout, so an ASAP
+    // order's `promised_at` counts from payment time (not creation) and a
+    // delivery is dispatched later. In-store drafts (no hold) keep the plain move.
+    await finalizeOnlinePayment(orderId, { from: ["draft"] });
+  } else if (order.status === "draft" || order.status === "placed") {
     await driver.transitionOrderStatus(orderId, ["draft", "placed"], "paid");
   } else if (order.status === "awaiting_payment") {
     await finalizeOnlinePayment(orderId);

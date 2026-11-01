@@ -48,11 +48,15 @@ import type {
 import type {
   ConnectAccount,
   Payment,
+  PaymentSessionRow,
   PaymentSettings,
   TerminalLocation,
   TerminalReader,
 } from "./payment-types";
-import { LiveTenderConflictError } from "./payment-types";
+import {
+  LiveTenderConflictError,
+  PaymentSessionConflictError,
+} from "./payment-types";
 import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
@@ -273,6 +277,31 @@ function mapPayment(r: Row): Payment {
     raw: (r.raw as Record<string, unknown> | null) ?? null,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
+  };
+}
+
+function mapPaymentSession(r: Row): PaymentSessionRow {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    order_id: r.order_id as string,
+    payment_id: (r.payment_id as string | null) ?? null,
+    status: r.status as PaymentSessionRow["status"],
+    url: r.url as string,
+    stripe_session_id: (r.stripe_session_id as string | null) ?? null,
+    currency: r.currency as string,
+    amount_cents: r.amount_cents as number,
+    tip_cents: r.tip_cents as number,
+    application_fee_cents: r.application_fee_cents as number,
+    idempotency_key: r.idempotency_key as string,
+    request_hash: r.request_hash as string,
+    success_url: r.success_url as string,
+    cancel_url: (r.cancel_url as string | null) ?? null,
+    // timestamptz comes back as "…+00:00": normalise to the Z form.
+    expires_at: new Date(r.expires_at as string).toISOString(),
+    simulated: r.simulated as boolean,
+    created_at: new Date(r.created_at as string).toISOString(),
+    updated_at: new Date(r.updated_at as string).toISOString(),
   };
 }
 
@@ -2120,6 +2149,169 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .order("created_at"),
         ) as Row[]
       ).map(mapPayment);
+    },
+
+    // -- /v1 payment sessions + stored quotes --------------------------------
+    async insertPaymentSession(row) {
+      const res = await sb.from("payment_sessions").insert(row).select().single();
+      if (res.error) {
+        const msg = res.error.message;
+        if (msg.includes("payment_sessions_one_open_per_order")) {
+          throw new PaymentSessionConflictError("open");
+        }
+        if (
+          msg.includes("idempotency_key") ||
+          msg.includes("stripe_session_id") ||
+          res.error.code === "23505"
+        ) {
+          throw new PaymentSessionConflictError("key");
+        }
+      }
+      return mapPaymentSession(unwrap(res) as Row);
+    },
+
+    async getPaymentSession(id) {
+      const r = unwrap(
+        await sb.from("payment_sessions").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapPaymentSession(r) : null;
+    },
+
+    async getPaymentSessionByKey(tenantId, idempotencyKey) {
+      const r = unwrap(
+        await sb
+          .from("payment_sessions")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("idempotency_key", idempotencyKey)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPaymentSession(r) : null;
+    },
+
+    async getPaymentSessionByStripeId(stripeSessionId) {
+      const r = unwrap(
+        await sb
+          .from("payment_sessions")
+          .select("*")
+          .eq("stripe_session_id", stripeSessionId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPaymentSession(r) : null;
+    },
+
+    async getOpenPaymentSessionForOrder(orderId) {
+      const r = unwrap(
+        await sb
+          .from("payment_sessions")
+          .select("*")
+          .eq("order_id", orderId)
+          .eq("status", "open")
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPaymentSession(r) : null;
+    },
+
+    async updatePaymentSession(id, patch) {
+      // Status only ever leaves `open` (one UPDATE; the WHERE is the lock). Other
+      // fields (url, stripe id, expiry) are only patched on an open session.
+      const { status, ...rest } = patch;
+      const changes: Row = { ...rest, updated_at: nowIso() };
+      if (status !== undefined) changes.status = status;
+      const updated = unwrap(
+        await sb
+          .from("payment_sessions")
+          .update(changes)
+          .eq("id", id)
+          .eq("status", "open")
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      if (updated) return mapPaymentSession(updated);
+      // Not open any more (or missing): a `payment_id` may still be recorded on a
+      // session that just completed.
+      if (rest.payment_id !== undefined) {
+        const r = unwrap(
+          await sb
+            .from("payment_sessions")
+            .update({ payment_id: rest.payment_id, updated_at: nowIso() })
+            .eq("id", id)
+            .is("payment_id", null)
+            .select()
+            .maybeSingle(),
+        ) as Row | null;
+        if (r) return mapPaymentSession(r);
+      }
+      return this.getPaymentSession(id);
+    },
+
+    async saveQuote(quote) {
+      unwrap(
+        await sb.from("core_quotes").upsert({
+          id: quote.id,
+          tenant_id: quote.tenant_id,
+          location_id: quote.location_id,
+          request: quote.request,
+          quote_hash: quote.quote_hash,
+          expires_at: quote.expires_at,
+          created_at: quote.created_at,
+        }),
+      );
+    },
+
+    async getQuote(tenantId, id) {
+      const r = unwrap(
+        await sb
+          .from("core_quotes")
+          .select("*")
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r
+        ? {
+            id: r.id as string,
+            tenant_id: r.tenant_id as string,
+            location_id: r.location_id as string,
+            request: r.request as Record<string, unknown>,
+            quote_hash: r.quote_hash as string,
+            expires_at: new Date(r.expires_at as string).toISOString(),
+            created_at: new Date(r.created_at as string).toISOString(),
+          }
+        : null;
+    },
+
+    async pruneExpiredQuotes(before) {
+      const rows = unwrap(
+        await sb.from("core_quotes").delete().lt("expires_at", before).select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async listExpiredHolds(now, opts) {
+      let q = sb
+        .from("orders")
+        .select("*")
+        .eq("status", "draft")
+        .eq("hold->>reason", "awaiting_payment")
+        .lt("hold->>expires_at", now);
+      if (opts?.after) {
+        q = q.or(
+          `created_at.gt.${opts.after.created_at},and(created_at.eq.${opts.after.created_at},id.gt.${opts.after.id})`,
+        );
+      }
+      if (opts?.checkoutMode) {
+        q = q.or(
+          `fulfillment->>checkout_mode.eq.${opts.checkoutMode},fulfillment->>checkout_mode.is.null`,
+        );
+      }
+      const rows = unwrap(
+        await q
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(opts?.limit ?? 1000),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
     // -- Stripe Connect ----------------------------------------------------

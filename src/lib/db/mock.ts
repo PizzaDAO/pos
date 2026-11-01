@@ -42,13 +42,16 @@ import type {
   ConnectAccount,
   Payment,
   PaymentRefund,
+  PaymentSessionRow,
   PaymentSettings,
   RefundReservation,
+  StoredQuote,
   TerminalLocation,
   TerminalReader,
 } from "./payment-types";
 import {
   LiveTenderConflictError,
+  PaymentSessionConflictError,
   ONE_LIVE_TENDER_RAILS,
   tenderHoldsOpenSlot,
 } from "./payment-types";
@@ -245,6 +248,8 @@ const orders = new Map<string, Order>();
 const tenantSettings = new Map<string, TenantSettings>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
+const paymentSessions = new Map<string, PaymentSessionRow>();
+const storedQuotes = new Map<string, StoredQuote>();
 /** Terminal PIN switch-in sessions keyed by id (server-side revocation). */
 const staffSessions = new Map<string, StaffSession>();
 /** Per-staff PIN failure counters / locks (mirrors staff.pin_* columns). */
@@ -1558,6 +1563,111 @@ export const mockDriver: PosDriver = {
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
   },
 
+  // -- /v1 payment sessions + stored quotes ------------------------------------
+
+  // Single synchronous block (no awaits): atomic in the mock, like the unique
+  // indexes it mirrors.
+  async insertPaymentSession(row) {
+    for (const s of paymentSessions.values()) {
+      if (s.tenant_id === row.tenant_id && s.idempotency_key === row.idempotency_key) {
+        throw new PaymentSessionConflictError("key");
+      }
+      if (row.status === "open" && s.order_id === row.order_id && s.status === "open") {
+        throw new PaymentSessionConflictError("open");
+      }
+      if (
+        row.stripe_session_id !== null &&
+        s.stripe_session_id === row.stripe_session_id
+      ) {
+        throw new PaymentSessionConflictError("key");
+      }
+    }
+    paymentSessions.set(row.id, { ...row });
+    return { ...row };
+  },
+
+  async getPaymentSession(id) {
+    const s = paymentSessions.get(id);
+    return s ? { ...s } : null;
+  },
+
+  async getPaymentSessionByKey(tenantId, idempotencyKey) {
+    for (const s of paymentSessions.values()) {
+      if (s.tenant_id === tenantId && s.idempotency_key === idempotencyKey) {
+        return { ...s };
+      }
+    }
+    return null;
+  },
+
+  async getPaymentSessionByStripeId(stripeSessionId) {
+    for (const s of paymentSessions.values()) {
+      if (s.stripe_session_id === stripeSessionId) return { ...s };
+    }
+    return null;
+  },
+
+  async getOpenPaymentSessionForOrder(orderId) {
+    for (const s of paymentSessions.values()) {
+      if (s.order_id === orderId && s.status === "open") return { ...s };
+    }
+    return null;
+  },
+
+  async updatePaymentSession(id, patch) {
+    const s = paymentSessions.get(id);
+    if (!s) return null;
+    const next = { ...s, ...patch, updated_at: nowIso() };
+    // Terminal statuses stick: only an open session changes status.
+    if (s.status !== "open") next.status = s.status;
+    paymentSessions.set(id, next);
+    return { ...next };
+  },
+
+  async saveQuote(quote) {
+    storedQuotes.set(quote.id, { ...quote });
+  },
+
+  async getQuote(tenantId, id) {
+    const q = storedQuotes.get(id);
+    return q && q.tenant_id === tenantId ? { ...q } : null;
+  },
+
+  async pruneExpiredQuotes(before) {
+    let n = 0;
+    for (const [id, q] of storedQuotes) {
+      if (q.expires_at < before) {
+        storedQuotes.delete(id);
+        n += 1;
+      }
+    }
+    return n;
+  },
+
+  async listExpiredHolds(now, opts) {
+    ensureKitchenSeed();
+    const after = opts?.after;
+    return [...orders.values()]
+      .filter(
+        (o) =>
+          o.status === "draft" &&
+          o.hold?.reason === "awaiting_payment" &&
+          !!o.hold.expires_at &&
+          o.hold.expires_at < now &&
+          (after === undefined ||
+            o.created_at > after.created_at ||
+            (o.created_at === after.created_at && o.id > after.id)) &&
+          (opts?.checkoutMode === undefined ||
+            o.fulfillment?.checkout_mode === undefined ||
+            o.fulfillment.checkout_mode === opts.checkoutMode),
+      )
+      .sort(
+        (a, b) =>
+          a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
+      )
+      .slice(0, opts?.limit ?? Number.MAX_SAFE_INTEGER);
+  },
+
   // -- Stripe Connect --------------------------------------------------------
 
   async getConnectAccount(tenantId: string): Promise<ConnectAccount | null> {
@@ -2424,6 +2534,8 @@ export function resetMockOrders(): void {
 /** Test helper: clear payments + connect state. */
 export function resetMockPayments(): void {
   payments.clear();
+  paymentSessions.clear();
+  storedQuotes.clear();
   connectAccounts.clear();
   terminalLocations.clear();
   terminalReaders.clear();

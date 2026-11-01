@@ -4,7 +4,9 @@
  * Vercel Cron (every 5 minutes, see vercel.json) calls this with
  * `Authorization: Bearer $CRON_SECRET`. Every `awaiting_payment` online order
  * past its expiry window is closed on its payment provider and moved to
- * `abandoned` (or finalized if its payment landed). See `src/lib/shop/lifecycle.ts`.
+ * `abandoned` (or finalized if its payment landed). It also voids `/v1` held
+ * orders (`draft`, hold `awaiting_payment`) whose hold expired, and prunes stored
+ * quotes. See `src/lib/shop/lifecycle.ts`.
  *
  * Auth: `CRON_SECRET` is REQUIRED. The one exception is the in-memory mock driver
  * (zero-env dev/CI), where there is no data worth protecting and the route is
@@ -12,7 +14,8 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
-import { expireOnlineOrders } from "@/lib/shop/lifecycle";
+import { getPosDriver } from "@/lib/db";
+import { expireHeldOrders, expireOnlineOrders } from "@/lib/shop/lifecycle";
 import { usingMockDriver } from "@/lib/payments/env";
 import { reconcileTerminalTenders } from "@/lib/payments/terminal/flow";
 import { captureError } from "@/lib/observability";
@@ -38,6 +41,19 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const summary = await expireOnlineOrders();
+  // /v1 held orders whose hold ran out (draft + awaiting_payment). Failure here
+  // must not fail the online-order sweep.
+  const held = await expireHeldOrders().catch((err) => {
+    captureError(err, { scope: "expire-held-orders-cron" });
+    return null;
+  });
+  // Stored /v1 quotes long past their validity window.
+  const quotesPruned = await getPosDriver()
+    .pruneExpiredQuotes(new Date(startedAt - 60 * 60_000).toISOString())
+    .catch((err) => {
+      captureError(err, { scope: "prune-quotes-cron" });
+      return null;
+    });
   // Also sweep in-store card-reader tenders left open (tablet died mid-payment):
   // re-read from Stripe, capture if it went through, else cancel. Failure here
   // must not fail the online-order sweep.
@@ -49,7 +65,7 @@ export async function GET(request: Request) {
     return null;
   });
   return NextResponse.json(
-    { ...summary, terminal },
+    { ...summary, held, quotesPruned, terminal },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

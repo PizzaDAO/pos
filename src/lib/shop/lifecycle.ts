@@ -361,6 +361,137 @@ export async function expireOnlineOrders(
   return summary;
 }
 
+export interface HeldExpireSummary {
+  checked: number;
+  /** Expired holds canceled (`draft -> voided`). */
+  voided: number;
+  /** Found paid at the last look (finalized instead of voided). */
+  finalized: number;
+  /** Left alone: money in flight, another mode's tender, or cancel refused. */
+  skipped: number;
+  errors: number;
+}
+
+/**
+ * The held-order sweeper (`/v1` orders): a `draft` order held for payment
+ * (`hold.reason = awaiting_payment`) whose hold ran out is closed on its payment
+ * provider and voided, or finalized if its payment landed at the last look. Same
+ * discipline as `expireOnlineOrders`: tenders are closed STRICTLY first (an open
+ * Checkout Session is expired at Stripe; one Stripe will not release, because
+ * the payer is mid-payment, leaves the order alone), only this deployment's mode
+ * is swept, and the void is `driver.cancelOrder` (atomic with the tender check).
+ *
+ * Never touched: parked in-store drafts (no hold), holds with another reason
+ * (`scheduled`, `manual`), and orders of another deployment mode.
+ */
+export async function expireHeldOrders(
+  now: Date = new Date(),
+): Promise<HeldExpireSummary> {
+  const driver = getPosDriver();
+  const summary: HeldExpireSummary = {
+    checked: 0,
+    voided: 0,
+    finalized: 0,
+    skipped: 0,
+    errors: 0,
+  };
+  const mode = deploymentCheckoutMode();
+  let after: { created_at: string; id: string } | undefined;
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const batch = await driver.listExpiredHolds(now.toISOString(), {
+      limit: PAGE_SIZE,
+      after,
+      checkoutMode: mode,
+    });
+    if (batch.length === 0) break;
+    for (const order of batch) await sweepHeldOne(order, now, summary);
+    const last = batch[batch.length - 1]!;
+    after = { created_at: last.created_at, id: last.id };
+    if (batch.length < PAGE_SIZE) break;
+  }
+  return summary;
+}
+
+async function sweepHeldOne(
+  listed: Order,
+  now: Date,
+  summary: HeldExpireSummary,
+): Promise<void> {
+  const driver = getPosDriver();
+  try {
+    // Re-read: an extension, release or payment may have moved it since the list.
+    const order = await driver.getOrder(listed.id);
+    const exp = order?.hold?.expires_at ? Date.parse(order.hold.expires_at) : null;
+    if (
+      !order ||
+      order.status !== "draft" ||
+      order.hold?.reason !== "awaiting_payment" ||
+      exp === null ||
+      exp > now.getTime()
+    ) {
+      return;
+    }
+    summary.checked += 1;
+    const payments = await driver.listPaymentsForOrder(order.id);
+    if (foreignMode(payments)) {
+      summary.skipped += 1;
+      return;
+    }
+    // A last look at anything real, so a payment that landed is not voided.
+    for (const p of payments) {
+      if (p.simulated) continue;
+      if (p.status !== "requires_action" && p.status !== "pending") continue;
+      await refreshPaymentStatus(p.id).catch((err) =>
+        captureError(err, { scope: "expireHeldOrders.refresh", orderId: order.id }),
+      );
+    }
+    const stillHeld = async () => (await driver.getOrder(order.id))?.status === "draft";
+    if (!(await stillHeld())) {
+      summary.finalized += 1;
+      return;
+    }
+    // Close open card sessions/intents on the provider (strict: throws if the
+    // provider will not release one, which leaves the order alone).
+    await cancelOpenOnlineIntents(order.id);
+    if (!(await stillHeld())) {
+      summary.finalized += 1;
+      return;
+    }
+    // Anything left pending (crypto) is closed strictly too; settled money that
+    // did not cover the order is parked for a human.
+    const left = await driver.listPaymentsForOrder(order.id);
+    if (left.some((p) => p.status === "authorized" || p.status === "captured")) {
+      captureError(new Error("expired held order holds settled money"), {
+        scope: "expireHeldOrders.settled",
+        orderId: order.id,
+      });
+      summary.skipped += 1;
+      return;
+    }
+    for (const p of left) {
+      if (p.status !== "pending") continue;
+      const outcome = await cancelOpenTender(p);
+      if (outcome === "in_flight") {
+        summary.skipped += 1;
+        return;
+      }
+      if (outcome === "settled") {
+        summary.finalized += 1;
+        return;
+      }
+    }
+    const res = await driver.cancelOrder(order.id, order.tenant_id, {
+      nowMs: now.getTime(),
+    });
+    if (res.ok) summary.voided += 1;
+    else if (!(await stillHeld())) summary.finalized += 1;
+    else summary.skipped += 1;
+  } catch (err) {
+    summary.errors += 1;
+    captureError(err, { scope: "expireHeldOrders", orderId: listed.id });
+  }
+}
+
 /**
  * Orders stamped with a DIFFERENT deployment mode (e.g. test-mode orders seen by
  * the live sweeper, or after the deployment flipped mode) are normally left to

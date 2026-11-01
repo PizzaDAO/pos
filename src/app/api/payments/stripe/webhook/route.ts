@@ -213,13 +213,15 @@ export async function POST(request: Request) {
   }
 
   try {
-    await applyRailStatus(
-      matched.id,
-      mapped,
-      mapped === "requires_action"
+    await applyRailStatus(matched.id, mapped, {
+      // A Checkout (payment-session) tender is matched by metadata.payment_id and
+      // has no charge id yet: record the PaymentIntent so refunds can find it.
+      // (Only fills an empty charge_id; shop tenders already carry theirs.)
+      chargeId: intent.id,
+      ...(mapped === "requires_action"
         ? { raw: { last_error: intent.last_payment_error?.message ?? null } }
-        : {},
-    );
+        : {}),
+    });
   } catch (err) {
     // `applyRailStatus` resolves the one-live-card-tender conflict itself; this is
     // the last line of defence so Stripe never retries a webhook forever on it.

@@ -9,11 +9,18 @@
  * from the client, and ids outside the token's tenant answer NOT_FOUND.
  *
  * Implemented: tenant, capabilities, entitlements, locations, menu (+86),
- * quotes (stateless), orders (list/get/create held/cancel/release/extend hold), payments
- * (read), customers (read), staff, drawer sessions, deliveries (read), sales.
+ * quotes (stored; create/get, and `orders.create{quote_id}` re-prices them),
+ * orders (list/get/create held/cancel/release/extend hold), payments (read, plus
+ * hosted payment sessions and the payments account), customers (read), staff,
+ * drawer sessions, deliveries (read), sales.
  * Declared but unsupported by POS answer 501 CAPABILITY_UNSUPPORTED:
  * orders.updateStatus, payments.recordExternal, customers.upsert,
- * deliveries.updateStatus, quotes.get, events.list (events go out by webhook).
+ * deliveries.updateStatus, events.list (events go out by webhook).
+ *
+ * Payment sessions are the ONLY /v1 path that can reach Stripe. They are gated on
+ * the server (`assertSessionChargeAllowed` in payment-sessions.ts): simulated
+ * mode or a positively identified Stripe TEST key only; live keys answer 501
+ * unless the tenant is explicitly allow-listed.
  */
 import {
   AvailabilityUpdateSchema,
@@ -23,6 +30,7 @@ import {
   OrderHoldExtendInputSchema,
   OrderListQuerySchema,
   PROBLEM_CONTENT_TYPE,
+  PaymentSessionCreateInputSchema,
   ProblemError,
   QuoteRequestSchema,
   SalesSummaryQuerySchema,
@@ -40,6 +48,7 @@ import {
   type Order as CoreOrder,
   type Principal,
   type Problem,
+  type QuoteRequest,
   type V1Operation,
 } from "@openpizza/core";
 import type { ZodError } from "zod";
@@ -48,8 +57,9 @@ import {
   type CreateOrderInput,
   type PosDriver,
   type OrderFulfillment,
-  type Payment,
 } from "@/lib/db";
+import type { StoredQuote } from "@/lib/db/payment-types";
+import { deploymentCheckoutMode } from "@/lib/payments/env";
 import { isGuid, isIsoTimestamp } from "@/lib/db/paging";
 import { cancelDeliveryForOrder } from "@/lib/delivery/service";
 import { captureError } from "@/lib/observability";
@@ -79,6 +89,13 @@ import {
   type LocationBundle,
 } from "./loaders";
 import { toContractCustomer, toContractPayment, toContractTenant } from "./mappers";
+import { netSettledBaseCents } from "./money";
+import {
+  createPaymentSession,
+  getPaymentsAccount,
+  loadPaymentSession,
+  toContractSession,
+} from "./payment-sessions";
 import { buildDailySales, buildSalesSummary, isSalesRow } from "./sales";
 
 export interface V1Deps {
@@ -200,29 +217,7 @@ function decodeCursor(c: string): [string, string] {
   throw ProblemError.of("VALIDATION_FAILED", { detail: "Invalid cursor." });
 }
 
-/**
- * Base money (tips excluded) still held on SETTLED tenders — captured or
- * authorized, as main's settledCents — in the order's currency, net of refunds
- * beyond the tip: sum(max(0, amount - max(0, refunded - tip))).
- */
-export function netSettledBaseCents(
-  payments: Payment[],
-  currency: string,
-): number {
-  const cur = currency.toUpperCase();
-  return payments
-    .filter(
-      (p) =>
-        (p.status === "captured" || p.status === "authorized") &&
-        p.currency.toUpperCase() === cur,
-    )
-    .reduce(
-      (n, p) =>
-        n +
-        Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
-      0,
-    );
-}
+export { netSettledBaseCents };
 
 /**
  * Keyset pagination over items sorted by (created_at, id) ascending, with the
@@ -380,7 +375,8 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
       payment_modes: ["prepaid", "pay_at_counter"],
       notes: [
         "Delivery orders cannot be created through /v1 yet; use pickup/dine_in.",
-        "Quotes are stateless: send the full cart to POST /orders (optionally with quote_hash).",
+        "Quotes are stored for 10 minutes: POST /orders accepts quote_id (no lines) and re-prices it; send quote_hash to detect price changes.",
+        "Payment sessions are Stripe Checkout (card only) on the tenant's connected account; sessions expire no sooner than 31 minutes (Stripe's minimum) and the hold is extended to cover them.",
         "Order status transitions are driven by the KDS/terminal, not /v1.",
       ],
     };
@@ -493,14 +489,41 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
       // In-store terminals bypass hours; everything else is gated.
       checkHours: true,
     });
+    // Persist a VALID quote so `quotes.get` and `orders.create{quote_id}` can
+    // reload and re-price it. Only the request is kept; money is always re-derived.
+    if (quote.valid) {
+      await ctx.driver.saveQuote({
+        id: quote.id,
+        tenant_id: ctx.principal.tenant_id,
+        location_id: bundle.location.id,
+        request: parsed.data as unknown as Record<string, unknown>,
+        quote_hash: quote.quote_hash,
+        expires_at: quote.expires_at,
+        created_at: quote.created_at,
+      });
+    }
     return { body: quote };
   },
 
-  "quotes.get": async () => {
-    throw ProblemError.of("QUOTE_NOT_FOUND", {
-      detail:
-        "POS quotes are stateless and not stored. Send the cart to POST /orders (with quote_hash to detect price changes).",
+  // Reload the stored request and RE-PRICE it now: the returned quote has the
+  // original id, but live prices, availability and expiry (an expired quote is
+  // 409 QUOTE_EXPIRED; a foreign or unknown id is 404 QUOTE_NOT_FOUND).
+  "quotes.get": async (ctx) => {
+    const stored = await loadStoredQuote(ctx, ctx.params.quote_id!);
+    const bundle = await ownedLocation(ctx, stored.location_id);
+    const menu = await loadMenu(bundle, ctx.driver);
+    const quote = priceCart({
+      menu,
+      location: bundle.contract,
+      request: stored.request as unknown as QuoteRequest,
+      now: ctx.now(),
+      checkHours: true,
+      quoteId: stored.id,
     });
+    // Same id, live prices; the validity window stays the original one.
+    return {
+      body: { ...quote, created_at: stored.created_at, expires_at: stored.expires_at },
+    };
   },
 
   "orders.list": async (ctx) => {
@@ -773,6 +796,55 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     return { body: p };
   },
 
+  // Hosted pay link (Stripe Checkout on the connected account). The safety gate
+  // (`assertSessionChargeAllowed`) runs inside, before any tender or Stripe call.
+  "payments.createSession": async (ctx) => {
+    await requireActiveTenant(ctx);
+    const order = await ownedOrder(ctx, ctx.params.order_id!);
+    const parsed = PaymentSessionCreateInputSchema.safeParse(await readBody(ctx.req));
+    if (!parsed.success) throw zodProblem(parsed.error);
+    const key = ctx.req.headers.get("idempotency-key");
+    if (!key) {
+      throw ProblemError.of("VALIDATION_FAILED", {
+        detail: "The Idempotency-Key header is required.",
+      });
+    }
+    const { row, replayed } = await createPaymentSession({
+      driver: ctx.driver,
+      tenantId: ctx.principal.tenant_id,
+      order,
+      input: parsed.data,
+      idempotencyKey: key,
+      now: ctx.now(),
+      baseUrl: ctx.url.origin,
+    });
+    return {
+      status: replayed ? 200 : 201,
+      body: toContractSession(row),
+      headers: replayed ? { "idempotent-replayed": "true" } : undefined,
+    };
+  },
+
+  "payments.getSession": async (ctx) => {
+    const row = await ctx.driver.getPaymentSession(ctx.params.session_id!);
+    if (!row || row.tenant_id !== ctx.principal.tenant_id) throw notFound("Payment session");
+    // Tenant AND location scope, through the order.
+    await ownedOrder(ctx, row.order_id);
+    return { body: toContractSession(await loadPaymentSession(ctx.driver, row, ctx.now())) };
+  },
+
+  "payments.account": async (ctx) => {
+    const tenantId = ctx.principal.tenant_id;
+    const first = (await loadLocations(tenantId, ctx.driver))[0];
+    return {
+      body: await getPaymentsAccount(
+        ctx.driver,
+        tenantId,
+        first?.settings.currency ?? "USD",
+      ),
+    };
+  },
+
   "customers.list": async (ctx) => {
     const tenantId = ctx.principal.tenant_id;
     const q = ctx.url.searchParams;
@@ -998,6 +1070,24 @@ const UNSUPPORTED: V1Operation[] = [
 // Orders (write)
 // ---------------------------------------------------------------------------
 
+/**
+ * A stored quote of THIS tenant and an allowed location, still valid. A foreign,
+ * out-of-scope or unknown id is the same 404 (existence never leaks); an expired
+ * one is 409 QUOTE_EXPIRED (the caller re-quotes).
+ */
+async function loadStoredQuote(ctx: Ctx, quoteId: string): Promise<StoredQuote> {
+  const stored = await ctx.driver.getQuote(ctx.principal.tenant_id, quoteId);
+  if (!stored || !allowedLocation(ctx.principal, stored.location_id)) {
+    throw ProblemError.of("QUOTE_NOT_FOUND", { detail: "Quote not found." });
+  }
+  if (Date.parse(stored.expires_at) < ctx.now().getTime()) {
+    throw ProblemError.of("QUOTE_EXPIRED", {
+      detail: "The quote expired; request a new quote.",
+    });
+  }
+  return stored;
+}
+
 async function ownedOrder(ctx: Ctx, orderId: string) {
   const order = await ctx.driver.getOrder(orderId);
   if (
@@ -1039,8 +1129,33 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
   const bundle = await ownedLocation(ctx, input.location_id);
   const terminal = isTerminal(ctx.principal);
 
+  // `quote_id` with no `lines` (pizza-mcp, kiosk): reload the stored request. The
+  // cart, fulfillment and adjustments come from it; `tip` and `customer_id` from
+  // the input when given, else the stored ones. Prices are NEVER taken from the
+  // store: the cart is re-priced below, and drift against the stored hash is
+  // PRICE_CHANGED.
+  let lines = input.lines;
+  let fulfillmentIn = input.fulfillment;
+  let adjustmentsIn = input.adjustments;
+  let tipIn = input.tip;
+  let customerIdIn = input.customer_id;
+  let storedQuote: StoredQuote | null = null;
+  if ((!lines || lines.length === 0) && input.quote_id) {
+    storedQuote = await loadStoredQuote(ctx, input.quote_id);
+    if (storedQuote.location_id !== input.location_id) {
+      throw ProblemError.of("QUOTE_NOT_FOUND", { detail: "Quote not found." });
+    }
+    const req = QuoteRequestSchema.parse(storedQuote.request);
+    lines = req.lines;
+    fulfillmentIn = input.fulfillment ?? req.fulfillment;
+    adjustmentsIn = input.adjustments ?? req.adjustments;
+    tipIn = input.tip !== undefined ? input.tip : req.tip;
+    customerIdIn = input.customer_id ?? req.customer_id;
+    if (req.tax_exempt) throw unsupported("tax-exempt orders");
+  }
+
   // Discounts/comps are an owner/manager power in POS: callers need an explicit scope.
-  if ((input.adjustments?.length ?? 0) > 0) {
+  if ((adjustmentsIn?.length ?? 0) > 0) {
     if (!hasLiteralScope(ctx.principal, "orders:discount")) {
       throw ProblemError.of("INSUFFICIENT_SCOPE", {
         detail: "missing scope(s): orders:discount (must be granted explicitly)",
@@ -1057,15 +1172,13 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
       throw ProblemError.of("FORBIDDEN", { detail: gate.reason ?? "Plan does not allow this." });
     }
   }
-  if (!input.lines || input.lines.length === 0) {
+  if (!lines || lines.length === 0) {
     throw ProblemError.of("VALIDATION_FAILED", {
-      detail: input.quote_id
-        ? "POS does not store quotes; send `lines` (and optionally `quote_hash`)."
-        : "lines are required.",
+      detail: "Send `lines`, or a `quote_id` from POST /quotes.",
       path: "lines",
     });
   }
-  if (input.fulfillment?.type === "delivery") {
+  if (fulfillmentIn?.type === "delivery") {
     throw unsupported("delivery orders", "Delivery orders cannot be created through /v1 yet.");
   }
   if (input.tax_exempt) throw unsupported("tax-exempt orders");
@@ -1089,7 +1202,7 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
       throw conflict();
     }
     const sent = signature(
-      input.lines.map((l) => ({ item_id: l.item_id, quantity: l.quantity })),
+      lines.map((l) => ({ item_id: l.item_id, quantity: l.quantity })),
     );
     const had = signature(
       existing.items.filter((i) => !i.voided).map((i) => ({ item_id: i.item_id, quantity: i.quantity })),
@@ -1110,12 +1223,12 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     location: bundle.contract,
     request: {
       location_id: input.location_id,
-      lines: input.lines,
-      fulfillment: input.fulfillment ?? { type: "pickup" },
-      adjustments: input.adjustments ?? [],
-      tip: input.tip ?? null,
+      lines,
+      fulfillment: fulfillmentIn ?? { type: "pickup" },
+      adjustments: adjustmentsIn ?? [],
+      tip: tipIn ?? null,
       tax_exempt: false,
-      customer_id: input.customer_id ?? null,
+      customer_id: customerIdIn ?? null,
     },
     now: ctx.now(),
     checkHours: !inStore,
@@ -1127,6 +1240,26 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
         errors: quote.errors,
       }),
     );
+  }
+  if (storedQuote) {
+    // Drift guard against the STORED quote, independent of any tip override:
+    // re-price the stored request as it was quoted and compare hashes. A menu or
+    // price change since the quote is PRICE_CHANGED, never a silently new total.
+    const asQuoted = priceCart({
+      menu,
+      location: bundle.contract,
+      request: storedQuote.request as unknown as QuoteRequest,
+      now: ctx.now(),
+      checkHours: false,
+    });
+    if (asQuoted.quote_hash !== storedQuote.quote_hash) {
+      throw new ProblemError(
+        problem("PRICE_CHANGED", {
+          detail: "Prices changed since the quote.",
+          details: { quote: asQuoted },
+        }),
+      );
+    }
   }
   const preTip = quote.totals.total_cents - quote.totals.tip_cents;
   if (quote.totals.tip_cents > maxTipCents(preTip)) {
@@ -1190,8 +1323,8 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
 
   // Customer + staff (tenant-checked).
   let customerId: string | null = null;
-  if (input.customer_id) {
-    const c = await ctx.driver.getCustomer(input.customer_id);
+  if (customerIdIn) {
+    const c = await ctx.driver.getCustomer(customerIdIn);
     if (!c || c.tenant_id !== tenantId) throw notFound("Customer");
     customerId = c.id;
   } else if (input.contact?.email) {
@@ -1240,13 +1373,16 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     : null;
 
   const f = bundle.settings.fulfillment;
-  const scheduled = input.fulfillment?.scheduled_for ?? null;
+  const scheduled = fulfillmentIn?.scheduled_for ?? null;
   const prepMs = (f?.prep_minutes ?? 15) * 60_000;
   const fulfillment: OrderFulfillment = {
     type: "pickup",
     scheduled_for: scheduled ?? "asap",
     promised_at: scheduled ?? new Date(now.getTime() + prepMs).toISOString(),
-    delivery_notes: input.fulfillment?.delivery_notes ?? undefined,
+    // Which deployment kind created the hold: the held-order sweeper only
+    // touches its own mode (prod and a test-key preview may share one database).
+    checkout_mode: deploymentCheckoutMode(),
+    delivery_notes: fulfillmentIn?.delivery_notes ?? undefined,
     contact: input.contact
       ? { name: input.contact.name ?? null, phone: input.contact.phone ?? null }
       : undefined,
