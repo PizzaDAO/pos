@@ -10,8 +10,8 @@
 --      UPDATE that reserves the refund. Exposed as Payment.refunds[] and the
 --      `refund` on payment.refunded events.
 --   3. Defense in depth for staff identity: a manager cannot change the email of
---      an owner (or anyone ranked above them), and cannot (re)link an owner's /
---      higher-ranked staff row to a different login.
+--      an owner (or anyone ranked above them), and cannot change the login or
+--      role of an owner's / higher-ranked staff row (nor promote their own).
 --
 -- All additive and live-safe: nullable / defaulted column adds are metadata-only
 -- (no table rewrite, no long lock); triggers and functions are replaced
@@ -19,6 +19,12 @@
 -- refunds entries (the API synthesizes one stable `<payment>:legacy` refund for
 -- money refunded before per-refund records existed).
 -- ============================================================================
+
+-- One explicit transaction (psql -f / apply.sh would otherwise autocommit each
+-- statement, splitting the DROP + CREATE of reserve_payment_refund). Fail fast
+-- instead of queueing behind a long lock on a live database.
+begin;
+set local lock_timeout = '3s';
 
 -- ---- 1. per-line fire / void stamps -------------------------------------------
 alter table public.order_items
@@ -44,7 +50,9 @@ as $$
 declare
   v_status text;
 begin
-  select o.status::text into v_status from public.orders o where o.id = new.order_id;
+  select o.status::text into v_status from public.orders o
+   where o.id = new.order_id
+     for share; -- wait out a concurrent status change (see orders_fire_lines)
   if new.voided then
     new.voided_at := now();
     new.status_at_void := v_status;
@@ -88,9 +96,10 @@ create trigger order_items_stamp_void
   for each row execute function public.order_items_stamp_void();
 
 -- An order going live (released from a hold, paid, ...) fires its unfired,
--- unvoided lines. One UPDATE; a no-op once they are fired. The order UPDATE
--- that triggers it holds the order row lock, so it serializes with a
--- concurrent line insert (which reads the new status).
+-- unvoided lines. One UPDATE; a no-op once they are fired. A concurrent line
+-- insert takes FOR SHARE on the order row first (order_items_stamp_insert), so
+-- it either waits for this status UPDATE to commit and then sees the live
+-- status, or commits before it and is fired here; it cannot be missed.
 create or replace function public.orders_fire_lines()
 returns trigger
 language plpgsql
@@ -195,6 +204,10 @@ as $$
 declare
   v_idx bigint;
 begin
+  -- Lock the row first so concurrent releases serialize and each computes its
+  -- index against the other's result.
+  perform 1 from public.payments where id = p_payment_id for update;
+
   select t.o into v_idx
     from public.payments p,
          jsonb_array_elements(p.refunds) with ordinality as t(e, o)
@@ -299,9 +312,11 @@ create trigger users_guard_email_edit
   before update of email on public.users
   for each row execute function public.guard_user_email_edit();
 
--- Re-linking a staff row to another login changes whose email the hub trusts
--- for that role. A manager may not link / relink / unlink a staff row whose own
--- role, or whose current or new login's membership, outranks them.
+-- A staff row decides whose email the hub trusts for a role, so changing its
+-- login OR its role is rank-gated: the actor must rank at least as high as the
+-- row's old AND new role (also on insert), and as any login it is linked from /
+-- to. This closes the demote -> relink -> promote bypass and self-promotion
+-- (a manager setting role = 'owner' on their own row).
 create or replace function public.guard_staff_user_link()
 returns trigger
 language plpgsql
@@ -313,10 +328,9 @@ declare
   v_actor_rank integer;
   v_top integer;
 begin
-  if tg_op = 'UPDATE' and new.user_id is not distinct from old.user_id then
-    return new;
-  end if;
-  if tg_op = 'INSERT' and new.user_id is null then
+  if tg_op = 'UPDATE'
+     and new.user_id is not distinct from old.user_id
+     and new.role is not distinct from old.role then
     return new;
   end if;
   if v_actor is null or public.is_platform_admin() then
@@ -327,17 +341,17 @@ begin
    where m.tenant_id = new.tenant_id and m.user_id = v_actor;
   v_actor_rank := coalesce(v_actor_rank, 0);
 
-  select max(public.membership_rank(m.role)) into v_top
+  v_top := public.membership_rank(new.role);
+  if tg_op = 'UPDATE' then
+    v_top := greatest(v_top, public.membership_rank(old.role));
+  end if;
+  select greatest(v_top, coalesce(max(public.membership_rank(m.role)), 0)) into v_top
     from public.memberships m
    where m.tenant_id = new.tenant_id
      and m.user_id in (new.user_id, case when tg_op = 'UPDATE' then old.user_id end);
-  v_top := greatest(
-    coalesce(v_top, 0),
-    public.membership_rank(new.role),
-    case when tg_op = 'UPDATE' then public.membership_rank(old.role) else 0 end);
 
   if v_top > v_actor_rank then
-    raise exception 'not allowed to change the login of a higher-ranked staff member'
+    raise exception 'not allowed to change the role or login of a higher-ranked staff member'
       using errcode = '42501';
   end if;
   return new;
@@ -346,5 +360,10 @@ $$;
 
 drop trigger if exists staff_guard_user_link on public.staff;
 create trigger staff_guard_user_link
-  before insert or update of user_id on public.staff
+  before insert or update of user_id, role on public.staff
   for each row execute function public.guard_staff_user_link();
+
+-- PostgREST caches the RPC signatures: pick up the new reserve_payment_refund.
+notify pgrst, 'reload schema';
+
+commit;

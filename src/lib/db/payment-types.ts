@@ -79,7 +79,7 @@ export interface Payment {
   refund_ids?: string[];
   /**
    * Every refund with a stable id (Σ amount_cents = refunded_cents). Written
-   * ONLY by `reservePaymentRefund` / `setPaymentRefundMeta`, never by
+   * ONLY by `reservePaymentRefund` / `releasePaymentRefund`, never by
    * `upsertPayment`. Absent on tenders refunded before it existed.
    */
   refunds?: PaymentRefund[];

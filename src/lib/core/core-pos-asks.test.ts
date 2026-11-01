@@ -11,6 +11,7 @@ import { OrderSchema, PaymentSchema, type Principal } from "@openpizza/core";
 import {
   getPosDriver,
   DEMO_LOCATION_DOWNTOWN_ID,
+  DEMO_OWNER_USER_ID,
   DEMO_TENANT_ID,
   type CreateOrderInput,
   type OrderItem,
@@ -497,5 +498,47 @@ describe("4. food-only amount_due_cents", () => {
       toContractOrder({ order: o, payments: [part], timezone: "UTC" }),
     );
     expect(body.amount_due_cents).toBe(600);
+  });
+});
+
+describe("review fixes", () => {
+  const cartBody = async (extra: Record<string, unknown>) => ({
+    location_id: DEMO_LOCATION_DOWNTOWN_ID,
+    lines: [{ item_id: ID(77), quantity: 1 }],
+    ...extra,
+  });
+
+  it("answers 422 for custom fees on quotes and orders", async () => {
+    const fees = [{ code: "service", label: "Service", amount_cents: 100 }];
+    const q = await call("POST", "/quotes", { body: await cartBody({ fees }), scopes: ["quotes:write", "orders:write"] });
+    expect(q.status).toBe(422);
+    expect(q.json.detail).toMatch(/fees/);
+    const o = await call("POST", "/orders", { body: await cartBody({ fees }), scopes: ["orders:write"] });
+    expect(o.status).toBe(422);
+  });
+
+  it("staff carry the linked login's email (batched)", async () => {
+    const { loadStaffList } = await import("./loaders");
+    await getPosDriver().upsertStaff({
+      id: ID(60),
+      tenant_id: DEMO_TENANT_ID,
+      name: "Linked",
+      role: "manager",
+      active: true,
+      user_id: DEMO_OWNER_USER_ID,
+      created_at: T0.toISOString(),
+    });
+    const staff = await loadStaffList(DEMO_TENANT_ID);
+    const linked = staff.filter((s) => s.user_id);
+    expect(linked.length).toBeGreaterThan(0);
+    for (const s of linked) expect(s.email).toMatch(/@/);
+    for (const s of staff.filter((x) => !x.user_id)) expect(s.email).toBeNull();
+  });
+
+  it("legacy refund entry has a stable timestamp", () => {
+    const p = payment(ID(50), { refunded_cents: 100 });
+    const a = toContractPayment(p).refunds![0]!;
+    const b = toContractPayment({ ...p, updated_at: "2027-01-01T00:00:00.000Z" }).refunds![0]!;
+    expect(b.at).toBe(a.at);
   });
 });

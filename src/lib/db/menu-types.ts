@@ -256,7 +256,9 @@ export function isLiveOrderStatus(status: OrderStatus): boolean {
 /**
  * A held order's hold. `extend_key` / `extend_ttl_seconds` remember the last
  * `orders.extendHold` call (idempotent replay: same key + ttl = same result,
- * nothing extended twice); they never leave the server.
+ * nothing extended twice). The /v1 mappers copy only reason + expires_at, so
+ * they are not part of the contract; other POS routes that return a raw Order
+ * may still carry them.
  */
 export interface OrderHold {
   reason: string;

@@ -417,7 +417,7 @@ export function toContractRefunds(p: Payment): CorePaymentRefund[] {
     out.unshift({
       id: `${p.id}:legacy`,
       amount_cents: p.refunded_cents - known,
-      at: ts(p.updated_at),
+      at: ts(p.created_at), // stable across reads (updated_at moves)
       processor_ref: null,
       reason: null,
     });
@@ -732,7 +732,11 @@ export function toContractCustomer(
   };
 }
 
-export function toContractStaff(s: Staff, hasPin: boolean): CoreStaffMember {
+export function toContractStaff(
+  s: Staff,
+  hasPin: boolean,
+  email?: string | null,
+): CoreStaffMember {
   return {
     id: s.id,
     tenant_id: s.tenant_id,
@@ -742,6 +746,9 @@ export function toContractStaff(s: Staff, hasPin: boolean): CoreStaffMember {
     active: s.active,
     user_id: s.user_id ?? null,
     location_ids: s.location_ids ?? [],
+    // The linked login's email (public.users via user_id): the hub staff login
+    // matches on it. null when unlinked or not a valid address.
+    email: cleanEmail(email),
     has_pin: hasPin,
     external_ids: {},
     created_at: ts(s.created_at),

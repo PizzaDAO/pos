@@ -1399,6 +1399,18 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return r ? mapUser(r) : null;
     },
 
+    async getUserEmails(userIds) {
+      const out = new Map<string, string>();
+      const ids = [...new Set(userIds)];
+      for (let i = 0; i < ids.length; i += 100) {
+        const rows = unwrap(
+          await sb.from("users").select("id,email").in("id", ids.slice(i, i + 100)),
+        ) as Row[];
+        for (const r of rows) out.set(r.id as string, r.email as string);
+      }
+      return out;
+    },
+
     async getUserByEmail(email) {
       const r = unwrap(
         await sb

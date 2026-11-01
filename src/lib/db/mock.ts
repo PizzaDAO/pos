@@ -889,6 +889,15 @@ export const mockDriver: PosDriver = {
     return usersById.get(userId) ?? null;
   },
 
+  async getUserEmails(userIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const id of userIds) {
+      const u = usersById.get(id);
+      if (u) out.set(id, u.email);
+    }
+    return out;
+  },
+
   async getUserByEmail(email: string): Promise<User | null> {
     const target = email.trim().toLowerCase();
     for (const u of usersById.values()) {

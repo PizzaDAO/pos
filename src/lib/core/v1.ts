@@ -28,6 +28,7 @@ import {
   SalesSummaryQuerySchema,
   V1_ROUTES,
   extendedHoldExpiry,
+  holdCapSeconds,
   isProblemError,
   priceCart,
   problem,
@@ -152,6 +153,21 @@ async function readBody(req: Request): Promise<unknown> {
     return JSON.parse(text);
   } catch {
     throw ProblemError.of("VALIDATION_FAILED", { detail: "Body is not valid JSON." });
+  }
+}
+
+/**
+ * Custom fee / gratuity lines (core 0.3.x `fees`) are priced by `priceCart` but
+ * POS order creation cannot store them, so accepting them would quote one total
+ * and charge another. Refuse until POS supports them.
+ */
+function rejectFees(fees: unknown[] | undefined): void {
+  if (fees && fees.length > 0) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail:
+        "POS does not support custom fee lines (`fees`) yet; remove them from the request.",
+      path: "fees",
+    });
   }
 }
 
@@ -299,9 +315,33 @@ async function ownedLocation(ctx: Ctx, locationId: string): Promise<LocationBund
 // Handlers
 // ---------------------------------------------------------------------------
 
-const POS_EVENTS = EVENT_TYPES.filter(
-  (t) => !t.startsWith("tenant.") && !t.startsWith("entitlements."),
-);
+/** Event types POS actually emits (the outbox triggers + mock-events); nothing else is advertised. */
+const POS_EMITTED_EVENTS: readonly string[] = [
+  "order.placed",
+  "order.updated",
+  "order.status_changed",
+  "order.ready",
+  "order.completed",
+  "order.canceled",
+  "payment.authorized",
+  "payment.captured",
+  "payment.failed",
+  "payment.refunded",
+  "menu.updated",
+  "menu.item.unavailable",
+  "menu.item.available",
+  "location.updated",
+  "customer.created",
+  "customer.updated",
+  "staff.created",
+  "staff.updated",
+  "staff.deactivated",
+  "drawer_session.opened",
+  "drawer_session.closed",
+  "business_day.closed",
+  "delivery.status_changed",
+];
+const POS_EVENTS = EVENT_TYPES.filter((t) => POS_EMITTED_EVENTS.includes(t));
 
 const handlers: Partial<Record<V1Operation, Handler>> = {
   "tenant.get": async (ctx) => {
@@ -442,6 +482,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
   "quotes.create": async (ctx) => {
     const parsed = QuoteRequestSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
+    rejectFees(parsed.data.fees);
     const bundle = await ownedLocation(ctx, parsed.data.location_id);
     const menu = await loadMenu(bundle, ctx.driver);
     const quote = priceCart({
@@ -1028,6 +1069,7 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     throw unsupported("delivery orders", "Delivery orders cannot be created through /v1 yet.");
   }
   if (input.tax_exempt) throw unsupported("tax-exempt orders");
+  rejectFees(input.fees);
 
   // Order id: client id > derived from Idempotency-Key > random.
   const idemKey = ctx.req.headers.get("idempotency-key");
@@ -1187,7 +1229,12 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     : terminal
       ? (input.hold?.reason ?? "awaiting_payment")
       : "awaiting_payment";
-  const ttl = input.hold?.ttl_seconds ?? 900;
+  // The reason is what bounds the ttl: only `scheduled` may run up to 30 days,
+  // and a non-terminal caller's reason is forced to awaiting_payment above.
+  const ttl = Math.min(
+    input.hold?.ttl_seconds ?? 900,
+    holdReason ? holdCapSeconds(holdReason) : 900,
+  );
   const hold = holdReason
     ? { reason: holdReason, expires_at: new Date(now.getTime() + ttl * 1000).toISOString() }
     : null;

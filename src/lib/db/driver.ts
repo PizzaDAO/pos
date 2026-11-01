@@ -774,6 +774,8 @@ export interface PosDriver {
   // --------------------------------------------------------------------------
 
   listStaff(tenantId: string): Promise<Staff[]>;
+  /** Emails of the given auth users (one query), keyed by user id. Unknown ids are absent. */
+  getUserEmails(userIds: string[]): Promise<Map<string, string>>;
   upsertStaff(staff: Staff): Promise<Staff>;
 
   /**
