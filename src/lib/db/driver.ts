@@ -13,6 +13,7 @@ import type {
   Order,
   OrderFulfillment,
   OrderStatus,
+  OrderTotals,
   StoreSettings,
 } from "./menu-types";
 import type {
@@ -110,6 +111,35 @@ export interface OrderPageOptions {
   createdTo?: string;
   /** Only rows updated at/after this ISO instant. */
   updatedSince?: string;
+}
+
+/** Header-only order row (see {@link PosDriver.listOrderHeads}). */
+export interface OrderHead {
+  id: string;
+  tenant_id: string;
+  location_id: string;
+  created_at: string;
+  status: OrderStatus;
+  hold: unknown | null;
+  currency: string;
+  staff_id: string | null;
+  totals: OrderTotals;
+}
+
+export interface OrderHeadOptions {
+  /** null / omitted = every location of the tenant. */
+  locationIds?: string[] | null;
+  /** Inclusive ISO created_at bounds. */
+  createdFrom?: string;
+  createdTo?: string;
+  /** SQL status filter. */
+  statuses?: OrderStatus[];
+  /** Exclusive keyset cursor (ascending order only). */
+  after?: { created_at: string; id: string };
+  /** 1..500. */
+  limit: number;
+  /** Default oldest first. */
+  newestFirst?: boolean;
 }
 
 export interface PosDriver {
@@ -318,6 +348,24 @@ export interface PosDriver {
     locationId: string,
     opts: OrderPageOptions,
   ): Promise<Order[]>;
+
+  /**
+   * Light order rows (no item graph) for read models that only need header
+   * fields: one query per page. Filters are SQL, not post-filters.
+   */
+  listOrderHeads(tenantId: string, opts: OrderHeadOptions): Promise<OrderHead[]>;
+
+  /** Full order graphs for known ids, batch-loaded (order not guaranteed). */
+  getOrdersByIds(ids: string[]): Promise<Order[]>;
+
+  /**
+   * Payments of a tenant that have been refunded and last changed at/after
+   * `since` (a refund bumps `updated_at`), oldest change first, capped.
+   */
+  listRefundedPayments(
+    tenantId: string,
+    opts: { locationIds?: string[] | null; since: string; limit: number },
+  ): Promise<Payment[]>;
 
   /**
    * Atomic compare-and-set status transition: moves the order to `to` only if

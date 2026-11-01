@@ -7,6 +7,9 @@ import { handleV1 } from "@/lib/core/v1";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Range read models (hourly, items, tips) page the database; give them the full
+// budget rather than the platform default. They also abort early on huge ranges.
+export const maxDuration = 60;
 
 type Ctx = { params: Promise<{ path: string[] }> };
 

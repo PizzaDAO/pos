@@ -17,7 +17,10 @@ export const KITCHEN_LOAD_WINDOW_MS = 12 * 3_600_000;
 
 export function buildKitchenLoad(input: {
   location_id: string;
+  /** The board's orders (already filtered to the active statuses in SQL). */
   orders: Order[];
+  /** Orders placed in the last 15 minutes, counted from header rows. */
+  recent_count: number;
   prep_minutes: number;
   accepting_orders: boolean;
   now: Date;
@@ -29,13 +32,6 @@ export function buildKitchenLoad(input: {
   for (const o of active) {
     by_status[o.fulfillment_status] = (by_status[o.fulfillment_status] ?? 0) + 1;
   }
-  const since = input.now.getTime() - 15 * 60_000;
-  const orders_last_15m = input.orders.filter(
-    (o) =>
-      o.placed_at &&
-      o.fulfillment_status !== "canceled" &&
-      new Date(o.placed_at).getTime() >= since,
-  ).length;
   const active_items = active.reduce(
     (n, o) => n + o.lines.reduce((m, l) => m + (l.voided ? 0 : l.quantity), 0),
     0,
@@ -60,7 +56,7 @@ export function buildKitchenLoad(input: {
     active_orders: n,
     active_items,
     by_status,
-    orders_last_15m,
+    orders_last_15m: input.recent_count,
     oldest_active_placed_at: oldest,
     // Each order past the first two adds two minutes to a new ASAP pickup.
     quoted_ready_minutes: input.prep_minutes + Math.max(0, n - 2) * 2,

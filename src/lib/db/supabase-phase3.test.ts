@@ -16,7 +16,7 @@ import { pathToFileURL } from "node:url";
 import type { PosDriver } from "@/lib/db/driver";
 import { hydrateEvent, type OutboxRow } from "@/lib/core/outbox";
 import { tipFactsForOrder } from "@/lib/core/tips";
-import { loadOrder } from "@/lib/core/loaders";
+import { businessDate } from "@openpizza/core";
 
 const PGLITE = process.env.PGLITE ? resolve(process.env.PGLITE) : null;
 const ROOT = resolve(__dirname, "../../..");
@@ -45,7 +45,7 @@ function fakeClient() {
       }
     },
     from(table: string) {
-      type F = { col: string; op: "eq" | "in" | "is" | "gte" | "lte"; val: unknown };
+      type F = { col: string; op: "eq" | "in" | "is" | "gte" | "lte" | "gt"; val: unknown };
       const filters: F[] = [];
       let single = false;
       let orderBy = "";
@@ -57,6 +57,7 @@ function fakeClient() {
       q.is = (col: string, val: unknown) => (filters.push({ col, op: "is", val }), q);
       q.gte = (col: string, val: unknown) => (filters.push({ col, op: "gte", val }), q);
       q.lte = (col: string, val: unknown) => (filters.push({ col, op: "lte", val }), q);
+      q.gt = (col: string, val: unknown) => (filters.push({ col, op: "gt", val }), q);
       q.order = (col: string, o?: { ascending?: boolean }) => (
         (orderBy = `${orderBy ? orderBy + ", " : " order by "}${col}${o?.ascending === false ? " desc" : ""}`), q
       );
@@ -74,12 +75,15 @@ function fakeClient() {
               if (f.op === "is") return `${f.col} is null`;
               params.push(f.val);
               if (f.op === "in") return `${f.col}::text = any($${params.length})`;
-              const o = { eq: "=", gte: ">=", lte: "<=" }[f.op];
+              const o = { eq: "=", gte: ">=", lte: "<=", gt: ">" }[f.op];
               return `${f.col} ${o} $${params.length}`;
             })
             .join(" and ");
           const sql = `select * from public.${table}${where ? ` where ${where}` : ""}${orderBy}${lim}`;
-          const rows = (await db.query(sql, params)).rows;
+          // PostgREST returns timestamps as strings, PGlite as Dates.
+          const rows = (await db.query(sql, params)).rows.map((r) =>
+            Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : v])),
+          );
           return { data: single ? (rows[0] ?? null) : rows, error: null };
         } catch (e) {
           return { data: null, error: { message: (e as Error).message } };
@@ -143,6 +147,24 @@ describe.skipIf(!PGLITE)("tip events through the Supabase driver on PGlite", () 
        values ($1, $2, $3, $4, 'cash', $5, 1000, $6, 'USD', false, $7)`,
       [id, order, T, loc, status, tip, refunded],
     );
+  const factsOf = async (orderId: string) => {
+    const o = (await driver.getOrder(orderId))!;
+    const tz = "America/New_York";
+    return tipFactsForOrder(
+      {
+        id: o.id,
+        tenant_id: o.tenant_id,
+        location_id: o.location_id,
+        business_date: businessDate(o.created_at, tz),
+        currency: o.currency,
+        staff_id: o.staff_id ?? null,
+        status: o.status,
+        tip_cents: o.totals.tip_cents,
+        timezone: tz,
+      },
+      await driver.listPaymentsForOrder(orderId),
+    );
+  };
   const tipRows = async () =>
     (await db.query("select * from public.core_outbox where event_type like 'tip.%' order by sequence"))
       .rows as unknown as OutboxRow[];
@@ -172,10 +194,7 @@ describe.skipIf(!PGLITE)("tip events through the Supabase driver on PGlite", () 
 
     const facts = new Map<string, unknown>();
     for (const orderId of [ORD, ORD_ONLINE]) {
-      const order = (await loadOrder(T, orderId, driver))!;
-      for (const f of tipFactsForOrder(order, await driver.listPaymentsForOrder(orderId))) {
-        facts.set(f.id, f);
-      }
+      for (const f of await factsOf(orderId)) facts.set(f.id, f);
     }
     for (const row of rows) {
       const ev = await hydrateEvent(row, driver);
@@ -191,5 +210,70 @@ describe.skipIf(!PGLITE)("tip events through the Supabase driver on PGlite", () 
       (r) => r.row_snapshot?.fact_id === `tip_online_${ORD_ONLINE}`,
     ).length;
     expect(n).toBe(1);
+  });
+
+  it("shop flow: a card tip captured while the checkout is unannounced is emitted once when it is paid", async () => {
+    const SHOP = "e3000000-0000-4000-8000-000000000003";
+    const PS = "e3000000-0000-4000-8000-0000000000b1";
+    await db.query(
+      `insert into public.orders (id, tenant_id, location_id, status, currency, totals, order_number, core_announced)
+       values ($1, $2, $3, 'awaiting_payment', 'USD', $5::jsonb, $4, false)`,
+      [SHOP, T, loc, "S3-3", JSON.stringify({ subtotal_cents: 2000, discount_cents: 0, taxable_cents: 2000, tax_cents: 0, total_cents: 2000, tip_cents: 0 })],
+    );
+    const before = (await tipRows()).length;
+    await db.query(
+      `insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated)
+       values ($1, $2, $3, $4, 'stripe_online', 'captured', 2000, 250, 'USD', false)`,
+      [PS, SHOP, T, loc],
+    );
+    expect(await tipRows()).toHaveLength(before);
+    await db.query("update public.orders set status = 'paid' where id = $1", [SHOP]);
+    await db.query("update public.orders set status = 'paid' where id = $1", [SHOP]); // replay
+    const mine = (await tipRows()).filter((r) => r.row_snapshot?.order_id === SHOP);
+    expect(mine.map((r) => r.row_snapshot?.fact_id)).toEqual([`tip_${PS}`]);
+    const ev = await hydrateEvent(mine[0]!, driver);
+    expect(ev!.data).toEqual((await factsOf(SHOP))[0]);
+  });
+
+  it("the read endpoints run on the Supabase driver: tips (incl. a refund after the fact), hourly, kitchen load", async () => {
+    const { handleV1 } = await import("@/lib/core/v1");
+    const principal = {
+      kind: "service" as const,
+      id: "hub:test",
+      tenant_id: T,
+      location_ids: null,
+      scopes: ["*"],
+      module: "workforce",
+    };
+    const get = async (path: string) => {
+      const res = await handleV1(new Request(`https://pos.test/api/v1${path}`), path.split("?")[0]!.split("/").filter(Boolean), { principal, driver });
+      return { status: res.status, json: JSON.parse(await res.text()) };
+    };
+    const day = (d: number) => new Date(Date.now() + d * 86_400_000).toISOString().slice(0, 10);
+    const tips = await get(`/tips?from=${day(-2)}&to=${day(2)}`);
+    expect(tips.status).toBe(200);
+    const byId = new Map<string, { kind: string; amount_cents: number; business_date: string }>(
+      tips.json.data.map((f: { id: string }) => [f.id, f]),
+    );
+    expect(byId.get(`tip_${P1}`)).toMatchObject({ kind: "cash_on_tender", amount_cents: 300 });
+    // The refunds were recorded `at` 2026-06-04: adjustments are dated by the
+    // refund, so they appear in THAT range even though the order is from today.
+    expect(byId.has(`tipadj_${P1}_c120`)).toBe(false);
+    const refundDay = await get("/tips?from=2026-06-03&to=2026-06-05");
+    const adj = new Map<string, { kind: string; amount_cents: number }>(
+      refundDay.json.data.map((f: { id: string }) => [f.id, f]),
+    );
+    expect(adj.get(`tipadj_${P1}_c120`)).toMatchObject({ kind: "adjustment", amount_cents: -120 });
+    expect(adj.get(`tipadj_${P1}_c300`)).toMatchObject({ kind: "adjustment", amount_cents: -180 });
+    expect(adj.has(`tip_${P1}`)).toBe(false);
+    const paged = await get(`/tips?from=${day(-2)}&to=${day(2)}&limit=1`);
+    expect(paged.json.data).toHaveLength(1);
+    expect(paged.json.next_cursor).toBeTruthy();
+    const hourly = await get(`/locations/${loc}/sales/hourly?from=${day(-2)}&to=${day(2)}`);
+    expect(hourly.status).toBe(200);
+    expect(hourly.json.data.reduce((n: number, r: { order_count: number }) => n + r.order_count, 0)).toBeGreaterThan(0);
+    const kitchen = await get(`/locations/${loc}/kitchen-load`);
+    expect(kitchen.status).toBe(200);
+    expect(kitchen.json.active_orders).toBeGreaterThan(0);
   });
 });

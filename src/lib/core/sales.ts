@@ -306,15 +306,24 @@ export function localDateHour(iso: string, tz: string): { date: string; hour: nu
  * cancel only in void_count). Bucketed by placed_at, else created_at, in the
  * LOCATION's zone.
  */
+export interface HourlyOrderInput {
+  location_id: string;
+  business_date: string;
+  fulfillment_status: string;
+  placed_at: string | null;
+  created_at: string;
+  totals: { subtotal_cents: number; discount_cents: number; tip_cents: number };
+}
+
 export function buildHourlySales(input: {
   from: string;
   to: string;
-  orders: Order[];
+  orders: HourlyOrderInput[];
   timezones: Map<string, string>;
 }): HourlySales[] {
   const rows = new Map<string, HourlySales>();
   for (const o of input.orders) {
-    if (!countable(o) || o.fulfillment_status === "canceled") continue;
+    if (o.fulfillment_status === "held" || o.fulfillment_status === "canceled") continue;
     if (o.business_date < input.from || o.business_date > input.to) continue;
     const tz = input.timezones.get(o.location_id) ?? "UTC";
     const { date, hour } = localDateHour(o.placed_at ?? o.created_at, tz);

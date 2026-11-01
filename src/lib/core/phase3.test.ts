@@ -24,7 +24,8 @@ import { handleV1 } from "./v1";
 import { hydrateEvent, memoryOutbox } from "./outbox";
 import { buildHourlySales, localDateHour } from "./sales";
 import { buildKitchenLoad } from "./kitchen-load";
-import { tipFactsForOrder } from "./tips";
+import { tipFactsForOrder, type TipOrderInput } from "./tips";
+import { RangeTooLarge, loadHeadsInRange } from "./range-loader";
 
 const DOWNTOWN = DEMO_LOCATION_DOWNTOWN_ID;
 const UPTOWN = DEMO_LOCATION_UPTOWN_ID;
@@ -303,13 +304,17 @@ describe("GET /sales/items", () => {
 });
 
 describe("tip facts (the core rule)", () => {
-  const order = (over: Partial<{ tip: number; id: string }> = {}) => ({
-    id: over.id ?? ID(50),
+  const order = ({ tip = 0, ...over }: Partial<TipOrderInput> & { tip?: number } = {}): TipOrderInput => ({
+    id: ID(50),
     tenant_id: DEMO_TENANT_ID,
     location_id: DOWNTOWN,
     business_date: "2026-06-04",
     currency: "USD",
-    totals: { tip_cents: over.tip ?? 0 },
+    staff_id: null,
+    status: "paid",
+    tip_cents: tip,
+    timezone: "America/New_York",
+    ...over,
   });
   const cash = (id: string, over: Partial<Payment> = {}) =>
     pay(ID(50), id, { rail: "cash", ...over });
@@ -364,18 +369,44 @@ describe("tip facts (the core rule)", () => {
     expect(small).toHaveLength(1);
   });
 
-  it("an online tip is hit only by the refund BEYOND the base (matches netSettledBaseCents)", () => {
+  it("an online tip is reversed once, in full, only when every tender is refunded in full: it nets to zero", () => {
     const refund = (id: string, n: number, at: string) => ({ id, amount_cents: n, at, processor_ref: null, reason: null });
-    const facts = tipFactsForOrder(order({ tip: 500 }), [
-      cash(A, { amount_cents: 1000, refunded_cents: 1200, refunds: [refund("r1", 1200, "2026-06-04T23:00:00.000Z")] }),
-      cash(B, { amount_cents: 1500, refunded_cents: 1500, refunds: [refund("r2", 1500, "2026-06-04T23:10:00.000Z")], created_at: "2026-06-04T22:05:00.000Z" }),
+    const partial = tipFactsForOrder(order({ tip: 500 }), [
+      cash(A, { amount_cents: 1000, refunded_cents: 400, refunds: [refund("r1", 400, "2026-06-05T01:00:00.000Z")] }),
     ]);
-    // base 2500; refunds 1200 + 1500 = 2700 -> 200 of the tip is gone
-    expect(facts.map((f) => [f.kind, f.amount_cents])).toEqual([
-      ["online", 500],
-      ["adjustment", -200],
+    expect(partial.map((f) => f.kind)).toEqual(["online"]);
+    const full = tipFactsForOrder(order({ tip: 500 }), [
+      cash(A, { amount_cents: 1000, refunded_cents: 1000, status: "refunded", refunds: [refund("r1", 1000, "2026-06-05T01:00:00.000Z")] }),
+      cash(B, { amount_cents: 1500, refunded_cents: 1500, status: "refunded", refunds: [refund("r2", 1500, "2026-06-05T02:00:00.000Z")], created_at: "2026-06-04T22:05:00.000Z" }),
     ]);
-    expect(facts[1]!.adjusts).toBe(`tip_online_${ID(50)}`);
+    expect(full.map((f) => [f.kind, f.amount_cents])).toEqual([["online", 500], ["adjustment", -500]]);
+    expect(full.reduce((n, f) => n + f.amount_cents, 0)).toBe(0);
+    expect(full[1]!.adjusts).toBe(`tip_online_${ID(50)}`);
+    // one of two tenders still standing: not a reversal
+    const one = tipFactsForOrder(order({ tip: 500 }), [
+      cash(A, { amount_cents: 1000, refunded_cents: 1000, status: "refunded", refunds: [refund("r1", 1000, "2026-06-05T01:00:00.000Z")] }),
+      cash(B, { amount_cents: 1500, created_at: "2026-06-04T22:05:00.000Z" }),
+    ]);
+    expect(one.map((f) => f.kind)).toEqual(["online"]);
+  });
+
+  it("an adjustment is dated by WHEN THE REFUND HAPPENED in the location zone, not the order's date", () => {
+    const refund = (id: string, n: number, at: string) => ({ id, amount_cents: n, at, processor_ref: null, reason: null });
+    const facts = tipFactsForOrder(order(), [
+      // 2026-06-09T02:30Z is 22:30 on Jun 8 in New York
+      cash(A, { tip_cents: 300, refunded_cents: 300, status: "refunded", refunds: [refund("r1", 300, "2026-06-09T02:30:00.000Z")] }),
+    ]);
+    expect(facts[0]!.business_date).toBe("2026-06-04");
+    expect(facts[1]).toMatchObject({ kind: "adjustment", business_date: "2026-06-08", occurred_at: "2026-06-09T02:30:00.000Z" });
+  });
+
+  it("staff attribution falls back to the order's staff; held, canceled and unpaid orders have no facts", () => {
+    const f = tipFactsForOrder(order({ staff_id: ID(301) }), [cash(A, { tip_cents: 100, staff_id: null }), cash(B, { tip_cents: 100, staff_id: ID(302), created_at: "2026-06-04T22:05:00.000Z" })]);
+    expect(f.map((x) => x.staff_id)).toEqual([ID(301), ID(302)]);
+    expect(tipFactsForOrder(order({ tip: 500, staff_id: ID(301) }), [cash(A)])[0]!.staff_id).toBe(ID(301));
+    for (const status of ["draft", "voided", "abandoned", "awaiting_payment"]) {
+      expect(tipFactsForOrder(order({ status, tip: 500 }), [cash(A, { tip_cents: 100 })])).toEqual([]);
+    }
   });
 });
 
@@ -484,7 +515,7 @@ describe("GET /locations/{id}/kitchen-load", () => {
         lines: [{ quantity: 2, voided: false }, { quantity: 9, voided: true }],
       })) as unknown as CoreOrder[];
     const level = (n: number, accepting = true) =>
-      buildKitchenLoad({ location_id: "l", orders: mkOrders(n), prep_minutes: 15, accepting_orders: accepting, now: new Date("2026-06-04T18:00:00Z") });
+      buildKitchenLoad({ location_id: "l", orders: mkOrders(n), recent_count: 0, prep_minutes: 15, accepting_orders: accepting, now: new Date("2026-06-04T18:00:00Z") });
     expect([0, 1, 2, 4, 5, 8, 9].map((n) => level(n).level)).toEqual(["idle", "idle", "normal", "normal", "busy", "busy", "slammed"]);
     expect(level(3).active_items).toBe(6);
     expect(level(1, false).level).toBe("slammed");
@@ -560,5 +591,110 @@ describe("tip events (mock outbox twin of core_trg_payments)", () => {
     memoryOutbox.clear();
     await d.upsertPayment(pay(ID(9), ID(109), { rail: "cash", tip_cents: 100 }));
     expect(memoryOutbox.rows).toHaveLength(0);
+  });
+});
+
+describe("review fixes", () => {
+  const tipRows = () => memoryOutbox.rows.filter((r) => r.event_type.startsWith("tip."));
+
+  it("shop flow: a tip captured before the checkout is announced is emitted once, at release; a held order too", async () => {
+    const d = getPosDriver();
+    await mk(ID(1), { at: "2026-06-04T15:00:00Z", status: "awaiting_payment" });
+    await d.upsertPayment(pay(ID(1), ID(101), { tip_cents: 250 }));
+    expect(tipRows()).toHaveLength(0);
+    await d.updateOrderStatus(ID(1), "paid");
+    await d.updateOrderStatus(ID(1), "paid"); // replay
+    await d.updateOrderStatus(ID(1), "in_kitchen");
+    expect(tipRows().map((r) => r.row_snapshot?.fact_id)).toEqual([`tip_${ID(101)}`]);
+    // the next tender goes through the payment path, once
+    await d.upsertPayment(pay(ID(1), ID(102), { tip_cents: 50, rail: "cash" }));
+    await d.upsertPayment(pay(ID(1), ID(102), { tip_cents: 50, rail: "cash" }));
+    expect(tipRows()).toHaveLength(2);
+    // held /v1 order: payment.captured goes out, the tip waits for the release
+    memoryOutbox.clear();
+    await mk(ID(2), { at: "2026-06-04T15:10:00Z", status: "draft", hold: true });
+    await d.upsertPayment(pay(ID(2), ID(103), { tip_cents: 75 }));
+    expect(memoryOutbox.rows.map((r) => r.event_type)).toEqual(["payment.captured"]);
+    await d.updateOrderStatus(ID(2), "placed");
+    expect(tipRows().map((r) => r.row_snapshot?.fact_id)).toEqual([`tip_${ID(103)}`]);
+  });
+
+  it("a fully refunded online-tip order nets to zero in the list and in the events", async () => {
+    const d = getPosDriver();
+    await mk(ID(1), { at: "2026-06-04T15:00:00Z", tip: 500 });
+    await d.upsertPayment(pay(ID(1), ID(101), { amount_cents: 2000 }));
+    await d.reservePaymentRefund(ID(101), 800, "r1", { at: "2026-06-04T20:00:00.000Z" } as never);
+    expect(tipRows().map((r) => r.event_type)).toEqual(["tip.recorded"]);
+    await d.reservePaymentRefund(ID(101), 1200, "r2", { at: "2026-06-04T21:00:00.000Z" } as never);
+    expect(tipRows().map((r) => r.row_snapshot?.fact_id)).toEqual([`tip_online_${ID(1)}`, `tipadj_online_${ID(1)}_full`]);
+    const facts = (await call("GET", "/tips?from=2026-06-04&to=2026-06-04")).json.data as { amount_cents: number }[];
+    expect(facts.reduce((n, f) => n + f.amount_cents, 0)).toBe(0);
+    for (const row of tipRows()) expect(await hydrateEvent(row)).not.toBeNull();
+  });
+
+  it("a refund after the period lands on the refund's date; canceled and held orders have no facts", async () => {
+    const d = getPosDriver();
+    await mk(ID(1), { at: "2026-06-04T15:00:00Z" });
+    await d.upsertPayment(pay(ID(1), ID(101), { rail: "cash", tip_cents: 300, created_at: "2026-06-04T15:01:00.000Z" }));
+    vi.setSystemTime(new Date("2026-06-20T16:00:00Z"));
+    await d.reservePaymentRefund(ID(101), 300, "r1", {} as never);
+    const early = (await call("GET", "/tips?from=2026-06-04&to=2026-06-04")).json.data as { kind: string }[];
+    expect(early.map((f) => f.kind)).toEqual(["cash_on_tender"]);
+    const late = (await call("GET", "/tips?from=2026-06-18&to=2026-06-21")).json.data as {
+      kind: string; amount_cents: number; business_date: string;
+    }[];
+    expect(late).toEqual([expect.objectContaining({ kind: "adjustment", amount_cents: -300, business_date: "2026-06-20" })]);
+    // an order voided later has no facts, in the list or the events
+    await mk(ID(2), { at: "2026-06-05T15:00:00Z" });
+    await d.upsertPayment(pay(ID(2), ID(102), { rail: "cash", tip_cents: 100 }));
+    await d.updateOrderStatus(ID(2), "voided");
+    const all = (await call("GET", "/tips?from=2026-06-04&to=2026-06-21")).json.data as { order_id: string }[];
+    expect(all.every((f) => f.order_id === ID(1))).toBe(true);
+    const row = tipRows().find((r) => r.subject_id === ID(102))!;
+    expect(await hydrateEvent(row)).toBeNull();
+  });
+
+  it("pages across 7-day chunks without repeats, and a late cursor resumes at its date", async () => {
+    const d = getPosDriver();
+    const days = ["2026-06-01", "2026-06-02", "2026-06-12", "2026-06-25", "2026-06-26"];
+    for (const [i, day] of days.entries()) {
+      await mk(ID(i + 1), { at: `${day}T15:00:00Z` });
+      await d.upsertPayment(pay(ID(i + 1), ID(100 + i), { rail: "cash", tip_cents: 10 + i, created_at: `${day}T15:01:00.000Z` }));
+    }
+    const seen: string[] = [];
+    let cursor = "";
+    for (let guard = 0; guard < 10; guard++) {
+      const r = await call("GET", `/tips?from=2026-06-01&to=2026-06-30&limit=2${cursor}`);
+      seen.push(...r.json.data.map((f: { amount_cents: number }) => String(f.amount_cents)));
+      if (!r.json.next_cursor) break;
+      cursor = `&cursor=${r.json.next_cursor}`;
+    }
+    expect(seen).toEqual(["10", "11", "12", "13", "14"]);
+  });
+
+  it("an over-large range aborts early instead of paging it all", async () => {
+    for (let i = 1; i <= 6; i++) await mk(ID(i), { at: "2026-06-04T15:00:00Z" });
+    const tz = new Map([[DOWNTOWN, "America/New_York"]]);
+    const driver = getPosDriver();
+    const spy = vi.spyOn(driver, "listOrderHeads");
+    await expect(
+      loadHeadsInRange(driver, DEMO_TENANT_ID, { locationIds: [DOWNTOWN], from: "2026-06-04", to: "2026-06-04", timezones: tz, cap: 5 }),
+    ).rejects.toBeInstanceOf(RangeTooLarge);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("kitchen.load lists newest first and reads only the board's statuses", async () => {
+    vi.setSystemTime(new Date("2026-06-04T18:00:00Z"));
+    for (let i = 1; i <= 3; i++) await mk(ID(i), { at: `2026-06-04T17:${40 + i}:00Z` });
+    await mk(ID(4), { at: "2026-06-04T17:50:00Z", status: "completed" });
+    vi.setSystemTime(new Date("2026-06-04T18:00:00Z"));
+    const driver = getPosDriver();
+    const spy = vi.spyOn(driver, "listOrderHeads");
+    const r = await call("GET", `/locations/${DOWNTOWN}/kitchen-load`);
+    expect(r.json.active_orders).toBe(3);
+    expect(r.json.oldest_active_placed_at).toBe("2026-06-04T17:41:00.000Z");
+    const active = spy.mock.calls.find(([, o]) => o.statuses)![1];
+    expect(active.statuses).toEqual(["placed", "paid", "in_kitchen", "ready", "recall"]);
+    expect(active.newestFirst).toBe(true);
   });
 });

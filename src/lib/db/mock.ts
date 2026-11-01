@@ -1102,6 +1102,62 @@ export const mockDriver: PosDriver = {
       .slice(0, Math.min(Math.max(opts.limit, 1), 500));
   },
 
+  async listOrderHeads(tenantId, opts) {
+    ensureKitchenSeed();
+    const after = opts.after;
+    const rows = [...orders.values()]
+      .filter(
+        (o) =>
+          o.tenant_id === tenantId &&
+          (!opts.locationIds || opts.locationIds.includes(o.location_id)) &&
+          (!opts.createdFrom || o.created_at >= opts.createdFrom) &&
+          (!opts.createdTo || o.created_at <= opts.createdTo) &&
+          (!opts.statuses || opts.statuses.includes(o.status)) &&
+          (!after ||
+            o.created_at > after.created_at ||
+            (o.created_at === after.created_at && o.id > after.id)),
+      )
+      .sort(
+        (a, b) =>
+          (a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)) *
+          (opts.newestFirst ? -1 : 1),
+      )
+      .slice(0, Math.min(Math.max(opts.limit, 1), 500));
+    return rows.map((o) => ({
+      id: o.id,
+      tenant_id: o.tenant_id,
+      location_id: o.location_id,
+      created_at: o.created_at,
+      status: o.status,
+      hold: o.hold ?? null,
+      currency: o.currency,
+      staff_id: o.staff_id ?? null,
+      totals: { ...o.totals },
+    }));
+  },
+
+  async getOrdersByIds(ids) {
+    ensureKitchenSeed();
+    return ids.flatMap((id) => {
+      const o = orders.get(id);
+      return o ? [o] : [];
+    });
+  },
+
+  async listRefundedPayments(tenantId, opts) {
+    return [...payments.values()]
+      .filter(
+        (p) =>
+          p.tenant_id === tenantId &&
+          p.refunded_cents > 0 &&
+          p.updated_at >= opts.since &&
+          (!opts.locationIds || opts.locationIds.includes(p.location_id)),
+      )
+      .sort((a, b) => a.updated_at.localeCompare(b.updated_at) || a.id.localeCompare(b.id))
+      .slice(0, opts.limit)
+      .map((p) => ({ ...p }));
+  },
+
   async casOrderStatus(id, from, to) {
     ensureKitchenSeed();
     const current = orders.get(id);

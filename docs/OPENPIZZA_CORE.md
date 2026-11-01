@@ -268,3 +268,30 @@ resets the lockout. PINs are never logged or echoed.
   first location for customers, the order's location for orders); elsewhere they are null.
 * Late-payment "Mark refunded" books each external tender and stays open (409) when a booking does
   not fit or the payment is gone.
+
+## Phase 3: read models and tip events
+
+* **`sales.hourly`**: one row per location-local date x hour that had orders, bucketed by
+  `placed_at` (else `created_at`) in the LOCATION's zone (DST days are right: no hour 2 on
+  spring-forward, the repeated hour folds into one bucket). Same order set as `sales.daily`
+  (unpaid checkouts, held and canceled excluded), so the rows of one `business_date` add up to
+  that day's daily figures. `tip_cents` is the ORDER-level tip (`totals.tip_cents`), exactly the
+  figure `sales.daily` reports; it is not the tip-fact total (use `tips.list` for that).
+* **`sales.items`**: per location x business date x item x size; voided lines skipped.
+* **`kitchen.load`**: active statuses filtered in SQL, newest first, capped at 300 orders;
+  `accepting_orders` mirrors `locations.get` (POS has no pause flag).
+* **`tips.list`** and `tip.recorded` / `tip.adjusted` carry `TipFact`s built by one function
+  (`src/lib/core/tips.ts`). Rule: if any settled tender has a tip, tender tips are the truth (one
+  fact per tender; `staff_id` = the tender's, else the order's); otherwise the order tip is one
+  `online` fact. Held, canceled and unpaid-checkout orders have no facts. Refunds come off the tip
+  first; each is a signed `adjustment` fact dated by WHEN THE REFUND HAPPENED (location zone), not
+  by the order's business date, so a refund after a period closed lands in the open period. An
+  online tip is reversed once, in full, only when every settled tender is refunded in full.
+* **`processing_fee_cents` is always 0.** POS holds no card-processing fee data for a tender (the
+  Stripe fee is not stored; `application_fee_cents` is the platform's cut, a different thing).
+  Consumers must not read 0 as "no fee was charged", and no capability flag claims fee data.
+* Events are emitted by the `payments` trigger for an order the hub has seen, and by a backfill
+  when an order first becomes announced (shop card tips are captured before that). The trigger
+  never fails the write it rides on (own exception block; malformed totals count as 0).
+* Ranges are at most 93 days, ids are strings (not GUIDs), the cursor is
+  `[business_date, occurred_at, id]`, and a range that holds too many orders answers 422 early.

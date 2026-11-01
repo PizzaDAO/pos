@@ -239,45 +239,53 @@ function paymentEvents(
 
 const SETTLED = ["captured", "refunded"];
 
+/** Digits-only order tip, like public.core_order_tip_cents (anything else is 0). */
+const orderTip = (o: { totals: { tip_cents: number } } | null): number =>
+  o && Number.isSafeInteger(o.totals.tip_cents) && o.totals.tip_cents > 0 ? o.totals.tip_cents : 0;
+
+function tipRow(box: MemoryOutbox, p: Payment, type: "tip.recorded" | "tip.adjusted", factId: string): void {
+  box.append({
+    tenant_id: p.tenant_id,
+    location_id: p.location_id,
+    event_type: type,
+    subject_type: "payment",
+    subject_id: p.id,
+    row_snapshot: { fact_id: factId, order_id: p.order_id },
+  });
+}
+
 /**
- * Same rules as the tip section of public.core_trg_payments (20261107000000):
+ * Same rules as the tip section of public.core_trg_payments (20261107000000), for
+ * an order the hub has SEEN (strictly announced; tenders on a not-yet-announced
+ * order are covered by {@link tipBackfill} when it is announced):
  *   - a tender becoming captured with a tip -> tip.recorded `tip_<payment>`;
  *   - a tip-less capture that is the FIRST settled tender of an order with an
  *     order tip -> tip.recorded `tip_online_<order>`;
- *   - a refund on a settled tender -> tip.adjusted for the part that lands on the
- *     tip (tip first; online: the part beyond the base), id carries the
- *     cumulative refunded tip so a replay never mints a second fact.
- * Pure transitions (no outbox scan): a replayed upsert changes neither status nor
- * refunded_cents and emits nothing.
+ *   - a refund on a settled tipped tender -> tip.adjusted for the part that lands
+ *     on the tip (tip first), id carries the cumulative refunded tip;
+ *   - every settled tender of an online-tip order refunded in full -> one
+ *     tip.adjusted `tipadj_online_<order>_full`.
+ * Pure transitions: a replayed upsert changes neither status nor refunded_cents.
  */
 async function tipEvents(
   box: MemoryOutbox,
   inner: PosDriver,
-  announced: boolean,
+  strictAnnounced: boolean,
   after: Payment,
   before: Payment | null,
 ): Promise<void> {
-  if (!announced) return;
-  const emit = (type: "tip.recorded" | "tip.adjusted", factId: string) =>
-    box.append({
-      tenant_id: after.tenant_id,
-      location_id: after.location_id,
-      event_type: type,
-      subject_type: "payment",
-      subject_id: after.id,
-      row_snapshot: { fact_id: factId, order_id: after.order_id },
-    });
+  if (!strictAnnounced) return;
   const wasSettled = !!before && SETTLED.includes(before.status);
   if (after.status === "captured" && !wasSettled) {
     if (after.tip_cents > 0) {
-      emit("tip.recorded", `tip_${after.id}`);
+      tipRow(box, after, "tip.recorded", `tip_${after.id}`);
     } else {
       const order = await inner.getOrder(after.order_id);
       const others = (await inner.listPaymentsForOrder(after.order_id)).filter(
         (p) => p.id !== after.id && SETTLED.includes(p.status),
       );
-      if ((order?.totals.tip_cents ?? 0) > 0 && others.length === 0) {
-        emit("tip.recorded", `tip_online_${after.order_id}`);
+      if (orderTip(order) > 0 && others.length === 0) {
+        tipRow(box, after, "tip.recorded", `tip_online_${after.order_id}`);
       }
     }
   }
@@ -285,23 +293,42 @@ async function tipEvents(
     if (after.tip_cents > 0) {
       const cumNew = Math.min(after.refunded_cents, after.tip_cents);
       const cumOld = Math.min(before.refunded_cents, after.tip_cents);
-      if (cumNew > cumOld) emit("tip.adjusted", `tipadj_${after.id}_c${cumNew}`);
+      if (cumNew > cumOld) tipRow(box, after, "tip.adjusted", `tipadj_${after.id}_c${cumNew}`);
     } else {
       const order = await inner.getOrder(after.order_id);
-      const tip = order?.totals.tip_cents ?? 0;
       const live = (await inner.listPaymentsForOrder(after.order_id)).filter((p) =>
         SETTLED.includes(p.status),
       );
-      if (tip > 0 && !live.some((p) => p.tip_cents > 0)) {
-        const base = live.reduce((n, p) => n + p.amount_cents, 0);
-        const runNew = live.reduce((n, p) => n + p.refunded_cents, 0);
-        const runOld = runNew - (after.refunded_cents - before.refunded_cents);
-        const cum = (run: number) => Math.max(0, Math.min(run - base, tip));
-        if (cum(runNew) > cum(runOld)) {
-          emit("tip.adjusted", `tipadj_online_${after.order_id}_c${cum(runNew)}`);
-        }
+      if (
+        orderTip(order) > 0 &&
+        !live.some((p) => p.tip_cents > 0) &&
+        live.every((p) => p.refunded_cents >= p.amount_cents + p.tip_cents)
+      ) {
+        tipRow(box, after, "tip.adjusted", `tipadj_online_${after.order_id}_full`);
       }
     }
+  }
+}
+
+/**
+ * public.core_tip_backfill_for_order: when an order first becomes announced, the
+ * tip events of the tenders already settled on it (a shop card tip is captured
+ * while the checkout is unannounced; a held /v1 order's tip waits for release).
+ */
+async function tipBackfill(box: MemoryOutbox, inner: PosDriver, orderId: string): Promise<void> {
+  const order = await inner.getOrder(orderId);
+  const settled = (await inner.listPaymentsForOrder(orderId))
+    .filter((p) => SETTLED.includes(p.status))
+    .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+  let any = false;
+  for (const p of settled) {
+    if (p.tip_cents > 0) {
+      any = true;
+      tipRow(box, p, "tip.recorded", `tip_${p.id}`);
+    }
+  }
+  if (!any && orderTip(order) > 0 && settled[0]) {
+    tipRow(box, settled[0], "tip.recorded", `tip_online_${orderId}`);
   }
 }
 
@@ -317,6 +344,17 @@ export function withOutbox(
     // Mirrors core_trg_payments (20261105000200): the hub has seen the order, OR it
     // is a held /v1 order (draft + hold), whose payment must precede order.placed.
     return announced.has(o) || (o.status === "draft" && !!o.hold);
+  };
+  const orderEventsT = async (order: Order, before: Order) => {
+    const was = announced.has(before);
+    orderEvents(box, announced, order, before);
+    if (!was && announced.has(order)) await tipBackfill(box, inner, order.id);
+  };
+  const strictAnnounced = async (orderId: string): Promise<boolean> => {
+    const o = await inner.getOrder(orderId);
+    if (!o) return false;
+    announced.note(o);
+    return announced.has(o);
   };
   const emitMenuUpdated = (tenantId: string, itemId: string | null) => {
     // Coalesce into a pending row that has NOT been claimed yet; once a worker
@@ -365,7 +403,7 @@ export function withOutbox(
       const before = await inner.getOrder(id);
       const res = await inner.cancelOrder(id, tenantId, opts);
       if (res.ok && before && res.order && res.order.status !== before.status) {
-        orderEvents(box, announced, res.order, before);
+        await orderEventsT(res.order, before);
       }
       return res;
     },
@@ -373,7 +411,7 @@ export function withOutbox(
     async updateOrderStatus(id, status) {
       const before = await inner.getOrder(id);
       const order = await inner.updateOrderStatus(id, status);
-      if (order && before) orderEvents(box, announced, order, before);
+      if (order && before) await orderEventsT(order, before);
       return order;
     },
 
@@ -382,7 +420,7 @@ export function withOutbox(
       const after = await inner.upsertPayment(payment);
       const ann = await orderAnnounced(after.order_id);
       paymentEvents(box, ann, after, before);
-      await tipEvents(box, inner, ann, after, before);
+      await tipEvents(box, inner, await strictAnnounced(after.order_id), after, before);
       return after;
     },
 
@@ -394,7 +432,7 @@ export function withOutbox(
       if (res.outcome === "ok") {
         const ann = await orderAnnounced(res.payment.order_id);
         paymentEvents(box, ann, res.payment, null);
-        await tipEvents(box, inner, ann, res.payment, null);
+        await tipEvents(box, inner, await strictAnnounced(res.payment.order_id), res.payment, null);
       }
       return res;
     },
@@ -421,7 +459,7 @@ export function withOutbox(
     async transitionOrderStatus(id, from, to, patch) {
       const before = await inner.getOrder(id);
       const order = await inner.transitionOrderStatus(id, from, to, patch);
-      if (order && before) orderEvents(box, announced, order, before);
+      if (order && before) await orderEventsT(order, before);
       return order;
     },
 
@@ -430,7 +468,7 @@ export function withOutbox(
     async mergeOrderFulfillment(id, patch) {
       const before = await inner.getOrder(id);
       const order = await inner.mergeOrderFulfillment(id, patch);
-      if (order && before) orderEvents(box, announced, order, before);
+      if (order && before) await orderEventsT(order, before);
       return order;
     },
 
@@ -442,7 +480,7 @@ export function withOutbox(
       if (res.ok && before) {
         const ann = await orderAnnounced(res.payment.order_id);
         paymentEvents(box, ann, res.payment, before);
-        await tipEvents(box, inner, ann, res.payment, before);
+        await tipEvents(box, inner, await strictAnnounced(res.payment.order_id), res.payment, before);
       }
       return res;
     },

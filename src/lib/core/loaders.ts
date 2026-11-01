@@ -134,7 +134,7 @@ export async function loadOrder(
   return mapOrder(order, loc?.location.timezone ?? "UTC", d);
 }
 
-const SCAN_PAGE = 200;
+const SCAN_PAGE = 500;
 const MAX_SCAN_PAGES = 25;
 
 export interface OrdersPageQuery {

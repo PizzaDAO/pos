@@ -24,6 +24,7 @@
  */
 import { createClient } from "@supabase/supabase-js";
 import {
+  businessDate,
   createEvent,
   fromPosOrderStatus,
   retryDelaySeconds,
@@ -380,11 +381,24 @@ export async function hydrateEvent(
     const factId = row.row_snapshot?.fact_id;
     const pay = await driver.getPayment(row.subject_id);
     if (typeof factId === "string" && pay && pay.tenant_id === tenant) {
-      const order = await loadOrder(tenant, pay.order_id, driver);
-      if (order) {
-        const fact = tipFactsForOrder(order, await driver.listPaymentsForOrder(order.id)).find(
-          (f) => f.id === factId && (f.kind === "adjustment") === (t === "tip.adjusted"),
-        );
+      const order = await driver.getOrder(pay.order_id);
+      const loc = order ? await loadLocation(tenant, order.location_id, driver) : null;
+      if (order && order.tenant_id === tenant && loc) {
+        const tz = loc.location.timezone;
+        const fact = tipFactsForOrder(
+          {
+            id: order.id,
+            tenant_id: order.tenant_id,
+            location_id: order.location_id,
+            business_date: businessDate(order.created_at, tz),
+            currency: order.currency,
+            staff_id: order.staff_id ?? null,
+            status: order.status,
+            tip_cents: order.totals.tip_cents,
+            timezone: tz,
+          },
+          await driver.listPaymentsForOrder(order.id),
+        ).find((f) => f.id === factId && (f.kind === "adjustment") === (t === "tip.adjusted"));
         data = fact ?? null;
         if (fact) locationId = fact.location_id;
       }
