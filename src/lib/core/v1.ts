@@ -1416,7 +1416,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       }),
     ]);
     const active = await mapOrders(
-      await ctx.driver.getOrdersByIds(activeHeads.map((h) => h.id)),
+      await ctx.driver.getOrdersByIds(tenantId, activeHeads.map((h) => h.id)),
       () => bundle.location.timezone,
       ctx.driver,
     );
@@ -1539,7 +1539,8 @@ async function loadRangeOrders(
   });
   if (orders.length > ITEMS_ROW_CAP) {
     throw ProblemError.of("VALIDATION_FAILED", {
-      detail: "That range holds too many orders; narrow from..to or pass location_id.",
+      detail:
+        "That range holds too many orders for one request; ask for at most 7 days at a time (or pass location_id).",
     });
   }
   return orders.filter((o) => o.business_date >= q.from && o.business_date <= q.to);

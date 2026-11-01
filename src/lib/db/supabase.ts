@@ -1742,9 +1742,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       }));
     },
 
-    async getOrdersByIds(ids) {
-      if (ids.length === 0) return [];
-      const rows = await selectIn("orders", "id", ids);
+    async getOrdersByIds(tenantId, ids) {
+      const rows: Row[] = [];
+      for (let i = 0; i < ids.length; i += 100) {
+        rows.push(
+          ...(unwrap(
+            await sb
+              .from("orders")
+              .select("*")
+              .eq("tenant_id", tenantId)
+              .in("id", ids.slice(i, i + 100))
+              .order("id")
+              .limit(100),
+          ) as Row[]),
+        );
+      }
       return readOrderRows(rows);
     },
 

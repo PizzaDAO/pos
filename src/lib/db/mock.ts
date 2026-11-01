@@ -1136,11 +1136,11 @@ export const mockDriver: PosDriver = {
     }));
   },
 
-  async getOrdersByIds(ids) {
+  async getOrdersByIds(tenantId, ids) {
     ensureKitchenSeed();
     return ids.flatMap((id) => {
       const o = orders.get(id);
-      return o ? [o] : [];
+      return o && o.tenant_id === tenantId ? [o] : [];
     });
   },
 

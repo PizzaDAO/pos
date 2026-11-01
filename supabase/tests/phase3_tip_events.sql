@@ -141,6 +141,37 @@ begin
   select count(*) into n from public.core_outbox where subject_id = p4 and event_type = 'tip.recorded';
   if n <> 1 then raise exception 'release backfill emitted % tip.recorded', n; end if;
 
+  -- ---- refunds that happened BEFORE the order was announced ---------------
+  declare
+    o7 uuid := gen_random_uuid();
+    o8 uuid := gen_random_uuid();
+    q1 uuid := gen_random_uuid();
+    q2 uuid := gen_random_uuid();
+  begin
+    insert into public.orders (id, tenant_id, location_id, status, currency, totals, order_number, core_announced)
+    values (o7, t, loc, 'awaiting_payment', 'USD', '{"total_cents":3000,"tip_cents":0}'::jsonb, 'T3-7', false),
+           (o8, t, loc, 'awaiting_payment', 'USD', '{"total_cents":3000,"tip_cents":400}'::jsonb, 'T3-8', false);
+    -- tipped tender: 120 recorded as an entry, 80 more unrecorded (legacy remainder first)
+    insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated, refunded_cents, refunds)
+    values (q1, o7, t, loc, 'stripe_online', 'captured', 1000, 150, 'USD', false, 200,
+            '[{"id":"r1","amount_cents":120,"at":"2026-06-04T20:00:00Z"}]'::jsonb);
+    -- online tip, fully refunded
+    insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated, refunded_cents)
+    values (q2, o8, t, loc, 'stripe_online', 'refunded', 1000, 0, 'USD', false, 1000);
+    update public.orders set status = 'paid' where id in (o7, o8);
+    -- remainder 80 first (cum 80), then the 120 entry (cum 150 = capped at the tip)
+    if (select array_agg(row_snapshot ->> 'fact_id' order by sequence) from public.core_outbox
+         where subject_id = q1 and event_type like 'tip.%')
+       is distinct from array['tip_' || q1::text, 'tipadj_' || q1::text || '_c80', 'tipadj_' || q1::text || '_c150'] then
+      raise exception 'backfill with refunds: %', (select array_agg(row_snapshot ->> 'fact_id' order by sequence) from public.core_outbox where subject_id = q1 and event_type like 'tip.%');
+    end if;
+    if (select array_agg(row_snapshot ->> 'fact_id' order by sequence) from public.core_outbox
+         where subject_id = q2 and event_type like 'tip.%')
+       is distinct from array['tip_online_' || o8::text, 'tipadj_online_' || o8::text || '_full'] then
+      raise exception 'online backfill reversal: %', (select array_agg(row_snapshot ->> 'fact_id' order by sequence) from public.core_outbox where subject_id = q2 and event_type like 'tip.%');
+    end if;
+  end;
+
   -- ---- malformed numbers never fail a payment write ----------------------
   insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated)
   values (p5, o5, t, loc, 'cash', 'captured', 1000, 0, 'USD', false);      -- tip_cents 12.5

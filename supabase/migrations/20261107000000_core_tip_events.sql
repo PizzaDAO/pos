@@ -12,10 +12,14 @@
 -- DEPLOY ORDER: code first, this migration second. A worker that predates the
 -- code marks tip.* rows dead.
 --
--- NEVER FAILS A PAYMENT OR ORDER WRITE. All tip logic runs inside its own
--- BEGIN ... EXCEPTION WHEN OTHERS block (a subtransaction): any error, including
--- a malformed totals value, a deadlock or a full disk, becomes a WARNING and the
--- tip event is skipped; the capture / refund / order update still commits. Every
+-- CANNOT FAIL A PAYMENT OR ORDER WRITE ON ITS OWN ERRORS. All tip logic runs
+-- inside its own BEGIN ... EXCEPTION WHEN OTHERS block (a subtransaction): any
+-- ordinary error, including a malformed totals value, a deadlock or a full disk,
+-- becomes a WARNING and the tip event is skipped; the capture / refund / order
+-- update still commits. NOT caught, by Postgres design: WHEN OTHERS does not
+-- match QUERY_CANCELED (57014: statement_timeout or a client cancel) or
+-- ASSERT_FAILURE, so a statement that is cancelled while the tip section runs is
+-- cancelled as a whole, exactly as it would be without this migration. Every
 -- numeric read of jsonb is guarded by a digits-only regex first (a value such as
 -- 12.5 or 150.00 counts as 0, it does not raise).
 --
@@ -78,12 +82,18 @@ declare
   v_first_id uuid;
   v_first_tenant uuid;
   v_first_loc uuid;
+  v_known bigint;
+  v_amounts bigint[];
+  v_amt bigint;
+  v_run bigint;
+  v_prev bigint;
+  v_cum bigint;
 begin
   begin
     select public.core_order_tip_cents(o.totals) into v_tip
       from public.orders o where o.id = p_order;
     for r in
-      select p.id, p.tenant_id, p.location_id, p.tip_cents
+      select p.id, p.tenant_id, p.location_id, p.tip_cents, p.refunded_cents, p.refunds
         from public.payments p
        where p.order_id = p_order and p.status::text in ('captured', 'refunded')
        order by p.created_at, p.id
@@ -96,12 +106,55 @@ begin
         perform public.core_emit(r.tenant_id, r.location_id, 'tip.recorded',
           'payment', r.id, null, null,
           jsonb_build_object('fact_id', 'tip_' || r.id::text, 'order_id', p_order));
+        -- Refunds that happened before the hub saw the order: one tip.adjusted per
+        -- step, with the same cumulative ids the list builder (tips.ts) derives from
+        -- refunds[] (an unrecorded remainder counts as one step, first).
+        if r.refunded_cents > 0 then
+          v_known := coalesce((
+            select sum(case when (e ->> 'amount_cents') ~ '^[0-9]{1,12}$'
+                            then (e ->> 'amount_cents')::bigint else 0 end)
+              from jsonb_array_elements(
+                     case when jsonb_typeof(r.refunds) = 'array' then r.refunds else '[]'::jsonb end) e), 0);
+          v_amounts := '{}'::bigint[];
+          if r.refunded_cents > v_known then
+            v_amounts := array[r.refunded_cents - v_known];
+          end if;
+          v_amounts := v_amounts || coalesce((
+            select array_agg(case when (e ->> 'amount_cents') ~ '^[0-9]{1,12}$'
+                                  then (e ->> 'amount_cents')::bigint else 0 end order by n)
+              from jsonb_array_elements(
+                     case when jsonb_typeof(r.refunds) = 'array' then r.refunds else '[]'::jsonb end)
+                   with ordinality as t(e, n)), '{}'::bigint[]);
+          v_run := 0;
+          v_prev := 0;
+          foreach v_amt in array v_amounts loop
+            v_run := v_run + v_amt;
+            v_cum := least(v_run, r.tip_cents);
+            if v_cum > v_prev then
+              perform public.core_emit(r.tenant_id, r.location_id, 'tip.adjusted',
+                'payment', r.id, null, null,
+                jsonb_build_object('fact_id', 'tipadj_' || r.id::text || '_c' || v_cum,
+                                   'order_id', p_order));
+              v_prev := v_cum;
+            end if;
+          end loop;
+        end if;
       end if;
     end loop;
     if not v_any and coalesce(v_tip, 0) > 0 and v_first_id is not null then
       perform public.core_emit(v_first_tenant, v_first_loc, 'tip.recorded',
         'payment', v_first_id, null, null,
         jsonb_build_object('fact_id', 'tip_online_' || p_order::text, 'order_id', p_order));
+      -- Every settled tender already refunded in full: the online tip is reversed.
+      if not exists (
+           select 1 from public.payments p
+            where p.order_id = p_order and p.status::text in ('captured', 'refunded')
+              and p.refunded_cents < p.amount_cents + p.tip_cents) then
+        perform public.core_emit(v_first_tenant, v_first_loc, 'tip.adjusted',
+          'payment', v_first_id, null, null,
+          jsonb_build_object('fact_id', 'tipadj_online_' || p_order::text || '_full',
+                             'order_id', p_order));
+      end if;
     end if;
   exception when others then
     raise warning 'core_tip_backfill_for_order(%): tip events skipped (%: %)',

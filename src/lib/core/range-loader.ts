@@ -6,18 +6,39 @@
  * whole range and answering 422 at the end.
  */
 import { businessDate } from "@openpizza/core";
-import type { OrderHead, Payment, PosDriver } from "@/lib/db";
+import type { OrderHead, OrderStatus, Payment, PosDriver } from "@/lib/db";
 import { sortTipFacts, tipFactsForOrder } from "./tips";
 import type { TipFact } from "@openpizza/core";
 
 export class RangeTooLarge extends Error {
-  constructor(message = "That range holds too many orders; narrow from..to or pass location_id.") {
+  constructor(
+    message = "That range holds too many orders for one request; ask for at most 7 days at a time (or pass location_id).",
+  ) {
     super(message);
   }
 }
 
+/**
+ * POS statuses that can carry sales or tips. Unpaid online checkouts
+ * (`awaiting_payment`, `abandoned`) and held drafts are filtered IN SQL, so they
+ * are neither scanned nor counted against the cap.
+ */
+export const SALES_SCAN_STATUSES: OrderStatus[] = [
+  "placed",
+  "paid",
+  "in_kitchen",
+  "ready",
+  "recall",
+  "out_for_delivery",
+  "completed",
+  "voided",
+  "refunded",
+];
+
 export const HEAD_PAGE = 500;
 export const RANGE_ORDER_CAP = 10_000;
+/** Neighbouring-day rows the padded window may add beyond the in-scope cap. */
+const PAD_ALLOWANCE = 3_000;
 const DAY = 86_400_000;
 
 const dayMs = (d: string) => Date.parse(`${d}T00:00:00Z`);
@@ -54,16 +75,20 @@ export async function loadHeadsInRange(
     const page = await driver.listOrderHeads(tenantId, {
       locationIds: opts.locationIds,
       ...win,
+      statuses: SALES_SCAN_STATUSES,
       after,
       limit: HEAD_PAGE,
     });
     scanned += page.length;
-    if (scanned > cap) throw new RangeTooLarge();
     for (const h of page) {
       const timezone = opts.timezones.get(h.location_id) ?? "UTC";
       const bd = businessDate(h.created_at, timezone);
       if (bd >= opts.from && bd <= opts.to) out.push({ ...h, business_date: bd, timezone });
     }
+    // The cap counts orders IN SCOPE (right business date, sales statuses). The
+    // padded window around the range adds at most ~3 days of neighbours, so the
+    // scan itself stops a little past the cap, not at it.
+    if (out.length > cap || scanned > cap + PAD_ALLOWANCE) throw new RangeTooLarge();
     if (page.length < HEAD_PAGE) return out;
     const last = page[page.length - 1]!;
     after = { created_at: last.created_at, id: last.id };
@@ -133,7 +158,7 @@ export async function loadTipFacts(
   if (refunded.length >= REFUND_CAP) throw new RangeTooLarge("Too many refunds in that range; narrow from..to.");
   const refundOrderIds = [...new Set(refunded.map((p) => p.order_id))];
   if (refundOrderIds.length) {
-    const orders = await driver.getOrdersByIds(refundOrderIds);
+    const orders = await driver.getOrdersByIds(tenantId, refundOrderIds);
     const pays = await paymentsForOrders(driver, orders.map((o) => o.id));
     for (const o of orders) {
       done.add(o.id);

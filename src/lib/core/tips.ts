@@ -8,8 +8,10 @@
  *     order-level `totals.tip_cents` is ignored;
  *   - otherwise an order with at least one settled (captured or refunded) tender
  *     has its `totals.tip_cents` as ONE `online` fact.
- * Held, canceled and unpaid-checkout orders have no facts (MockCore's rule); the
- * list and the events apply it to CURRENT state, so they agree.
+ * Held, canceled and unpaid-checkout orders have no facts (MockCore's rule), with
+ * one exception: a voided order with a refunded tender keeps them, so a tip that
+ * was recorded (and maybe paid out) is reversed by its refund. The list and the
+ * events apply this to CURRENT state, so they agree.
  *
  * Adjustments (refunds) are separate signed facts and never rewrite an earlier
  * fact. They are dated by WHEN THE REFUND HAPPENED, in the location's zone: a
@@ -47,7 +49,12 @@ export interface TipOrderInput {
   timezone: string;
 }
 
-/** Held, canceled and unpaid-checkout orders carry no tip facts. */
+/**
+ * Held and unpaid-checkout orders carry no tip facts. A VOIDED order carries none
+ * either, unless a tender of it was refunded: then its facts stay, so the tip
+ * recorded (and perhaps paid out) and the refund that reversed it net to zero in
+ * the refund's period (see {@link tipFactsForOrder}).
+ */
 export function isTipOrderStatus(status: string): boolean {
   return !["draft", "voided", "abandoned", "awaiting_payment"].includes(status);
 }
@@ -67,9 +74,13 @@ export const tenderTipAdjustmentId = (paymentId: string, cumTipRefunded: number)
 export const onlineTipReversalId = (orderId: string) => `tipadj_online_${orderId}_full`;
 
 export function tipFactsForOrder(order: TipOrderInput, payments: Payment[]): TipFact[] {
-  if (!isTipOrderStatus(order.status)) return [];
   const live = payments.filter(isLive).sort(byCreated);
   if (live.length === 0) return [];
+  if (
+    !isTipOrderStatus(order.status) &&
+    !(order.status === "voided" && live.some((p) => p.refunded_cents > 0))
+  )
+    return [];
   const base = {
     tenant_id: order.tenant_id,
     location_id: order.location_id,

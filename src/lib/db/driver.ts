@@ -355,8 +355,8 @@ export interface PosDriver {
    */
   listOrderHeads(tenantId: string, opts: OrderHeadOptions): Promise<OrderHead[]>;
 
-  /** Full order graphs for known ids, batch-loaded (order not guaranteed). */
-  getOrdersByIds(ids: string[]): Promise<Order[]>;
+  /** Full order graphs for known ids OF THIS TENANT (filtered in SQL), batch-loaded (order not guaranteed). */
+  getOrdersByIds(tenantId: string, ids: string[]): Promise<Order[]>;
 
   /**
    * Payments of a tenant that have been refunded and last changed at/after

@@ -325,10 +325,30 @@ async function tipBackfill(box: MemoryOutbox, inner: PosDriver, orderId: string)
     if (p.tip_cents > 0) {
       any = true;
       tipRow(box, p, "tip.recorded", `tip_${p.id}`);
+      // Refunds from before the hub saw the order: one step each, an unrecorded
+      // remainder first (same ids as tips.ts).
+      const known = (p.refunds ?? []).reduce((n, r) => n + r.amount_cents, 0);
+      const steps = [
+        ...(p.refunded_cents > known ? [p.refunded_cents - known] : []),
+        ...(p.refunds ?? []).map((r) => r.amount_cents),
+      ];
+      let run = 0;
+      let prev = 0;
+      for (const amt of steps) {
+        run += amt;
+        const cum = Math.min(run, p.tip_cents);
+        if (cum > prev) {
+          tipRow(box, p, "tip.adjusted", `tipadj_${p.id}_c${cum}`);
+          prev = cum;
+        }
+      }
     }
   }
   if (!any && orderTip(order) > 0 && settled[0]) {
     tipRow(box, settled[0], "tip.recorded", `tip_online_${orderId}`);
+    if (settled.every((p) => p.refunded_cents >= p.amount_cents + p.tip_cents)) {
+      tipRow(box, settled[0], "tip.adjusted", `tipadj_online_${orderId}_full`);
+    }
   }
 }
 

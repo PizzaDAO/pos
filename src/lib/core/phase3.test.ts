@@ -698,3 +698,68 @@ describe("review fixes", () => {
     expect(active.newestFirst).toBe(true);
   });
 });
+
+describe("second review fixes", () => {
+  const tipRows = () => memoryOutbox.rows.filter((r) => r.event_type.startsWith("tip."));
+  const refund = (id: string, n: number, at: string) => ({ id, amount_cents: n, at, processor_ref: null, reason: null });
+  const base = (over: Partial<TipOrderInput> = {}): TipOrderInput => ({
+    id: ID(50), tenant_id: DEMO_TENANT_ID, location_id: DOWNTOWN, business_date: "2026-06-04", currency: "USD",
+    staff_id: null, status: "paid", tip_cents: 0, timezone: "America/New_York", ...over,
+  });
+
+  it("a voided order that had a refunded tip keeps its facts and nets to zero; one with no refund has none", () => {
+    const refunded = pay(ID(50), ID(201), {
+      rail: "cash", tip_cents: 300, amount_cents: 1000, refunded_cents: 300, status: "captured",
+      refunds: [refund("r1", 300, "2026-06-09T16:00:00.000Z")],
+    });
+    const facts = tipFactsForOrder(base({ status: "voided" }), [refunded]);
+    expect(facts.map((f) => [f.kind, f.amount_cents, f.business_date])).toEqual([
+      ["cash_on_tender", 300, "2026-06-04"],
+      ["adjustment", -300, "2026-06-09"],
+    ]);
+    expect(facts.reduce((n, f) => n + f.amount_cents, 0)).toBe(0);
+    const unrefunded = pay(ID(50), ID(202), { rail: "cash", tip_cents: 300 });
+    expect(tipFactsForOrder(base({ status: "voided" }), [unrefunded])).toEqual([]);
+    for (const status of ["draft", "abandoned", "awaiting_payment"]) {
+      expect(tipFactsForOrder(base({ status }), [refunded])).toEqual([]);
+    }
+  });
+
+  it("the legacy remainder is the first refund step (matches the SQL backfill)", () => {
+    const p = pay(ID(50), ID(201), { rail: "cash", tip_cents: 150, refunded_cents: 200, refunds: [refund("r1", 120, "2026-06-04T20:00:00.000Z")] });
+    expect(tipFactsForOrder(base(), [p]).map((f) => f.id)).toEqual([`tip_${ID(201)}`, `tipadj_${ID(201)}_c80`, `tipadj_${ID(201)}_c150`]);
+  });
+
+  it("getOrdersByIds is tenant-scoped", async () => {
+    await mk(ID(1), { at: "2026-06-04T15:00:00Z" });
+    const d = getPosDriver();
+    expect(await d.getOrdersByIds(DEMO_TENANT_ID, [ID(1)])).toHaveLength(1);
+    expect(await d.getOrdersByIds("99999999-0000-4000-8000-000000000001", [ID(1)])).toEqual([]);
+  });
+
+  it("the cap counts orders in scope: unpaid checkouts and neighbouring days do not use it up", async () => {
+    const tz = new Map([[DOWNTOWN, "America/New_York"]]);
+    const driver = getPosDriver();
+    for (let i = 1; i <= 3; i++) await mk(ID(i), { at: "2026-06-04T15:00:00Z" });
+    for (let i = 10; i <= 25; i++) await mk(ID(i), { at: "2026-06-04T16:00:00Z", status: i % 2 ? "awaiting_payment" : "abandoned" });
+    for (let i = 30; i <= 36; i++) await mk(ID(i), { at: "2026-06-05T15:00:00Z" }); // next day, inside the padding
+    const heads = await loadHeadsInRange(driver, DEMO_TENANT_ID, { locationIds: [DOWNTOWN], from: "2026-06-04", to: "2026-06-04", timezones: tz, cap: 5 });
+    expect(heads).toHaveLength(3);
+    // and the 422 tells the caller how to proceed
+    const r = await call("GET", `/tips?from=2026-01-01&to=2026-01-02&location_id=${ID(999)}`);
+    expect(r.status).toBe(404);
+    await expect(
+      loadHeadsInRange(driver, DEMO_TENANT_ID, { locationIds: [DOWNTOWN], from: "2026-06-04", to: "2026-06-05", timezones: tz, cap: 5 }),
+    ).rejects.toThrow(/at most 7 days at a time/);
+  });
+
+  it("a refund before the order was announced is backfilled with its steps", async () => {
+    const d = getPosDriver();
+    await mk(ID(1), { at: "2026-06-04T15:00:00Z", status: "awaiting_payment" });
+    await d.upsertPayment(pay(ID(1), ID(101), { tip_cents: 150, refunded_cents: 200, refunds: [refund("r1", 120, "2026-06-04T20:00:00.000Z")] }));
+    expect(tipRows()).toHaveLength(0);
+    await d.updateOrderStatus(ID(1), "paid");
+    expect(tipRows().map((r) => r.row_snapshot?.fact_id)).toEqual([`tip_${ID(101)}`, `tipadj_${ID(101)}_c80`, `tipadj_${ID(101)}_c150`]);
+    for (const row of tipRows()) expect(await hydrateEvent(row)).not.toBeNull();
+  });
+});
