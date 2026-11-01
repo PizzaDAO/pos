@@ -7,6 +7,12 @@
  *    worth. The order is NOT sent to the kitchen on its own.
  *  - `duplicate`: an order holds more settled money than it is worth (two tenders
  *    both settled); one of them must be refunded.
+ *  - `scheduled`: a catering order whose hold lapsed without being released. It is
+ *    still a `draft`. `detail` says why: `paid` (fully paid, too old to fire),
+ *    `partial` (a deposit) or `invoice_pending` (an invoice still owed). Refund is
+ *    the action for paid/partial; Cancel for invoice_pending (nothing was paid, so
+ *    nothing is refunded). Accept never applies. Only a `draft`, unresolved item
+ *    can be acted on; releasing the order by hand resolves the item.
  *
  * GET  ?tenantId=&locationId=   open items (unresolved, or refund still owed by
  *                               hand) from a dedicated, ordered, capped query.
@@ -22,6 +28,9 @@
  *     `refund()` only records an intent): they stay `captured` and the item
  *     becomes `refund_owed_manual`, listed with instructions until staff return
  *     the money themselves.
+ *   - "cancel": (`scheduled` + `invoice_pending` only) void the order and close its
+ *     pending invoice tender through the normal cancel path. No money moves; the
+ *     audit entry says so.
  *   - "mark_refunded": staff did the manual transfer; record it (the tender is
  *     marked refunded) and close the item.
  * All are audited.
@@ -30,6 +39,7 @@ import { NextResponse } from "next/server";
 import { getPosDriver, type LatePaymentMarker, type Payment } from "@/lib/db";
 import { requireTenantRole } from "@/lib/auth/api";
 import {
+  cancelOpenOnlineIntents,
   isManualRefundRail,
   netSettledCents,
   refundPayment,
@@ -44,8 +54,9 @@ const ROLES = ["owner", "manager"] as const;
 /** A claim older than this is treated as left behind by a crashed request. */
 const CLAIM_STALE_MS = 10 * 60_000;
 
-type Action = "accept" | "refund" | "mark_refunded";
-const CLAIM_FOR: Record<Action, "accepting" | "refunding" | "marking_refunded"> = {
+type Action = "accept" | "refund" | "mark_refunded" | "cancel";
+const CLAIM_FOR: Record<Action, "accepting" | "refunding" | "marking_refunded" | "canceling"> = {
+  cancel: "canceling",
   accept: "accepting",
   refund: "refunding",
   mark_refunded: "marking_refunded",
@@ -106,7 +117,10 @@ export async function POST(request: Request) {
   const b = parsed.body as { orderId?: unknown; action?: unknown } | null;
   if (
     typeof b?.orderId !== "string" ||
-    (b.action !== "accept" && b.action !== "refund" && b.action !== "mark_refunded")
+    (b.action !== "accept" &&
+      b.action !== "refund" &&
+      b.action !== "mark_refunded" &&
+      b.action !== "cancel")
   ) {
     return NextResponse.json({ error: "Malformed request." }, { status: 422 });
   }
@@ -127,6 +141,37 @@ export async function POST(request: Request) {
       { error: "No unresolved payment issue on this order." },
       { status: 409 },
     );
+  }
+  if (pre.kind === "scheduled" && action !== "mark_refunded") {
+    // A scheduled item can only be acted on while the order is still a held draft
+    // and the item is unresolved (a released/voided order has nothing left to do).
+    if (order.status !== "draft" || pre.resolved !== undefined) {
+      return NextResponse.json(
+        { error: "This scheduled order is no longer held; there is nothing to resolve." },
+        { status: 409 },
+      );
+    }
+    if (action === "accept") {
+      return NextResponse.json(
+        { error: "A scheduled order cannot be accepted here; refund it, or release it from the order." },
+        { status: 409 },
+      );
+    }
+    if (action === "refund" && pre.detail === "invoice_pending") {
+      return NextResponse.json(
+        { error: "Nothing was paid on this order, so there is nothing to refund. Cancel the order instead." },
+        { status: 409 },
+      );
+    }
+    if (action === "cancel" && pre.detail !== "invoice_pending") {
+      return NextResponse.json(
+        { error: "Money has been taken on this order; refund it rather than canceling." },
+        { status: 409 },
+      );
+    }
+  }
+  if (action === "cancel" && pre.kind !== "scheduled") {
+    return NextResponse.json({ error: "Cancel only applies to scheduled orders." }, { status: 409 });
   }
   const wrongState =
     (action === "accept" &&
@@ -171,6 +216,46 @@ export async function POST(request: Request) {
     const settled = (await driver.listPaymentsForOrder(order.id)).filter(
       (p) => p.status === "captured" || p.status === "authorized",
     );
+
+    if (action === "cancel") {
+      // Same steps as /v1 cancel: close any open card session first, then void
+      // atomically against the tender state (a pending invoice tender is closed
+      // with the order; settled money would refuse and send staff to Refund).
+      try {
+        await cancelOpenOnlineIntents(order.id);
+      } catch {
+        await release();
+        return NextResponse.json({ error: "An open card payment could not be closed; try again." }, { status: 502 });
+      }
+      const voided = await driver.cancelOrder(order.id, order.tenant_id);
+      if (!voided.ok) {
+        await release();
+        return NextResponse.json(
+          {
+            error:
+              voided.reason === "captured"
+                ? "Money has been taken on this order; refund it instead."
+                : voided.reason === "in_flight"
+                  ? "A payment is in flight; try again shortly."
+                  : "The order can no longer be canceled.",
+          },
+          { status: 409 },
+        );
+      }
+      const updated = await driver.updateLatePayment(order.id, {
+        resolved: "canceled",
+        resolved_at: resolvedAt,
+        claim: null,
+        claim_at: null,
+      });
+      await recordAudit({
+        actor,
+        action: "scheduled_order_canceled",
+        tenantId: order.tenant_id,
+        detail: `Staff canceled scheduled order ${order.id} (hold expired, invoice never paid); its pending invoice tender was closed. No money moved, nothing was refunded.`,
+      });
+      return NextResponse.json({ order: updated });
+    }
 
     if (action === "accept") {
       if (netSettledCents(settled) < order.totals.total_cents) {

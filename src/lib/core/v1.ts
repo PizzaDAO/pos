@@ -885,6 +885,18 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!res.ok && res.reason === "conflict" && res.order.status === "voided") {
       throw ProblemError.of("INVALID_TRANSITION", { detail: "Order was canceled." });
     }
+    // Released by hand after all: a still-open "stranded" flag is moot.
+    const flag = order.fulfillment?.late_payment;
+    if (res.ok && flag && flag.kind === "scheduled" && !flag.resolved) {
+      await ctx.driver
+        .updateLatePayment(order.id, {
+          resolved: "released",
+          resolved_at: ctx.now().toISOString(),
+          claim: null,
+          claim_at: null,
+        })
+        .catch((err) => captureError(err, { scope: "v1.orders.release.unflag", orderId: order.id }));
+    }
     return { body: await mapOrderFor(ctx, order.id) };
   },
 

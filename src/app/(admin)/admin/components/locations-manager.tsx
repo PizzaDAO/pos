@@ -87,11 +87,33 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
 
   async function saveCountry(locationId: string, value: string) {
     setError(null);
-    const res = await fetch("/api/admin/locations", {
+    const first = await fetch("/api/admin/locations", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tenantId, locationId, country: value.trim() || null }),
     });
+    let res = first;
+    if (first.status === 422) {
+      // The server states what changing the country does to phone numbers; the
+      // owner must confirm it explicitly before it is saved.
+      const d = (await first.clone().json().catch(() => ({}))) as { error?: string; code?: string };
+      if (d.code === "confirm_required") {
+        if (!window.confirm(`${d.error}\n\nChange the country?`)) {
+          await load();
+          return;
+        }
+        res = await fetch("/api/admin/locations", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tenantId,
+            locationId,
+            country: value.trim() || null,
+            confirmPhoneEffects: true,
+          }),
+        });
+      }
+    }
     if (!res.ok) {
       const data = (await res.json().catch(() => ({}))) as { error?: string };
       setError(data.error ?? `Could not save country (HTTP ${res.status}).`);

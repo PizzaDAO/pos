@@ -1570,7 +1570,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     async listLocations(tenantId) {
       return (
         unwrap(
-          await sb.from("locations").select("*").eq("tenant_id", tenantId),
+          await sb
+            .from("locations")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true }),
         ) as Row[]
       ).map(mapLocation);
     },

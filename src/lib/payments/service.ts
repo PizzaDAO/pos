@@ -1164,9 +1164,11 @@ export { netSettledCents };
  * carries a resolution is never overwritten.
  */
 /**
- * How long a `scheduled` hold may sit past its expiry before it can no longer be
- * released (a paid order would otherwise fire old food at the kitchen) and staff
- * are alerted. Shared by `orders.release` and the held-order sweeper.
+ * How long past its hold EXPIRY a `scheduled` order may still be released (a paid
+ * order would otherwise fire old food at the kitchen) before staff are alerted.
+ * Shared by `orders.release` and the held-order sweeper. Measured from expiry, not
+ * from the fire time: catering's holds expire 6 h after fire_at, so the effective
+ * cutoff there is fire_at + 12 h (catering's own release window is set to match).
  */
 export const SCHEDULED_PAID_GRACE_MS = 6 * 60 * 60 * 1000;
 
@@ -1183,10 +1185,11 @@ export async function flagStrandedScheduled(
   detail: "paid" | "partial" | "invoice_pending",
 ): Promise<boolean> {
   const prior = order.fulfillment?.late_payment;
-  if (prior && !prior.resolved && prior.kind === "scheduled" && prior.detail === detail) {
-    return false;
-  }
-  if (prior && !prior.resolved && prior.kind !== "scheduled") return false;
+  // Any resolved marker (accepted, refunded, refund_owed_manual: money still owed
+  // back by hand, released, canceled) is staff's decision: never overwritten, never
+  // re-flagged. An unresolved one of another kind belongs to its own flow.
+  if (prior && (prior.resolved || prior.kind !== "scheduled")) return false;
+  if (prior && prior.detail === detail) return false;
   const settled = payments.filter((p) => p.status === "captured" || p.status === "authorized");
   const amount =
     detail === "invoice_pending"

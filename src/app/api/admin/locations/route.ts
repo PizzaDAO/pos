@@ -16,6 +16,16 @@ import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { recordAudit } from "@/lib/security";
+
+/** What changing a location's country does to phone numbers (shown before saving). */
+const COUNTRY_CHANGE_WARNING =
+  "Changing a location's country changes how customers' phone numbers are read. " +
+  "Numbers typed without a + country code are read as national numbers of the NEW country; " +
+  "only US and CA numbers can be read that way, so for any other country they are left " +
+  "unreadable until a +country-code number is given. Stored numbers are not rewritten, but " +
+  "customer lookup and phone de-duplication use the new country, so the same person may stop " +
+  "matching (or start matching) existing customers.";
 
 export const runtime = "nodejs";
 
@@ -52,7 +62,12 @@ interface AddLocationBody {
  * with none reads as US.
  */
 export async function PATCH(request: Request) {
-  let body: { tenantId?: string; locationId?: string; country?: string | null };
+  let body: {
+    tenantId?: string;
+    locationId?: string;
+    country?: string | null;
+    confirmPhoneEffects?: boolean;
+  };
   try {
     body = await request.json();
   } catch {
@@ -70,8 +85,24 @@ export async function PATCH(request: Request) {
   }
   const auth = await requireTenantAccess(body.tenantId, "admin");
   if (!auth.ok) return auth.res;
-  const location = await getPosDriver().setLocationCountry(auth.tenantId, body.locationId, country);
+  const driver = getPosDriver();
+  const before = (await driver.listLocations(auth.tenantId)).find((l) => l.id === body.locationId);
+  if (!before) return NextResponse.json({ error: "Location not found." }, { status: 404 });
+  if ((before.country ?? null) === country) return NextResponse.json({ location: before });
+  if (body.confirmPhoneEffects !== true) {
+    return NextResponse.json(
+      { error: COUNTRY_CHANGE_WARNING, code: "confirm_required" },
+      { status: 422 },
+    );
+  }
+  const location = await driver.setLocationCountry(auth.tenantId, body.locationId, country);
   if (!location) return NextResponse.json({ error: "Location not found." }, { status: 404 });
+  await recordAudit({
+    actor: { id: auth.user.id, label: auth.user.email },
+    action: "location_country_change",
+    tenantId: auth.tenantId,
+    detail: `Location ${location.id} country ${before.country ?? "(unset, read as US)"} -> ${country ?? "(unset, read as US)"}; phone numbers are read in the new country.`,
+  });
   return NextResponse.json({ location });
 }
 

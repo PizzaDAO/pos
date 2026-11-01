@@ -524,7 +524,7 @@ export interface PosDriver {
    */
   claimLatePayment(
     orderId: string,
-    claim: "accepting" | "refunding" | "marking_refunded",
+    claim: "accepting" | "refunding" | "marking_refunded" | "canceling",
     staleBeforeIso: string,
   ): Promise<Order | null>;
 

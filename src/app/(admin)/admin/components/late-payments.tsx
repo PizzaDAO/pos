@@ -4,7 +4,9 @@
  * Lists online orders where the customer's money settled AFTER the checkout had
  * expired (the order was abandoned, so it never reached the kitchen). The owner
  * or manager either Accepts (promotes the order to paid and sends it to the
- * kitchen) or Refunds. Backed by /api/admin/late-payments.
+ * kitchen) or Refunds. Also lists scheduled catering orders whose hold ran out
+ * without being released (paid, partly paid, or an invoice still owed): Refund the
+ * money, or Cancel an order nobody paid for. Backed by /api/admin/late-payments.
  */
 "use client";
 
@@ -48,7 +50,7 @@ export function LatePayments({
 
   async function resolve(
     orderId: string,
-    action: "accept" | "refund" | "mark_refunded",
+    action: "accept" | "refund" | "mark_refunded" | "cancel",
   ) {
     setBusy(orderId);
     setError(null);
@@ -77,8 +79,11 @@ export function LatePayments({
         <h2 className="text-lg font-semibold">Late payments</h2>
       </div>
       <p className="text-sm text-muted-foreground">
-        These customers paid after their checkout expired, so the order was never
-        sent to the kitchen. Accept to cook it, or refund the payment.
+        <strong>Late payments:</strong> these customers paid after their checkout
+        expired, so the order was never sent to the kitchen. Accept to cook it, or
+        refund the payment. <strong>Scheduled orders:</strong> a catering order whose
+        hold ran out without being released was NOT sent to the kitchen. Refund what
+        was paid, or Cancel an order whose invoice was never paid.
       </p>
       {error && (
         <p role="alert" className="text-sm text-destructive">
@@ -138,7 +143,16 @@ export function LatePayments({
                       </Button>
                     ) : (
                       <>
-                        {!duplicate && (
+                        {m?.kind === "scheduled" && m.detail === "invoice_pending" && (
+                          <Button
+                            size="sm"
+                            disabled={busy === order.id}
+                            onClick={() => void resolve(order.id, "cancel")}
+                          >
+                            Cancel order
+                          </Button>
+                        )}
+                        {!duplicate && m?.detail !== "invoice_pending" && (
                           <Button
                             size="sm"
                             disabled={
@@ -151,14 +165,16 @@ export function LatePayments({
                             Accept
                           </Button>
                         )}
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={busy === order.id}
-                          onClick={() => void resolve(order.id, "refund")}
-                        >
-                          Refund
-                        </Button>
+                        {m?.detail !== "invoice_pending" && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busy === order.id}
+                            onClick={() => void resolve(order.id, "refund")}
+                          >
+                            Refund
+                          </Button>
+                        )}
                       </>
                     )}
                   </div>

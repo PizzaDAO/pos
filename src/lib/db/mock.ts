@@ -991,7 +991,10 @@ export const mockDriver: PosDriver = {
   },
 
   async listLocations(tenantId: string): Promise<Location[]> {
-    return locations.filter((l) => l.tenant_id === tenantId);
+    // Same order as the Supabase driver: (created_at, id).
+    return locations
+      .filter((l) => l.tenant_id === tenantId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
   },
 
   async getTenantBySlug(slug: string): Promise<Tenant | null> {
