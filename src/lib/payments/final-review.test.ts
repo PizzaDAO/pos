@@ -337,7 +337,7 @@ describe("3: refunds are atomic under concurrency", () => {
     const t = await tender("cash");
     const rails = await import("@/lib/payments/registry");
     const spy = vi
-      .spyOn(rails.requirePaymentRail(t.rail), "refund")
+      .spyOn(rails.requirePaymentRail(t.rail as "cash"), "refund")
       .mockRejectedValue(new Error("rail down"));
     await expect(
       refundPayment({ paymentId: t.id, amountCents: 300, refundId: "x" }),

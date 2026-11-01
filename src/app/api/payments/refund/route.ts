@@ -7,7 +7,11 @@
  * via a derived key. Simulated rails always "succeed".
  */
 import { NextResponse } from "next/server";
-import { RefundExceedsError, refundPayment } from "@/lib/payments/service";
+import {
+  ExternalRefundUnsupportedError,
+  RefundExceedsError,
+  refundPayment,
+} from "@/lib/payments/service";
 import { getOrderBalance } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantRole } from "@/lib/auth/api";
@@ -147,7 +151,7 @@ export async function POST(request: Request) {
           : undefined,
     });
   } catch (err) {
-    if (err instanceof RefundExceedsError) {
+    if (err instanceof RefundExceedsError || err instanceof ExternalRefundUnsupportedError) {
       return NextResponse.json({ error: err.message }, { status: 409 });
     }
     return NextResponse.json(

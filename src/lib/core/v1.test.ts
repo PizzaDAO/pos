@@ -135,7 +135,7 @@ describe("auth + routing", () => {
   });
 
   it("answers 501 for declared-but-unsupported operations", async () => {
-    const r = await call("POST", "/customers", { body: { email: "a@b.co" } });
+    const r = await call("POST", "/orders/00000000-0000-4000-8000-000000000001/status", { body: { fulfillment_status: "ready" } });
     expect(r.status).toBe(501);
     expect(r.json.code).toBe("CAPABILITY_UNSUPPORTED");
   });

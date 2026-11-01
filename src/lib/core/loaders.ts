@@ -99,6 +99,9 @@ export async function mapOrders(
     customerIds.length ? d.getCustomers(customerIds) : Promise.resolve([]),
   ]);
   const byCustomer = new Map(customers.map((c) => [c.id, c]));
+  const countryByLocation = new Map(
+    (await d.listLocations(orders[0]!.tenant_id)).map((l) => [l.id, countryOf(l.country)]),
+  );
   return orders.map((order) => {
     const c = order.customer_id ? byCustomer.get(order.customer_id) : undefined;
     return toContractOrder({
@@ -106,6 +109,7 @@ export async function mapOrders(
       payments: payments.get(order.id) ?? [],
       timezone: timezoneOf(order.location_id),
       customer: c && c.tenant_id === order.tenant_id ? c : null,
+      country: countryByLocation.get(order.location_id) ?? null,
     });
   });
 }
@@ -294,7 +298,25 @@ export async function loadCustomer(
   const c = (await d.getCustomers([customerId]))[0];
   if (!c || c.tenant_id !== tenantId) return null;
   const stats = await d.customerOrderStats(tenantId, [c.id]);
-  return toContractCustomer(c, stats.get(c.id) ?? NO_STATS);
+  return toContractCustomer(c, stats.get(c.id) ?? NO_STATS, await tenantCountry(tenantId, d));
+}
+
+/** A location's country as the contract reports it (`US` when POS has none). */
+export function countryOf(country: string | null | undefined): string {
+  return country && /^[A-Z]{2}$/.test(country) ? country : "US";
+}
+
+/**
+ * The country national-format customer phones are read in: the tenant's first
+ * location (a customer belongs to the tenant, not a location). Null when the
+ * tenant has no location, which leaves only E.164 numbers.
+ */
+export async function tenantCountry(
+  tenantId: string,
+  driver?: PosDriver,
+): Promise<string | null> {
+  const first = (await driverOf(driver).listLocations(tenantId))[0];
+  return first ? countryOf(first.country) : null;
 }
 
 export const NO_STATS = {

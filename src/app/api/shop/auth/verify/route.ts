@@ -29,7 +29,7 @@ export async function GET(request: Request) {
   // Redirect into the shop home with a confirmation flag (no slug context here,
   // so land on the generic shop entry — the customer is recognized by email).
   const url = new URL("/", origin);
-  url.searchParams.set("verified", customer.email);
+  url.searchParams.set("verified", customer.email ?? "");
   return NextResponse.json({
     ok: true,
     customer: { id: customer.id, email: customer.email, verified: true },

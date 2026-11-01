@@ -47,7 +47,7 @@ export interface Payment {
   order_id: string;
   tenant_id: string;
   location_id: string;
-  rail: PaymentRailKey | "cash";
+  rail: PaymentRailKey | "cash" | "external";
   status: PaymentStatus;
   /** Base amount applied to the order balance, in cents (excludes tip). */
   amount_cents: number;
@@ -70,6 +70,16 @@ export interface Payment {
   refunded_cents: number;
   /** Whether this payment was taken on a simulated rail (no live keys). */
   simulated: boolean;
+  /**
+   * `external` rail only (`payments.recordExternal`): how the money was taken,
+   * by whom, and the processor's own reference. `processor_ref` is deliberately
+   * NOT `charge_id`: that is the Stripe/Coinbase webhook correlation key.
+   */
+  method?: string | null;
+  processor?: string | null;
+  processor_ref?: string | null;
+  collection?: string | null;
+  staff_id?: string | null;
   /** Free-form rail data persisted alongside the payment row. */
   raw: Record<string, unknown> | null;
   /**
@@ -158,6 +168,71 @@ export const ONE_LIVE_TENDER_RAILS: readonly string[] = [
   // Card-present: one open reader tender per order (payments_one_live_terminal).
   "stripe_terminal",
 ];
+
+// ---------------------------------------------------------------------------
+// External tenders (`payments.recordExternal`)
+// ---------------------------------------------------------------------------
+
+/** What `PosDriver.recordExternalTender` is asked to store. */
+export interface ExternalTenderWrite {
+  tenantId: string;
+  orderId: string;
+  paymentId: string;
+  method: string;
+  processor: string;
+  processorRef: string | null;
+  amountCents: number;
+  tipCents: number;
+  /** Stored status. `authorized` is stored as `pending`: it never counts. */
+  status: "captured" | "pending";
+  /** What the caller asked for (kept in `raw.requested_status`). */
+  requestedStatus: "captured" | "authorized" | "pending";
+  collection: string | null;
+  staffId: string | null;
+  /**
+   * What the caller summed over the order's live tenders (pending, authorized,
+   * captured, refunded) when it validated the amounts. If the order changed
+   * since, nothing is written (`stale`) and the caller re-validates.
+   */
+  expect: { n: number; amount: number; tip: number; refunded: number };
+  /** Server-derived from the verified token (never caller-supplied); stored in raw. */
+  recordedBy: { principal_id: string; module: string | null };
+}
+
+/** Outcome of the atomic external-tender write (one transaction, order row locked). */
+export type ExternalTenderResult =
+  | { outcome: "ok"; payment: Payment; superseded: string[] }
+  /** This payment id already exists (any tenant / order: the caller decides replay vs conflict). */
+  | { outcome: "exists"; payment: Payment }
+  /** Another CAPTURED external tender already carries this processor + ref. */
+  | { outcome: "duplicate_ref"; payment: Payment }
+  | { outcome: "not_found" }
+  | { outcome: "invalid_state"; status: string }
+  | { outcome: "stale" };
+
+/** Statuses that count as "live" for the tender fingerprint and the tip caps. */
+export const FINGERPRINT_STATUSES: readonly string[] = [
+  "pending",
+  "authorized",
+  "captured",
+  "refunded",
+];
+
+/** The fingerprint `ExternalTenderWrite.expect` carries, from an order's tenders. */
+export function tenderFingerprint(
+  tenders: readonly Pick<
+    Payment,
+    "status" | "amount_cents" | "tip_cents" | "refunded_cents"
+  >[],
+): ExternalTenderWrite["expect"] {
+  const live = tenders.filter((p) => FINGERPRINT_STATUSES.includes(p.status));
+  return {
+    n: live.length,
+    amount: live.reduce((n, p) => n + p.amount_cents, 0),
+    tip: live.reduce((n, p) => n + p.tip_cents, 0),
+    refunded: live.reduce((n, p) => n + p.refunded_cents, 0),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Stripe Terminal (server-driven in-store card reader)

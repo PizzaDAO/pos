@@ -40,6 +40,8 @@ import type {
 } from "./menu-types";
 import type {
   ConnectAccount,
+  ExternalTenderResult,
+  ExternalTenderWrite,
   Payment,
   PaymentRefund,
   PaymentSessionRow,
@@ -50,14 +52,18 @@ import type {
   TerminalReader,
 } from "./payment-types";
 import {
+  FINGERPRINT_STATUSES,
   LiveTenderConflictError,
   PaymentSessionConflictError,
   ONE_LIVE_TENDER_RAILS,
+  tenderFingerprint,
   tenderHoldsOpenSlot,
 } from "./payment-types";
+import { applyCustomerIdentity } from "./customer-identity";
 import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
 import type {
   Customer,
+  CustomerIdentityWrite,
   DeliveryRecord,
   MagicLinkToken,
 } from "./customer-types";
@@ -1143,8 +1149,12 @@ export const mockDriver: PosDriver = {
     const mine = [...payments.values()].filter((p) => p.order_id === id);
     // Same rules as public.core_cancel_order(): stale unsettled tenders (no rail
     // charge) are voided; any other in-flight tender blocks the cancel.
-    const inFlight = mine.filter((p) =>
-      ["pending", "authorized", "requires_action"].includes(p.status),
+    // A PENDING external tender is a promise (invoice issued, cash still to
+    // collect), not money in flight: it never blocks and is voided with the order.
+    const inFlight = mine.filter(
+      (p) =>
+        ["pending", "authorized", "requires_action"].includes(p.status) &&
+        !(p.rail === "external" && p.status === "pending"),
     );
     for (const p of inFlight) {
       if (!isStaleUnsettled(p, nowMs)) {
@@ -1158,9 +1168,12 @@ export const mockDriver: PosDriver = {
     ) {
       return { ok: false, reason: "captured", order: current } as const;
     }
-    // Void the abandoned attempts (all stale, or we returned above).
-    for (const p of inFlight) {
-      payments.set(p.id, { ...p, status: "canceled", updated_at: nowIso() });
+    // Void the abandoned attempts (all stale, or we returned above) and any
+    // pending external promise.
+    for (const p of mine) {
+      if (inFlight.includes(p) || (p.rail === "external" && p.status === "pending")) {
+        payments.set(p.id, { ...p, status: "canceled", updated_at: nowIso() });
+      }
     }
     const order = (await this.updateOrderStatus(id, "voided")) as Order;
     return { ok: true, order } as const;
@@ -1482,6 +1495,89 @@ export const mockDriver: PosDriver = {
     };
     payments.set(created.id, created);
     return created;
+  },
+
+  // Mirrors public.core_record_external_tender(): ONE synchronous block (no
+  // awaits between the checks and the write), so it is atomic in the
+  // single-threaded mock exactly as the SQL function is under its row lock.
+  async recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult> {
+    const order = orders.get(input.orderId);
+    if (!order || order.tenant_id !== input.tenantId) return { outcome: "not_found" };
+    if (["voided", "abandoned", "refunded"].includes(order.status)) {
+      return { outcome: "invalid_state", status: order.status };
+    }
+    const existing = payments.get(input.paymentId);
+    if (existing) return { outcome: "exists", payment: { ...existing } };
+    const live = [...payments.values()].filter(
+      (p) => p.order_id === input.orderId && FINGERPRINT_STATUSES.includes(p.status),
+    );
+    const fp = tenderFingerprint(live);
+    const e = input.expect;
+    if (fp.n !== e.n || fp.amount !== e.amount || fp.tip !== e.tip || fp.refunded !== e.refunded) {
+      return { outcome: "stale" };
+    }
+    const dupRef = (): Payment | undefined =>
+      input.status === "captured" && input.processorRef
+        ? [...payments.values()].find(
+            (p) =>
+              p.tenant_id === input.tenantId &&
+              p.rail === "external" &&
+              p.status === "captured" &&
+              p.processor === input.processor &&
+              p.processor_ref === input.processorRef,
+          )
+        : undefined;
+    const dup = dupRef();
+    if (dup) return { outcome: "duplicate_ref", payment: { ...dup } };
+    const now = nowIso();
+    const created: Payment = {
+      id: input.paymentId,
+      order_id: input.orderId,
+      tenant_id: input.tenantId,
+      location_id: order.location_id,
+      rail: "external",
+      status: input.status,
+      amount_cents: input.amountCents,
+      tip_cents: input.tipCents,
+      application_fee_cents: 0,
+      currency: order.currency,
+      charge_id: null,
+      connect_account_id: null,
+      crypto_tx_hash: null,
+      crypto_chain: null,
+      cash_tendered_cents: null,
+      cash_change_cents: null,
+      refunded_cents: 0,
+      refund_ids: [],
+      refunds: [],
+      simulated: false,
+      raw: { requested_status: input.requestedStatus, recorded_by: input.recordedBy },
+      method: input.method,
+      processor: input.processor,
+      processor_ref: input.processorRef,
+      collection: input.collection,
+      staff_id: input.staffId,
+      created_at: now,
+      updated_at: now,
+    };
+    payments.set(created.id, created);
+    const superseded: string[] = [];
+    if (input.status === "captured" && input.processorRef) {
+      for (const p of payments.values()) {
+        if (
+          p.order_id === input.orderId &&
+          p.id !== created.id &&
+          p.rail === "external" &&
+          p.status === "pending" &&
+          p.processor === input.processor &&
+          p.processor_ref === input.processorRef
+        ) {
+          payments.set(p.id, { ...p, status: "canceled", updated_at: now });
+          superseded.push(p.id);
+        }
+      }
+    }
+    return { outcome: "ok", payment: { ...created }, superseded };
   },
 
   // Single synchronous block (no awaits): atomic in the single-threaded mock.
@@ -1809,7 +1905,21 @@ export const mockDriver: PosDriver = {
     return next;
   },
 
+  async upsertCustomerIdentity(
+    tenantId: string,
+    input: CustomerIdentityWrite,
+  ): Promise<{ customer: Customer; created: boolean; changed: boolean }> {
+    // One synchronous block: atomic in the single-threaded mock, as the SQL
+    // function is under its advisory locks.
+    const r = applyCustomerIdentity(tenantId, [...customers.values()], input, nowIso());
+    if (r.created || r.changed) customers.set(r.customer.id, r.customer);
+    return { customer: { ...r.customer }, created: r.created, changed: r.changed };
+  },
+
   async upsertCustomer(customer: Customer): Promise<Customer> {
+    if (!customer.email) {
+      throw new Error("upsertCustomer requires an email; use upsertCustomerIdentity.");
+    }
     const email = customer.email.trim().toLowerCase();
     const existingById = customers.get(customer.id);
     const existingByEmail = existingById
@@ -1825,14 +1935,25 @@ export const mockDriver: PosDriver = {
     const merged: Customer = {
       ...customer,
       id: base?.id ?? customer.id,
-      email,
+      // A row with a PROVEN contact is frozen for contacts (see the Supabase driver).
+      email: base?.email_verified_at || base?.phone_verified_at ? (base.email ?? email) : email,
+      email_verified_at: base?.email_verified_at ?? null,
+      phone_verified_at: base?.phone_verified_at ?? null,
+      // Consent / tags / external ids belong to upsertCustomerIdentity: a stale
+      // snapshot passed here never overwrites them (as in the Supabase driver).
+      marketing: base?.marketing ?? {},
+      tags: base?.tags ?? [],
+      external_ids: base?.external_ids ?? {},
       verified: customer.verified || base?.verified || false,
       name: fillBlanksOnly
         ? (base?.name ?? customer.name ?? null)
         : (customer.name ?? base?.name ?? null),
-      phone: fillBlanksOnly
-        ? (base?.phone ?? customer.phone ?? null)
-        : (customer.phone ?? base?.phone ?? null),
+      phone:
+        base?.email_verified_at || base?.phone_verified_at
+          ? (base.phone ?? null)
+          : fillBlanksOnly
+            ? (base?.phone ?? customer.phone ?? null)
+            : (customer.phone ?? base?.phone ?? null),
       created_at: base?.created_at ?? now,
       updated_at: now,
     };
@@ -2375,6 +2496,14 @@ export const mockDriver: PosDriver = {
     const l = pinLocks.get(staffId);
     // Only if no lock was set meanwhile.
     if (l && l.lockedUntil === null) pinLocks.delete(staffId);
+  },
+
+  async setStaffPinHash(tenantId, staffId, pinHash): Promise<boolean> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return false;
+    staffById.set(staffId, { ...s, pin_hash: pinHash });
+    pinLocks.delete(staffId); // a reset PIN starts with a fresh lockout budget
+    return true;
   },
 
   async tenantHasStaffPins(tenantId): Promise<boolean> {

@@ -69,7 +69,7 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
   const closed = data?.closed ?? false;
   const locationName = locName ?? locationId;
 
-  const family = { cash: 0, card: 0, crypto: 0 };
+  const family = { cash: 0, card: 0, crypto: 0, other: 0 };
   for (const s of report?.paymentMix ?? []) {
     family[railFamily(s.rail)] += s.amount_cents + s.tip_cents;
   }
@@ -141,6 +141,7 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
             <Row label="Cash" value={formatMoney(family.cash)} />
             <Row label="Card" value={formatMoney(family.card)} />
             <Row label="Crypto" value={formatMoney(family.crypto)} />
+            {family.other > 0 && <Row label="Other" value={formatMoney(family.other)} />}
           </Section>
 
           <Section title="Orders by channel">

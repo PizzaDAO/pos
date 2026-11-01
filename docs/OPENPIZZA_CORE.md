@@ -20,7 +20,8 @@ from the package**. Note the base path is `/api/v1` (the package README mentions
 | --- | --- |
 | Read | tenant, capabilities, entitlements, locations (+get), menu (ETag/304), orders (list/get), payments, customers (list/get/lookup), staff, drawer sessions, deliveries (list/get), sales daily + summary |
 | Write | `quotes.create` (stateless), `orders.create` (held by default), `orders.release`, `orders.cancel`, `menu.setAvailability` (86 / un-86) |
-| 501 `CAPABILITY_UNSUPPORTED` | `orders.updateStatus`, `payments.recordExternal`, `customers.upsert`, `deliveries.updateStatus`, `events.list` (events go out by webhook) |
+| Tenders + identity (phase 2) | `payments.recordExternal`, `customers.upsert`, `staff.verifyPin` (a HUB_ROUTES op, added to the table by hand), `staff.setPin` |
+| 501 `CAPABILITY_UNSUPPORTED` | `orders.updateStatus`, `deliveries.updateStatus`, `events.list` (events go out by webhook) |
 
 `quotes.get` answers `QUOTE_NOT_FOUND`: quotes are not stored. Send the cart to
 `POST /orders`, optionally with `quote_hash` (stale hash -> `PRICE_CHANGED` with the
@@ -191,3 +192,79 @@ POS-4), shift `drawer` cash events.
   session); the time clock is owned by workforce.
 * Mock ids are now real UUIDs (`genId`), and the KDS demo seed uses GUID ids, so mock
   data validates against the contract.
+
+### Phase 2: external tenders, customer upsert, staff PIN
+
+**`payments.recordExternal`** (`POST /orders/{id}/payments`). Money taken outside POS's
+processors (kiosk card reader, cash on delivery, paid invoice, gift card) goes on the new
+`external` rail (`payments.method/processor/processor_ref/collection/staff_id`; the ref is
+NOT `charge_id`, which is the Stripe webhook key). Server-enforced:
+
+* Scope: `payments:write`, or `payments.terminal:write` for a CAPTURED `collection: "terminal"`
+  tender only. A terminal tender also needs the caller to be the device that took the order:
+  the hub signs POS calls `sub = hub:<client id>`, and that id must equal `order.source.device_id`
+  (fails closed when the order has none).
+* The order must still take money (voided/abandoned/refunded = 409 `INVALID_TRANSITION`);
+  amounts use core's `checkTenderAmounts` against the FOOD amount due (the order tip never
+  reduces it; 422 with `details.reason` + `amount_due_cents`). An expired hold takes no
+  promise (pending/authorized = 409 `expired`) but captured money is still recorded.
+* Only `captured` counts; `authorized` is stored `pending` (reported back as `authorized`).
+  A captured tender supersedes a pending one with the same processor + ref; the same captured
+  processor + ref can never be counted twice (partial unique index).
+* Id = `input.id` ?? uuidv5(`tenant:Idempotency-Key`); replay = 200 `idempotent-replayed`; same id,
+  other body = `IDEMPOTENCY_CONFLICT`. One SQL function (`core_record_external_tender`) writes under
+  a row lock on the order and refuses when the order's tenders changed since the caller validated
+  the amounts (`stale`: re-validate; after 4 tries 409 `tender_in_progress`). Afterwards open
+  siblings close and the order is paid/released like a card; a replay re-runs that step.
+  A hold that is not an `awaiting_payment` hold is not ended by money.
+* No platform fee is taken on external tenders (`application_fee_cents` 0). They cannot be
+  refunded through POS (GAPS #48): `refundPayment` refuses `external`. A pending external tender
+  never blocks `orders.cancel` (it is voided with the order); a captured one does.
+
+**`customers.upsert`** (`POST /customers`): `customers.email` is nullable (phone-only customers).
+`core_upsert_customer` runs under advisory locks: match by email, else normalised phone
+(`core_phone_key`); never merges two customers; only fills blanks; never touches `verified`;
+consent only with an `at` (older never beats newer); tags union; existing external ids win;
+writes nothing (no `customer.updated`) when nothing changed.
+
+**`staff.verifyPin` / `staff.setPin`**: POS only answers (`{staff}` / 403 generic / 429 locked);
+the hub mints the session. Reuses the till's `begin_pin_attempt` lockout (5 -> 15 min, shared with
+`/api/terminal/pin`) and scrypt. `setPin` needs the literal `staff:set_pin`, stores only a hash, and
+resets the lockout. PINs are never logged or echoed.
+
+### Phase 2 review hardening
+
+* **Who may record external money.** `recordExternal` can mark an order paid, so beyond the scope
+  the caller's module (`op_mod`) must be `kiosk`, `driver`, `catering` or `guests`; anything else
+  (pizza-mcp, ...) is 403 `module_not_allowed`. The recording principal + module are stored in the
+  tender's `raw.recorded_by` (server-derived). `staff_id` in the body is attribution only (must be an
+  active member of the tenant). Outside the zero-env dev mode, `recordExternal` and `staff.setPin`
+  also refuse a `sub` without the `hub:` prefix (so the hub's rank / device-kind / tender-lock /
+  revoked-client checks cannot be skipped by a direct call).
+* **OTP identity.** `customers.email_verified_at` / `phone_verified_at` are the only proof of a
+  contact (the shop's magic-link stub proves nothing). Only `customers.upsert` with
+  `verified_contact: "email" | "phone"` sets them, and only with the literal `customers:verify` scope
+  (wildcards never grant it) through the hub. Phone: matches only a row whose phone is already
+  verified, else creates a new row. Email: the row holding that email (the unique constraint allows
+  one) is stamped verified. Ordinary upsert and the shop path never set verified state and never fill
+  a contact onto a row that has a verified contact. Consent applies only to a contact that ended up
+  attached to the row; a future `at` is clamped to now.
+* Late-payment refunds: an `external` tender cannot be sent back by POS; it is "owed by hand" and
+  `Mark refunded` records the bookkeeping, so the item is never stuck. Reports key external tenders
+  by method + processor (COD is cash, not card; gift cards are "Other").
+
+### Phase 2, second review
+
+* **Verification is per contact.** The contract `Customer` gains optional `email_verified` /
+  `phone_verified`; the legacy `verified` is true only when the row has a contact and EVERY contact it
+  has is proven. The legacy `customers.verified` column (set by the shop's magic-link stub for
+  anyone) is never read for this. A consumer must treat a missing per-contact flag as unverified
+  and must not log anyone in through a contact whose flag is not true.
+* A **phone-only row never gains an email** through an ordinary upsert (another customer is
+  created); an email row may take a blank phone, but not once any of its contacts is proven.
+* The trigger `core_guard_customer_verified` clears a contact's stamp whenever that contact's value
+  changes (any actor, including the service role); only a formatting change of a phone keeps it.
+* **National-format phones** (`415-555-0199`) are read as +1 only for US/CA locations (the tenant's
+  first location for customers, the order's location for orders); elsewhere they are null.
+* Late-payment "Mark refunded" books each external tender and stays open (409) when a booking does
+  not fit or the payment is gone.

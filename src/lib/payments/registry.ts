@@ -27,6 +27,14 @@ export const PAYMENT_RAIL_LABELS: Record<PaymentRailKey, string> = {
   crypto_coinbase: "Crypto — Coinbase Commerce",
 };
 
+/**
+ * Label for a stored tender's rail. `external` (money recorded through
+ * `payments.recordExternal`) is not a PaymentRail: it has no charge/refund path.
+ */
+export function tenderRailLabel(rail: PaymentRailKey | "external"): string {
+  return rail === "external" ? "External" : PAYMENT_RAIL_LABELS[rail];
+}
+
 /** Empty in Phase 0. Phase 2 populates this via `registerPaymentRail`. */
 const registry = new Map<PaymentRailKey, PaymentRail>();
 

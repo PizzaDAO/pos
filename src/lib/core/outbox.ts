@@ -36,6 +36,7 @@ import { getPosDriver, type PosDriver } from "@/lib/db";
 import { readSupabaseConfig } from "@/lib/db/supabase";
 import {
   NO_STATS,
+  tenantCountry,
   loadDelivery,
   loadLocation,
   loadLocations,
@@ -345,7 +346,7 @@ export async function hydrateEvent(
     if (c && c.tenant_id === tenant) {
       // Aggregate for this one customer; never a tenant-wide order scan.
       const stats = (await driver.customerOrderStats(tenant, [c.id])).get(c.id);
-      data = toContractCustomer(c, stats ?? NO_STATS);
+      data = toContractCustomer(c, stats ?? NO_STATS, await tenantCountry(tenant, driver));
     }
   } else if (t.startsWith("staff.")) {
     data = (await loadStaffList(tenant, driver)).find((s) => s.id === row.subject_id) ?? null;

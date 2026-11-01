@@ -28,6 +28,7 @@ import { formatMoney } from "@/lib/pricing";
 import {
   PAYMENT_RAIL_KEYS,
   PAYMENT_RAIL_LABELS,
+  tenderRailLabel,
 } from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
 import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
@@ -453,7 +454,7 @@ export function PaymentScreen({
                         className="flex items-center justify-between text-sm"
                       >
                         <span>
-                          {PAYMENT_RAIL_LABELS[p.rail]} ·{" "}
+                          {tenderRailLabel(p.rail)} ·{" "}
                           {formatMoney(p.amount_cents + p.tip_cents, currency)}
                         </span>
                         <Button

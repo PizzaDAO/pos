@@ -738,6 +738,9 @@ export async function refreshPaymentStatus(
     return isRealCheckoutTender(payment) ? syncCheckoutTender(payment) : payment;
   }
 
+  // An external tender has no rail to ask: it is exactly what the caller recorded.
+  if (payment.rail === "external") return payment;
+
   const rail = requirePaymentRail(payment.rail);
   const status = await rail.status(
     {
@@ -883,6 +886,16 @@ export class RefundExceedsError extends Error {
   }
 }
 
+/** A refund was asked for an `external` tender (no processor to refund through). */
+export class ExternalRefundUnsupportedError extends Error {
+  constructor() {
+    super(
+      "This payment was recorded from outside POS (cash on delivery, invoice, kiosk card, gift card) and cannot be refunded here. Refund it where it was taken.",
+    );
+    this.name = "ExternalRefundUnsupportedError";
+  }
+}
+
 /**
  * Rails whose `refund()` only RECORDS the intent: nothing is sent on-chain or via
  * Coinbase. The money must be returned by hand.
@@ -934,6 +947,11 @@ export async function refundPayment(input: {
   const driver = getPosDriver();
   const payment = await driver.getPayment(input.paymentId);
   if (!payment) return null;
+
+  // Money recorded through payments.recordExternal was taken outside POS's
+  // processors: there is no rail to return it through (GAPS #48), so refusing
+  // beats pretending (and an unrecoverable local-only "refund").
+  if (payment.rail === "external") throw new ExternalRefundUnsupportedError();
 
   const total = payment.amount_cents + payment.tip_cents;
   const refundId = input.refundId ?? null;
@@ -1043,7 +1061,10 @@ export async function refundPayment(input: {
  *  - online orders holding MORE settled money than they are worth (two tenders
  *    both settled) are flagged as a duplicate payment.
  */
-async function maybeMarkOrderPaid(orderId: string): Promise<void> {
+async function maybeMarkOrderPaid(
+  orderId: string,
+  opts: { respectHoldReason?: boolean } = {},
+): Promise<void> {
   const driver = getPosDriver();
   const order = await driver.getOrder(orderId);
   if (!order) return;
@@ -1064,6 +1085,14 @@ async function maybeMarkOrderPaid(orderId: string): Promise<void> {
     // order's `promised_at` counts from payment time (not creation) and a
     // delivery is dispatched later. In-store drafts (no hold) keep the plain move.
     await finalizeOnlinePayment(orderId, { from: ["draft"] });
+  } else if (
+    opts.respectHoldReason &&
+    order.status === "draft" &&
+    order.hold &&
+    order.hold.reason !== "awaiting_payment"
+  ) {
+    // A hold with another reason (`scheduled`, `manual`, ...) is not a payment
+    // hold: money alone does not end it (only a release does). Leave it held.
   } else if (order.status === "draft" || order.status === "placed") {
     await driver.transitionOrderStatus(orderId, ["draft", "placed"], "paid");
   } else if (order.status === "awaiting_payment") {
@@ -1074,6 +1103,31 @@ async function maybeMarkOrderPaid(orderId: string): Promise<void> {
     );
   }
   await flagDuplicatePayment(order, payments);
+}
+
+/**
+ * After an `external` tender was recorded (`payments.recordExternal`): once it is
+ * CAPTURED, close any other open tender if the order is now fully covered (a
+ * payment-session link must not stay payable), then mark the order paid. Both
+ * steps re-read the order and only act on SETTLED base money covering the food
+ * amount due (`orderDueCents`: tips never count), so a partial tender, a pending
+ * (invoice / cash still to collect) or an authorized one releases nothing.
+ *
+ * `respectHoldReason`: a hold that is not an `awaiting_payment` hold is not ended
+ * by money. The close step is best effort (the tender is already saved): its
+ * failure is alerted, never turned into an error for the caller.
+ */
+export async function settleOrderAfterExternalTender(saved: Payment): Promise<void> {
+  if (saved.status === "captured") {
+    await closeSiblingsOfSettledOrder(saved).catch((err) =>
+      captureError(err, {
+        scope: "close-siblings",
+        paymentId: saved.id,
+        orderId: saved.order_id,
+      }),
+    );
+  }
+  await maybeMarkOrderPaid(saved.order_id, { respectHoldReason: true });
 }
 
 /** Nil UUID: the `actor_user_id` of audit rows written by the system itself. */

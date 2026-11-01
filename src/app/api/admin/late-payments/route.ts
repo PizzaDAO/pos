@@ -65,7 +65,7 @@ function tenderView(p: Payment) {
     ...publicTender(p),
     // The customer's return address, when the rail recorded one.
     return_address: returnAddress,
-    manual_refund: isManualRefundRail(p.rail),
+    manual_refund: isManualRefundRail(p.rail) || p.rail === "external",
   };
 }
 
@@ -215,8 +215,10 @@ export async function POST(request: Request) {
         const net = p.amount_cents + p.tip_cents - p.refunded_cents;
         if (net <= 0) continue;
         const take = Math.min(net, remaining);
-        if (isManualRefundRail(p.rail)) {
-          // The system cannot send crypto back: it stays captured, owed by hand.
+        if (isManualRefundRail(p.rail) || p.rail === "external") {
+          // The system cannot send crypto back, nor money that was taken outside
+          // POS (cash on delivery, invoice, kiosk card, gift card): it stays
+          // captured, owed by hand, and staff attest it with Mark refunded.
           manual.push({ payment_id: p.id, amount_cents: take });
         } else {
           await refundPayment({
@@ -241,20 +243,48 @@ export async function POST(request: Request) {
         action: "late_payment_refunded",
         tenantId: order.tenant_id,
         detail: owedManually
-          ? `Refund of order ${order.id}: card/cash part sent; ${manual.reduce((n, m) => n + m.amount_cents, 0)}c of CRYPTO is OWED BY HAND (no money moved).`
+          ? `Refund of order ${order.id}: card/cash part sent; ${manual.reduce((n, m) => n + m.amount_cents, 0)}c (crypto or taken outside POS) is OWED BY HAND (no money moved).`
           : `Refunded ${marker.kind === "duplicate" ? "duplicate" : "late"} payment on order ${order.id}.`,
       });
       return NextResponse.json({
         order: updated,
         refundOwedManually: owedManually,
         note: owedManually
-          ? "Not refunded yet: crypto cannot be sent back by the system. Return the money from your wallet / Coinbase account, then press Mark refunded."
+          ? "Not refunded yet: crypto, and payments taken outside POS (cash on delivery, invoice, kiosk card, gift card), cannot be sent back by the system. Return the money where it was taken (wallet / Coinbase / the kiosk's processor / the cash drawer), then press Mark refunded."
           : undefined,
       });
     }
 
     // mark_refunded: staff did the manual transfer.
     for (const m of marker.manual_refunds ?? []) {
+      const owed = await driver.getPayment(m.payment_id);
+      if (owed?.rail === "external") {
+        // Taken outside POS: there is no processor to refund through. Staff attest
+        // they returned it, so only the bookkeeping is recorded (idempotent on the
+        // refund id); no rail is called.
+        const booked = await driver.reservePaymentRefund(
+          m.payment_id,
+          m.amount_cents,
+          `manual-${m.payment_id}-${m.amount_cents}`,
+          { reason: "refunded outside POS, confirmed by staff" },
+        );
+        // `duplicate` = already booked by an earlier press: fine. Anything else
+        // (the tender is gone, or less is left on it than is owed) was NOT booked,
+        // so the item must stay open rather than be marked resolved.
+        if (!booked.ok && booked.reason !== "duplicate") {
+          await release();
+          return NextResponse.json(
+            {
+              error:
+                booked.reason === "not_found"
+                  ? "A payment owed back no longer exists; check the order before marking it refunded."
+                  : "Less is left on a payment than is owed back (it was already refunded in part); check the order before marking it refunded.",
+            },
+            { status: 409 },
+          );
+        }
+        continue;
+      }
       await refundPayment({
         paymentId: m.payment_id,
         amountCents: m.amount_cents,
@@ -273,7 +303,7 @@ export async function POST(request: Request) {
       actor,
       action: "late_payment_refunded",
       tenantId: order.tenant_id,
-      detail: `Staff confirmed the manual crypto refund of order ${order.id} was sent.`,
+      detail: `Staff confirmed the manual refund (crypto, or a payment taken outside POS) of order ${order.id} was sent.`,
     });
     return NextResponse.json({ order: updated });
   } catch (err) {

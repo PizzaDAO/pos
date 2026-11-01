@@ -10,6 +10,7 @@
  * onto the two contract axes (`fromPosOrderStatus`); POS `shifts` are exposed as
  * `drawer_sessions`; ids are POS ids verbatim (the contract accepts them).
  */
+import { parseExternalMixKey } from "@/lib/reports";
 import {
   allocate,
   businessDate,
@@ -66,10 +67,24 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export const POS_SOURCE = "openpizza_pos" as const;
 
-function cleanPhone(p: string | null | undefined): string | null {
+/**
+ * E.164 for the contract. A number already in E.164 passes. A NATIONAL number
+ * typed at checkout (`415-555-0199`, `(415) 555 0199`, `1 415 555 0199`) is only
+ * normalised when the location's country is the US or Canada (NANP, +1); for any
+ * other country (or an unknown one) it is null: guessing +1 would hand a module
+ * a stranger's number.
+ */
+export function cleanPhone(
+  p: string | null | undefined,
+  country?: string | null,
+): string | null {
   if (!p) return null;
   const compact = p.replace(/[\s().-]/g, "");
-  return PHONE_RE.test(compact) ? compact : null;
+  if (PHONE_RE.test(compact)) return compact;
+  if (country !== "US" && country !== "CA") return null;
+  if (/^[2-9]\d{9}$/.test(compact)) return `+1${compact}`;
+  if (/^1[2-9]\d{9}$/.test(compact)) return `+${compact}`;
+  return null;
 }
 
 function cleanEmail(e: string | null | undefined): string | null {
@@ -388,8 +403,25 @@ export function railToProcessor(rail: string): string {
   return rail;
 }
 
+/** An external tender reports what the caller recorded; a rail tender its rail's family. */
+export function tenderMethod(p: Pick<Payment, "rail" | "method">): string {
+  return p.rail === "external" ? (p.method ?? "external") : railToMethod(p.rail);
+}
+export function tenderProcessor(p: Pick<Payment, "rail" | "processor">): string {
+  return p.rail === "external" ? (p.processor ?? "external") : railToProcessor(p.rail);
+}
+
 /** Tender status with the refund variants the contract has and POS folds. */
 function tenderStatus(p: Payment): string {
+  // An external `authorized` tender is STORED pending (it must never count toward
+  // the balance); report what the caller recorded.
+  if (
+    p.rail === "external" &&
+    p.status === "pending" &&
+    p.raw?.requested_status === "authorized"
+  ) {
+    return "authorized";
+  }
   if (p.refunded_cents > 0 && p.status !== "refunded") {
     return p.refunded_cents >= p.amount_cents + p.tip_cents
       ? "refunded"
@@ -452,8 +484,8 @@ export function toContractPayment(p: Payment): CorePayment {
     tenant_id: p.tenant_id,
     location_id: p.location_id,
     order_id: p.order_id,
-    method: railToMethod(p.rail),
-    processor: railToProcessor(p.rail),
+    method: tenderMethod(p),
+    processor: tenderProcessor(p),
     status: tenderStatus(p) as CorePayment["status"],
     currency: p.currency,
     amount_cents: p.amount_cents,
@@ -463,9 +495,11 @@ export function toContractPayment(p: Payment): CorePayment {
     application_fee_cents: p.application_fee_cents,
     cash_tendered_cents: p.cash_tendered_cents,
     cash_change_cents: p.cash_change_cents,
-    processor_ref: p.charge_id ?? p.crypto_tx_hash ?? null,
-    staff_id: null,
+    processor_ref: p.charge_id ?? p.crypto_tx_hash ?? p.processor_ref ?? null,
+    staff_id: p.staff_id ?? null,
     simulated: p.simulated,
+    // Replay checks in the modules (driver) read `collection`.
+    collection: p.collection ?? null,
     external_ids: {},
     created_at: ts(p.created_at),
     updated_at: ts(p.updated_at),
@@ -587,6 +621,8 @@ export function toContractOrder(input: {
   payments: Payment[];
   timezone: string;
   customer?: Customer | null;
+  /** The order's location country (national-format phones); null/unknown = E.164 only. */
+  country?: string | null;
 }): CoreOrder {
   const { order, payments, timezone, customer } = input;
   const axes = fromPosOrderStatus(toPosOrderStatus(order.status));
@@ -618,7 +654,7 @@ export function toContractOrder(input: {
   const contact = {
     name: f?.contact?.name ?? customer?.name ?? null,
     email: cleanEmail(customer?.email),
-    phone: cleanPhone(f?.contact?.phone ?? customer?.phone),
+    phone: cleanPhone(f?.contact?.phone ?? customer?.phone, input.country),
   };
 
   const t = order.totals;
@@ -672,8 +708,8 @@ export function toContractOrder(input: {
     },
     tenders: payments.map((p) => ({
       payment_id: p.id,
-      method: railToMethod(p.rail),
-      processor: railToProcessor(p.rail),
+      method: tenderMethod(p),
+      processor: tenderProcessor(p),
       status: tenderStatus(p),
       amount_cents: p.amount_cents,
       tip_cents: p.tip_cents,
@@ -706,7 +742,9 @@ export function toContractOrder(input: {
 export function toContractCustomer(
   c: Customer,
   stats: { order_count: number; last_order_at: string | null; lifetime_spend_cents: number },
-): CoreCustomer {
+  /** The tenant's country (for national-format phones); null/unknown = E.164 only. */
+  country?: string | null,
+): CoreCustomer & { email_verified: boolean; phone_verified: boolean } {
   const noConsent = { opt_in: false, at: null, source: null };
   const name = c.name?.trim() || null;
   const [first, ...rest] = (name ?? "").split(/\s+/);
@@ -714,19 +752,31 @@ export function toContractCustomer(
     id: c.id,
     tenant_id: c.tenant_id,
     email: cleanEmail(c.email),
-    phone: cleanPhone(c.phone),
+    phone: cleanPhone(c.phone, country),
     name,
     first_name: first || null,
     last_name: rest.length ? rest.join(" ") : null,
-    verified: c.verified,
-    marketing: { email: noConsent, sms: noConsent },
+    // Verification is PER CONTACT: a row-wide flag would let one proven contact
+    // vouch for another (a planted one). `verified` is true only when the row has
+    // a contact and EVERY contact it has is proven. The legacy `customers.verified`
+    // column (the shop's magic-link stub asserts it for anyone) is never trusted.
+    verified:
+      Boolean(c.email || c.phone) &&
+      (!c.email || Boolean(c.email_verified_at)) &&
+      (!c.phone || Boolean(c.phone_verified_at)),
+    email_verified: Boolean(c.email && c.email_verified_at),
+    phone_verified: Boolean(c.phone && c.phone_verified_at),
+    marketing: {
+      email: c.marketing?.email ?? noConsent,
+      sms: c.marketing?.sms ?? noConsent,
+    },
     stats: {
       order_count: stats.order_count,
       last_order_at: stats.last_order_at ? ts(stats.last_order_at) : null,
       lifetime_spend_cents: stats.lifetime_spend_cents,
     },
-    tags: [],
-    external_ids: {},
+    tags: c.tags ?? [],
+    external_ids: c.external_ids ?? {},
     created_at: ts(c.created_at),
     updated_at: ts(c.updated_at),
   };
@@ -829,7 +879,7 @@ export function toContractDelivery(input: {
       geo: null,
       contact: {
         name: order?.fulfillment?.contact?.name ?? null,
-        phone: cleanPhone(order?.fulfillment?.contact?.phone),
+        phone: cleanPhone(order?.fulfillment?.contact?.phone, location.address?.country),
       },
       notes: order?.fulfillment?.delivery_notes ?? null,
     },
@@ -893,7 +943,7 @@ export function toContractDailySales(
       void_count: 0,
     })),
     payment_mix: r.paymentMix.map((m) => ({
-      method: railToMethod(m.rail),
+      method: parseExternalMixKey(m.rail)?.method ?? railToMethod(m.rail),
       count: m.count,
       amount_cents: m.amount_cents,
       tip_cents: m.tip_cents,

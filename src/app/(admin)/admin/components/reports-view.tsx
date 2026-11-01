@@ -59,7 +59,7 @@ export function ReportsView({ tenantId, locations }: Props) {
   }, [load]);
 
   const familyTotals = useMemo(() => {
-    const totals = { cash: 0, card: 0, crypto: 0 };
+    const totals = { cash: 0, card: 0, crypto: 0, other: 0 };
     for (const s of report?.paymentMix ?? []) {
       totals[railFamily(s.rail)] += s.amount_cents + s.tip_cents;
     }
@@ -143,6 +143,7 @@ export function ReportsView({ tenantId, locations }: Props) {
               <MixCard label="Cash" cents={familyTotals.cash} />
               <MixCard label="Card" cents={familyTotals.card} />
               <MixCard label="Crypto" cents={familyTotals.crypto} />
+              {familyTotals.other > 0 && <MixCard label="Other" cents={familyTotals.other} />}
             </div>
             <MixBars slices={report.paymentMix} />
           </section>
