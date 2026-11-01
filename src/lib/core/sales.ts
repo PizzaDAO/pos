@@ -13,6 +13,8 @@
  */
 import type {
   DailySales,
+  HourlySales,
+  ItemSales,
   Order,
   SalesFigures,
   SalesGroupBy,
@@ -254,4 +256,148 @@ export function buildDailySales(input: {
     closed: input.closedAt !== null,
     closed_at: input.closedAt,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Hourly + item-level rollups (sales.hourly, sales.items)
+// ---------------------------------------------------------------------------
+
+const dtfCache = new Map<string, Intl.DateTimeFormat>();
+function dtf(tz: string): Intl.DateTimeFormat {
+  let f = dtfCache.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      hourCycle: "h23",
+    });
+    dtfCache.set(tz, f);
+  }
+  return f;
+}
+
+/**
+ * Wall-clock date (YYYY-MM-DD) and hour (0..23) of an instant in a zone. Uses the
+ * zone's own rules per instant, so a DST day is right: spring-forward has no
+ * hour 2 row, fall-back folds both 01:xx hours into one (date, hour) bucket.
+ */
+export function localDateHour(iso: string, tz: string): { date: string; hour: number } {
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = dtf(tz).formatToParts(new Date(iso));
+  } catch {
+    parts = dtf("UTC").formatToParts(new Date(iso));
+  }
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    hour: Number(get("hour")) % 24,
+  };
+}
+
+/**
+ * `sales.hourly`: one row per location-local date x hour that had orders.
+ * Caller passes orders already limited to the business-date range (the same
+ * set `sales.daily` counts), so the rows of one business_date add up to that
+ * day's daily figures. Held and canceled orders are excluded (daily counts a
+ * cancel only in void_count). Bucketed by placed_at, else created_at, in the
+ * LOCATION's zone.
+ */
+export function buildHourlySales(input: {
+  from: string;
+  to: string;
+  orders: Order[];
+  timezones: Map<string, string>;
+}): HourlySales[] {
+  const rows = new Map<string, HourlySales>();
+  for (const o of input.orders) {
+    if (!countable(o) || o.fulfillment_status === "canceled") continue;
+    if (o.business_date < input.from || o.business_date > input.to) continue;
+    const tz = input.timezones.get(o.location_id) ?? "UTC";
+    const { date, hour } = localDateHour(o.placed_at ?? o.created_at, tz);
+    const key = `${o.location_id}|${date}|${hour}|${o.business_date}`;
+    let r = rows.get(key);
+    if (!r) {
+      r = {
+        location_id: o.location_id,
+        date,
+        business_date: o.business_date,
+        hour,
+        order_count: 0,
+        net_cents: 0,
+        gross_cents: 0,
+        tip_cents: 0,
+      };
+      rows.set(key, r);
+    }
+    r.order_count += 1;
+    r.gross_cents += o.totals.subtotal_cents;
+    r.net_cents += o.totals.subtotal_cents - o.totals.discount_cents;
+    r.tip_cents += o.totals.tip_cents;
+  }
+  return [...rows.values()].sort(
+    (a, b) =>
+      a.location_id.localeCompare(b.location_id) ||
+      a.date.localeCompare(b.date) ||
+      a.hour - b.hour ||
+      a.business_date.localeCompare(b.business_date),
+  );
+}
+
+/**
+ * `sales.items`: per location x business date x item x size. Voided lines and
+ * canceled / held orders are skipped. Names come from the order lines (they
+ * survive menu edits); the category falls back to the menu's item -> category map.
+ */
+export function buildItemSales(input: {
+  from: string;
+  to: string;
+  orders: Order[];
+  categoryOfItem?: Map<string, string>;
+}): ItemSales[] {
+  const rows = new Map<string, ItemSales & { _orders: Set<string> }>();
+  for (const o of input.orders) {
+    if (!countable(o) || o.fulfillment_status === "canceled") continue;
+    if (o.business_date < input.from || o.business_date > input.to) continue;
+    for (const l of o.lines) {
+      if (l.voided) continue;
+      const key = `${o.location_id}|${o.business_date}|${l.item_id}|${l.size_id ?? ""}`;
+      let r = rows.get(key);
+      if (!r) {
+        r = {
+          location_id: o.location_id,
+          business_date: o.business_date,
+          item_id: l.item_id,
+          item_name: l.item_name,
+          size_id: l.size_id ?? null,
+          size_name: l.size_name ?? null,
+          category_id: l.category_id ?? input.categoryOfItem?.get(l.item_id) ?? null,
+          units: 0,
+          order_count: 0,
+          gross_cents: 0,
+          discount_cents: 0,
+          net_cents: 0,
+          _orders: new Set(),
+        };
+        rows.set(key, r);
+      }
+      r.units += l.quantity;
+      r.gross_cents += l.line_total_cents;
+      r.discount_cents += l.discount_cents;
+      r.net_cents += Math.max(0, l.net_cents);
+      r._orders.add(o.id);
+    }
+  }
+  return [...rows.values()]
+    .map(({ _orders, ...r }) => ({ ...r, order_count: _orders.size }))
+    .sort(
+      (a, b) =>
+        a.location_id.localeCompare(b.location_id) ||
+        a.business_date.localeCompare(b.business_date) ||
+        a.item_id.localeCompare(b.item_id) ||
+        (a.size_id ?? "").localeCompare(b.size_id ?? ""),
+    );
 }

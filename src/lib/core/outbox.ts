@@ -51,6 +51,7 @@ import {
   toPosOrderStatus,
   refundForEvent,
 } from "./mappers";
+import { tipFactsForOrder } from "./tips";
 
 export const EVENT_SOURCE = "openpizza_pos";
 
@@ -372,6 +373,22 @@ export async function hydrateEvent(
     );
     const loc = close ? await loadLocation(tenant, close.location_id, driver) : null;
     data = close && loc ? toContractDailySales(close, loc.settings.currency) : null;
+  } else if (t === "tip.recorded" || t === "tip.adjusted") {
+    // The row names a payment and a deterministic fact id; the fact is rebuilt
+    // from CURRENT state with the same builder as GET /v1/tips. A fact that no
+    // longer exists (a released refund) or is the wrong kind is dropped.
+    const factId = row.row_snapshot?.fact_id;
+    const pay = await driver.getPayment(row.subject_id);
+    if (typeof factId === "string" && pay && pay.tenant_id === tenant) {
+      const order = await loadOrder(tenant, pay.order_id, driver);
+      if (order) {
+        const fact = tipFactsForOrder(order, await driver.listPaymentsForOrder(order.id)).find(
+          (f) => f.id === factId && (f.kind === "adjustment") === (t === "tip.adjusted"),
+        );
+        data = fact ?? null;
+        if (fact) locationId = fact.location_id;
+      }
+    }
   } else if (t === "delivery.status_changed") {
     data = await loadDelivery(tenant, row.subject_id, driver);
   } else {

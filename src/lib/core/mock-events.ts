@@ -237,6 +237,74 @@ function paymentEvents(
   });
 }
 
+const SETTLED = ["captured", "refunded"];
+
+/**
+ * Same rules as the tip section of public.core_trg_payments (20261107000000):
+ *   - a tender becoming captured with a tip -> tip.recorded `tip_<payment>`;
+ *   - a tip-less capture that is the FIRST settled tender of an order with an
+ *     order tip -> tip.recorded `tip_online_<order>`;
+ *   - a refund on a settled tender -> tip.adjusted for the part that lands on the
+ *     tip (tip first; online: the part beyond the base), id carries the
+ *     cumulative refunded tip so a replay never mints a second fact.
+ * Pure transitions (no outbox scan): a replayed upsert changes neither status nor
+ * refunded_cents and emits nothing.
+ */
+async function tipEvents(
+  box: MemoryOutbox,
+  inner: PosDriver,
+  announced: boolean,
+  after: Payment,
+  before: Payment | null,
+): Promise<void> {
+  if (!announced) return;
+  const emit = (type: "tip.recorded" | "tip.adjusted", factId: string) =>
+    box.append({
+      tenant_id: after.tenant_id,
+      location_id: after.location_id,
+      event_type: type,
+      subject_type: "payment",
+      subject_id: after.id,
+      row_snapshot: { fact_id: factId, order_id: after.order_id },
+    });
+  const wasSettled = !!before && SETTLED.includes(before.status);
+  if (after.status === "captured" && !wasSettled) {
+    if (after.tip_cents > 0) {
+      emit("tip.recorded", `tip_${after.id}`);
+    } else {
+      const order = await inner.getOrder(after.order_id);
+      const others = (await inner.listPaymentsForOrder(after.order_id)).filter(
+        (p) => p.id !== after.id && SETTLED.includes(p.status),
+      );
+      if ((order?.totals.tip_cents ?? 0) > 0 && others.length === 0) {
+        emit("tip.recorded", `tip_online_${after.order_id}`);
+      }
+    }
+  }
+  if (before && after.refunded_cents > before.refunded_cents && SETTLED.includes(after.status)) {
+    if (after.tip_cents > 0) {
+      const cumNew = Math.min(after.refunded_cents, after.tip_cents);
+      const cumOld = Math.min(before.refunded_cents, after.tip_cents);
+      if (cumNew > cumOld) emit("tip.adjusted", `tipadj_${after.id}_c${cumNew}`);
+    } else {
+      const order = await inner.getOrder(after.order_id);
+      const tip = order?.totals.tip_cents ?? 0;
+      const live = (await inner.listPaymentsForOrder(after.order_id)).filter((p) =>
+        SETTLED.includes(p.status),
+      );
+      if (tip > 0 && !live.some((p) => p.tip_cents > 0)) {
+        const base = live.reduce((n, p) => n + p.amount_cents, 0);
+        const runNew = live.reduce((n, p) => n + p.refunded_cents, 0);
+        const runOld = runNew - (after.refunded_cents - before.refunded_cents);
+        const cum = (run: number) => Math.max(0, Math.min(run - base, tip));
+        if (cum(runNew) > cum(runOld)) {
+          emit("tip.adjusted", `tipadj_online_${after.order_id}_c${cum(runNew)}`);
+        }
+      }
+    }
+  }
+}
+
 export function withOutbox(
   inner: PosDriver,
   box: MemoryOutbox = memoryOutbox,
@@ -312,7 +380,9 @@ export function withOutbox(
     async upsertPayment(payment) {
       const before = await inner.getPayment(payment.id);
       const after = await inner.upsertPayment(payment);
-      paymentEvents(box, await orderAnnounced(after.order_id), after, before);
+      const ann = await orderAnnounced(after.order_id);
+      paymentEvents(box, ann, after, before);
+      await tipEvents(box, inner, ann, after, before);
       return after;
     },
 
@@ -322,7 +392,9 @@ export function withOutbox(
     async recordExternalTender(input) {
       const res = await inner.recordExternalTender(input);
       if (res.outcome === "ok") {
-        paymentEvents(box, await orderAnnounced(res.payment.order_id), res.payment, null);
+        const ann = await orderAnnounced(res.payment.order_id);
+        paymentEvents(box, ann, res.payment, null);
+        await tipEvents(box, inner, ann, res.payment, null);
       }
       return res;
     },
@@ -368,7 +440,9 @@ export function withOutbox(
       const before = await inner.getPayment(paymentId);
       const res = await inner.reservePaymentRefund(paymentId, amountCents, refundId, meta);
       if (res.ok && before) {
-        paymentEvents(box, await orderAnnounced(res.payment.order_id), res.payment, before);
+        const ann = await orderAnnounced(res.payment.order_id);
+        paymentEvents(box, ann, res.payment, before);
+        await tipEvents(box, inner, ann, res.payment, before);
       }
       return res;
     },
