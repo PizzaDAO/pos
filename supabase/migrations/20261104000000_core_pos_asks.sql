@@ -330,11 +330,17 @@ declare
 begin
   if tg_op = 'UPDATE'
      and new.user_id is not distinct from old.user_id
-     and new.role is not distinct from old.role then
+     and new.role is not distinct from old.role
+     and new.tenant_id is not distinct from old.tenant_id then
     return new;
   end if;
   if v_actor is null or public.is_platform_admin() then
     return new;
+  end if;
+  -- A row moved through a tenant where the actor ranks higher would skip the checks below.
+  if tg_op = 'UPDATE' and new.tenant_id is distinct from old.tenant_id then
+    raise exception 'not allowed to move a staff member to another tenant'
+      using errcode = '42501';
   end if;
   select public.membership_rank(m.role) into v_actor_rank
     from public.memberships m
@@ -360,7 +366,7 @@ $$;
 
 drop trigger if exists staff_guard_user_link on public.staff;
 create trigger staff_guard_user_link
-  before insert or update of user_id, role on public.staff
+  before insert or update of user_id, role, tenant_id on public.staff
   for each row execute function public.guard_staff_user_link();
 
 -- PostgREST caches the RPC signatures: pick up the new reserve_payment_refund.

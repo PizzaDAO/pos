@@ -77,6 +77,12 @@ begin
   perform pg_temp.expect(mgr_u, format('update public.staff set name=%L where id=%L', 'Renamed', owner_s), false, 'unrelated update is not guarded');
   perform pg_temp.expect(owner_u, format('update public.staff set role=%L where id=%L', 'manager', mgr_s), false, 'owner changes a manager row');
   perform pg_temp.expect('', format('update public.staff set role=%L where id=%L', 'owner', mgr_s), false, 'service role promotes');
+  -- the cross-tenant bypass: move the row to a tenant where the actor ranks higher
+  insert into public.tenants (id, name, slug)
+  values ('0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0b', 'guard-t2', 'guard-t2');
+  insert into public.memberships (user_id, tenant_id, role)
+  values (mgr_u::uuid, '0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0b', 'owner');
+  perform pg_temp.expect(mgr_u, format('update public.staff set tenant_id=%L where id=%L', '0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0b', owner_s), true, 'manager moves owner row to another tenant');
   raise notice 'staff identity guards: ok';
 end
 $$;
