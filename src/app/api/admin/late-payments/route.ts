@@ -82,7 +82,11 @@ export async function GET(request: Request) {
   const auth = await requireTenantRole(tenantId, [...ROLES]);
   if (!auth.ok) return auth.res;
   const driver = getPosDriver();
-  const orders = await driver.listOpenLatePayments(tenantId, locationId, 100);
+  // A scheduled-hold item resolves itself once the order leaves `draft` (refunded
+  // and voided, or released by hand).
+  const orders = (await driver.listOpenLatePayments(tenantId, locationId, 100)).filter(
+    (o) => o.fulfillment?.late_payment?.kind !== "scheduled" || o.status === "draft",
+  );
   const out = await Promise.all(
     orders.map(async (order) => ({
       order,

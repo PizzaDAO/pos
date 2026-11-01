@@ -107,7 +107,16 @@ export function LatePayments({
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="text-sm">
                     <div className="font-semibold">
-                      {duplicate ? "Duplicate payment, refund one" : "Late payment"} ·
+                      {duplicate
+                        ? "Duplicate payment, refund one"
+                        : m?.kind === "scheduled"
+                          ? m.detail === "paid"
+                            ? "Scheduled order PAID but not released (too old to fire)"
+                            : m.detail === "partial"
+                              ? "Scheduled order only PARTLY paid, hold expired"
+                              : "Scheduled order: invoice still owed, hold expired"
+                          : "Late payment"}{" "}
+                      ·
                       Order {order.order_number} ·{" "}
                       {formatMoney(m?.amount_cents ?? 0, order.currency)}
                     </div>
@@ -132,7 +141,11 @@ export function LatePayments({
                         {!duplicate && (
                           <Button
                             size="sm"
-                            disabled={busy === order.id || order.status !== "abandoned"}
+                            disabled={
+                              busy === order.id ||
+                              order.status !== "abandoned" ||
+                              m?.kind === "scheduled"
+                            }
                             onClick={() => void resolve(order.id, "accept")}
                           >
                             Accept

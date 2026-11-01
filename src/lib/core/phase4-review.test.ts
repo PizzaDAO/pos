@@ -221,11 +221,66 @@ describe("F3 / F4: scheduled holds", () => {
     } as never);
     // The card payment alone does not release a scheduled order.
     expect((await getPosDriver().getOrder(ID(13)))!.status).toBe("draft");
-    const later = new Date(NOW.getTime() + 2 * DAY);
-    const r = await call("POST", `/orders/${ID(13)}/release`, { p: CAT(), body: {}, now: later });
+    // Just past the hold (inside the 6 h grace): the money is real, it releases.
+    const soon = new Date(NOW.getTime() + 3600_000 + 30 * 60_000);
+    const r = await call("POST", `/orders/${ID(13)}/release`, { p: CAT(), body: {}, now: soon });
     expect(r.status).toBe(200);
     expect(r.json.fulfillment_status).not.toBe("held");
     expect((await getPosDriver().getOrder(ID(13)))!.status).not.toBe("draft");
+  });
+
+  it("past the grace a paid expired hold is NOT fired: 409, flagged for staff as PAID", async () => {
+    const o = await call("POST", "/orders", { p: CAT(), body: await body({ id: ID(15), ...sched() }) });
+    await getPosDriver().upsertPayment({
+      id: ID(215), order_id: ID(15), tenant_id: DEMO_TENANT_ID, location_id: DEMO_LOCATION_DOWNTOWN_ID,
+      rail: "stripe_online", status: "captured", amount_cents: o.json.totals.total_cents - o.json.totals.tip_cents,
+      tip_cents: 0, application_fee_cents: 0, currency: "USD", charge_id: "ch_2", connect_account_id: null,
+      crypto_tx_hash: null, crypto_chain: null, cash_tendered_cents: null, cash_change_cents: null,
+      refunded_cents: 0, simulated: true, raw: null, created_at: NOW.toISOString(), updated_at: NOW.toISOString(),
+    } as never);
+    const r = await call("POST", `/orders/${ID(15)}/release`, { p: CAT(), body: {}, now: new Date(NOW.getTime() + 2 * DAY) });
+    expect(r.status).toBe(409);
+    expect(r.json.details.reason).toBe("stranded_paid");
+    expect(r.json.detail).toMatch(/fully paid/);
+    const after = (await getPosDriver().getOrder(ID(15)))!;
+    expect(after.status).toBe("draft");
+    expect(after.fulfillment?.late_payment).toMatchObject({ kind: "scheduled", detail: "paid" });
+    // Visible in the admin list.
+    const open = await getPosDriver().listOpenLatePayments(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID);
+    expect(open.map((x) => x.id)).toContain(ID(15));
+  });
+
+  it("a PARTLY paid expired hold says so and is flagged as partial", async () => {
+    await call("POST", "/orders", { p: CAT(), body: await body({ id: ID(16), ...sched() }) });
+    await getPosDriver().upsertPayment({
+      id: ID(216), order_id: ID(16), tenant_id: DEMO_TENANT_ID, location_id: DEMO_LOCATION_DOWNTOWN_ID,
+      rail: "stripe_online", status: "captured", amount_cents: 500,
+      tip_cents: 0, application_fee_cents: 0, currency: "USD", charge_id: "ch_3", connect_account_id: null,
+      crypto_tx_hash: null, crypto_chain: null, cash_tendered_cents: null, cash_change_cents: null,
+      refunded_cents: 0, simulated: true, raw: null, created_at: NOW.toISOString(), updated_at: NOW.toISOString(),
+    } as never);
+    const r = await call("POST", `/orders/${ID(16)}/release`, { p: CAT(), body: {}, now: new Date(NOW.getTime() + 2 * DAY) });
+    expect(r.status).toBe(409);
+    expect(r.json.detail).toMatch(/PARTLY paid/);
+    expect((await getPosDriver().getOrder(ID(16)))!.fulfillment?.late_payment).toMatchObject({
+      kind: "scheduled",
+      detail: "partial",
+    });
+  });
+
+  it("an expired scheduled hold with an invoice owed is not voided by a release", async () => {
+    await call("POST", "/orders", { p: CAT(), body: await body({ id: ID(17), ...sched() }) });
+    await getPosDriver().upsertPayment({
+      id: ID(217), order_id: ID(17), tenant_id: DEMO_TENANT_ID, location_id: DEMO_LOCATION_DOWNTOWN_ID,
+      rail: "external", status: "pending", amount_cents: 2000,
+      tip_cents: 0, application_fee_cents: 0, currency: "USD", charge_id: null, connect_account_id: null,
+      crypto_tx_hash: null, crypto_chain: null, cash_tendered_cents: null, cash_change_cents: null,
+      refunded_cents: 0, simulated: false, raw: null, created_at: NOW.toISOString(), updated_at: NOW.toISOString(),
+    } as never);
+    const r = await call("POST", `/orders/${ID(17)}/release`, { p: CAT(), body: {}, now: new Date(NOW.getTime() + 2 * DAY) });
+    expect(r.status).toBe(409);
+    expect(r.json.details.reason).toBe("invoice_pending");
+    expect((await getPosDriver().getOrder(ID(17)))!.status).toBe("draft");
   });
 
   it("an UNPAID expired scheduled hold is still voided on release", async () => {

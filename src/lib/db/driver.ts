@@ -189,6 +189,17 @@ export interface PosDriver {
   /** Add a location to a tenant during/after onboarding (own slug + settings). */
   createLocation(input: CreateLocationInput): Promise<Location>;
 
+  /**
+   * Set (or clear, with null) an existing location's ISO country. One conditional
+   * update scoped to `tenantId` (the service key bypasses RLS); null when the
+   * location is not this tenant's.
+   */
+  setLocationCountry(
+    tenantId: string,
+    locationId: string,
+    country: string | null,
+  ): Promise<Location | null>;
+
   /** Replace a new tenant's menu with the starter template (onboarding import). */
   importStarterMenu(tenantId: string): Promise<void>;
 

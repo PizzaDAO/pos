@@ -361,7 +361,14 @@ export interface OrderFulfillment {
  *    both settled); one of them must be refunded.
  */
 export interface LatePaymentMarker {
-  kind?: "late" | "duplicate";
+  kind?: "late" | "duplicate" | "scheduled";
+  /**
+   * `scheduled` markers: why a catering hold needs a human. `paid`: fully paid but
+   * the hold ran out unreleased past the grace (never fired to the kitchen);
+   * `partial`: only partly paid; `invoice_pending`: an invoice is still owed on an
+   * expired hold (not voided automatically).
+   */
+  detail?: "paid" | "partial" | "invoice_pending";
   payment_id: string;
   /** Late: settled amount (base + tip). Duplicate: the EXCESS, in cents. */
   amount_cents: number;

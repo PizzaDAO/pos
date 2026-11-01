@@ -110,13 +110,15 @@ function pushBucket(
   label: string,
   gross: number,
   count: number,
+  fees = 0,
 ): void {
   const existing = map.get(key);
   if (existing) {
     existing.gross_cents += gross;
     existing.count += count;
+    if (fees) existing.fees_cents = (existing.fees_cents ?? 0) + fees;
   } else {
-    map.set(key, { key, label, gross_cents: gross, count });
+    map.set(key, { key, label, gross_cents: gross, count, ...(fees ? { fees_cents: fees } : {}) });
   }
 }
 
@@ -195,6 +197,7 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
       channelLabel(order.channel),
       gross,
       1,
+      order.totals.fees_cents ?? 0,
     );
     pushBucket(
       byLocation,

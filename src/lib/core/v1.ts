@@ -81,7 +81,9 @@ import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import { cancelDeliveryForOrder } from "@/lib/delivery/service";
 import { captureError } from "@/lib/observability";
 import {
+  SCHEDULED_PAID_GRACE_MS,
   cancelOpenOnlineIntents,
+  flagStrandedScheduled,
   orderDueCents,
   settleOrderAfterExternalTender,
 } from "@/lib/payments/service";
@@ -784,11 +786,39 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     // real (a card paid a `scheduled` hold, then the hold ran out before its
     // release time), so it releases normally instead of being voided/stranded.
     const expired = Boolean(expires) && new Date(expires!).getTime() <= ctx.now().getTime();
+    const expiredPayments = expired ? await ctx.driver.listPaymentsForOrder(order.id) : [];
     const paidInFull =
       expired &&
-      netSettledBaseCents(await ctx.driver.listPaymentsForOrder(order.id), order.currency) >=
-        orderDueCents(order);
+      netSettledBaseCents(expiredPayments, order.currency) >= orderDueCents(order);
+    const isScheduled = order.hold?.reason === "scheduled";
+    if (paidInFull && isScheduled) {
+      // Paid, but the hold ran out long ago: releasing now would fire old food at
+      // the kitchen. Past the grace it is not released; staff decide (refund, or
+      // recreate it) from the admin "Late payments" list.
+      const lateMs = ctx.now().getTime() - new Date(expires!).getTime();
+      if (lateMs > SCHEDULED_PAID_GRACE_MS) {
+        await flagStrandedScheduled(order, expiredPayments, "paid");
+        throw ProblemError.of("CONFLICT", {
+          detail:
+            "The order is fully paid but its scheduled hold expired too long ago to release it; it was not fired. Staff have been alerted to refund or recreate it.",
+          details: { reason: "stranded_paid" },
+        });
+      }
+    }
     if (expired && !paidInFull) {
+      // A scheduled order with an invoice still owed is never voided by a lapse:
+      // money was promised, so a human decides.
+      if (
+        isScheduled &&
+        expiredPayments.some((p) => p.status === "pending" && p.rail === "external")
+      ) {
+        await flagStrandedScheduled(order, expiredPayments, "invoice_pending");
+        throw ProblemError.of("CONFLICT", {
+          detail:
+            "The scheduled hold expired while an invoice is still owed; the order was not canceled. Staff have been alerted to decide.",
+          details: { reason: "invoice_pending" },
+        });
+      }
       // Void it the same way cancel does: close any open card session/intent on
       // the provider FIRST (an open Checkout link must not outlive the order),
       // then void atomically against the tender state.
@@ -812,9 +842,19 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
         // a manual accept), so it must not carry the retryable `tender_in_progress`
         // reason that pizza-mcp retries on.
         const captured = voided.reason === "captured";
+        if (captured && isScheduled) {
+          // Settled money that does not cover the order (a deposit): partly paid.
+          await flagStrandedScheduled(
+            order,
+            await ctx.driver.listPaymentsForOrder(order.id),
+            "partial",
+          );
+        }
         throw ProblemError.of("CONFLICT", {
           detail: captured
-            ? "The hold expired but the order holds captured payment; refund it or accept the order."
+            ? isScheduled
+              ? "The scheduled hold expired and the order is only PARTLY paid; it was not released. Staff have been alerted to refund it or collect the balance."
+              : "The hold expired but the order holds captured payment; refund it or accept the order."
             : "The hold expired but a payment is in flight; retry shortly.",
           details: { reason: captured ? "captured_money" : "tender_in_progress" },
         });
