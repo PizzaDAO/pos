@@ -3,9 +3,10 @@
  *
  * The platform fee is what the PLATFORM charges per CARD order via Stripe
  * Connect `application_fee_amount`. It is `pct(bps) + flat`, computed on the
- * charge amount INCLUDING tip (Stripe takes the application fee off the full
- * transaction that settles to the connected account). Crypto + cash rails carry
- * no per-order application fee in v1 (per PLAN.md — crypto is subscription-only).
+ * BASE amount (the food), tips EXCLUDED: a tip belongs to the staff, so the
+ * platform takes no cut of it. This holds on every card rail (terminal, and
+ * stripe_online since pos-v1-gaps; online used to include the tip). Crypto +
+ * cash rails carry no per-order application fee in v1 (per PLAN.md — crypto is subscription-only).
  */
 import type { PaymentRailKey } from "./PaymentRail";
 
@@ -49,7 +50,7 @@ export function railChargesApplicationFee(
 }
 
 export interface PlatformFeeInput {
-  /** Amount the fee is computed on, in cents (base + tip for the tender). */
+  /** Amount the fee is computed on, in cents (the BASE amount; never the tip). */
   amountCents: number;
   /** Fee rate in basis points (250 = 2.50%). */
   feeBps: number;

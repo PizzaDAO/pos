@@ -246,7 +246,9 @@ export function withOutbox(
     const o = await inner.getOrder(orderId);
     if (!o) return false;
     announced.note(o);
-    return announced.has(o);
+    // Mirrors core_trg_payments (20261105000200): the hub has seen the order, OR it
+    // is a held /v1 order (draft + hold), whose payment must precede order.placed.
+    return announced.has(o) || (o.status === "draft" && !!o.hold);
   };
   const emitMenuUpdated = (tenantId: string, itemId: string | null) => {
     // Coalesce into a pending row that has NOT been claimed yet; once a worker

@@ -38,12 +38,148 @@ import { simId, simRaw } from "./simulate";
 
 const KEY = "stripe_online" as const;
 
-function feeForTender(amount: number, tip: number): number {
+/**
+ * Platform application fee for a tender. Computed on the BASE amount only: tips
+ * are the staff's, not revenue the platform takes a cut of (same policy as the
+ * terminal rail and GAPS). `tip` is accepted so call sites state it, but it is
+ * deliberately NOT part of the fee base. (Before pos-v1-gaps this charged the fee
+ * on amount + tip; that was the only behaviour change to the shop checkout.)
+ */
+export function feeForTender(amount: number, _tip: number): number {
   const { bps, flatCents } = getDefaultPlatformFee();
   return computeApplicationFeeCents({
-    amountCents: amount + tip,
+    amountCents: amount,
     feeBps: bps,
     feeFlatCents: flatCents,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stripe Checkout (hosted pay links for /v1 payment sessions)
+// ---------------------------------------------------------------------------
+
+export interface CheckoutSessionParams {
+  /** Our tender id (payments.id): rides on the PaymentIntent for webhook matching. */
+  paymentId: string;
+  orderId: string;
+  tenantId: string;
+  connectAccountId: string;
+  currency: string;
+  /** Base amount (food), cents. */
+  amountCents: number;
+  tipCents: number;
+  applicationFeeCents: number;
+  successUrl: string;
+  cancelUrl: string;
+  /** Unix seconds. */
+  expiresAt: number;
+  customerEmail?: string | null;
+  description: string;
+}
+
+export interface StripeCheckoutSession {
+  id: string;
+  url: string | null;
+  status: "open" | "complete" | "expired" | string;
+  payment_status?: string;
+  payment_intent?: string | null;
+  amount_total?: number | null;
+  currency?: string | null;
+  expires_at: number;
+  livemode?: boolean;
+}
+
+/**
+ * Create a Checkout Session on the tenant's CONNECTED account (direct charge:
+ * `Stripe-Account` header, application fee on the PaymentIntent). Card only so
+ * capture stays synchronous (wallets ride on card). The PaymentIntent carries
+ * `payment_id` metadata, which is how the existing `payment_intent.succeeded`
+ * webhook finds the tender (Stripe creates the PaymentIntent only when the payer
+ * confirms, so there is no charge id to store earlier).
+ *
+ * CALLER MUST HAVE PASSED `assertSessionChargeAllowed` (the safety gate); this
+ * function additionally refuses to run in simulated mode.
+ */
+export async function createCheckoutSession(
+  p: CheckoutSessionParams,
+): Promise<StripeCheckoutSession> {
+  if (cardRailsSimulated()) {
+    throw new Error("createCheckoutSession called in simulated mode.");
+  }
+  const currency = p.currency.toLowerCase();
+  const lineItems: Record<string, unknown>[] = [
+    {
+      price_data: {
+        currency,
+        unit_amount: p.amountCents,
+        product_data: { name: p.description },
+      },
+      quantity: 1,
+    },
+  ];
+  if (p.tipCents > 0) {
+    lineItems.push({
+      price_data: {
+        currency,
+        unit_amount: p.tipCents,
+        product_data: { name: "Tip" },
+      },
+      quantity: 1,
+    });
+  }
+  return stripeRequest<StripeCheckoutSession>(
+    "/checkout/sessions",
+    {
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: lineItems,
+      success_url: p.successUrl,
+      cancel_url: p.cancelUrl,
+      expires_at: p.expiresAt,
+      customer_email: p.customerEmail ?? undefined,
+      client_reference_id: p.paymentId,
+      metadata: {
+        payment_id: p.paymentId,
+        order_id: p.orderId,
+        tenant_id: p.tenantId,
+      },
+      payment_intent_data: {
+        application_fee_amount:
+          p.applicationFeeCents > 0 ? p.applicationFeeCents : undefined,
+        metadata: {
+          payment_id: p.paymentId,
+          order_id: p.orderId,
+          tenant_id: p.tenantId,
+          tip_cents: String(p.tipCents),
+        },
+      },
+    },
+    {
+      stripeAccount: p.connectAccountId,
+      // One session per tender: a retry of the same tender never makes a second.
+      idempotencyKey: `cs_${p.paymentId}`,
+    },
+  );
+}
+
+/** Expire an open Checkout Session (throws if it already completed/expired). */
+export async function expireCheckoutSession(
+  sessionId: string,
+  connectAccountId: string | null,
+): Promise<StripeCheckoutSession> {
+  return stripeRequest<StripeCheckoutSession>(
+    `/checkout/sessions/${sessionId}/expire`,
+    {},
+    { stripeAccount: connectAccountId },
+  );
+}
+
+export async function getCheckoutSession(
+  sessionId: string,
+  connectAccountId: string | null,
+): Promise<StripeCheckoutSession> {
+  return stripeGet<StripeCheckoutSession>(`/checkout/sessions/${sessionId}`, {
+    stripeAccount: connectAccountId,
   });
 }
 

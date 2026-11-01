@@ -18,8 +18,10 @@ import type {
 import type {
   ConnectAccount,
   Payment,
+  PaymentSessionRow,
   PaymentSettings,
   RefundReservation,
+  StoredQuote,
   TerminalLocation,
   TerminalReader,
 } from "./payment-types";
@@ -540,6 +542,64 @@ export interface PosDriver {
 
   /** All tenders recorded against an order (oldest first). */
   listPaymentsForOrder(orderId: string): Promise<Payment[]>;
+
+  // --------------------------------------------------------------------------
+  // /v1 payment sessions (hosted pay links) + stored quotes
+  // --------------------------------------------------------------------------
+
+  /**
+   * Insert a payment session. Throws `PaymentSessionConflictError` when the
+   * (tenant, idempotency key) pair or the order's single OPEN slot is taken.
+   */
+  insertPaymentSession(row: PaymentSessionRow): Promise<PaymentSessionRow>;
+  getPaymentSession(id: string): Promise<PaymentSessionRow | null>;
+  getPaymentSessionByKey(
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<PaymentSessionRow | null>;
+  getPaymentSessionByStripeId(
+    stripeSessionId: string,
+  ): Promise<PaymentSessionRow | null>;
+  getOpenPaymentSessionForOrder(
+    orderId: string,
+  ): Promise<PaymentSessionRow | null>;
+  /**
+   * Merge `patch` into a session. A session that already left `open` keeps its
+   * terminal status (a late `canceled` never overwrites `completed`).
+   */
+  updatePaymentSession(
+    id: string,
+    patch: Partial<
+      Pick<PaymentSessionRow, "status" | "payment_id" | "stripe_session_id" | "url" | "expires_at">
+    >,
+  ): Promise<PaymentSessionRow | null>;
+
+  /** Persist a validated quote request (idempotent on id). */
+  saveQuote(quote: StoredQuote): Promise<void>;
+  /** A stored quote of this tenant, or null. */
+  getQuote(tenantId: string, id: string): Promise<StoredQuote | null>;
+  /** Delete quotes that expired before `before` (ISO). Returns how many. */
+  pruneExpiredQuotes(before: string): Promise<number>;
+
+  /**
+   * Held (`draft`) orders whose `awaiting_payment` hold expired before `now`,
+   * oldest first, keyset-paged. `checkoutMode` keeps this deployment's orders
+   * (plus legacy orders with no marker). Parked in-store drafts (no hold) and
+   * holds with another reason (`scheduled`, `manual`) are never returned.
+   */
+  listExpiredHolds(
+    now: string,
+    opts?: {
+      limit?: number;
+      after?: { created_at: string; id: string };
+      checkoutMode?: "live" | "test" | "sim";
+      /**
+       * Instead: holds stamped with a mode OTHER than this one that have not been
+       * alerted on yet (`foreign_alerted_at` unset), for the long-grace pass.
+       */
+      foreignOf?: "live" | "test" | "sim";
+    },
+  ): Promise<Order[]>;
 
   // --------------------------------------------------------------------------
   // Stripe Connect (Phase 2)

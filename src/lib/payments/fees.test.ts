@@ -4,6 +4,7 @@ import {
   railChargesApplicationFee,
   roundHalfUp,
 } from "@/lib/payments/fees";
+import { feeForTender, stripeOnlineRail } from "@/lib/payments/rails/stripe-online";
 
 describe("computeApplicationFeeCents", () => {
   it("computes pct(bps) + flat, round-half-up on the pct", () => {
@@ -92,6 +93,25 @@ describe("railChargesApplicationFee — card-only", () => {
     expect(railChargesApplicationFee("cash")).toBe(false);
     expect(railChargesApplicationFee("crypto_onchain_usdc")).toBe(false);
     expect(railChargesApplicationFee("crypto_coinbase")).toBe(false);
+  });
+});
+
+describe("stripe_online platform fee excludes the tip", () => {
+  it("feeForTender takes pct + flat of the BASE amount only", () => {
+    // 2.5% of $20.00 = 50c + 10c flat = 60c, whatever the tip.
+    expect(feeForTender(2000, 0)).toBe(60);
+    expect(feeForTender(2000, 500)).toBe(60);
+    expect(feeForTender(2000, 5000)).toBe(60);
+  });
+
+  it("the rail's quote and simulated charge carry that fee, and charge amount + tip", async () => {
+    const req = {
+      amount: { amount: 2000, currency: "USD" },
+      tip: { amount: 500, currency: "USD" },
+    };
+    const q = await stripeOnlineRail.quote(req as never);
+    expect(q.total.amount).toBe(2500);
+    expect(q.applicationFee?.amount).toBe(60);
   });
 });
 

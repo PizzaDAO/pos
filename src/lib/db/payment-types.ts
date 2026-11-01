@@ -227,3 +227,64 @@ export function tenderHoldsOpenSlot(status: PaymentStatus): boolean {
 export function tenderFreesSlot(status: PaymentStatus): boolean {
   return status === "canceled" || status === "failed";
 }
+
+// ---------------------------------------------------------------------------
+// /v1 payment sessions + stored quotes (pos-v1-gaps phase 1)
+// ---------------------------------------------------------------------------
+
+export type PaymentSessionStatus = "open" | "completed" | "expired" | "canceled";
+
+/**
+ * A hosted pay link (`payment_sessions`). One `stripe_online` tender backs each
+ * session; the session itself never carries money, it is only the link.
+ */
+export interface PaymentSessionRow {
+  /** Random, unguessable. */
+  id: string;
+  tenant_id: string;
+  order_id: string;
+  /** The tender (payments.id) once captured; null before. */
+  payment_id: string | null;
+  status: PaymentSessionStatus;
+  url: string;
+  /** Stripe Checkout Session id (`cs_test_…`), or a `cs_sim_…` id when simulated. */
+  stripe_session_id: string | null;
+  currency: string;
+  amount_cents: number;
+  tip_cents: number;
+  application_fee_cents: number;
+  idempotency_key: string;
+  request_hash: string;
+  success_url: string;
+  cancel_url: string | null;
+  expires_at: string;
+  simulated: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The idempotency key or the one-open-session slot is already taken. */
+export class PaymentSessionConflictError extends Error {
+  readonly kind: "key" | "open";
+  constructor(kind: "key" | "open") {
+    super(
+      kind === "key"
+        ? "Idempotency key already used for a payment session."
+        : "This order already has an open payment session.",
+    );
+    this.name = "PaymentSessionConflictError";
+    this.kind = kind;
+  }
+}
+
+/** A stored `/v1` quote (`core_quotes`): the validated request, re-priced on use. */
+export interface StoredQuote {
+  id: string;
+  tenant_id: string;
+  location_id: string;
+  /** The parsed QuoteRequest (zod defaults applied). */
+  request: Record<string, unknown>;
+  quote_hash: string;
+  expires_at: string;
+  created_at: string;
+}
