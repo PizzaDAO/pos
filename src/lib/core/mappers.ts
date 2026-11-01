@@ -390,6 +390,15 @@ export function railToProcessor(rail: string): string {
 
 /** Tender status with the refund variants the contract has and POS folds. */
 function tenderStatus(p: Payment): string {
+  // An external `authorized` tender is STORED pending (it must never count toward
+  // the balance); report what the caller recorded.
+  if (
+    p.rail === "external" &&
+    p.status === "pending" &&
+    p.raw?.requested_status === "authorized"
+  ) {
+    return "authorized";
+  }
   if (p.refunded_cents > 0 && p.status !== "refunded") {
     return p.refunded_cents >= p.amount_cents + p.tip_cents
       ? "refunded"
@@ -452,8 +461,8 @@ export function toContractPayment(p: Payment): CorePayment {
     tenant_id: p.tenant_id,
     location_id: p.location_id,
     order_id: p.order_id,
-    method: railToMethod(p.rail),
-    processor: railToProcessor(p.rail),
+    method: p.rail === "external" ? (p.method ?? "external") : railToMethod(p.rail),
+    processor: p.rail === "external" ? (p.processor ?? "external") : railToProcessor(p.rail),
     status: tenderStatus(p) as CorePayment["status"],
     currency: p.currency,
     amount_cents: p.amount_cents,
@@ -463,9 +472,11 @@ export function toContractPayment(p: Payment): CorePayment {
     application_fee_cents: p.application_fee_cents,
     cash_tendered_cents: p.cash_tendered_cents,
     cash_change_cents: p.cash_change_cents,
-    processor_ref: p.charge_id ?? p.crypto_tx_hash ?? null,
-    staff_id: null,
+    processor_ref: p.charge_id ?? p.crypto_tx_hash ?? p.processor_ref ?? null,
+    staff_id: p.staff_id ?? null,
     simulated: p.simulated,
+    // Replay checks in the modules (driver) read `collection`.
+    collection: p.collection ?? null,
     external_ids: {},
     created_at: ts(p.created_at),
     updated_at: ts(p.updated_at),
@@ -719,14 +730,17 @@ export function toContractCustomer(
     first_name: first || null,
     last_name: rest.length ? rest.join(" ") : null,
     verified: c.verified,
-    marketing: { email: noConsent, sms: noConsent },
+    marketing: {
+      email: c.marketing?.email ?? noConsent,
+      sms: c.marketing?.sms ?? noConsent,
+    },
     stats: {
       order_count: stats.order_count,
       last_order_at: stats.last_order_at ? ts(stats.last_order_at) : null,
       lifetime_spend_cents: stats.lifetime_spend_cents,
     },
-    tags: [],
-    external_ids: {},
+    tags: c.tags ?? [],
+    external_ids: c.external_ids ?? {},
     created_at: ts(c.created_at),
     updated_at: ts(c.updated_at),
   };

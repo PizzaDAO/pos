@@ -7,6 +7,31 @@
  */
 import type { DeliveryAddress } from "./menu-types";
 
+/** One channel's marketing consent (mirrors the contract `Consent`). */
+export interface CustomerConsent {
+  opt_in: boolean;
+  at?: string | null;
+  source?: string | null;
+  disclosure_version?: string | null;
+  disclosure_text?: string | null;
+  ip?: string | null;
+  user_agent?: string | null;
+  captured_by?: string | null;
+}
+
+/** What `PosDriver.upsertCustomerIdentity` is asked to store (already validated). */
+export interface CustomerIdentityWrite {
+  /** Used only when a new row is created. */
+  newId: string;
+  email: string | null;
+  phone: string | null;
+  name: string | null;
+  /** Only channels that carry an `at` (consent without evidence is not stored). */
+  marketing: { email?: CustomerConsent; sms?: CustomerConsent };
+  tags: string[];
+  externalIds: Record<string, string>;
+}
+
 /**
  * A customer of a tenant (online ordering). Created on guest checkout and
  * optionally "claimed" via a magic-link account stub (no real email send — see
@@ -17,7 +42,8 @@ export interface Customer {
   /** Client/server UUID. */
   id: string;
   tenant_id: string;
-  email: string;
+  /** Null for a phone-only customer (`customers.upsert` by phone). */
+  email: string | null;
   name: string | null;
   phone: string | null;
   /**
@@ -25,6 +51,10 @@ export interface Customer {
    * stub. Guests start `false`; clicking a (simulated) magic link flips it.
    */
   verified: boolean;
+  /** Marketing consent per channel (`customers.upsert`); absent = none recorded. */
+  marketing?: { email?: CustomerConsent; sms?: CustomerConsent };
+  tags?: string[];
+  external_ids?: Record<string, string>;
   created_at: string;
   updated_at: string;
 }

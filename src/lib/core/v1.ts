@@ -11,11 +11,14 @@
  * Implemented: tenant, capabilities, entitlements, locations, menu (+86),
  * quotes (stored; create/get, and `orders.create{quote_id}` re-prices them),
  * orders (list/get/create held/cancel/release/extend hold), payments (read, plus
- * hosted payment sessions and the payments account), customers (read), staff,
- * drawer sessions, deliveries (read), sales.
+ * hosted payment sessions, the payments account and `recordExternal`), customers
+ * (read + `upsert`), staff (read, `verifyPin`, `setPin`), drawer sessions,
+ * deliveries (read), sales.
  * Declared but unsupported by POS answer 501 CAPABILITY_UNSUPPORTED:
- * orders.updateStatus, payments.recordExternal, customers.upsert,
- * deliveries.updateStatus, events.list (events go out by webhook).
+ * orders.updateStatus, deliveries.updateStatus, events.list (events go out by
+ * webhook).
+ * `staff.verifyPin` is a HUB_ROUTES operation: it is added to the route table by
+ * hand (EXTRA_ROUTES).
  *
  * Payment sessions are the ONLY /v1 path that can reach Stripe. They are gated on
  * the server (`assertSessionChargeAllowed` in payment-sessions.ts): simulated
@@ -24,7 +27,10 @@
  */
 import {
   AvailabilityUpdateSchema,
+  CustomerUpsertInputSchema,
   EVENT_TYPES,
+  ExternalTenderInputSchema,
+  HUB_ROUTES,
   OrderCancelInputSchema,
   OrderCreateInputSchema,
   OrderHoldExtendInputSchema,
@@ -34,8 +40,12 @@ import {
   ProblemError,
   QuoteRequestSchema,
   SalesSummaryQuerySchema,
+  StaffPinSetInputSchema,
+  StaffPinVerifyInputSchema,
   V1_ROUTES,
+  checkTenderAmounts,
   extendedHoldExpiry,
+  hasScopes,
   holdCapSeconds,
   isProblemError,
   priceCart,
@@ -55,6 +65,7 @@ import type { ZodError } from "zod";
 import {
   getPosDriver,
   type CreateOrderInput,
+  type Payment,
   type PosDriver,
   type OrderFulfillment,
 } from "@/lib/db";
@@ -66,6 +77,7 @@ import { captureError } from "@/lib/observability";
 import {
   cancelOpenOnlineIntents,
   orderDueCents,
+  settleOrderAfterExternalTender,
 } from "@/lib/payments/service";
 import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError, maxTipCents } from "@/lib/reprice";
@@ -88,7 +100,16 @@ import {
   mapOrder,
   type LocationBundle,
 } from "./loaders";
-import { toContractCustomer, toContractPayment, toContractTenant } from "./mappers";
+import {
+  toContractCustomer,
+  toContractPayment,
+  toContractStaff,
+  toContractTenant,
+} from "./mappers";
+import { phoneKey } from "@/lib/db/customer-identity";
+import type { CustomerConsent } from "@/lib/db";
+import { hashPin, verifyPin } from "@/lib/auth/pin";
+import { tenderFingerprint } from "@/lib/db/payment-types";
 import { netSettledBaseCents } from "./money";
 import {
   createPaymentSession,
@@ -106,7 +127,16 @@ export interface V1Deps {
   principal?: Principal;
 }
 
+/** Narrow kiosk scope: record captured card-terminal tenders only. */
+export const TERMINAL_PAYMENT_SCOPE = "payments.terminal:write";
+
 interface Ctx {
+  /**
+   * True when the caller holds `payments.terminal:write` but NOT the route's
+   * `payments:write` (a kiosk): the recordExternal handler then allows only a
+   * captured `collection: "terminal"` tender.
+   */
+  terminalOnly?: boolean;
   req: Request;
   url: URL;
   params: Record<string, string>;
@@ -338,7 +368,7 @@ const POS_EMITTED_EVENTS: readonly string[] = [
 ];
 const POS_EVENTS = EVENT_TYPES.filter((t) => POS_EMITTED_EVENTS.includes(t));
 
-const handlers: Partial<Record<V1Operation, Handler>> = {
+const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
   "tenant.get": async (ctx) => {
     const tenant = await ctx.driver.getTenant(ctx.principal.tenant_id);
     if (!tenant) throw notFound("Tenant");
@@ -364,8 +394,8 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         "menu.write": false,
         "menu.availability.write": true,
         "menu.half_placement": true,
-        "customers.write": false,
-        "payments.external_tender": false,
+        "customers.write": true,
+        "payments.external_tender": true,
         "deliveries.write": false,
         "sales.summary": true,
         drawer_sessions: true,
@@ -911,7 +941,8 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
       let after: { created_at: string; id: string } | undefined;
       for (let guard = 0; guard < 400 && !found; guard++) {
         const batch = await ctx.driver.listCustomers(tenantId, { after, limit: 500 });
-        found = batch.find((c) => c.phone?.replace(/[\s().-]/g, "") === phone) ?? null;
+        const key = phoneKey(phone);
+        found = key ? (batch.find((c) => phoneKey(c.phone) === key) ?? null) : null;
         if (batch.length < 500) break;
         const lastRow = batch[batch.length - 1]!;
         after = { created_at: lastRow.created_at, id: lastRow.id };
@@ -926,6 +957,61 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     if (!c) throw notFound("Customer");
     return { body: c };
   },
+
+  /**
+   * POST /customers (0.3.0): upsert by email, else by phone, within the token's
+   * tenant. The atomic rules live in the driver (`upsertCustomerIdentity`): email
+   * wins, two customers are never merged, blanks are filled but never
+   * overwritten, `verified` is never touched (the hub's OTP flow vouches for the
+   * contact itself), consent changes only with an `at`. Naturally idempotent:
+   * repeating the request changes nothing.
+   */
+  "customers.upsert": async (ctx) => {
+    await requireActiveTenant(ctx);
+    const parsed = CustomerUpsertInputSchema.safeParse(await readBody(ctx.req));
+    if (!parsed.success) throw zodProblem(parsed.error);
+    const i = parsed.data;
+    if ((i.tags?.length ?? 0) > 100 || Object.keys(i.external_ids ?? {}).length > 50) {
+      throw ProblemError.of("VALIDATION_FAILED", {
+        detail: "Too many tags (max 100) or external ids (max 50).",
+      });
+    }
+    const name =
+      i.name?.trim() ||
+      [i.first_name, i.last_name]
+        .map((s) => s?.trim())
+        .filter(Boolean)
+        .join(" ") ||
+      null;
+    // Consent without an `at` is not evidence: it is not stored (and never
+    // flips an existing channel).
+    const marketing: { email?: CustomerConsent; sms?: CustomerConsent } = {};
+    for (const ch of ["email", "sms"] as const) {
+      const c = i.marketing?.[ch];
+      if (c?.at) marketing[ch] = c;
+    }
+    const tenantId = ctx.principal.tenant_id;
+    const { customer } = await ctx.driver.upsertCustomerIdentity(tenantId, {
+      newId: globalThis.crypto.randomUUID(),
+      email: i.email ?? null,
+      phone: i.phone ?? null,
+      name,
+      marketing,
+      tags: (i.tags ?? []).map((t) => t.trim()).filter(Boolean),
+      externalIds: i.external_ids ?? {},
+    });
+    const body =
+      (await loadCustomer(tenantId, customer.id, ctx.driver)) ??
+      toContractCustomer(customer, NO_STATS);
+    return { status: 200, body };
+  },
+
+  /**
+   * POST /orders/{id}/payments (0.3.0): record a tender taken OUTSIDE POS's
+   * processors (kiosk card reader, cash on delivery, paid invoice, gift card).
+   * See `recordExternalTender` below.
+   */
+  "payments.recordExternal": async (ctx) => recordExternalTender(ctx),
 
   "staff.list": async (ctx) => {
     let staff = await loadStaffList(ctx.principal.tenant_id, ctx.driver);
@@ -942,6 +1028,97 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
     );
     if (!s) throw notFound("Staff member");
     return { body: s };
+  },
+
+  /**
+   * POST /staff/verify-pin (HUB_ROUTES, so it is added to the route table by
+   * hand): answers "is this the staff member's PIN?" and nothing else. The hub
+   * mints the acting-staff session; POS never does, and never sees a token.
+   *
+   * Reuses the till's PIN logic: `begin_pin_attempt` counts the attempt under a
+   * row lock BEFORE the PIN is checked (5 attempts without a success -> 15-minute
+   * lock, shared with /api/terminal/pin), scrypt `verifyPin`, then
+   * `clearPinAttempts`. Every mismatch (unknown / inactive / wrong location /
+   * no PIN / wrong PIN / suspended tenant / foreign location) is the SAME 403,
+   * and an unknown member burns the same scrypt time, so nothing is enumerable.
+   * The PIN is never logged, echoed or stored.
+   */
+  "staff.verifyPin": async (ctx) => {
+    const parsed = StaffPinVerifyInputSchema.safeParse(await readBody(ctx.req));
+    if (!parsed.success) throw zodProblem(parsed.error, "Request is invalid.");
+    const { location_id, staff_id, pin } = parsed.data;
+    const tenantId = ctx.principal.tenant_id;
+    const mismatch = () => ProblemError.of("FORBIDDEN", { detail: "PIN not recognised." });
+
+    const tenant = await ctx.driver.getTenant(tenantId);
+    const location = allowedLocation(ctx.principal, location_id)
+      ? await loadLocation(tenantId, location_id, ctx.driver)
+      : null;
+    const staff = isGuid(staff_id) ? await ctx.driver.getStaffById(tenantId, staff_id) : null;
+    const eligible =
+      tenant?.status === "active" &&
+      !!location &&
+      !!staff &&
+      staff.active &&
+      (!staff.location_ids?.length || staff.location_ids.includes(location_id));
+    if (!eligible || !staff) {
+      // Same cost as a real check; the answer is the same generic 403.
+      verifyPin(pin, dummyPinHash());
+      throw mismatch();
+    }
+
+    const attempt = await ctx.driver.beginPinAttempt(tenantId, staff.id);
+    if (!attempt.allowed) {
+      throw ProblemError.of("RATE_LIMITED", {
+        detail: "Too many incorrect PINs. Try again later.",
+        details: { locked_until: attempt.lockedUntil },
+      });
+    }
+    // A member with no PIN set costs the same scrypt as a wrong PIN (and can
+    // never match: the dummy is a random secret, and the result is ANDed).
+    const ok =
+      verifyPin(pin, staff.pin_hash ?? dummyPinHash()) && Boolean(staff.pin_hash);
+    if (!ok) throw mismatch();
+    await ctx.driver.clearPinAttempts(tenantId, staff.id);
+
+    const email = staff.user_id
+      ? ((await ctx.driver.getUserEmails([staff.user_id])).get(staff.user_id) ?? null)
+      : null;
+    return {
+      body: { staff: toContractStaff({ ...staff, pin_hash: undefined }, true, email) },
+    };
+  },
+
+  /**
+   * PUT /staff/{id}/pin (literal scope `staff:set_pin`; the hub has already
+   * checked role rank and location). POS re-checks the TENANT (and a
+   * location-limited token's reach) and hashes with the till's scrypt. `null`
+   * clears the PIN. One targeted update of `pin_hash`; the PIN is never logged.
+   */
+  "staff.setPin": async (ctx) => {
+    await requireActiveTenant(ctx);
+    const parsed = StaffPinSetInputSchema.safeParse(await readBody(ctx.req));
+    if (!parsed.success) throw zodProblem(parsed.error);
+    const tenantId = ctx.principal.tenant_id;
+    const staffId = ctx.params.staff_id!;
+    const staff = isGuid(staffId) ? await ctx.driver.getStaffById(tenantId, staffId) : null;
+    if (!staff) throw notFound("Staff member");
+    // A location-limited token may only touch staff entirely inside its reach
+    // (staff with no location list work everywhere, so they are out of reach).
+    const lids = scopedLocationIds(ctx.principal);
+    if (
+      lids &&
+      (!staff.location_ids?.length || !staff.location_ids.every((l) => lids.includes(l)))
+    ) {
+      throw notFound("Staff member");
+    }
+    const hash = parsed.data.pin === null ? null : hashPin(parsed.data.pin);
+    if (!(await ctx.driver.setStaffPinHash(tenantId, staff.id, hash))) {
+      throw notFound("Staff member");
+    }
+    const member = (await loadStaffList(tenantId, ctx.driver)).find((s) => s.id === staff.id);
+    if (!member) throw notFound("Staff member");
+    return { body: member };
   },
 
   "drawerSessions.list": async (ctx) => {
@@ -1089,11 +1266,25 @@ function paddedRange(from: string, to: string): { createdFrom: string; createdTo
 
 const UNSUPPORTED: V1Operation[] = [
   "orders.updateStatus",
-  "payments.recordExternal",
-  "customers.upsert",
   "deliveries.updateStatus",
   "events.list",
 ];
+
+/**
+ * Operations that live in the hub's route table (`HUB_ROUTES`) but that the hub
+ * delegates to the commerce source, so POS must serve them too. They are added
+ * to the router by hand: `V1_ROUTES` does not list them.
+ */
+type ExtraOperation = "staff.verifyPin";
+const EXTRA_ROUTES: Record<ExtraOperation, { method: string; path: string; scopes: readonly string[] }> = {
+  "staff.verifyPin": HUB_ROUTES["staff.verifyPin"],
+};
+
+let dummyHash: string | null = null;
+/** A hash nobody's PIN matches (random secret), for equal-cost misses. */
+function dummyPinHash(): string {
+  return (dummyHash ??= hashPin(globalThis.crypto.randomUUID()));
+}
 
 // ---------------------------------------------------------------------------
 // Orders (write)
@@ -1463,11 +1654,267 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
 }
 
 // ---------------------------------------------------------------------------
+// payments.recordExternal
+// ---------------------------------------------------------------------------
+
+/** Statuses of an order that can no longer take a tender. */
+const CLOSED_FOR_TENDERS: readonly string[] = ["voided", "abandoned", "refunded"];
+
+/**
+ * The hub's `source.device_id` rule (hub `guardExternalTender`), enforced here
+ * too: a `collection: "terminal"` tender is only accepted from the device that
+ * took the order. The hub signs POS calls with `sub = hub:<caller client id>`
+ * (a device's client id is its principal id), so the caller is the `sub` with the
+ * `hub:` prefix removed. Fails closed: an order with no `source.device_id`
+ * accepts no terminal tender.
+ */
+function assertTerminalDevice(p: Principal, deviceId: string | null | undefined): void {
+  const caller = p.id.startsWith("hub:") ? p.id.slice(4) : p.id;
+  if (!deviceId || deviceId !== caller) {
+    throw ProblemError.of("FORBIDDEN", {
+      detail:
+        "terminal tenders can only be recorded by the device that took the order (order.source.device_id)",
+      details: { reason: "device_mismatch" },
+    });
+  }
+}
+
+const norm = (s: string | null | undefined): string | null => s?.trim() || null;
+
+interface ExternalWanted {
+  method: string;
+  processor: string;
+  processorRef: string | null;
+  amountCents: number;
+  tipCents: number;
+  requestedStatus: "captured" | "authorized" | "pending";
+  collection: string | null;
+  staffId: string | null;
+}
+
+function sameExternal(p: Payment, w: ExternalWanted): boolean {
+  const requested = (p.raw?.requested_status as string | undefined) ?? p.status;
+  return (
+    p.method === w.method &&
+    p.processor === w.processor &&
+    (p.processor_ref ?? null) === w.processorRef &&
+    p.amount_cents === w.amountCents &&
+    p.tip_cents === w.tipCents &&
+    requested === w.requestedStatus &&
+    (p.collection ?? null) === w.collection &&
+    (p.staff_id ?? null) === w.staffId
+  );
+}
+
+/**
+ * POST /orders/{id}/payments. Money recorded here was taken OUTSIDE POS's own
+ * processors and nothing proves it: trust rests on the scope, the hub's guard and
+ * the checks below, all enforced on the server.
+ *
+ *  - scope: `payments:write`, or `payments.terminal:write` for a CAPTURED
+ *    `collection: "terminal"` tender only (a kiosk); a terminal tender also needs
+ *    the caller to be the device that took the order;
+ *  - tenant/location from the token (foreign or out-of-scope order = 404);
+ *  - the order must still take money (voided/abandoned = 409 INVALID_TRANSITION);
+ *  - amounts via core's `checkTenderAmounts` against the FOOD amount due
+ *    (tips never reduce it): over-due or over-tip = 422, with the due in details;
+ *  - id = `input.id` ?? uuidv5(tenant:Idempotency-Key); a replay of the same
+ *    tender returns it (200), the same id with another body is
+ *    IDEMPOTENCY_CONFLICT; the same processor + ref cannot be captured twice;
+ *  - written by ONE transaction under the order's row lock (driver); if the
+ *    order's tenders changed since the amounts were validated, re-validate;
+ *  - only a CAPTURED tender counts (`authorized` is stored `pending`); then open
+ *    siblings close and the order is paid/released exactly as for a card, hold
+ *    rules included. A replay re-runs that step, so a crash after the insert is
+ *    healed by the retry.
+ */
+async function recordExternalTender(ctx: Ctx): Promise<Reply> {
+  await requireActiveTenant(ctx);
+  const parsed = ExternalTenderInputSchema.safeParse(await readBody(ctx.req));
+  if (!parsed.success) throw zodProblem(parsed.error);
+  const input = parsed.data;
+  const tenantId = ctx.principal.tenant_id;
+  const collection = norm(input.collection ?? null);
+
+  if (ctx.terminalOnly && (collection !== "terminal" || input.status !== "captured")) {
+    throw ProblemError.of("INSUFFICIENT_SCOPE", {
+      detail:
+        "payments.terminal:write only records captured card-terminal tenders (collection: terminal)",
+      details: { missing: ["payments:write"], granted: ctx.principal.scopes },
+    });
+  }
+
+  const order = await ownedOrder(ctx, ctx.params.order_id!);
+  if (collection === "terminal") assertTerminalDevice(ctx.principal, order.source?.device_id);
+
+  const idemKey = ctx.req.headers.get("idempotency-key")?.trim() || null;
+  const paymentId = input.id ?? (idemKey ? uuidv5(`${tenantId}:${idemKey}`) : null);
+  if (!paymentId) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: "The Idempotency-Key header (or an `id`) is required: a tender must be replay-safe.",
+      path: "headers.idempotency-key",
+    });
+  }
+  if (!isGuid(paymentId)) {
+    throw ProblemError.of("VALIDATION_FAILED", { detail: "`id` must be a UUID.", path: "id" });
+  }
+  if (input.amount_cents <= 0) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: "amount_cents must be greater than zero.",
+      path: "amount_cents",
+    });
+  }
+  let staffId: string | null = null;
+  if (input.staff_id) {
+    const s = isGuid(input.staff_id)
+      ? await ctx.driver.getStaffById(tenantId, input.staff_id)
+      : null;
+    if (!s || !s.active) throw notFound("Staff member");
+    staffId = s.id;
+  }
+  const wanted: ExternalWanted = {
+    method: input.method,
+    processor: input.processor,
+    processorRef: norm(input.processor_ref),
+    amountCents: input.amount_cents,
+    tipCents: input.tip_cents,
+    requestedStatus: input.status,
+    collection,
+    staffId,
+  };
+  const conflict = () =>
+    ProblemError.of("IDEMPOTENCY_CONFLICT", {
+      detail: "This id is already in use or was used with a different request.",
+    });
+  // A tender that already exists: the same request replays (and re-runs the
+  // settlement step, which is idempotent); anything else answers like a foreign id.
+  const replay = async (existing: Payment): Promise<Reply> => {
+    if (
+      existing.tenant_id !== tenantId ||
+      existing.order_id !== order.id ||
+      existing.rail !== "external" ||
+      !sameExternal(existing, wanted)
+    ) {
+      throw conflict();
+    }
+    await settleOrderAfterExternalTender(existing);
+    return {
+      status: 200,
+      body: toContractPayment((await ctx.driver.getPayment(existing.id)) ?? existing),
+      headers: { "idempotent-replayed": "true" },
+    };
+  };
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const current = await ownedOrder(ctx, order.id);
+    if (CLOSED_FOR_TENDERS.includes(current.status)) {
+      throw ProblemError.of("INVALID_TRANSITION", {
+        detail: `Order is ${current.status}; it can no longer take a payment.`,
+      });
+    }
+    const existing = await ctx.driver.getPayment(paymentId);
+    if (existing) return replay(existing);
+
+    // Hold rule: an expired hold takes no promise of money (nothing to wait for);
+    // CAPTURED money that already changed hands is still recorded.
+    const heldUntil = current.status === "draft" ? current.hold?.expires_at : null;
+    if (
+      heldUntil &&
+      Date.parse(heldUntil) <= ctx.now().getTime() &&
+      input.status !== "captured"
+    ) {
+      throw ProblemError.of("CONFLICT", {
+        detail: "The order's hold expired; only a captured payment can still be recorded.",
+        details: { reason: "expired" },
+      });
+    }
+
+    const tenders = await ctx.driver.listPaymentsForOrder(current.id);
+    // FOOD amount due (tips never reduce it), net of refunds beyond the tip: the
+    // same base the release check uses.
+    const due = Math.max(
+      0,
+      orderDueCents(current) - netSettledBaseCents(tenders, current.currency),
+    );
+    const bad = checkTenderAmounts(
+      { amount_due_cents: due, tenders },
+      { amount_cents: input.amount_cents, tip_cents: input.tip_cents },
+    );
+    if (bad) {
+      throw ProblemError.of("VALIDATION_FAILED", {
+        detail: bad.detail,
+        path: bad.path,
+        details: { reason: bad.reason, amount_due_cents: due },
+      });
+    }
+
+    const res = await ctx.driver.recordExternalTender({
+      tenantId,
+      orderId: current.id,
+      paymentId,
+      method: wanted.method,
+      processor: wanted.processor,
+      processorRef: wanted.processorRef,
+      amountCents: wanted.amountCents,
+      tipCents: wanted.tipCents,
+      // `authorized` and `pending` never count toward the balance.
+      status: input.status === "captured" ? "captured" : "pending",
+      requestedStatus: wanted.requestedStatus,
+      collection: wanted.collection,
+      staffId: wanted.staffId,
+      expect: tenderFingerprint(tenders),
+    });
+    switch (res.outcome) {
+      case "stale":
+        continue; // the order's tenders changed under us: re-read, re-validate
+      case "not_found":
+        throw notFound("Order");
+      case "invalid_state":
+        throw ProblemError.of("INVALID_TRANSITION", {
+          detail: `Order is ${res.status}; it can no longer take a payment.`,
+        });
+      case "exists":
+        return replay(res.payment);
+      case "duplicate_ref": {
+        // The same real-world payment recorded again under another key: the same
+        // order and amount is a retry; anything else would double count it.
+        const d = res.payment;
+        if (d.order_id === current.id && d.amount_cents === wanted.amountCents) {
+          await settleOrderAfterExternalTender(d);
+          return {
+            status: 200,
+            body: toContractPayment(d),
+            headers: { "idempotent-replayed": "true" },
+          };
+        }
+        throw ProblemError.of("CONFLICT", {
+          detail: "A captured payment with this processor and reference is already recorded.",
+          details: { reason: "duplicate_processor_ref" },
+        });
+      }
+      case "ok": {
+        await settleOrderAfterExternalTender(res.payment);
+        return {
+          status: 201,
+          body: toContractPayment((await ctx.driver.getPayment(res.payment.id)) ?? res.payment),
+          headers: { location: `/api/v1/payments/${res.payment.id}` },
+        };
+      }
+    }
+  }
+  // Contended order: the modules retry this exact reason with backoff.
+  throw ProblemError.of("CONFLICT", {
+    detail: "Another tender for this order is being recorded; retry.",
+    details: { reason: "tender_in_progress" },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 interface CompiledRoute {
-  op: V1Operation;
+  op: V1Operation | ExtraOperation;
   method: string;
   regex: RegExp;
   names: string[];
@@ -1475,9 +1922,17 @@ interface CompiledRoute {
   static: number;
 }
 
-const ROUTES: CompiledRoute[] = (Object.keys(V1_ROUTES) as V1Operation[])
-  .map((op) => {
-    const def = V1_ROUTES[op];
+const ROUTE_DEFS: [V1Operation | ExtraOperation, { method: string; path: string; scopes: readonly string[] }][] = [
+  ...(Object.keys(V1_ROUTES) as V1Operation[]).map(
+    (op) => [op, V1_ROUTES[op]] as [V1Operation, (typeof V1_ROUTES)[V1Operation]],
+  ),
+  ...(Object.keys(EXTRA_ROUTES) as ExtraOperation[]).map(
+    (op) => [op, EXTRA_ROUTES[op]] as [ExtraOperation, (typeof EXTRA_ROUTES)[ExtraOperation]],
+  ),
+];
+
+const ROUTES: CompiledRoute[] = ROUTE_DEFS
+  .map(([op, def]) => {
     const names: string[] = [];
     const pattern = def.path.replace(/\{(\w+)\}/g, (_, n: string) => {
       names.push(n);
@@ -1537,13 +1992,24 @@ export async function handleV1(
     // Authenticate BEFORE revealing whether a route exists.
     const principal = deps.principal ?? (await authenticateV1(req, deps.auth));
     if (!route) throw ProblemError.of("NOT_FOUND", { detail: `No route ${req.method} ${path}.` });
-    requireScopes(principal, route.scopes);
+    // A kiosk holds `payments.terminal:write` instead of `payments:write`: it may
+    // reach recordExternal, and the handler then allows only a captured terminal
+    // tender (so this can never widen what the token may do).
+    const terminalOnly =
+      route.op === "payments.recordExternal" &&
+      !hasScopes(principal.scopes, route.scopes) &&
+      hasScopes(principal.scopes, [TERMINAL_PAYMENT_SCOPE]);
+    if (!terminalOnly) requireScopes(principal, route.scopes);
     if (params.location_id) requireLocation(principal, params.location_id);
 
-    if (UNSUPPORTED.includes(route.op) || !handlers[route.op]) {
+    if (
+      (UNSUPPORTED as string[]).includes(route.op) ||
+      !handlers[route.op]
+    ) {
       throw unsupported(route.op);
     }
     const reply = await handlers[route.op]!({
+      terminalOnly,
       req,
       url: new URL(req.url),
       params,

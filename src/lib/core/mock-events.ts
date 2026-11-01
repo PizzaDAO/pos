@@ -288,6 +288,20 @@ export function withOutbox(
       return order;
     },
 
+    // cancelOrder is atomic in the SQL function (one transaction, order row
+    // locked). In the mock it must stay one synchronous block too: if it called
+    // `wrapped.updateOrderStatus` (which awaits a read first) a tender recorded
+    // between the tender check and the void would leave a paid-and-voided order.
+    // So run the inner (synchronous) version, then emit its order events.
+    async cancelOrder(id, tenantId, opts) {
+      const before = await inner.getOrder(id);
+      const res = await inner.cancelOrder(id, tenantId, opts);
+      if (res.ok && before && res.order && res.order.status !== before.status) {
+        orderEvents(box, announced, res.order, before);
+      }
+      return res;
+    },
+
     async updateOrderStatus(id, status) {
       const before = await inner.getOrder(id);
       const order = await inner.updateOrderStatus(id, status);
@@ -300,6 +314,43 @@ export function withOutbox(
       const after = await inner.upsertPayment(payment);
       paymentEvents(box, await orderAnnounced(after.order_id), after, before);
       return after;
+    },
+
+    // External tenders: the INSERT trigger announces payment.captured (a pending
+    // one is no event); a superseded pending tender is a status change to
+    // `canceled` (no event type for it either).
+    async recordExternalTender(input) {
+      const res = await inner.recordExternalTender(input);
+      if (res.outcome === "ok") {
+        paymentEvents(box, await orderAnnounced(res.payment.order_id), res.payment, null);
+      }
+      return res;
+    },
+
+    async casPaymentStatus(paymentId, from, to) {
+      const before = await inner.getPayment(paymentId);
+      const after = await inner.casPaymentStatus(paymentId, from, to);
+      if (after && before) {
+        paymentEvents(box, await orderAnnounced(after.order_id), after, before);
+      }
+      return after;
+    },
+
+    // customers.upsert: customer.created on a new row, customer.updated only when
+    // something changed (the SQL function writes nothing otherwise).
+    async upsertCustomerIdentity(tenantId, input) {
+      const res = await inner.upsertCustomerIdentity(tenantId, input);
+      if (res.created || res.changed) {
+        box.append({
+          tenant_id: tenantId,
+          location_id: null,
+          event_type: res.created ? "customer.created" : "customer.updated",
+          subject_type: "customer",
+          subject_id: res.customer.id,
+          row_snapshot: { id: res.customer.id },
+        });
+      }
+      return res;
     },
 
     // Main's compare-and-set status moves (online checkout lifecycle,
@@ -399,7 +450,9 @@ export function withOutbox(
     async upsertCustomer(customer: Customer) {
       const known =
         (await inner.getCustomer(customer.id)) ??
-        (await inner.getCustomerByEmail(customer.tenant_id, customer.email));
+        (customer.email
+          ? await inner.getCustomerByEmail(customer.tenant_id, customer.email)
+          : null);
       const result = await inner.upsertCustomer(customer);
       box.append({
         tenant_id: result.tenant_id,

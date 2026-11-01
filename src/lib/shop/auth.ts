@@ -75,7 +75,7 @@ export async function requestMagicLink(input: {
   await driver.createMagicLinkToken({
     token,
     tenant_id: input.tenantId,
-    email: customer.email,
+    email: customer.email ?? input.email,
     customer_id: customer.id,
     expires_at: new Date(now.getTime() + TOKEN_TTL_MS).toISOString(),
     consumed: false,

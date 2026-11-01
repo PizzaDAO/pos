@@ -7,7 +7,7 @@
  * print/email/SMS stubs.
  */
 import type { Order, OrderItem, Payment } from "@/lib/db";
-import { PAYMENT_RAIL_LABELS } from "./registry";
+import { tenderRailLabel } from "./registry";
 
 export interface ReceiptLine {
   name: string;
@@ -135,7 +135,7 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
 
   const tenders: ReceiptTender[] = payments.map((p) => ({
     rail: p.rail,
-    label: PAYMENT_RAIL_LABELS[p.rail],
+    label: tenderRailLabel(p.rail),
     amountCents: p.amount_cents + p.tip_cents,
     tipCents: p.tip_cents,
     status: p.status,

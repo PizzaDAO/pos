@@ -273,6 +273,11 @@ function mapPayment(r: Row): Payment {
     refunded_cents: r.refunded_cents as number,
     refund_ids: (r.refund_ids as string[] | null) ?? [],
     refunds: (r.refunds as Payment["refunds"] | null) ?? [],
+    method: (r.method as string | null) ?? null,
+    processor: (r.processor as string | null) ?? null,
+    processor_ref: (r.processor_ref as string | null) ?? null,
+    collection: (r.collection as string | null) ?? null,
+    staff_id: (r.staff_id as string | null) ?? null,
     simulated: r.simulated as boolean,
     raw: (r.raw as Record<string, unknown> | null) ?? null,
     created_at: r.created_at as string,
@@ -372,10 +377,13 @@ function mapCustomer(r: Row): Customer {
   return {
     id: r.id as string,
     tenant_id: r.tenant_id as string,
-    email: r.email as string,
+    email: (r.email as string | null) ?? null,
     name: (r.name as string | null) ?? null,
     phone: (r.phone as string | null) ?? null,
     verified: r.verified as boolean,
+    marketing: (r.marketing as Customer["marketing"] | null) ?? {},
+    tags: (r.tags as string[] | null) ?? [],
+    external_ids: (r.external_ids as Record<string, string> | null) ?? {},
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -2090,6 +2098,64 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return mapPayment(unwrap(res) as Row);
     },
 
+    async recordExternalTender(input) {
+      const out = unwrap(
+        await sb.rpc("core_record_external_tender", {
+          p_tenant_id: input.tenantId,
+          p_order_id: input.orderId,
+          p_id: input.paymentId,
+          p_method: input.method,
+          p_processor: input.processor,
+          p_processor_ref: input.processorRef,
+          p_amount: input.amountCents,
+          p_tip: input.tipCents,
+          p_status: input.status,
+          p_requested_status: input.requestedStatus,
+          p_collection: input.collection,
+          p_staff_id: input.staffId,
+          p_expect: input.expect,
+        }),
+      ) as {
+        outcome: string;
+        payment?: Row;
+        superseded?: string[];
+        status?: string;
+      };
+      switch (out.outcome) {
+        case "ok":
+          return {
+            outcome: "ok",
+            payment: mapPayment(out.payment as Row),
+            superseded: out.superseded ?? [],
+          } as const;
+        case "exists":
+        case "duplicate_ref":
+          return {
+            outcome: out.outcome,
+            payment: mapPayment(out.payment as Row),
+          } as const;
+        case "invalid_state":
+          return { outcome: "invalid_state", status: out.status ?? "" } as const;
+        case "not_found":
+        case "stale":
+          return { outcome: out.outcome } as const;
+        default:
+          throw new Error(`core_record_external_tender: unexpected outcome ${out.outcome}`);
+      }
+    },
+
+    async casPaymentStatus(paymentId, from, to) {
+      const rows = unwrap(
+        await sb
+          .from("payments")
+          .update({ status: to, updated_at: nowIso() })
+          .eq("id", paymentId)
+          .in("status", from)
+          .select(),
+      ) as Row[];
+      return rows[0] ? mapPayment(rows[0]) : null;
+    },
+
     async reservePaymentRefund(paymentId, amountCents, refundId, meta) {
       const out = unwrap(
         await sb.rpc("reserve_payment_refund", {
@@ -2517,6 +2583,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async upsertCustomer(customer) {
+      // The shop/checkout path (email is the key). Phone-only identities go
+      // through upsertCustomerIdentity.
+      if (!customer.email) {
+        throw new Error("upsertCustomer requires an email; use upsertCustomerIdentity.");
+      }
       const email = customer.email.trim().toLowerCase();
       const byId = unwrap(
         await sb
@@ -2558,11 +2629,42 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         created_at: base?.created_at ?? now,
         updated_at: now,
       };
+      // Consent / tags / external ids belong to upsertCustomerIdentity: a stale
+      // snapshot passed here must never overwrite them.
+      const {
+        marketing: _m,
+        tags: _t,
+        external_ids: _e,
+        ...writable
+      } = merged;
+      void _m;
+      void _t;
+      void _e;
       return mapCustomer(
         unwrap(
-          await sb.from("customers").upsert(merged).select().single(),
+          await sb.from("customers").upsert(writable).select().single(),
         ) as Row,
       );
+    },
+
+    async upsertCustomerIdentity(tenantId, input) {
+      const out = unwrap(
+        await sb.rpc("core_upsert_customer", {
+          p_tenant_id: tenantId,
+          p_new_id: input.newId,
+          p_email: input.email,
+          p_phone: input.phone,
+          p_name: input.name,
+          p_marketing: input.marketing,
+          p_tags: input.tags,
+          p_external_ids: input.externalIds,
+        }),
+      ) as { customer: Row; created: boolean; changed: boolean };
+      return {
+        customer: mapCustomer(out.customer),
+        created: out.created === true,
+        changed: out.changed === true,
+      };
     },
 
     async createMagicLinkToken(token) {
@@ -3444,6 +3546,24 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .is("pin_locked_until", null)
           .select("id"),
       );
+    },
+
+    async setStaffPinHash(tenantId, staffId, pinHash) {
+      // One targeted update (never a whole-row write of a stale staff snapshot).
+      // A reset PIN starts with a fresh lockout budget.
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .update({
+            pin_hash: pinHash,
+            pin_failed_attempts: 0,
+            pin_locked_until: null,
+          })
+          .eq("id", staffId)
+          .eq("tenant_id", tenantId)
+          .select("id"),
+      ) as Row[];
+      return rows.length > 0;
     },
 
     async tenantHasStaffPins(tenantId) {

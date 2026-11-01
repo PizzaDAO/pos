@@ -17,6 +17,8 @@ import type {
 } from "./menu-types";
 import type {
   ConnectAccount,
+  ExternalTenderResult,
+  ExternalTenderWrite,
   Payment,
   PaymentSessionRow,
   PaymentSettings,
@@ -27,6 +29,7 @@ import type {
 } from "./payment-types";
 import type {
   Customer,
+  CustomerIdentityWrite,
   DeliveryRecord,
   MagicLinkToken,
 } from "./customer-types";
@@ -508,6 +511,27 @@ export interface PosDriver {
   upsertPayment(payment: Payment): Promise<Payment>;
 
   /**
+   * Record an `external`-rail tender ATOMICALLY (one transaction, the order row
+   * locked): refuse a voided/abandoned order, report a replay (`exists`), refuse
+   * when the order's live tenders no longer match `expect` (`stale`: the caller
+   * re-validates the amounts), refuse a second CAPTURED tender with the same
+   * processor + ref (`duplicate_ref`), insert, and cancel a pending tender with
+   * the same processor + ref (superseded). Insert-if-absent: never a whole-row
+   * upsert, so a stale snapshot cannot overwrite a tender that changed meanwhile.
+   */
+  recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult>;
+
+  /**
+   * Compare-and-set a tender's status (`from` -> `to`). Returns the tender when
+   * it moved, null when it was not in `from` (someone else got there first).
+   */
+  casPaymentStatus(
+    paymentId: string,
+    from: Payment["status"][],
+    to: Payment["status"],
+  ): Promise<Payment | null>;
+
+  /**
    * ATOMICALLY reserve a refund on a tender: increment `refunded_cents`, append
    * `refundId` to `refund_ids`, and flip status to `refunded` when fully refunded
    * -- all in one step, refused when it would exceed amount + tip, the tender
@@ -680,6 +704,18 @@ export interface PosDriver {
    * email at checkout). Per-order contact lives on the order's fulfillment.
    */
   upsertCustomer(customer: Customer): Promise<Customer>;
+
+  /**
+   * `customers.upsert` (core v1): match within the tenant by email, else by
+   * normalised phone, in ONE atomic step (no read-then-whole-row-write, so two
+   * concurrent upserts cannot lose each other's fields or create duplicates).
+   * Never merges two customers, only fills blanks, never touches `verified`,
+   * applies consent only with an `at`. See `./customer-identity`.
+   */
+  upsertCustomerIdentity(
+    tenantId: string,
+    input: CustomerIdentityWrite,
+  ): Promise<{ customer: Customer; created: boolean; changed: boolean }>;
 
   /** Persist a (stubbed, never-emailed) magic-link token. */
   createMagicLinkToken(token: MagicLinkToken): Promise<MagicLinkToken>;
@@ -858,6 +894,16 @@ export interface PosDriver {
    * meantime (a concurrent burst that tripped the lock keeps it).
    */
   clearPinAttempts(tenantId: string, staffId: string): Promise<void>;
+  /**
+   * Set (a scrypt hash) or clear (null) a staff member's PIN: one targeted
+   * update of `pin_hash` (+ the lockout state, so a reset PIN is usable at once),
+   * never a whole-row write. False when the staff member is not in the tenant.
+   */
+  setStaffPinHash(
+    tenantId: string,
+    staffId: string,
+    pinHash: string | null,
+  ): Promise<boolean>;
   /** Does the tenant have any ACTIVE staff member with a PIN set? */
   tenantHasStaffPins(tenantId: string): Promise<boolean>;
 
