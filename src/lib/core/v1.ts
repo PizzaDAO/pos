@@ -682,9 +682,15 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
         // Paid or in flight meanwhile: the order is not simply expired.
         const now = await ctx.driver.getOrder(order.id);
         if (now && now.status !== "draft") return { body: await mapOrderFor(ctx, order.id) };
+        // Captured money on an expired hold is NOT retryable (it needs a refund or
+        // a manual accept), so it must not carry the retryable `tender_in_progress`
+        // reason that pizza-mcp retries on.
+        const captured = voided.reason === "captured";
         throw ProblemError.of("CONFLICT", {
-          detail: "The hold expired but a payment is in flight; retry shortly.",
-          details: { reason: "tender_in_progress" },
+          detail: captured
+            ? "The hold expired but the order holds captured payment; refund it or accept the order."
+            : "The hold expired but a payment is in flight; retry shortly.",
+          details: { reason: captured ? "captured_money" : "tender_in_progress" },
         });
       }
       throw ProblemError.of("INVALID_TRANSITION", {

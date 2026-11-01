@@ -447,10 +447,22 @@ export async function createPaymentSession(
       conflict("settled", "The order changed while the payment session was being created."),
     );
   }
-  await driver.upsertPayment({
-    ...current,
-    raw: { ...current.raw, checkout_session_id: stripeSessionId },
-  });
+  try {
+    await driver.upsertPayment({
+      ...current,
+      raw: { ...current.raw, checkout_session_id: stripeSessionId },
+    });
+  } catch (err) {
+    // E.g. the one-live-tender index refusing the write: never a 500 with a payable
+    // session left open.
+    if (err instanceof LiveTenderConflictError) {
+      return failSession(
+        conflict("tender_in_progress", "A payment on this order is already in progress."),
+      );
+    }
+    await failSession(ProblemError.of("INTERNAL")).catch(() => undefined);
+    throw err;
+  }
 
   // 10. Re-check the ORDER now that the link exists: voided meanwhile, settled by
   //     another tender, or no longer owing this amount -> close the tender and the

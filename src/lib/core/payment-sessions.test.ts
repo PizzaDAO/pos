@@ -1285,6 +1285,55 @@ describe("F3: a payer-added tip is not a duplicate payment", () => {
   });
 });
 
+describe("N1: a tipped duplicate refunds food AND tip", () => {
+  it("the marker amount is the whole duplicate charge (food + tip)", async () => {
+    const o = await heldOrder({ tip: 300 });
+    const s = await session(o.id);
+    await completeSimulatedSession(s.json.id, NOW);
+    const driver = getPosDriver();
+    const food = o.amount_due_cents;
+    await driver.upsertPayment({
+      id: "dup-tipped",
+      order_id: o.id,
+      tenant_id: DEMO_TENANT_ID,
+      location_id: DEMO_LOCATION_DOWNTOWN_ID,
+      rail: "cash",
+      status: "requires_action",
+      amount_cents: food,
+      tip_cents: 300,
+      application_fee_cents: 0,
+      currency: "USD",
+      charge_id: null,
+      connect_account_id: null,
+      crypto_tx_hash: null,
+      crypto_chain: null,
+      cash_tendered_cents: null,
+      cash_change_cents: null,
+      refunded_cents: 0,
+      simulated: false,
+      raw: null,
+      created_at: NOW.toISOString(),
+      updated_at: NOW.toISOString(),
+    });
+    await applyRailStatus("dup-tipped", "captured");
+    const lp = (await driver.getOrder(o.id))!.fulfillment?.late_payment;
+    expect(lp?.kind).toBe("duplicate");
+    expect(lp?.amount_cents).toBe(food + 300);
+  });
+});
+
+describe("release of an expired hold holding captured money", () => {
+  it("answers captured_money (not the retryable tender_in_progress)", async () => {
+    const o = await heldOrder();
+    const a = await session(o.id, { amount_cents: 1000 });
+    await completeSimulatedSession(a.json.id, NOW);
+    const later = new Date(NOW.getTime() + 40 * 60_000);
+    const r = await call("POST", `/orders/${o.id}/release`, { body: {}, now: later });
+    expect(r.status).toBe(409);
+    expect(r.json.details?.reason).toBe("captured_money");
+  });
+});
+
 describe("F5: simulated sessions only where they cannot cook a real order", () => {
   const code = (fn: () => unknown) => {
     try {

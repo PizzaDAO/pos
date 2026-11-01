@@ -1169,8 +1169,16 @@ async function flagDuplicatePayment(order: Order, payments: Payment[]): Promise<
         n + Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
       0,
     );
-  const excess = held - orderDueCents(order);
-  if (excess <= 0) return;
+  const baseExcess = held - orderDueCents(order);
+  if (baseExcess <= 0) return;
+  // The admin refund returns exactly the marker amount. A payer-added tip is never
+  // a duplicate on its own (base test above), but when the base IS duplicated the
+  // refund must also return the tip charged on the duplicate: online orders measure
+  // the whole money held against the order total.
+  const excess =
+    order.channel === "in_store"
+      ? baseExcess
+      : Math.max(baseExcess, netSettledCents(payments) - order.totals.total_cents);
   const prior = order.fulfillment?.late_payment;
   if (prior && (prior.kind !== "duplicate" || prior.resolved || prior.amount_cents === excess)) {
     return;
