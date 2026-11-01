@@ -43,6 +43,7 @@ import type {
   OrderItem,
   OrderItemModifier,
   OrderStatus,
+  OrderTotals,
   StoreSettings,
 } from "./menu-types";
 import type {
@@ -1705,6 +1706,75 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .range(offset, offset + limit - 1),
       ) as Row[];
       return readOrderRows(rows);
+    },
+
+    async listOrderHeads(tenantId, opts) {
+      const limit = Math.min(Math.max(opts.limit, 1), 500);
+      let q = sb
+        .from("orders")
+        .select("id,tenant_id,location_id,created_at,status,hold,currency,staff_id,totals")
+        .eq("tenant_id", tenantId);
+      if (opts.locationIds) q = q.in("location_id", opts.locationIds);
+      if (opts.createdFrom) q = q.gte("created_at", opts.createdFrom);
+      if (opts.createdTo) q = q.lte("created_at", opts.createdTo);
+      if (opts.statuses) q = q.in("status", opts.statuses);
+      if (opts.after) {
+        const { created_at: c, id } = safeKeyset(opts.after);
+        q = q.or(`created_at.gt.${c},and(created_at.eq.${c},id.gt.${id})`);
+      }
+      const asc = !opts.newestFirst;
+      const rows = unwrap(
+        await q
+          .order("created_at", { ascending: asc })
+          .order("id", { ascending: asc })
+          .limit(limit),
+      ) as Row[];
+      return rows.map((r) => ({
+        id: r.id as string,
+        tenant_id: r.tenant_id as string,
+        location_id: r.location_id as string,
+        created_at: new Date(r.created_at as string).toISOString(),
+        status: r.status as OrderStatus,
+        hold: r.hold ?? null,
+        currency: r.currency as string,
+        staff_id: (r.staff_id as string | null) ?? null,
+        totals: r.totals as OrderTotals,
+      }));
+    },
+
+    async getOrdersByIds(tenantId, ids) {
+      const rows: Row[] = [];
+      for (let i = 0; i < ids.length; i += 100) {
+        rows.push(
+          ...(unwrap(
+            await sb
+              .from("orders")
+              .select("*")
+              .eq("tenant_id", tenantId)
+              .in("id", ids.slice(i, i + 100))
+              .order("id")
+              .limit(100),
+          ) as Row[]),
+        );
+      }
+      return readOrderRows(rows);
+    },
+
+    async listRefundedPayments(tenantId, opts) {
+      let q = sb
+        .from("payments")
+        .select("*")
+        .eq("tenant_id", tenantId)
+        .gt("refunded_cents", 0)
+        .gte("updated_at", opts.since);
+      if (opts.locationIds) q = q.in("location_id", opts.locationIds);
+      const rows = unwrap(
+        await q
+          .order("updated_at", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(Math.min(Math.max(opts.limit, 1), 1000)),
+      ) as Row[];
+      return rows.map(mapPayment);
     },
 
     async listOrdersPage(tenantId, locationId, opts) {

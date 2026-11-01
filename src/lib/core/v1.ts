@@ -13,7 +13,8 @@
  * orders (list/get/create held/cancel/release/extend hold), payments (read, plus
  * hosted payment sessions, the payments account and `recordExternal`), customers
  * (read + `upsert`), staff (read, `verifyPin`, `setPin`), drawer sessions,
- * deliveries (read), sales.
+ * deliveries (read), sales (summary, daily, hourly, items), tips (list), kitchen
+ * load.
  * Declared but unsupported by POS answer 501 CAPABILITY_UNSUPPORTED:
  * orders.updateStatus, deliveries.updateStatus, events.list (events go out by
  * webhook).
@@ -39,12 +40,14 @@ import {
   PaymentSessionCreateInputSchema,
   ProblemError,
   QuoteRequestSchema,
+  SalesRangeQuerySchema,
   SalesSummaryQuerySchema,
   StaffPinSetInputSchema,
   StaffPinVerifyInputSchema,
   V1_ROUTES,
   checkTenderAmounts,
   extendedHoldExpiry,
+  fromPosOrderStatus,
   hasScopes,
   holdCapSeconds,
   isProblemError,
@@ -65,6 +68,7 @@ import type { ZodError } from "zod";
 import {
   getPosDriver,
   type CreateOrderInput,
+  type OrderStatus,
   type Payment,
   type PosDriver,
   type OrderFulfillment,
@@ -72,6 +76,7 @@ import {
 import type { StoredQuote } from "@/lib/db/payment-types";
 import { deploymentCheckoutMode } from "@/lib/payments/env";
 import { isGuid, isIsoTimestamp } from "@/lib/db/paging";
+import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import { cancelDeliveryForOrder } from "@/lib/delivery/service";
 import { captureError } from "@/lib/observability";
 import {
@@ -99,9 +104,11 @@ import {
   loadStaffList,
   loadTenantOrders,
   mapOrder,
+  mapOrders,
   type LocationBundle,
 } from "./loaders";
 import {
+  toPosOrderStatus,
   toContractCustomer,
   toContractPayment,
   toContractStaff,
@@ -118,7 +125,9 @@ import {
   loadPaymentSession,
   toContractSession,
 } from "./payment-sessions";
-import { buildDailySales, buildSalesSummary, isSalesRow } from "./sales";
+import { buildDailySales, buildHourlySales, buildItemSales, buildSalesSummary, isSalesRow } from "./sales";
+import { buildKitchenLoad, KITCHEN_LOAD_WINDOW_MS } from "./kitchen-load";
+import { RangeTooLarge, loadHeadsInRange, loadTipFacts, type TipCursor } from "./range-loader";
 
 export interface V1Deps {
   auth?: AuthDeps;
@@ -367,6 +376,8 @@ const POS_EMITTED_EVENTS: readonly string[] = [
   "drawer_session.closed",
   "business_day.closed",
   "delivery.status_changed",
+  "tip.recorded",
+  "tip.adjusted",
 ];
 const POS_EVENTS = EVENT_TYPES.filter((t) => POS_EMITTED_EVENTS.includes(t));
 
@@ -400,6 +411,10 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
         "payments.external_tender": true,
         "deliveries.write": false,
         "sales.summary": true,
+        "sales.hourly": true,
+        "sales.items": true,
+        "tips.list": true,
+        "kitchen.load": true,
         drawer_sessions: true,
         webhooks: true,
       },
@@ -410,6 +425,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
         "Quotes are stored for 10 minutes: POST /orders accepts quote_id (no lines) and re-prices it; send quote_hash to detect price changes.",
         "Payment sessions are Stripe Checkout (card only) on the tenant's connected account; sessions expire no sooner than 31 minutes (Stripe's minimum) and the hold is extended to cover them.",
         "Order status transitions are driven by the KDS/terminal, not /v1.",
+        "Tip facts carry processing_fee_cents = 0: POS holds no card-processing fee data.",
       ],
     };
     return { body: caps };
@@ -1300,7 +1316,235 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       }),
     };
   },
+
+  "sales.hourly": async (ctx) => {
+    const bundle = await ownedLocation(ctx, ctx.params.location_id!);
+    const q = parseRange(ctx.url.searchParams);
+    const timezones = new Map([[bundle.location.id, bundle.location.timezone]]);
+    // Header rows only (no item graph, no mapping): hourly needs status, times
+    // and totals. The derivations below are the mapper's own, so it ties to daily.
+    const heads = await guardRange(() =>
+      loadHeadsInRange(ctx.driver, ctx.principal.tenant_id, {
+        locationIds: [bundle.location.id],
+        from: q.from,
+        to: q.to,
+        timezones,
+      }),
+    );
+    const orders = heads
+      .filter((h) => !isUnpaidOnlineStatus(h.status))
+      .map((h) => ({
+        location_id: h.location_id,
+        business_date: h.business_date,
+        fulfillment_status: fromPosOrderStatus(toPosOrderStatus(h.status)).fulfillment_status,
+        placed_at: h.status === "draft" ? null : new Date(h.created_at).toISOString(),
+        created_at: new Date(h.created_at).toISOString(),
+        totals: h.totals,
+      }));
+    return { body: { data: buildHourlySales({ from: q.from, to: q.to, orders, timezones }) } };
+  },
+
+  "sales.items": async (ctx) => {
+    const q = parseRange(ctx.url.searchParams);
+    const { ids, bundles } = await rangeLocations(ctx, q.location_id);
+    const orders = await loadRangeOrders(ctx, ids, q);
+    // Category per item from the menu (lines already carry category_id when POS
+    // wrote it; older lines fall back to the current menu).
+    const categoryOfItem = new Map<string, string>();
+    if (orders.some((o) => o.lines.some((l) => !l.voided && !l.category_id))) {
+      for (const b of bundles) {
+        const menu = await loadMenu(b, ctx.driver);
+        for (const c of menu.categories) {
+          for (const i of c.items) categoryOfItem.set(i.id, c.id);
+        }
+      }
+    }
+    return {
+      body: { data: buildItemSales({ from: q.from, to: q.to, orders, categoryOfItem }) },
+    };
+  },
+
+  "tips.list": async (ctx) => {
+    const sp = ctx.url.searchParams;
+    const q = parseRange(sp);
+    const limit = parseLimit(sp);
+    const cursor = parseTipCursor(sp.get("cursor"));
+    const { ids, bundles } = await rangeLocations(ctx, q.location_id);
+    const facts = await guardRange(() =>
+      loadTipFacts(ctx.driver, ctx.principal.tenant_id, {
+        locationIds: ids,
+        from: q.from,
+        to: q.to,
+        timezones: new Map(bundles.map((b) => [b.location.id, b.location.timezone])),
+        cursor,
+        need: limit,
+      }),
+    );
+    const data = facts.slice(0, limit);
+    const last = data[data.length - 1];
+    return {
+      body: {
+        data,
+        next_cursor:
+          facts.length > limit && last
+            ? Buffer.from(JSON.stringify([last.business_date, last.occurred_at, last.id])).toString("base64url")
+            : null,
+      },
+    };
+  },
+
+  "kitchen.load": async (ctx) => {
+    const bundle = await ownedLocation(ctx, ctx.params.location_id!);
+    const now = ctx.now();
+    const tenantId = ctx.principal.tenant_id;
+    const since = new Date(now.getTime() - KITCHEN_LOAD_WINDOW_MS).toISOString();
+    // SQL does the filtering: only the board's statuses, newest first, capped;
+    // the last-15-minutes count reads header rows only.
+    const [activeHeads, recentHeads] = await Promise.all([
+      ctx.driver.listOrderHeads(tenantId, {
+        locationIds: [bundle.location.id],
+        createdFrom: since,
+        statuses: KITCHEN_POS_STATUSES,
+        newestFirst: true,
+        limit: 300,
+      }),
+      ctx.driver.listOrderHeads(tenantId, {
+        locationIds: [bundle.location.id],
+        createdFrom: new Date(now.getTime() - 15 * 60_000).toISOString(),
+        newestFirst: true,
+        limit: 500,
+      }),
+    ]);
+    const active = await mapOrders(
+      await ctx.driver.getOrdersByIds(tenantId, activeHeads.map((h) => h.id)),
+      () => bundle.location.timezone,
+      ctx.driver,
+    );
+    active.sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const recent = recentHeads.filter((h) => !["draft", "voided", "abandoned", "awaiting_payment"].includes(h.status)).length;
+    return {
+      body: buildKitchenLoad({
+        location_id: bundle.location.id,
+        orders: active,
+        recent_count: recent,
+        prep_minutes: bundle.settings.fulfillment?.prep_minutes ?? bundle.contract.fulfillment.prep_minutes,
+        accepting_orders: bundle.contract.fulfillment.accepting_orders,
+        now,
+      }),
+    };
+  },
 };
+
+/** POS statuses that can be on the board (contract placed/accepted/preparing/ready). */
+const KITCHEN_POS_STATUSES: OrderStatus[] = ["placed", "paid", "in_kitchen", "ready", "recall"];
+
+const MAX_RANGE_DAYS = 93;
+const ITEMS_ROW_CAP = 5_000;
+
+function parseLimit(sp: URLSearchParams): number {
+  const raw = sp.get("limit");
+  const limit = raw ? Number(raw) : DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: `limit must be an integer 1..${MAX_LIMIT}.`,
+    });
+  }
+  return limit;
+}
+
+/** Tip cursor: [business_date, occurred_at, id] (fact ids are strings, not GUIDs). */
+function parseTipCursor(raw: string | null): TipCursor | undefined {
+  if (!raw) return undefined;
+  try {
+    const v = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    if (
+      Array.isArray(v) &&
+      typeof v[0] === "string" &&
+      /^\d{4}-\d{2}-\d{2}$/.test(v[0]) &&
+      isIsoTimestamp(v[1]) &&
+      typeof v[2] === "string" &&
+      /^[\w:.-]{1,200}$/.test(v[2])
+    ) {
+      return { business_date: v[0], occurred_at: v[1], id: v[2] };
+    }
+  } catch {
+    /* fallthrough */
+  }
+  throw ProblemError.of("VALIDATION_FAILED", { detail: "Invalid cursor." });
+}
+
+/** A range that would not fit the caps answers 422 early, never a timeout. */
+async function guardRange<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (e) {
+    if (e instanceof RangeTooLarge) {
+      throw ProblemError.of("VALIDATION_FAILED", { detail: e.message });
+    }
+    throw e;
+  }
+}
+
+/** `?from&to[&location_id]` (SalesRangeQuery): dates valid, ordered, and at most 93 days. */
+function parseRange(sp: URLSearchParams): { from: string; to: string; location_id?: string } {
+  const parsed = SalesRangeQuerySchema.safeParse({
+    from: sp.get("from") ?? undefined,
+    to: sp.get("to") ?? undefined,
+    location_id: sp.get("location_id") ?? undefined,
+  });
+  if (!parsed.success) throw zodProblem(parsed.error);
+  const { from, to } = parsed.data;
+  const days = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000;
+  if (!Number.isFinite(days) || days < 0 || days > MAX_RANGE_DAYS) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: `from..to must be a forward range of at most ${MAX_RANGE_DAYS} days.`,
+      path: "to",
+    });
+  }
+  return parsed.data;
+}
+
+/** Locations a range read covers: the named one (owned), else the token's allowed ones. */
+async function rangeLocations(
+  ctx: Ctx,
+  locationId: string | undefined,
+): Promise<{ ids: string[] | null; bundles: LocationBundle[] }> {
+  if (locationId) {
+    const b = await ownedLocation(ctx, locationId);
+    return { ids: [b.location.id], bundles: [b] };
+  }
+  const ids = scopedLocationIds(ctx.principal);
+  const bundles = (await loadLocations(ctx.principal.tenant_id, ctx.driver)).filter(
+    (b) => !ids || ids.includes(b.location.id),
+  );
+  return { ids, bundles };
+}
+
+/**
+ * Orders (full, mapped) whose business_date is in [from, to]; used by sales.items,
+ * which needs lines. Bounded by the padded created_at window (SQL) and a small
+ * row cap that aborts as soon as it is crossed (422), not after paging it all.
+ */
+async function loadRangeOrders(
+  ctx: Ctx,
+  locationIds: string[] | null,
+  q: { from: string; to: string },
+): Promise<CoreOrder[]> {
+  const orders = await loadTenantOrders(ctx.principal.tenant_id, {
+    locationIds,
+    ...paddedRange(q.from, q.to),
+    maxRows: ITEMS_ROW_CAP + 1,
+    rowFilter: isSalesRow,
+    driver: ctx.driver,
+  });
+  if (orders.length > ITEMS_ROW_CAP) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail:
+        "That range holds too many orders for one request; ask for at most 7 days at a time (or pass location_id).",
+    });
+  }
+  return orders.filter((o) => o.business_date >= q.from && o.business_date <= q.to);
+}
 
 /** business_date is location-local: pad the UTC created_at window by a day each side. */
 function paddedRange(from: string, to: string): { createdFrom: string; createdTo: string } {
