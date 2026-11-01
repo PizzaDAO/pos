@@ -320,9 +320,9 @@ export function withOutbox(
 
     // Refunds move refunded_cents / status through the atomic reservation
     // (and its release when the rail call fails).
-    async reservePaymentRefund(paymentId, amountCents, refundId) {
+    async reservePaymentRefund(paymentId, amountCents, refundId, meta) {
       const before = await inner.getPayment(paymentId);
-      const res = await inner.reservePaymentRefund(paymentId, amountCents, refundId);
+      const res = await inner.reservePaymentRefund(paymentId, amountCents, refundId, meta);
       if (res.ok && before) {
         paymentEvents(box, await orderAnnounced(res.payment.order_id), res.payment, before);
       }

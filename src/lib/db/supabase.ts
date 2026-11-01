@@ -268,6 +268,7 @@ function mapPayment(r: Row): Payment {
     cash_change_cents: (r.cash_change_cents as number | null) ?? null,
     refunded_cents: r.refunded_cents as number,
     refund_ids: (r.refund_ids as string[] | null) ?? [],
+    refunds: (r.refunds as Payment["refunds"] | null) ?? [],
     simulated: r.simulated as boolean,
     raw: (r.raw as Record<string, unknown> | null) ?? null,
     created_at: r.created_at as string,
@@ -718,6 +719,9 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         voided: ir.voided as boolean,
         unit_price_cents: ir.unit_price_cents as number,
         line_total_cents: ir.line_total_cents as number,
+        fired_at: (ir.fired_at as string | null) ?? null,
+        voided_at: (ir.voided_at as string | null) ?? null,
+        status_at_void: (ir.status_at_void as string | null) ?? null,
       }));
       return mapOrder(orderRow, items);
     });
@@ -1709,6 +1713,38 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       } as const;
     },
 
+    async extendOrderHold(id, tenantId, expect, next) {
+      // Compare-and-set in ONE statement: only still-held (`draft`) orders whose
+      // hold expires exactly when the caller computed from. A concurrent
+      // release / cancel / expiry (status moves) or extension (expiry moves)
+      // updates zero rows. The orders_core_version trigger bumps `version`.
+      let q = sb
+        .from("orders")
+        .update({ hold: next, updated_at: nowIso() })
+        .eq("id", id)
+        .eq("tenant_id", tenantId)
+        .eq("status", "draft");
+      q =
+        expect.expires_at === null
+          ? q.is("hold->>expires_at", null)
+          : q.eq("hold->>expires_at", expect.expires_at);
+      const updated = unwrap(await q.select()) as Row[];
+      if (updated[0]) {
+        return { ok: true, order: await readOrderRow(updated[0]) } as const;
+      }
+      const current = unwrap(
+        await sb.from("orders").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      if (!current || current.tenant_id !== tenantId) {
+        return { ok: false, reason: "not_found" } as const;
+      }
+      return {
+        ok: false,
+        reason: "conflict",
+        order: await readOrderRow(current),
+      } as const;
+    },
+
     async cancelOrder(id, tenantId) {
       // One SQL function: lock the order row, check in-flight/captured tenders,
       // void abandoned ones, transition to voided. All or nothing.
@@ -1986,10 +2022,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       const {
         refunded_cents: _rc,
         refund_ids: _ri,
+        refunds: _rf,
         ...writable
       } = payment;
       void _rc;
       void _ri;
+      void _rf;
       const res = await sb
         .from("payments")
         .upsert({
@@ -2011,16 +2049,20 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return mapPayment(unwrap(res) as Row);
     },
 
-    async reservePaymentRefund(paymentId, amountCents, refundId) {
+    async reservePaymentRefund(paymentId, amountCents, refundId, meta) {
       const out = unwrap(
         await sb.rpc("reserve_payment_refund", {
           p_payment_id: paymentId,
           p_amount: amountCents,
           p_refund_id: refundId,
+          p_processor_ref: meta?.processorRef ?? null,
+          p_reason: meta?.reason ?? null,
         }),
-      ) as { outcome: string; payment?: Row };
+      ) as { outcome: string; payment?: Row; refund_entry_id?: string };
       const payment = out.payment ? mapPayment(out.payment) : null;
-      if (out.outcome === "ok" && payment) return { ok: true, payment };
+      if (out.outcome === "ok" && payment) {
+        return { ok: true, payment, refundEntryId: out.refund_entry_id };
+      }
       const reason =
         out.outcome === "duplicate" || out.outcome === "not_found"
           ? out.outcome

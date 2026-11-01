@@ -170,7 +170,13 @@ describe("atomic refund RPC wiring", () => {
     expect(ok.ok).toBe(true);
     expect(rpcCalls.at(-1)).toEqual({
       name: "reserve_payment_refund",
-      args: { p_payment_id: "p1", p_amount: 300, p_refund_id: "a" },
+      args: {
+        p_payment_id: "p1",
+        p_amount: 300,
+        p_refund_id: "a",
+        p_processor_ref: null,
+        p_reason: null,
+      },
     });
     rpcResult = { outcome: "duplicate", payment: row };
     expect(await driver.reservePaymentRefund("p1", 300, "a")).toMatchObject({

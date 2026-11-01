@@ -496,7 +496,8 @@ describe("quotes + order writes", () => {
     expect(order.fulfillment_status).toBe("placed");
     expect(order.totals).toEqual(quote.totals);
     expect(order.totals.tip_cents).toBeGreaterThan(0);
-    expect(order.amount_due_cents).toBe(quote.totals.total_cents);
+    // food only: the order tip is collected on the tender, not part of the balance
+    expect(order.amount_due_cents).toBe(quote.totals.total_cents - quote.totals.tip_cents);
     expect(order.payment_status).toBe("unpaid");
 
     // idempotent replay with the same Idempotency-Key

@@ -331,6 +331,24 @@ export interface PosDriver {
   >;
 
   /**
+   * Compare-and-set a held order's hold: writes `next` only while the order is
+   * still `draft` and its hold still expires at `expect.expires_at` (what the
+   * caller computed the extension from). A concurrent release / cancel /
+   * expiry / other extension makes it `conflict` (nothing written); the caller
+   * re-reads and decides. `next` may carry bookkeeping beyond reason/expiry.
+   */
+  extendOrderHold(
+    id: string,
+    tenantId: string,
+    expect: { expires_at: string | null },
+    next: NonNullable<Order["hold"]>,
+  ): Promise<
+    | { ok: true; order: Order }
+    | { ok: false; reason: "not_found" }
+    | { ok: false; reason: "conflict"; order: Order }
+  >;
+
+  /**
    * Atomically cancel an order: lock the order row, refuse while a tender is in
    * flight (abandoned unsettled tenders past the stale TTL are voided) or money
    * is still captured, then transition to `voided`. Idempotent for voided.
@@ -499,9 +517,15 @@ export interface PosDriver {
     paymentId: string,
     amountCents: number,
     refundId: string | null,
+    /**
+     * Recorded on the new `payment.refunds[]` entry (which gets a server-minted
+     * stable id, returned as `refundEntryId`): the rail's refund id and the
+     * staff-given reason.
+     */
+    meta?: { processorRef?: string | null; reason?: string | null },
   ): Promise<RefundReservation>;
 
-  /** Undo a reservation whose rail call failed. */
+  /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */
   releasePaymentRefund(
     paymentId: string,
     amountCents: number,

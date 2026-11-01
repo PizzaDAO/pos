@@ -26,6 +26,7 @@ import {
   type Order as CoreOrder,
   type OrderLine as CoreOrderLine,
   type Payment as CorePayment,
+  type PaymentRefund as CorePaymentRefund,
   type PosOrderStatus,
   type StaffMember as CoreStaffMember,
   type Tenant as CoreTenant,
@@ -397,6 +398,54 @@ function tenderStatus(p: Payment): string {
   return p.status;
 }
 
+/**
+ * `Payment.refunds[]` (oldest first, Σ amount_cents = refunded_cents). Tenders
+ * refunded before per-refund records existed get ONE synthetic entry for the
+ * unaccounted remainder with a deterministic id (`<payment>:legacy`), so the
+ * sum invariant holds and the id is stable across reads.
+ */
+export function toContractRefunds(p: Payment): CorePaymentRefund[] {
+  const out: CorePaymentRefund[] = (p.refunds ?? []).map((r) => ({
+    id: r.id,
+    amount_cents: r.amount_cents,
+    at: ts(r.at),
+    processor_ref: r.processor_ref ?? null,
+    reason: r.reason ?? null,
+  }));
+  const known = out.reduce((n, r) => n + r.amount_cents, 0);
+  if (p.refunded_cents > known) {
+    out.unshift({
+      id: `${p.id}:legacy`,
+      amount_cents: p.refunded_cents - known,
+      at: ts(p.updated_at),
+      processor_ref: null,
+      reason: null,
+    });
+  }
+  return out;
+}
+
+/**
+ * The refund a `payment.refunded` event is about: the entry whose running total
+ * ends at the event's recorded `refunded_cents` transition (`changes`), so it
+ * stays right when later refunds land before delivery. Falls back to the last.
+ */
+export function refundForEvent(
+  refunds: CorePaymentRefund[],
+  changes: Record<string, [unknown, unknown]> | null,
+): CorePaymentRefund | null {
+  if (refunds.length === 0) return null;
+  const after = changes?.refunded_cents?.[1];
+  if (typeof after === "number") {
+    let run = 0;
+    for (const r of refunds) {
+      run += r.amount_cents;
+      if (run === after) return r;
+    }
+  }
+  return refunds[refunds.length - 1]!;
+}
+
 export function toContractPayment(p: Payment): CorePayment {
   return {
     id: p.id,
@@ -410,6 +459,7 @@ export function toContractPayment(p: Payment): CorePayment {
     amount_cents: p.amount_cents,
     tip_cents: p.tip_cents,
     refunded_cents: p.refunded_cents,
+    refunds: toContractRefunds(p),
     application_fee_cents: p.application_fee_cents,
     cash_tendered_cents: p.cash_tendered_cents,
     cash_change_cents: p.cash_change_cents,
@@ -436,7 +486,9 @@ export function derivePaymentStatus(
     0,
   );
   const refunded = payments.reduce((s, p) => s + p.refunded_cents, 0);
-  const total = order.totals.total_cents;
+  // Food only: the order tip is not part of the balance a tender covers (a
+  // tender's own tip rides on tip_cents). due = (total - tip) - Σ captured.
+  const total = Math.max(0, order.totals.total_cents - (order.totals.tip_cents ?? 0));
   const due = Math.max(0, total - captured);
 
   let status: CoreOrder["payment_status"];
@@ -520,6 +572,12 @@ function toContractLines(order: Order): CoreOrderLine[] {
       tax_exempt: false,
       notes: i.notes,
       voided: i.voided,
+      fired_at: i.fired_at ? ts(i.fired_at) : null,
+      voided_at: i.voided && i.voided_at ? ts(i.voided_at) : null,
+      status_at_void:
+        i.voided && i.status_at_void
+          ? fromPosOrderStatus(toPosOrderStatus(i.status_at_void)).fulfillment_status
+          : null,
     } as CoreOrderLine;
   });
 }

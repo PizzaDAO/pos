@@ -22,7 +22,7 @@
     "core:vendor": "bash scripts/vendor-core.sh"
   },
   "dependencies": {
-    "@openpizza/core": "file:vendor/openpizza-core-0.1.0.tgz",
+    "@openpizza/core": "file:vendor/openpizza-core-0.3.4.tgz",
     "@radix-ui/react-slot": "^1.1.1",
     "@sentry/nextjs": "^11.9.0",
     "@supabase/ssr": "^0.5.2",
