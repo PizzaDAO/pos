@@ -253,6 +253,20 @@ export function isLiveOrderStatus(status: OrderStatus): boolean {
   return !(NOT_LIVE_ORDER_STATUSES as readonly string[]).includes(status);
 }
 
+/**
+ * A held order's hold. `extend_key` / `extend_ttl_seconds` remember the last
+ * `orders.extendHold` call (idempotent replay: same key + ttl = same result,
+ * nothing extended twice). The /v1 mappers copy only reason + expires_at, so
+ * they are not part of the contract; other POS routes that return a raw Order
+ * may still carry them.
+ */
+export interface OrderHold {
+  reason: string;
+  expires_at: string | null;
+  extend_key?: string | null;
+  extend_ttl_seconds?: number | null;
+}
+
 export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
 
 /**
@@ -412,6 +426,17 @@ export interface OrderItem {
   unit_price_cents: number;
   /** line total = unit_price_cents * quantity (0 when voided). */
   line_total_cents: number;
+  /**
+   * When the line was sent to the kitchen: the order reached a live status, or
+   * the line was added to an already-live order. Server-stamped (DB trigger /
+   * mock driver); client values are ignored. null = not fired (held, unpaid
+   * online, or voided before it was sent).
+   */
+  fired_at?: string | null;
+  /** When the line was voided (server-stamped). null while not voided. */
+  voided_at?: string | null;
+  /** The ORDER's POS status at the moment the line was voided. */
+  status_at_void?: string | null;
 }
 
 export interface OrderTotals {
@@ -453,7 +478,7 @@ export interface Order {
   /** Monotonic change counter (bumped by DB trigger / mock). Absent = 1. */
   version?: number;
   /** Set when the order is held (awaiting payment) and not yet released. */
-  hold?: { reason: string; expires_at: string | null } | null;
+  hold?: OrderHold | null;
   created_at: string;
   updated_at: string;
 }
@@ -482,5 +507,5 @@ export interface CreateOrderInput {
   /** Order origin (core). */
   source?: OrderSource;
   /** Hold (awaiting payment) metadata for core-created held orders. */
-  hold?: { reason: string; expires_at: string | null } | null;
+  hold?: OrderHold | null;
 }

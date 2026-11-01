@@ -48,4 +48,7 @@ done
 echo "==> Running RLS isolation test"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$TEST_FILE"
 
+echo "==> Running staff identity guard test"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$ROOT/supabase/tests/staff_identity_guards.sql"
+
 echo "==> RLS isolation harness complete."

@@ -48,6 +48,7 @@ import {
   toContractDailySales,
   toContractDrawerSession,
   toPosOrderStatus,
+  refundForEvent,
 } from "./mappers";
 
 export const EVENT_SOURCE = "openpizza_pos";
@@ -302,7 +303,13 @@ export async function hydrateEvent(
   if (t.startsWith("order.")) {
     data = await loadOrder(tenant, row.subject_id, driver);
   } else if (t.startsWith("payment.")) {
-    data = await loadPayment(tenant, row.subject_id, driver);
+    const pay = await loadPayment(tenant, row.subject_id, driver);
+    // payment.refunded names the refund it is about (consumers dedupe on
+    // refund.id); the others are the plain Payment.
+    data =
+      pay && t === "payment.refunded"
+        ? { ...pay, refund: refundForEvent(pay.refunds ?? [], row.changes) }
+        : pay;
   } else if (t === "menu.item.available" || t === "menu.item.unavailable") {
     const snap = row.row_snapshot ?? {};
     data = {

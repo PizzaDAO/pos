@@ -312,7 +312,13 @@ export async function loadStaffList(
     d.listStaff(tenantId),
     d.listStaffWithPin(tenantId),
   ]);
-  return staff.map((s) => toContractStaff(s, withPin.has(s.id)));
+  // One batched lookup for the linked logins' emails (no N+1).
+  const emails = await d.getUserEmails(
+    staff.flatMap((s) => (s.user_id ? [s.user_id] : [])),
+  );
+  return staff.map((s) =>
+    toContractStaff(s, withPin.has(s.id), s.user_id ? emails.get(s.user_id) : null),
+  );
 }
 
 /** Drawer sessions for a location; reconciliation is computed only for `select`ed rows. */

@@ -9,7 +9,7 @@
  * from the client, and ids outside the token's tenant answer NOT_FOUND.
  *
  * Implemented: tenant, capabilities, entitlements, locations, menu (+86),
- * quotes (stateless), orders (list/get/create held/cancel/release), payments
+ * quotes (stateless), orders (list/get/create held/cancel/release/extend hold), payments
  * (read), customers (read), staff, drawer sessions, deliveries (read), sales.
  * Declared but unsupported by POS answer 501 CAPABILITY_UNSUPPORTED:
  * orders.updateStatus, payments.recordExternal, customers.upsert,
@@ -20,12 +20,15 @@ import {
   EVENT_TYPES,
   OrderCancelInputSchema,
   OrderCreateInputSchema,
+  OrderHoldExtendInputSchema,
   OrderListQuerySchema,
   PROBLEM_CONTENT_TYPE,
   ProblemError,
   QuoteRequestSchema,
   SalesSummaryQuerySchema,
   V1_ROUTES,
+  extendedHoldExpiry,
+  holdCapSeconds,
   isProblemError,
   priceCart,
   problem,
@@ -150,6 +153,21 @@ async function readBody(req: Request): Promise<unknown> {
     return JSON.parse(text);
   } catch {
     throw ProblemError.of("VALIDATION_FAILED", { detail: "Body is not valid JSON." });
+  }
+}
+
+/**
+ * Custom fee / gratuity lines (core 0.3.x `fees`) are priced by `priceCart` but
+ * POS order creation cannot store them, so accepting them would quote one total
+ * and charge another. Refuse until POS supports them.
+ */
+function rejectFees(fees: unknown[] | undefined): void {
+  if (fees && fees.length > 0) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail:
+        "POS does not support custom fee lines (`fees`) yet; remove them from the request.",
+      path: "fees",
+    });
   }
 }
 
@@ -297,9 +315,33 @@ async function ownedLocation(ctx: Ctx, locationId: string): Promise<LocationBund
 // Handlers
 // ---------------------------------------------------------------------------
 
-const POS_EVENTS = EVENT_TYPES.filter(
-  (t) => !t.startsWith("tenant.") && !t.startsWith("entitlements."),
-);
+/** Event types POS actually emits (the outbox triggers + mock-events); nothing else is advertised. */
+const POS_EMITTED_EVENTS: readonly string[] = [
+  "order.placed",
+  "order.updated",
+  "order.status_changed",
+  "order.ready",
+  "order.completed",
+  "order.canceled",
+  "payment.authorized",
+  "payment.captured",
+  "payment.failed",
+  "payment.refunded",
+  "menu.updated",
+  "menu.item.unavailable",
+  "menu.item.available",
+  "location.updated",
+  "customer.created",
+  "customer.updated",
+  "staff.created",
+  "staff.updated",
+  "staff.deactivated",
+  "drawer_session.opened",
+  "drawer_session.closed",
+  "business_day.closed",
+  "delivery.status_changed",
+];
+const POS_EVENTS = EVENT_TYPES.filter((t) => POS_EMITTED_EVENTS.includes(t));
 
 const handlers: Partial<Record<V1Operation, Handler>> = {
   "tenant.get": async (ctx) => {
@@ -440,6 +482,7 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
   "quotes.create": async (ctx) => {
     const parsed = QuoteRequestSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
+    rejectFees(parsed.data.fees);
     const bundle = await ownedLocation(ctx, parsed.data.location_id);
     const menu = await loadMenu(bundle, ctx.driver);
     const quote = priceCart({
@@ -625,6 +668,97 @@ const handlers: Partial<Record<V1Operation, Handler>> = {
       throw ProblemError.of("INVALID_TRANSITION", { detail: "Order was canceled." });
     }
     return { body: await mapOrderFor(ctx, order.id) };
+  },
+
+  /**
+   * POST /orders/{id}/hold/extend (0.3.1): move a held order's `expires_at` to
+   * now + ttl, clamped to created_at + `holdCapSeconds(reason)`. The hub has
+   * already checked that the caller created the hold. Refuses (409) when the
+   * order is not held (released, canceled, ...), the hold already expired
+   * (extending never revives it), it is at its cap, or it is settled.
+   *
+   * Concurrency: the write is a compare-and-set on (status = draft, hold
+   * expiry = the value the new expiry was computed from), so it loses cleanly
+   * to a concurrent release / cancel / expiry / extension (re-read, re-decide)
+   * and can never resurrect a voided order or extend one that was placed.
+   * Idempotency: the last Idempotency-Key + ttl live on the hold; a replay of
+   * the same pair returns the current order without extending again, the same
+   * key with another ttl is IDEMPOTENCY_CONFLICT.
+   */
+  "orders.extendHold": async (ctx) => {
+    await requireActiveTenant(ctx);
+    const parsed = OrderHoldExtendInputSchema.safeParse(await readBody(ctx.req));
+    if (!parsed.success) throw zodProblem(parsed.error);
+    const ttl = parsed.data.ttl_seconds;
+    const key = ctx.req.headers.get("idempotency-key");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const order = await ownedOrder(ctx, ctx.params.order_id!);
+      const hold = order.status === "draft" ? (order.hold ?? null) : null;
+      if (key && hold?.extend_key === key) {
+        if (hold.extend_ttl_seconds !== ttl) {
+          throw ProblemError.of("IDEMPOTENCY_CONFLICT", {
+            detail: "Idempotency-Key was used with a different request.",
+          });
+        }
+        return {
+          body: await mapOrderFor(ctx, order.id),
+          headers: { "idempotent-replayed": "true" },
+        };
+      }
+      const next = extendedHoldExpiry(
+        {
+          fulfillment_status: hold ? "held" : order.status,
+          hold: hold ? { reason: hold.reason, expires_at: hold.expires_at } : null,
+          created_at: order.created_at,
+        } as Parameters<typeof extendedHoldExpiry>[0],
+        ttl,
+        ctx.now(),
+      );
+      if ("error" in next) {
+        throw next.error === "not_held"
+          ? ProblemError.of("INVALID_TRANSITION", {
+              detail: "The order is not held.",
+              details: { reason: "not_held" },
+            })
+          : ProblemError.of("CONFLICT", {
+              detail:
+                next.error === "expired"
+                  ? "The hold already expired."
+                  : "The hold is at its maximum lifetime.",
+              details: { reason: next.error },
+            });
+      }
+      // A fully paid order is released by settlement, not kept on hold.
+      const due = orderDueCents(order);
+      if (
+        due > 0 &&
+        netSettledBaseCents(await ctx.driver.listPaymentsForOrder(order.id), order.currency) >=
+          due
+      ) {
+        throw ProblemError.of("INVALID_TRANSITION", {
+          detail: "The order is already paid in full.",
+          details: { reason: "settled" },
+        });
+      }
+      const res = await ctx.driver.extendOrderHold(
+        order.id,
+        ctx.principal.tenant_id,
+        { expires_at: hold!.expires_at },
+        {
+          ...hold!,
+          expires_at: next.expires_at,
+          extend_key: key,
+          extend_ttl_seconds: ttl,
+        },
+      );
+      if (res.ok) return { body: await mapOrderFor(ctx, order.id) };
+      if (res.reason === "not_found") throw notFound("Order");
+      // Lost a race (release / cancel / expiry / another extension): re-decide.
+    }
+    throw ProblemError.of("CONFLICT", {
+      detail: "The order changed while extending its hold; retry.",
+      details: { reason: "concurrent_update" },
+    });
   },
 
   "payments.listForOrder": async (ctx) => {
@@ -935,6 +1069,7 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     throw unsupported("delivery orders", "Delivery orders cannot be created through /v1 yet.");
   }
   if (input.tax_exempt) throw unsupported("tax-exempt orders");
+  rejectFees(input.fees);
 
   // Order id: client id > derived from Idempotency-Key > random.
   const idemKey = ctx.req.headers.get("idempotency-key");
@@ -1094,7 +1229,12 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     : terminal
       ? (input.hold?.reason ?? "awaiting_payment")
       : "awaiting_payment";
-  const ttl = input.hold?.ttl_seconds ?? 900;
+  // The reason is what bounds the ttl: only `scheduled` may run up to 30 days,
+  // and a non-terminal caller's reason is forced to awaiting_payment above.
+  const ttl = Math.min(
+    input.hold?.ttl_seconds ?? 900,
+    holdReason ? holdCapSeconds(holdReason) : 900,
+  );
   const hold = holdReason
     ? { reason: holdReason, expires_at: new Date(now.getTime() + ttl * 1000).toISOString() }
     : null;

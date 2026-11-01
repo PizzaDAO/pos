@@ -821,10 +821,16 @@ export async function refundPayment(input: {
 
   let recorded: RefundReservation;
   if (isCardRail(payment.rail)) {
-    await callRail();
-    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId);
+    const railRefund = await callRail();
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
+      // Stripe's refund id (re_...) rides on the payment's refunds[] entry.
+      processorRef: railRefund?.refundId ?? null,
+      reason: input.reason ?? null,
+    });
   } else {
-    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId);
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
+      reason: input.reason ?? null,
+    });
     if (recorded.ok) {
       try {
         await callRail();

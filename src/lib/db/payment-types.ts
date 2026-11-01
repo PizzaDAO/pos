@@ -23,6 +23,19 @@ export type PaymentStatus =
   | "canceled"
   | "refunded";
 
+/** One refund against a tender (`payments.refunds`, oldest first). */
+export interface PaymentRefund {
+  /** Stable, unique per refund (server-minted). */
+  id: string;
+  amount_cents: number;
+  at: string;
+  /** Provider-native refund id (Stripe `re_…`), when the rail returns one. */
+  processor_ref: string | null;
+  reason: string | null;
+  /** Internal: the client refund-request id this entry was reserved under. */
+  request_id?: string | null;
+}
+
 /**
  * A single tender against an order. One order can have many (split payment).
  * `id` is a client-generated UUID and doubles as the idempotency key end-to-end
@@ -64,13 +77,24 @@ export interface Payment {
    * Written ONLY by `reservePaymentRefund`, never by `upsertPayment`.
    */
   refund_ids?: string[];
+  /**
+   * Every refund with a stable id (Σ amount_cents = refunded_cents). Written
+   * ONLY by `reservePaymentRefund` / `releasePaymentRefund`, never by
+   * `upsertPayment`. Absent on tenders refunded before it existed.
+   */
+  refunds?: PaymentRefund[];
   created_at: string;
   updated_at: string;
 }
 
 /** Result of an atomic refund reservation (see `PosDriver.reservePaymentRefund`). */
 export type RefundReservation =
-  | { ok: true; payment: Payment }
+  | {
+      ok: true;
+      payment: Payment;
+      /** Id of the refund entry this reservation appended to `payment.refunds`. */
+      refundEntryId?: string;
+    }
   | {
       ok: false;
       /** duplicate: refundId already applied; exceeds: over-refund / not refundable. */

@@ -34,12 +34,14 @@ import type {
   LatePaymentMarker,
   Order,
   OrderFulfillment,
+  OrderItem,
   OrderStatus,
   StoreSettings,
 } from "./menu-types";
 import type {
   ConnectAccount,
   Payment,
+  PaymentRefund,
   PaymentSettings,
   RefundReservation,
   TerminalLocation,
@@ -261,6 +263,49 @@ const magicLinks = new Map<string, MagicLinkToken>();
 /** Deliveries keyed by id. */
 const deliveries = new Map<string, DeliveryRecord>();
 let orderSeq = 0;
+
+/**
+ * Server-side line stamps (the Postgres triggers' twin, migration
+ * 20261104000000): a line is fired when its order is live; a line voided when
+ * the order is written carries `voided_at` + the order's status and is never
+ * fired (it never reached the kitchen).
+ */
+function stampNewLines(items: OrderItem[], status: OrderStatus, at: string): OrderItem[] {
+  const live = isLiveOrderStatus(status);
+  return items.map((i) => ({
+    ...i,
+    fired_at: i.voided ? null : live ? at : null,
+    voided_at: i.voided ? at : null,
+    status_at_void: i.voided ? status : null,
+  }));
+}
+
+/** An order that just became live fires its unfired, unvoided lines. */
+function fireLines(order: Order, prev: OrderStatus, at: string): OrderItem[] {
+  if (isLiveOrderStatus(prev) || !isLiveOrderStatus(order.status)) return order.items;
+  return order.items.map((i) =>
+    i.voided || i.fired_at ? i : { ...i, fired_at: at },
+  );
+}
+
+/** Remove the refunds[] entry of a released reservation (by request id, else the latest of that amount). */
+function dropReleasedRefund(
+  refunds: PaymentRefund[],
+  amountCents: number,
+  requestId: string | null,
+): PaymentRefund[] {
+  let idx = -1;
+  if (requestId) idx = refunds.findIndex((r) => r.request_id === requestId);
+  if (idx < 0) {
+    for (let i = refunds.length - 1; i >= 0; i--) {
+      if (refunds[i]!.amount_cents === amountCents) {
+        idx = i;
+        break;
+      }
+    }
+  }
+  return idx < 0 ? refunds : refunds.filter((_, i) => i !== idx);
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -844,6 +889,15 @@ export const mockDriver: PosDriver = {
     return usersById.get(userId) ?? null;
   },
 
+  async getUserEmails(userIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const id of userIds) {
+      const u = usersById.get(id);
+      if (u) out.set(id, u.email);
+    }
+    return out;
+  },
+
   async getUserByEmail(email: string): Promise<User | null> {
     const target = email.trim().toLowerCase();
     for (const u of usersById.values()) {
@@ -968,7 +1022,7 @@ export const mockDriver: PosDriver = {
       status: input.status ?? "placed",
       channel: input.channel,
       currency: input.currency,
-      items: input.items,
+      items: stampNewLines(input.items, input.status ?? "placed", now),
       discount_cents: input.discount_cents,
       totals: input.totals,
       notes: input.notes,
@@ -1045,6 +1099,30 @@ export const mockDriver: PosDriver = {
       return { ok: false, reason: "conflict", order: current } as const;
     }
     const order = (await this.updateOrderStatus(id, to)) as Order;
+    return { ok: true, order } as const;
+  },
+
+  // Single synchronous block (no awaits): an atomic compare-and-set in the mock.
+  async extendOrderHold(id, tenantId, expect, next) {
+    ensureKitchenSeed();
+    const current = orders.get(id);
+    if (!current || current.tenant_id !== tenantId) {
+      return { ok: false, reason: "not_found" } as const;
+    }
+    if (
+      current.status !== "draft" ||
+      !current.hold ||
+      (current.hold.expires_at ?? null) !== expect.expires_at
+    ) {
+      return { ok: false, reason: "conflict", order: current } as const;
+    }
+    const order: Order = {
+      ...current,
+      hold: next,
+      version: (current.version ?? 1) + 1,
+      updated_at: nowIso(),
+    };
+    orders.set(id, order);
     return { ok: true, order } as const;
   },
 
@@ -1150,13 +1228,15 @@ export const mockDriver: PosDriver = {
     const order = orders.get(id);
     if (!order) return null;
     const leavingHold = order.status === "draft" && status !== "draft";
+    const at = nowIso();
     const updated: Order = {
       ...order,
       status,
       hold: leavingHold ? null : (order.hold ?? null),
       version: (order.version ?? 1) + 1,
-      updated_at: nowIso(),
+      updated_at: at,
     };
+    updated.items = fireLines(updated, order.status, at);
     orders.set(id, updated);
     if (leavingHold && isLiveOrderStatus(status)) depleteForOrder(updated);
     return updated;
@@ -1176,14 +1256,16 @@ export const mockDriver: PosDriver = {
     // the hold is over, and a held order consumed no stock yet, so a move to a
     // live status depletes it (per-item idempotent) -- same as casOrderStatus.
     const leavingHold = order.status === "draft" && to !== "draft";
+    const at = nowIso();
     const updated: Order = {
       ...order,
       status: to,
       ...(patch?.fulfillment ? { fulfillment: patch.fulfillment } : {}),
       ...(leavingHold ? { hold: null } : {}),
       version: (order.version ?? 1) + 1,
-      updated_at: nowIso(),
+      updated_at: at,
     };
+    updated.items = fireLines(updated, order.status, at);
     orders.set(id, updated);
     if (leavingHold && isLiveOrderStatus(to)) depleteForOrder(updated);
     return updated;
@@ -1378,6 +1460,7 @@ export const mockDriver: PosDriver = {
         // passed to upsert must never roll it back.
         refunded_cents: existing.refunded_cents,
         refund_ids: existing.refund_ids,
+        refunds: existing.refunds,
         status:
           existing.status === "refunded" ? "refunded" : payment.status,
         created_at: existing.created_at,
@@ -1401,6 +1484,7 @@ export const mockDriver: PosDriver = {
     paymentId: string,
     amountCents: number,
     refundId: string | null,
+    meta?: { processorRef?: string | null; reason?: string | null },
   ): Promise<RefundReservation> {
     const p = payments.get(paymentId);
     if (!p) return { ok: false, reason: "not_found", payment: null };
@@ -1417,15 +1501,25 @@ export const mockDriver: PosDriver = {
       return { ok: false, reason: "exceeds", payment: p };
     }
     const refunded = p.refunded_cents + amountCents;
+    const now = nowIso();
+    const entry = {
+      id: globalThis.crypto.randomUUID(),
+      amount_cents: amountCents,
+      at: now,
+      processor_ref: meta?.processorRef ?? null,
+      reason: meta?.reason ?? null,
+      request_id: refundId,
+    };
     const updated: Payment = {
       ...p,
       refunded_cents: refunded,
       refund_ids: refundId ? [...ids, refundId] : ids,
+      refunds: [...(p.refunds ?? []), entry],
       status: refunded >= total ? "refunded" : p.status,
-      updated_at: nowIso(),
+      updated_at: now,
     };
     payments.set(paymentId, updated);
-    return { ok: true, payment: updated };
+    return { ok: true, payment: updated, refundEntryId: entry.id };
   },
 
   async releasePaymentRefund(
@@ -1441,6 +1535,7 @@ export const mockDriver: PosDriver = {
       refund_ids: refundId
         ? (p.refund_ids ?? []).filter((x) => x !== refundId)
         : p.refund_ids,
+      refunds: dropReleasedRefund(p.refunds ?? [], amountCents, refundId),
       status: p.status === "refunded" ? "captured" : p.status,
       updated_at: nowIso(),
     });

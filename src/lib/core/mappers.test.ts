@@ -129,7 +129,8 @@ describe("order mapping", () => {
     expect(orderViolations(o)).toEqual([]);
     expect(o.fulfillment_status).toBe("placed");
     expect(o.payment_status).toBe("unpaid");
-    expect(o.amount_due_cents).toBe(2257);
+    // food only: the 200c order tip is not part of the balance a tender covers
+    expect(o.amount_due_cents).toBe(2057);
     expect(o.lines.map((l) => l.discount_cents)).toEqual([50, 51, 0]);
     expect(o.lines[2]!.line_total_cents).toBe(0);
     expect(o.channel).toBe("online");
@@ -162,7 +163,7 @@ describe("order mapping", () => {
     const o = order({ status: "in_kitchen" });
     expect(derivePaymentStatus(o, [pay({ amount_cents: 1000, tip_cents: 0 })])).toEqual({
       payment_status: "partially_paid",
-      amount_due_cents: 1257,
+      amount_due_cents: 1057,
     });
     expect(derivePaymentStatus(o, [pay()]).payment_status).toBe("paid");
     expect(derivePaymentStatus(o, [pay({ refunded_cents: 500 })]).payment_status).toBe("partially_refunded");
