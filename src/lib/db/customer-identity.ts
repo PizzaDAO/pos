@@ -9,8 +9,7 @@
  *   - match by email (case-insensitive), else by normalised phone (a verified
  *     phone first);
  *   - NEVER merge two customers: a phone that belongs to someone with a different
- *     email is not attached to the new email's customer, and an email is never
- *     attached to a row whose phone/email is verified;
+ *     email (or to a phone-only row) is not attached to the new email's customer;
  *   - only FILL blanks, and never a contact onto a row that has a verified contact
  *     (planting a contact there must never make the row reachable by a one-time
  *     code); never sets verified state;
@@ -155,10 +154,11 @@ export function applyCustomerIdentity(
           a.id.localeCompare(b.id),
       )[0];
     if (byPhone) {
-      const frozen = hasVerifiedContact(byPhone);
       if (
         email &&
-        ((byPhone.email && byPhone.email !== email) || (byPhone.email === null && frozen))
+        // A phone-only row never gains an email through an ordinary upsert, and a
+        // row with a different email is a different person.
+        (byPhone.email === null || byPhone.email !== email)
       ) {
         phoneTaken = true;
       } else {

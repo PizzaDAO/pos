@@ -110,4 +110,17 @@ describe("late payment whose newest tender is external", () => {
     // idempotent: nothing left to mark
     expect((await post("mark_refunded")).status).toBe(409);
   });
+
+  it("does not mark the item resolved when the refund could not be booked (exceeds)", async () => {
+    const d = getPosDriver();
+    expect((await post("refund")).status).toBe(200);
+    // someone already booked 300 of the 500 by hand: 500 more no longer fits
+    expect((await d.reservePaymentRefund(EXT, 300, "elsewhere", {})).ok).toBe(true);
+    const r = await post("mark_refunded");
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toMatch(/already refunded in part/);
+    const marker = (await d.getOrder(ORDER))?.fulfillment?.late_payment;
+    expect(marker?.resolved).toBe("refund_owed_manual"); // still open
+    expect(marker?.claim).toBeFalsy(); // and released for another try
+  });
 });

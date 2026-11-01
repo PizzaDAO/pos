@@ -537,16 +537,23 @@ describe("2. customers.upsert", () => {
     expect((await upsert({ phone: "555-1234" })).status).toBe(422); // E.164 only
   });
 
-  it("creates by phone alone, then fills the email on a later call (same customer)", async () => {
+  it("creates by phone alone; an email offered later is another customer (a phone-only row never gains one)", async () => {
     const a = await upsert({ phone: "+15555550123", name: "Pat" });
     expect(a.status).toBe(200);
     const c = CustomerSchema.parse(a.json);
     expect(c.email).toBeNull();
     expect(c.phone).toBe("+15555550123");
     const b = await upsert({ phone: "+15555550123", email: "Pat@Example.com", name: "Someone Else" });
-    expect(b.json.id).toBe(c.id);
+    expect(b.json.id).not.toBe(c.id);
     expect(b.json.email).toBe("pat@example.com");
-    expect(b.json.name).toBe("Pat"); // blanks only, never overwritten
+    expect(b.json.phone).toBeNull(); // the phone stays with its owner
+    const still = await call("GET", `/customers/${c.id}`, { scopes: ["customers:read"] });
+    expect(still.json.email).toBeNull();
+    // an email row DOES take a phone (a blank), but never overwrites its name
+    const d = await upsert({ email: "pat@example.com", phone: "+15555550188", name: "Someone Else" });
+    expect(d.json.id).toBe(b.json.id);
+    expect(d.json.phone).toBe("+15555550188");
+    expect(d.json.name).toBe("Someone Else"); // b had no name: a blank is filled, then kept
   });
 
   it("never merges: a different email on a known phone is a new customer without that phone", async () => {
@@ -572,7 +579,7 @@ describe("2. customers.upsert", () => {
     expect((await upsert({ email: "pat@example.com", ...sms(true) })).json.marketing.sms.opt_in).toBe(false);
     const on = await upsert({ email: "pat@example.com", ...sms(true, "2026-01-02T00:00:00Z") });
     expect(on.json.marketing.sms.opt_in).toBe(true);
-    expect(on.json.verified).toBe(true);
+    expect(on.json.verified).toBe(false); // the legacy flag is never trusted; only per-contact proof
     const older = await upsert({ email: "pat@example.com", ...sms(false, "2026-01-01T00:00:00Z") });
     expect(older.json.marketing.sms.opt_in).toBe(true);
     const newer = await upsert({ email: "pat@example.com", ...sms(false, "2026-02-01T00:00:00Z") });

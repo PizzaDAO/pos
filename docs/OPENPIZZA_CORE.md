@@ -252,3 +252,19 @@ resets the lockout. PINs are never logged or echoed.
 * Late-payment refunds: an `external` tender cannot be sent back by POS; it is "owed by hand" and
   `Mark refunded` records the bookkeeping, so the item is never stuck. Reports key external tenders
   by method + processor (COD is cash, not card; gift cards are "Other").
+
+### Phase 2, second review
+
+* **Verification is per contact.** The contract `Customer` gains optional `email_verified` /
+  `phone_verified`; the legacy `verified` is true only when the row has a contact and EVERY contact it
+  has is proven. The legacy `customers.verified` column (set by the shop's magic-link stub for
+  anyone) is never read for this. A consumer must treat a missing per-contact flag as unverified
+  and must not log anyone in through a contact whose flag is not true.
+* A **phone-only row never gains an email** through an ordinary upsert (another customer is
+  created); an email row may take a blank phone, but not once any of its contacts is proven.
+* The trigger `core_guard_customer_verified` clears a contact's stamp whenever that contact's value
+  changes (any actor, including the service role); only a formatting change of a phone keeps it.
+* **National-format phones** (`415-555-0199`) are read as +1 only for US/CA locations (the tenant's
+  first location for customers, the order's location for orders); elsewhere they are null.
+* Late-payment "Mark refunded" books each external tender and stays open (409) when a booking does
+  not fit or the payment is gone.

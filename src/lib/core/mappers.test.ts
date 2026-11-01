@@ -191,6 +191,7 @@ describe("order mapping", () => {
       }),
       payments: [],
       timezone: "UTC",
+      country: "US",
     });
     expect(o.fulfillment_status).toBe("canceled");
     expect(o.canceled_at).not.toBeNull();
@@ -198,8 +199,24 @@ describe("order mapping", () => {
     expect(orderViolations(o)).toEqual([]);
     expect(o.fulfillment.type).toBe("delivery");
     expect(o.fulfillment.address?.country).toBe("US"); // "USA" is not alpha-2
-    expect(o.contact?.phone).toBe("+15555550123"); // national US format -> E.164 (was dropped); neverr invalid
+    expect(o.contact?.phone).toBe("+15555550123"); // national US format -> E.164 in a US location
     expect(OrderSchema.parse(o)).toBeTruthy();
+  });
+
+  it("a national-format phone is only normalised for US/CA; elsewhere it is null (no +1 guess)", () => {
+    const mk = (country: string | undefined) =>
+      toContractOrder({
+        order: order({
+          fulfillment: { type: "pickup", scheduled_for: "asap", promised_at: "2026-06-05T00:10:00.000Z", contact: { name: "Dee", phone: "415-555-0199" } },
+        }),
+        payments: [],
+        timezone: "UTC",
+        country,
+      });
+    expect(mk("US").contact?.phone).toBe("+14155550199");
+    expect(mk("CA").contact?.phone).toBe("+14155550199");
+    expect(mk("GB").contact?.phone).toBeNull();
+    expect(mk(undefined).contact?.phone).toBeNull();
   });
 
   it("explicit source/channel from core wins over the POS channel", () => {

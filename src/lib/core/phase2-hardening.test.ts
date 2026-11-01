@@ -302,6 +302,61 @@ describe("customers.upsert: OTP identity (customers:verify)", () => {
   });
 });
 
+describe("per-contact verification in the contract", () => {
+  const upsert = (body: Record<string, unknown>, scopes = ["customers:write"]) =>
+    call("POST", "/customers", { body, scopes });
+  const otp = (body: Record<string, unknown>) =>
+    upsert(body, ["customers:write", "customers:verify"]);
+
+  it("reports verification per contact, never row-wide, and never from the legacy column", async () => {
+    const d = getPosDriver();
+    // email proven by OTP, then a phone gets attached by an ordinary upsert
+    const v = (await otp({ email: "v@example.com", verified_contact: "email" })).json;
+    expect(v).toMatchObject({ verified: true, email_verified: true, phone_verified: false });
+    // the row is frozen, so a planted phone is refused ...
+    const planted = await upsert({ email: "v@example.com", phone: "+14155550999" });
+    expect(planted.json.phone).toBeNull();
+    // ... and on an UNVERIFIED email row the planted phone is reported unproven,
+    // and the row is NOT verified as a whole
+    await upsert({ email: "u@example.com" });
+    const u = await upsert({ email: "u@example.com", phone: "+14155550998" });
+    expect(u.json).toMatchObject({ verified: false, email_verified: false, phone_verified: false });
+    // proving the email later does not vouch for the planted phone
+    const e = await otp({ email: "u@example.com", verified_contact: "email" });
+    expect(e.json.phone).toBe("+14155550998");
+    expect(e.json).toMatchObject({ email_verified: true, phone_verified: false, verified: false });
+    // the legacy column (the magic-link stub) cannot assert anything
+    const row = (await d.getCustomer(e.json.id))!;
+    await d.upsertCustomer({ ...row, verified: true });
+    const again = await call("GET", `/customers/${e.json.id}`, { scopes: ["customers:read"] });
+    expect(again.json).toMatchObject({ email_verified: true, phone_verified: false, verified: false });
+  });
+
+  it("an email offered to a phone-only row creates another customer (scenario B residual)", async () => {
+    const p = (await otp({ phone: "+14155550123", verified_contact: "phone" })).json;
+    const a = await upsert({ email: "late@example.com", phone: "+14155550123" });
+    expect(a.json.id).not.toBe(p.id);
+    expect(a.json.phone).toBeNull();
+    const unverified = (await upsert({ phone: "+14155550124" })).json;
+    const b = await upsert({ email: "late2@example.com", phone: "+14155550124" });
+    expect(b.json.id).not.toBe(unverified.id);
+    expect((await call("GET", `/customers/${unverified.id}`, { scopes: ["customers:read"] })).json.email).toBeNull();
+  });
+
+  it("national phones are only read as +1 for a US/CA tenant", async () => {
+    const { toContractCustomer } = await import("./mappers");
+    const row = {
+      id: "c", tenant_id: DEMO_TENANT_ID, email: null, phone: "415-555-0199", name: null, verified: false,
+      created_at: T0.toISOString(), updated_at: T0.toISOString(),
+    };
+    const stats = { order_count: 0, last_order_at: null, lifetime_spend_cents: 0 };
+    expect(toContractCustomer(row, stats, "US").phone).toBe("+14155550199");
+    expect(toContractCustomer(row, stats, "GB").phone).toBeNull();
+    expect(toContractCustomer(row, stats).phone).toBeNull();
+    expect(toContractCustomer({ ...row, phone: "+442071838750" }, stats, "GB").phone).toBe("+442071838750");
+  });
+});
+
 describe("reports and the verifyPin oracle", () => {
   it("external tenders are reported by their own method, not as card", async () => {
     const { mixKey, railFamily, railLabel } = await import("@/lib/reports");

@@ -86,6 +86,7 @@ import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlemen
 import { authenticateV1, isSimulatedV1, type AuthDeps } from "./auth";
 import {
   NO_STATS,
+  tenantCountry,
   loadCustomer,
   loadDelivery,
   loadDrawerSessions,
@@ -920,10 +921,11 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     const data = rows.slice(0, limit);
     // Stats only for the page being returned (aggregate, not a full scan).
     const stats = await ctx.driver.customerOrderStats(tenantId, data.map((c) => c.id));
+    const country = await tenantCountry(tenantId, ctx.driver);
     const last = data[data.length - 1];
     return {
       body: {
-        data: data.map((c) => toContractCustomer(c, stats.get(c.id) ?? NO_STATS)),
+        data: data.map((c) => toContractCustomer(c, stats.get(c.id) ?? NO_STATS, country)),
         next_cursor: rows.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
       },
     };
@@ -1036,7 +1038,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     });
     const body =
       (await loadCustomer(tenantId, customer.id, ctx.driver)) ??
-      toContractCustomer(customer, NO_STATS);
+      toContractCustomer(customer, NO_STATS, await tenantCountry(tenantId, ctx.driver));
     return { status: 200, body };
   },
 

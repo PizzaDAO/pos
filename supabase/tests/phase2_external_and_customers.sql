@@ -105,10 +105,21 @@ begin
   cid := (c1 -> 'customer' ->> 'id')::uuid;
   if c1 -> 'customer' ->> 'email' is not null then raise exception 'email should be null'; end if;
 
-  -- same phone, different formatting, now with an email: matches, fills the blank email
-  c2 := public.core_upsert_customer(t, null, 'Pat@Example.com', '(555) 555-0123', 'Other Name', '{}'::jsonb, '{b}', '{"guests":"g2","x":"y"}');
-  if (c2 -> 'customer' ->> 'id')::uuid <> cid then raise exception 'phone match failed: %', c2; end if;
-  if c2 -> 'customer' ->> 'email' <> 'pat@example.com' then raise exception 'email not filled: %', c2; end if;
+  -- same phone, different formatting, now with an email: a PHONE-ONLY row never
+  -- gains an email through an ordinary upsert, so it is another customer
+  c2 := public.core_upsert_customer(t, null, 'Pat@Example.com', '(555) 555-0123', 'Other Name', '{}'::jsonb, '{b}', '{}');
+  if (c2 -> 'customer' ->> 'id')::uuid = cid then raise exception 'email attached to a phone-only row: %', c2; end if;
+  if c2 -> 'customer' ->> 'phone' is not null then raise exception 'phone moved off its owner: %', c2; end if;
+  if c2 -> 'customer' ->> 'email' <> 'pat@example.com' then raise exception 'email not stored: %', c2; end if;
+  if (select email from public.customers where id = cid) is not null then raise exception 'phone-only row changed'; end if;
+  -- start over with ONE row holding both, for the checks below
+  delete from public.customers where tenant_id = t;
+  c1 := public.core_upsert_customer(t, null, 'pat@example.com', null, 'Pat', '{}'::jsonb, '{a}', '{"guests":"g1"}');
+  cid := (c1 -> 'customer' ->> 'id')::uuid;
+  -- an email row DOES take a phone (fill a blank), keeps its name, unions tags, keeps external ids
+  c2 := public.core_upsert_customer(t, null, 'pat@example.com', '+15555550123', 'Other Name', '{}'::jsonb, '{b}', '{"guests":"g2","x":"y"}');
+  if (c2 -> 'customer' ->> 'id')::uuid <> cid then raise exception 'email match failed: %', c2; end if;
+  if c2 -> 'customer' ->> 'phone' <> '+15555550123' then raise exception 'phone not filled: %', c2; end if;
   if c2 -> 'customer' ->> 'name' <> 'Pat' then raise exception 'name overwritten: %', c2; end if;
   if (c2 -> 'customer' -> 'external_ids' ->> 'guests') <> 'g1' then raise exception 'external id overwritten: %', c2; end if;
   if c2 -> 'customer' -> 'external_ids' ->> 'x' <> 'y' then raise exception 'external id not added: %', c2; end if;
@@ -214,6 +225,33 @@ begin
     reset role;
     if (select phone_verified_at from public.customers where id = vid) is not null then
       raise exception 'authenticated role set phone_verified_at';
+    end if;
+  end;
+
+  -- ---------------- the verified stamp proves ONE value ----------------
+  declare g jsonb; gid uuid;
+  begin
+    g := public.core_upsert_customer(t, null, 'stamp@example.com', null, null, '{}'::jsonb, '{}', '{}', 'email');
+    gid := (g -> 'customer' ->> 'id')::uuid;
+    update public.customers set phone = '+15555550444' where id = gid;
+    if (select email_verified_at from public.customers where id = gid) is null then
+      raise exception 'adding a phone must not clear the email stamp';
+    end if;
+    -- as the service role / owner (this session): swapping the email clears ITS stamp
+    update public.customers set email = 'swapped@example.com' where id = gid;
+    if (select email_verified_at from public.customers where id = gid) is not null then
+      raise exception 'a changed email kept its verified stamp';
+    end if;
+    -- a phone stamp survives a formatting change, not a different number
+    g := public.core_upsert_customer(t, null, null, '+15555550555', null, '{}'::jsonb, '{}', '{}', 'phone');
+    gid := (g -> 'customer' ->> 'id')::uuid;
+    update public.customers set phone = '(555) 555-0555' where id = gid;
+    if (select phone_verified_at from public.customers where id = gid) is null then
+      raise exception 'a formatting change cleared the phone stamp';
+    end if;
+    update public.customers set phone = '+15555550556' where id = gid;
+    if (select phone_verified_at from public.customers where id = gid) is not null then
+      raise exception 'a changed phone kept its verified stamp';
     end if;
   end;
 

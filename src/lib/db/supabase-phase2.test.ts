@@ -207,10 +207,17 @@ describe.skipIf(!PGLITE)("supabase driver phase 2 on PGlite", () => {
   });
 
   it("upsertCustomerIdentity: phone-only, merge-by-phone, no merge across emails, consent order", async () => {
-    const base = { newId: crypto.randomUUID(), email: null, phone: "+15555550101", name: "Pat", marketing: {}, tags: ["a"], externalIds: { g: "1" } };
-    const a = await driver.upsertCustomerIdentity(T, base);
+    const base = { newId: crypto.randomUUID(), email: "pat@example.com", phone: "+15555550101", name: "Pat", marketing: {}, tags: ["a"], externalIds: { g: "1" } };
+    // a phone-only row never gains an email through an ordinary upsert
+    const lone = await driver.upsertCustomerIdentity(T, { ...base, email: null, newId: crypto.randomUUID(), phone: "+15555550102" });
+    const offered = await driver.upsertCustomerIdentity(T, { ...base, newId: crypto.randomUUID(), email: "offer@example.com", phone: "+15555550102" });
+    expect(offered.created).toBe(true);
+    expect(offered.customer.id).not.toBe(lone.customer.id);
+    expect(offered.customer.phone).toBeNull();
+    expect((await driver.getCustomer(lone.customer.id))?.email).toBeNull();
+    const a = await driver.upsertCustomerIdentity(T, { ...base, phone: null });
     expect(a).toMatchObject({ created: true, changed: true });
-    expect(a.customer.email).toBeNull();
+    expect(a.customer.phone).toBeNull();
     const b = await driver.upsertCustomerIdentity(T, {
       ...base, newId: crypto.randomUUID(), email: "Pat@Example.com", phone: "(555) 555-0101", name: "X", tags: ["b"],
       marketing: { sms: { opt_in: true, at: "2026-01-02T00:00:00Z" } },

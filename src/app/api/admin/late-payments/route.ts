@@ -262,12 +262,27 @@ export async function POST(request: Request) {
         // Taken outside POS: there is no processor to refund through. Staff attest
         // they returned it, so only the bookkeeping is recorded (idempotent on the
         // refund id); no rail is called.
-        await driver.reservePaymentRefund(
+        const booked = await driver.reservePaymentRefund(
           m.payment_id,
           m.amount_cents,
           `manual-${m.payment_id}-${m.amount_cents}`,
           { reason: "refunded outside POS, confirmed by staff" },
         );
+        // `duplicate` = already booked by an earlier press: fine. Anything else
+        // (the tender is gone, or less is left on it than is owed) was NOT booked,
+        // so the item must stay open rather than be marked resolved.
+        if (!booked.ok && booked.reason !== "duplicate") {
+          await release();
+          return NextResponse.json(
+            {
+              error:
+                booked.reason === "not_found"
+                  ? "A payment owed back no longer exists; check the order before marking it refunded."
+                  : "Less is left on a payment than is owed back (it was already refunded in part); check the order before marking it refunded.",
+            },
+            { status: 409 },
+          );
+        }
         continue;
       }
       await refundPayment({
@@ -288,7 +303,7 @@ export async function POST(request: Request) {
       actor,
       action: "late_payment_refunded",
       tenantId: order.tenant_id,
-      detail: `Staff confirmed the manual crypto refund of order ${order.id} was sent.`,
+      detail: `Staff confirmed the manual refund (crypto, or a payment taken outside POS) of order ${order.id} was sent.`,
     });
     return NextResponse.json({ order: updated });
   } catch (err) {

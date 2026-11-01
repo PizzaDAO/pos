@@ -23,7 +23,7 @@
 --
 --     ORDINARY mode: match by email, else by phone (verified phones first); NEVER
 --     merge two customers (a phone owned by someone with a different email is not
---     attached; neither is an email onto a phone that is verified); only FILL
+--     attached; nor is an email offered to a phone-only row); only FILL
 --     blanks, and never a contact onto a row that has a verified contact (so
 --     planting a contact there can never make it reachable by OTP); never sets
 --     verified state; consent changes only with an `at` (a future `at` is clamped
@@ -68,22 +68,38 @@ end
 $$;
 alter table public.customers validate constraint customers_email_or_phone;
 
--- Tenant members (and a customer on their own row) can write `customers` through
--- PostgREST under RLS. The verified timestamps are server-only: a user-role write
--- cannot set or change them (the SECURITY DEFINER upsert and the service role can).
+-- A verified timestamp proves ONE contact value. Two rules, enforced for every
+-- actor (including the service role and the owner of the SECURITY DEFINER upsert):
+--   1. when a contact's value changes, that contact's stamp is cleared, so a
+--      contact swapped under a stamp (a checkout fill, a PostgREST edit, a
+--      back-office fix) is unverified again. The OTP upsert never changes a
+--      contact value on an existing row (it matches or creates, and stamps), so
+--      it is unaffected. Phones compare by core_phone_key, so only a formatting
+--      change keeps the stamp.
+--   2. tenant members (and a customer on their own row) can write `customers`
+--      through PostgREST under RLS; for the user roles the stamps are read-only.
 create or replace function public.core_guard_customer_verified()
 returns trigger
 language plpgsql
 as $$
 begin
-  if current_user in ('anon', 'authenticated') then
-    if tg_op = 'INSERT' then
+  if tg_op = 'INSERT' then
+    if current_user in ('anon', 'authenticated') then
       new.email_verified_at := null;
       new.phone_verified_at := null;
-    else
-      new.email_verified_at := old.email_verified_at;
-      new.phone_verified_at := old.phone_verified_at;
     end if;
+    return new;
+  end if;
+  if current_user in ('anon', 'authenticated') then
+    new.email_verified_at := old.email_verified_at;
+    new.phone_verified_at := old.phone_verified_at;
+  end if;
+  if new.email is distinct from old.email then
+    new.email_verified_at := null;
+  end if;
+  if coalesce(public.core_phone_key(new.phone), new.phone)
+     is distinct from coalesce(public.core_phone_key(old.phone), old.phone) then
+    new.phone_verified_at := null;
   end if;
   return new;
 end;
@@ -226,12 +242,11 @@ begin
      limit 1
      for update;
     if found then
-      v_frozen := v_row.email_verified_at is not null or v_row.phone_verified_at is not null;
       if v_email is not null
-         and ((v_row.email is not null and v_row.email <> v_email)
-              or (v_row.email is null and v_frozen)) then
-        -- Two different people (or an email being planted on a verified row):
-        -- never merge. The phone stays with its owner.
+         and (v_row.email is null or v_row.email <> v_email) then
+        -- A different email, or an email offered to a PHONE-ONLY row: two
+        -- different people as far as we can tell. Never merge; the phone stays
+        -- with its owner.
         v_phone_taken := true;
       else
         v_found := true;
