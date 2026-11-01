@@ -25,12 +25,24 @@
 import type { Customer, CustomerConsent, CustomerIdentityWrite } from "./customer-types";
 
 /**
- * Comparison key for a phone: digits only, a leading NANP "1" dropped, shorter
- * than 7 digits = no key (mirrors `public.core_phone_key`).
+ * Comparison key for a phone (mirrors `public.core_phone_key(phone, country)`):
+ *  - international (`+` or `00` prefix): the digits, NANP +1 dropped;
+ *  - national, country US or CA: the NANP rule (10 digits, or 11 with a leading 1);
+ *  - national, any other country or an UNKNOWN one (`null`): NO key. A country is
+ *    never guessed, so such a number never matches another customer.
+ * `country` omitted (undefined) means "US", what callers assumed before the
+ * country existed; pass `null` for unknown.
  */
-export function phoneKey(phone: string | null | undefined): string | null {
-  const d = (phone ?? "").replace(/[^0-9]/g, "");
+export function phoneKey(
+  phone: string | null | undefined,
+  country: string | null = "US",
+): string | null {
+  const raw = (phone ?? "").trim();
+  const intl = /^(\+|00)[0-9]/.test(raw);
+  let d = raw.replace(/[^0-9]/g, "");
+  if (/^00[0-9]/.test(raw)) d = d.slice(2);
   if (d.length < 7) return null;
+  if (!intl && !["US", "CA"].includes((country ?? "").toUpperCase())) return null;
   return d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
 }
 
@@ -86,7 +98,8 @@ export function applyCustomerIdentity(
   const vc = input.verifiedContact;
   const email = vc === "phone" ? null : normaliseEmail(input.email);
   const phone = vc === "email" ? null : input.phone?.trim() || null;
-  const pkey = phoneKey(phone);
+  const country = input.country;
+  const pkey = phoneKey(phone, country);
   const mine = tenantCustomers.filter((c) => c.tenant_id === tenantId);
   if (!email && !phone) throw new Error("email or phone is required");
 
@@ -126,7 +139,7 @@ export function applyCustomerIdentity(
   if (vc === "phone") {
     if (!pkey) throw new Error("the verified phone has no usable digits");
     const row = mine
-      .filter((c) => c.phone && c.phone_verified_at && phoneKey(c.phone) === pkey)
+      .filter((c) => c.phone && c.phone_verified_at && phoneKey(c.phone, country) === pkey)
       .sort(
         (a, b) =>
           a.phone_verified_at!.localeCompare(b.phone_verified_at!) || a.id.localeCompare(b.id),
@@ -145,7 +158,7 @@ export function applyCustomerIdentity(
   let phoneTaken = false;
   if (!found && pkey) {
     const byPhone = mine
-      .filter((c) => c.phone && phoneKey(c.phone) === pkey)
+      .filter((c) => c.phone && phoneKey(c.phone, country) === pkey)
       .sort(
         (a, b) =>
           Number(!a.phone_verified_at) - Number(!b.phone_verified_at) ||
@@ -187,7 +200,7 @@ export function applyCustomerIdentity(
   const frozen = hasVerifiedContact(found);
   const phoneFree =
     pkey !== null &&
-    !mine.some((c) => c.id !== found.id && c.phone && phoneKey(c.phone) === pkey);
+    !mine.some((c) => c.id !== found.id && c.phone && phoneKey(c.phone, country) === pkey);
   const nextEmail = frozen ? found.email : (found.email ?? email);
   const nextPhone = found.phone ?? (phone && phoneFree && !frozen ? phone : null);
   const next: Customer = {
@@ -200,7 +213,7 @@ export function applyCustomerIdentity(
       input.marketing,
       {
         email: !!email && nextEmail === email,
-        sms: !!phone && !!nextPhone && (nextPhone === phone || phoneKey(nextPhone) === pkey),
+        sms: !!phone && !!nextPhone && (nextPhone === phone || phoneKey(nextPhone, country) === pkey),
       },
       now,
     ),

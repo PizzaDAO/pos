@@ -301,9 +301,12 @@ export async function loadCustomer(
   return toContractCustomer(c, stats.get(c.id) ?? NO_STATS, await tenantCountry(tenantId, d));
 }
 
-/** A location's country as the contract reports it (`US` when POS has none). */
-export function countryOf(country: string | null | undefined): string {
-  return country && /^[A-Z]{2}$/.test(country) ? country : "US";
+/**
+ * A location's country, or null when POS has none (or an invalid one). Never
+ * guessed: a null country leaves national-format phones unnormalised.
+ */
+export function countryOf(country: string | null | undefined): string | null {
+  return country && /^[A-Z]{2}$/.test(country) ? country : null;
 }
 
 /**

@@ -12,12 +12,14 @@ import type { DeliveryProvider, DeliveryProviderKey } from "./DeliveryProvider";
 export const DELIVERY_PROVIDER_KEYS: readonly DeliveryProviderKey[] = [
   "in_house_manual",
   "doordash_drive",
+  "openpizza_driver",
 ] as const;
 
 /** Human-readable labels for UI/config surfaces. */
 export const DELIVERY_PROVIDER_LABELS: Record<DeliveryProviderKey, string> = {
   in_house_manual: "In-house (zones + manual dispatch)",
   doordash_drive: "DoorDash Drive",
+  openpizza_driver: "Open Pizza Driver (partner-driven)",
 };
 
 /** Empty in Phase 0. Phase 4 populates this via `registerDeliveryProvider`. */

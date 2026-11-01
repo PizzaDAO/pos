@@ -27,6 +27,12 @@ import type {
   StoredQuote,
   TerminalLocation,
   TerminalReader,
+  TenderLinkResult,
+  AllergenRow,
+  AllergenPublicationRecord,
+  AllergenPublishResult,
+  DeliveryPatch,
+  DeliveryTransitionResult,
 } from "./payment-types";
 import type {
   Customer,
@@ -596,6 +602,20 @@ export interface PosDriver {
     refundId: string | null,
   ): Promise<void>;
 
+  /**
+   * TRUE compare-and-set: record a Checkout session id on a tender
+   * (`raw.checkout_session_id`) only while the tender is still `requires_action`
+   * and belongs to `tenantId`. One conditional UPDATE (Supabase:
+   * `core_link_tender_session`), never a whole-row write from a stale read, so a
+   * tender closed meanwhile (cash settled the order, a cancel, a supersede, a
+   * webhook) is left exactly as it is: `not_open`.
+   */
+  linkTenderSession(
+    tenantId: string,
+    paymentId: string,
+    sessionId: string,
+  ): Promise<TenderLinkResult>;
+
   /** Fetch a single payment tender by id, or null. */
   getPayment(id: string): Promise<Payment | null>;
 
@@ -635,6 +655,28 @@ export interface PosDriver {
       Pick<PaymentSessionRow, "status" | "payment_id" | "stripe_session_id" | "url" | "expires_at">
     >,
   ): Promise<PaymentSessionRow | null>;
+
+  /**
+   * Store a published allergen matrix and announce `menu.allergens.published`
+   * ATOMICALLY (Supabase: `core_publish_allergens`). Same version + hash is a
+   * `replay`; same version, other hash a `conflict`; every target and location
+   * must belong to `tenantId` (`unknown_*`, nothing written); a repeated target is
+   * a `duplicate`. A new version replaces the stored matrix.
+   */
+  publishAllergens(
+    tenantId: string,
+    input: {
+      version: string;
+      payload_hash: string;
+      location_ids: string[] | null;
+      published_by: string | null;
+      rows: AllergenRow[];
+    },
+  ): Promise<AllergenPublishResult>;
+  getAllergenPublication(
+    tenantId: string,
+    id: string,
+  ): Promise<AllergenPublicationRecord | null>;
 
   /** Persist a validated quote request (idempotent on id). */
   saveQuote(quote: StoredQuote): Promise<void>;
@@ -767,6 +809,17 @@ export interface PosDriver {
 
   /** Upsert-by-id of a delivery record (idempotent dispatch). */
   upsertDelivery(delivery: DeliveryRecord): Promise<DeliveryRecord>;
+
+  /**
+   * Compare-and-set a delivery's status/fields: written only while the delivery
+   * (of `tenantId`) is NOT terminal (delivered, canceled, failed). A late update
+   * can never move a finished delivery: `terminal` carries the stored row.
+   */
+  transitionDelivery(
+    id: string,
+    tenantId: string,
+    patch: DeliveryPatch,
+  ): Promise<DeliveryTransitionResult>;
 
   /** Fetch the delivery for an order, or null. */
   getDeliveryForOrder(orderId: string): Promise<DeliveryRecord | null>;

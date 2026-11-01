@@ -45,6 +45,8 @@ import type {
   Payment,
   PaymentRefund,
   PaymentSessionRow,
+  AllergenPublicationRecord,
+  AllergenRow,
   PaymentSettings,
   RefundReservation,
   StoredQuote,
@@ -273,6 +275,9 @@ const customers = new Map<string, Customer>();
 const magicLinks = new Map<string, MagicLinkToken>();
 /** Deliveries keyed by id. */
 const deliveries = new Map<string, DeliveryRecord>();
+const allergenPublications = new Map<string, AllergenPublicationRecord>();
+/** The latest published matrix per tenant. */
+const allergenRows = new Map<string, AllergenRow[]>();
 let orderSeq = 0;
 
 /**
@@ -1043,6 +1048,7 @@ export const mockDriver: PosDriver = {
       fulfillment: input.fulfillment,
       source: input.source,
       hold: input.hold ?? null,
+      core_ext: input.core_ext ?? null,
       version: 1,
       created_at: now,
       updated_at: now,
@@ -1556,6 +1562,23 @@ export const mockDriver: PosDriver = {
   // Mirrors public.core_record_external_tender(): ONE synchronous block (no
   // awaits between the checks and the write), so it is atomic in the
   // single-threaded mock exactly as the SQL function is under its row lock.
+  async linkTenderSession(tenantId, paymentId, sessionId) {
+    // Synchronous check-and-write (no await between them): atomic in the
+    // single-threaded mock, as the SQL function is under its row lock.
+    const p = payments.get(paymentId);
+    if (!p || p.tenant_id !== tenantId) return { ok: false, reason: "not_found" };
+    if (p.status !== "requires_action") {
+      return { ok: false, reason: "not_open", status: p.status };
+    }
+    const next: Payment = {
+      ...p,
+      raw: { ...(p.raw ?? {}), checkout_session_id: sessionId },
+      updated_at: nowIso(),
+    };
+    payments.set(next.id, next);
+    return { ok: true, payment: next };
+  },
+
   async recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult> {
     const order = orders.get(input.orderId);
     if (!order || order.tenant_id !== input.tenantId) return { outcome: "not_found" };
@@ -1776,6 +1799,66 @@ export const mockDriver: PosDriver = {
     return { ...next };
   },
 
+  async publishAllergens(tenantId, input) {
+    // Mirrors public.core_publish_allergens: one synchronous block.
+    const existing = [...allergenPublications.values()].find(
+      (p) => p.tenant_id === tenantId && p.version === input.version,
+    );
+    if (existing) {
+      return existing.payload_hash === input.payload_hash
+        ? { outcome: "replay", publication: { ...existing } }
+        : { outcome: "conflict" };
+    }
+    const badLocations = (input.location_ids ?? []).filter(
+      (l) => !locations.some((x) => x.id === l && x.tenant_id === tenantId),
+    );
+    if (badLocations.length) return { outcome: "unknown_location", ids: badLocations };
+    const owner = (r: AllergenRow): string | null => {
+      switch (r.target_type) {
+        case "item":
+          return menuItems.find((i) => i.id === r.target_id)?.tenant_id ?? null;
+        case "size": {
+          const size = itemSizes.find((x) => x.id === r.target_id);
+          return size ? (menuItems.find((i) => i.id === size.item_id)?.tenant_id ?? null) : null;
+        }
+        case "modifier": {
+          const m = modifiers.find((x) => x.id === r.target_id);
+          return m ? (modifierGroups.find((g) => g.id === m.group_id)?.tenant_id ?? null) : null;
+        }
+        default:
+          return null;
+      }
+    };
+    const bad = input.rows.filter((r) => owner(r) !== tenantId).map((r) => r.target_id);
+    if (bad.length) return { outcome: "unknown_target", ids: bad.slice(0, 20) };
+    const seen = new Set<string>();
+    const dups: string[] = [];
+    for (const r of input.rows) {
+      const k = `${r.target_type}:${r.target_id}`;
+      if (seen.has(k)) dups.push(r.target_id);
+      seen.add(k);
+    }
+    if (dups.length) return { outcome: "duplicate", ids: dups.slice(0, 20) };
+    const pub: AllergenPublicationRecord = {
+      id: globalThis.crypto.randomUUID(),
+      tenant_id: tenantId,
+      version: input.version,
+      payload_hash: input.payload_hash,
+      location_ids: input.location_ids,
+      row_count: input.rows.length,
+      published_by: input.published_by,
+      published_at: nowIso(),
+    };
+    allergenPublications.set(pub.id, pub);
+    allergenRows.set(tenantId, input.rows.map((r) => ({ ...r })));
+    return { outcome: "ok", publication: { ...pub } };
+  },
+
+  async getAllergenPublication(tenantId, id) {
+    const p = allergenPublications.get(id);
+    return p && p.tenant_id === tenantId ? { ...p } : null;
+  },
+
   async saveQuote(quote) {
     storedQuotes.set(quote.id, { ...quote });
   },
@@ -1983,10 +2066,12 @@ export const mockDriver: PosDriver = {
       : [...customers.values()].find(
           (c) => c.tenant_id === customer.tenant_id && c.email === email,
         );
-    const base = existingById ?? existingByEmail;
-    // Matched only by EMAIL (guest checkout with a new id): anyone can type an
-    // email, so never overwrite the stored name/phone — only fill blanks.
-    const fillBlanksOnly = !existingById && Boolean(existingByEmail);
+    // Matched only by EMAIL (anonymous checkout with a new id): never write an
+    // existing row from here (see the Supabase driver); the order carries its own
+    // contact.
+    if (!existingById && existingByEmail) return existingByEmail;
+    const base = existingById;
+    const fillBlanksOnly = false;
     const now = nowIso();
     const merged: Customer = {
       ...customer,
@@ -2058,6 +2143,25 @@ export const mockDriver: PosDriver = {
     };
     deliveries.set(merged.id, merged);
     return merged;
+  },
+
+  async transitionDelivery(id, tenantId, patch) {
+    const cur = deliveries.get(id);
+    if (!cur || cur.tenant_id !== tenantId) return { ok: false, reason: "not_found" };
+    if (["delivered", "canceled", "failed"].includes(cur.status)) {
+      return { ok: false, reason: "terminal", delivery: cur };
+    }
+    const next: DeliveryRecord = { ...cur, updated_at: nowIso() };
+    next.status = patch.status;
+    if (patch.driver_name !== undefined) next.driver_name = patch.driver_name;
+    if (patch.driver_phone !== undefined) next.driver_phone = patch.driver_phone;
+    if (patch.eta_minutes !== undefined) next.eta_minutes = patch.eta_minutes;
+    if (patch.tracking_ref !== undefined) next.tracking_ref = patch.tracking_ref;
+    if (patch.provider_delivery_id !== undefined) {
+      next.provider_delivery_id = patch.provider_delivery_id;
+    }
+    deliveries.set(id, next);
+    return { ok: true, delivery: next };
   },
 
   async getDeliveryForOrder(orderId: string): Promise<DeliveryRecord | null> {

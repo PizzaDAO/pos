@@ -424,11 +424,12 @@ export async function createPaymentSession(
     expiresAtMs = created.expires_at * 1000;
   }
 
-  // Link the tender to its session. RE-READ it first: it may have been closed
-  // while we talked to Stripe (cash settled the order and closed the siblings, a
-  // cancel, a supersede). Writing our stale copy back would resurrect a closed
-  // tender next to a live payable URL (double charge). If it is not still open,
-  // expire the session and fail.
+  // Link the tender to its session with a TRUE compare-and-set: one conditional
+  // write that lands only while the tender is still `requires_action` (it may have
+  // been closed while we talked to Stripe: cash settled the order and closed the
+  // siblings, a cancel, a supersede, a webhook). It never writes a stale copy of
+  // the row back, so a closed tender cannot be resurrected next to a live payable
+  // URL (double charge). If it is no longer open, expire the session and fail.
   const failSession = async (problem: ProblemError): Promise<never> => {
     if (!simulated) {
       await expireCheckoutSession(stripeSessionId, connectAccountId).catch((err) =>
@@ -441,17 +442,9 @@ export async function createPaymentSession(
     }
     throw problem;
   };
-  const current = await driver.getPayment(tenderId);
-  if (!current || current.status !== "requires_action") {
-    return failSession(
-      conflict("settled", "The order changed while the payment session was being created."),
-    );
-  }
+  let link;
   try {
-    await driver.upsertPayment({
-      ...current,
-      raw: { ...current.raw, checkout_session_id: stripeSessionId },
-    });
+    link = await driver.linkTenderSession(tenantId, tenderId, stripeSessionId);
   } catch (err) {
     // E.g. the one-live-tender index refusing the write: never a 500 with a payable
     // session left open.
@@ -462,6 +455,11 @@ export async function createPaymentSession(
     }
     await failSession(ProblemError.of("INTERNAL")).catch(() => undefined);
     throw err;
+  }
+  if (!link.ok) {
+    return failSession(
+      conflict("settled", "The order changed while the payment session was being created."),
+    );
   }
 
   // 10. Re-check the ORDER now that the link exists: voided meanwhile, settled by

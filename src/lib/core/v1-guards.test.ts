@@ -242,10 +242,20 @@ describe("tender settlement + active staff", () => {
 });
 
 describe("literal order-money scopes + hold reason", () => {
-  it("a caller-chosen hold reason cannot dodge the unpaid-release check", async () => {
+  it("a non-terminal caller cannot choose a manual hold (422, never silently rewritten)", async () => {
     const b = await orderBody(
       { hold: { reason: "manual" }, payment_intent: "prepaid" },
       "b9000000-0000-4000-8000-000000000001",
+    );
+    const refused = await call("POST", "/orders", { p: agent(), body: b });
+    expect(refused.status).toBe(422);
+    expect(refused.json.path).toBe("hold.reason");
+  });
+
+  it("a held order is not released unpaid, whatever the reason", async () => {
+    const b = await orderBody(
+      { hold: { reason: "awaiting_payment" }, payment_intent: "prepaid" },
+      "b9000000-0000-4000-8000-0000000000f1",
     );
     const created = await call("POST", "/orders", { p: agent(), body: b });
     expect(created.status).toBe(201);

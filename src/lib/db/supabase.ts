@@ -50,6 +50,7 @@ import type {
   ConnectAccount,
   Payment,
   PaymentSessionRow,
+  AllergenPublicationRecord,
   PaymentSettings,
   TerminalLocation,
   TerminalReader,
@@ -247,6 +248,7 @@ function mapOrder(r: Row, items: OrderItem[]): Order {
     fulfillment: (r.fulfillment as Order["fulfillment"]) ?? undefined,
     source: (r.source as Order["source"] | null) ?? undefined,
     hold: (r.hold as Order["hold"] | null) ?? null,
+    core_ext: (r.core_ext as Order["core_ext"] | null) ?? null,
     version: (r.version as number | null) ?? 1,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
@@ -412,6 +414,19 @@ function mapDelivery(r: Row): DeliveryRecord {
     simulated: r.simulated as boolean,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
+  };
+}
+
+function mapAllergenPublication(r: Row): AllergenPublicationRecord {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    version: r.version as string,
+    payload_hash: r.payload_hash as string,
+    location_ids: (r.location_ids as string[] | null) ?? null,
+    row_count: r.row_count as number,
+    published_by: (r.published_by as string | null) ?? null,
+    published_at: r.published_at as string,
   };
 }
 
@@ -1632,6 +1647,9 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             fulfillment: input.fulfillment ?? null,
             source: input.source ?? null,
             hold: input.hold ?? null,
+            // Only sent when set, so shop and terminal inserts keep working on a
+            // database that predates the column.
+            ...(input.core_ext ? { core_ext: input.core_ext } : {}),
             created_at: now,
             updated_at: now,
           })
@@ -2170,6 +2188,23 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return mapPayment(unwrap(res) as Row);
     },
 
+    async linkTenderSession(tenantId, paymentId, sessionId) {
+      const out = unwrap(
+        await sb.rpc("core_link_tender_session", {
+          p_tenant_id: tenantId,
+          p_payment_id: paymentId,
+          p_session_id: sessionId,
+        }),
+      ) as { outcome: string; payment?: Row; status?: string };
+      if (out.outcome === "ok") {
+        return { ok: true, payment: mapPayment(out.payment as Row) } as const;
+      }
+      if (out.outcome === "not_open") {
+        return { ok: false, reason: "not_open", status: out.status ?? "" } as const;
+      }
+      return { ok: false, reason: "not_found" } as const;
+    },
+
     async recordExternalTender(input) {
       const out = unwrap(
         await sb.rpc("core_record_external_tender", {
@@ -2370,6 +2405,47 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         if (r) return mapPaymentSession(r);
       }
       return this.getPaymentSession(id);
+    },
+
+    async publishAllergens(tenantId, input) {
+      const out = unwrap(
+        await sb.rpc("core_publish_allergens", {
+          p_tenant_id: tenantId,
+          p_version: input.version,
+          p_payload_hash: input.payload_hash,
+          p_location_ids: input.location_ids,
+          p_published_by: input.published_by,
+          p_rows: input.rows,
+        }),
+      ) as { outcome: string; publication?: Row; ids?: string[] };
+      switch (out.outcome) {
+        case "ok":
+        case "replay":
+          return {
+            outcome: out.outcome,
+            publication: mapAllergenPublication(out.publication as Row),
+          } as const;
+        case "conflict":
+          return { outcome: "conflict" } as const;
+        case "unknown_target":
+        case "unknown_location":
+        case "duplicate":
+          return { outcome: out.outcome, ids: out.ids ?? [] } as const;
+        default:
+          throw new Error(`core_publish_allergens: unexpected outcome ${out.outcome}`);
+      }
+    },
+
+    async getAllergenPublication(tenantId, id) {
+      const r = unwrap(
+        await sb
+          .from("menu_allergen_publications")
+          .select("*")
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapAllergenPublication(r) : null;
     },
 
     async saveQuote(quote) {
@@ -2667,14 +2743,14 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               .eq("email", email)
               .maybeSingle(),
           ) as Row | null);
-      const base = byId
-        ? mapCustomer(byId)
-        : byEmail
-          ? mapCustomer(byEmail)
-          : null;
-      // Matched only by EMAIL (guest checkout with a new id): anyone can type
-      // an email, so never overwrite the stored name/phone — only fill blanks.
-      const fillBlanksOnly = !byId && Boolean(byEmail);
+      // Matched only by EMAIL (an anonymous checkout with a new id): anyone can
+      // type someone else's email, so an existing row is NEVER written from
+      // here (no name, no phone): the details typed for the order live on the
+      // order itself (fulfillment.contact). Only a caller that already holds
+      // the row's id (a signed-in shop customer) updates it.
+      if (!byId && byEmail) return mapCustomer(byEmail);
+      const base = byId ? mapCustomer(byId) : null;
+      const fillBlanksOnly = false;
       const now = nowIso();
       // A row with a PROVEN contact is frozen for contacts: a checkout must not
       // plant a phone/email on it (that is how a victim's row becomes reachable
@@ -2730,6 +2806,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_tags: input.tags,
           p_external_ids: input.externalIds,
           p_verified_contact: input.verifiedContact ?? null,
+          ...(input.country !== undefined ? { p_country: input.country } : {}),
         }),
       ) as { customer: Row; created: boolean; changed: boolean };
       return {
@@ -2805,6 +2882,41 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .single(),
         ) as Row,
       );
+    },
+
+    async transitionDelivery(id, tenantId, patch) {
+      const changes: Row = { status: patch.status, updated_at: nowIso() };
+      if (patch.driver_name !== undefined) changes.driver_name = patch.driver_name;
+      if (patch.driver_phone !== undefined) changes.driver_phone = patch.driver_phone;
+      if (patch.eta_minutes !== undefined) changes.eta_minutes = patch.eta_minutes;
+      if (patch.tracking_ref !== undefined) changes.tracking_ref = patch.tracking_ref;
+      if (patch.provider_delivery_id !== undefined) {
+        changes.provider_delivery_id = patch.provider_delivery_id;
+      }
+      // ONE conditional UPDATE: only a delivery of this tenant that has not
+      // finished. The WHERE is the lock; a late update cannot reopen a finished
+      // delivery.
+      const updated = unwrap(
+        await sb
+          .from("deliveries")
+          .update(changes)
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .not("status", "in", "(delivered,canceled,failed)")
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      if (updated) return { ok: true, delivery: mapDelivery(updated) } as const;
+      const cur = unwrap(
+        await sb
+          .from("deliveries")
+          .select("*")
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      if (!cur) return { ok: false, reason: "not_found" } as const;
+      return { ok: false, reason: "terminal", delivery: mapDelivery(cur) } as const;
     },
 
     async getDeliveryForOrder(orderId) {

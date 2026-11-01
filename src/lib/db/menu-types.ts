@@ -439,7 +439,32 @@ export interface OrderItem {
   status_at_void?: string | null;
 }
 
+/** A custom fee / gratuity line carried by a /v1 order (core `FeeLine`). */
+export interface OrderFeeLine {
+  code: string;
+  kind: "fee" | "gratuity";
+  label: string;
+  percent_bps: number | null;
+  amount_cents: number;
+  taxable: boolean;
+}
+
+/**
+ * What /v1 order creation carries that POS has no column for (orders.core_ext).
+ * Written once at insert.
+ */
+export interface OrderCoreExt {
+  fees?: OrderFeeLine[];
+  tax_exempt?: boolean;
+  callout_name?: string | null;
+  metadata?: Record<string, string>;
+  /** Caller's intended fire time; POS stores and echoes it, it does not act on it. */
+  fire_at?: string | null;
+}
+
 export interface OrderTotals {
+  /** Σ custom fee + gratuity lines (included in total_cents). Absent = 0. */
+  fees_cents?: number;
   subtotal_cents: number;
   discount_cents: number;
   taxable_cents: number;
@@ -479,6 +504,8 @@ export interface Order {
   version?: number;
   /** Set when the order is held (awaiting payment) and not yet released. */
   hold?: OrderHold | null;
+  /** /v1 extras (fees, tax_exempt, callout_name, metadata, fire_at). */
+  core_ext?: OrderCoreExt | null;
   created_at: string;
   updated_at: string;
 }
@@ -508,4 +535,6 @@ export interface CreateOrderInput {
   source?: OrderSource;
   /** Hold (awaiting payment) metadata for core-created held orders. */
   hold?: OrderHold | null;
+  /** /v1 extras (fees, tax_exempt, callout_name, metadata, fire_at). */
+  core_ext?: OrderCoreExt | null;
 }

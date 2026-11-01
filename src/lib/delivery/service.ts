@@ -252,7 +252,11 @@ export async function refreshDelivery(
   // in /admin); the provider's track() returns only a SIMULATED driver, so we
   // never overlay it onto the authoritative DeliveryRecord. External providers
   // (DoorDash) own their tracking, so we pull their live state.
-  if (record.provider === "in_house_manual") return record;
+  // Partner-driven providers (the driver module) push their state through
+  // `deliveries.updateStatus`; there is nothing to pull.
+  if (record.provider === "in_house_manual" || record.provider === "openpizza_driver") {
+    return record;
+  }
   const provider = getDeliveryProvider(record.provider as DeliveryProviderKey);
   if (!provider || !record.provider_delivery_id) return record;
 

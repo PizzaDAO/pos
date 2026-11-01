@@ -7,6 +7,7 @@
 import { registerDeliveryProvider } from "../registry";
 import { inHouseManualProvider } from "./in-house-manual";
 import { doorDashDriveProvider } from "./doordash-drive";
+import { openPizzaDriverProvider } from "./openpizza-driver";
 
 let registered = false;
 
@@ -15,9 +16,10 @@ export function registerAllDeliveryProviders(): void {
   registered = true;
   registerDeliveryProvider(inHouseManualProvider);
   registerDeliveryProvider(doorDashDriveProvider);
+  registerDeliveryProvider(openPizzaDriverProvider);
 }
 
 // Register on import so a bare `import "@/lib/delivery/providers"` is enough.
 registerAllDeliveryProviders();
 
-export { inHouseManualProvider, doorDashDriveProvider };
+export { inHouseManualProvider, doorDashDriveProvider, openPizzaDriverProvider };
