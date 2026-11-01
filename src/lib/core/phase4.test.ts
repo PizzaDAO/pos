@@ -43,7 +43,7 @@ const agent = (extra: string[] = []) =>
 async function call(
   method: string,
   path: string,
-  opts: { body?: unknown; p?: Principal; raw?: string } = {},
+  opts: { body?: unknown; p?: Principal; raw?: string; now?: Date } = {},
 ) {
   const headers: Record<string, string> = {};
   if (opts.body !== undefined || opts.raw !== undefined) headers["content-type"] = "application/json";
@@ -55,7 +55,7 @@ async function call(
       body: opts.raw ?? (opts.body === undefined ? undefined : JSON.stringify(opts.body)),
     }),
     path.split("/").filter(Boolean),
-    { now: () => NOW, principal: opts.p },
+    { now: () => opts.now ?? NOW, principal: opts.p },
   );
   const text = await res.text();
   return { status: res.status, headers: res.headers, json: text ? JSON.parse(text) : null };
@@ -360,13 +360,14 @@ describe("menu.publishAllergens", () => {
     expect(ok.status).toBe(200);
   });
 
-  it("a location-limited token cannot publish a tenant-wide matrix; a duplicate target is 422; scope required", async () => {
+  it("a location-limited token cannot publish; a duplicate target is 422; scope required", async () => {
     const { item } = await menuIds();
+    // The matrix is tenant-wide: a location-limited token may not publish at all.
     const limited = { ...boh(), location_ids: [DEMO_LOCATION_DOWNTOWN_ID] };
     expect((await put({ version: "v2", payload_hash: "hash-aaaaaaaa", rows: [] }, limited)).status).toBe(403);
     expect(
-      (await put({ version: "v2", payload_hash: "hash-aaaaaaaa", location_ids: [DEMO_LOCATION_UPTOWN_ID], rows: [] }, limited)).status,
-    ).toBe(404);
+      (await put({ version: "v2", payload_hash: "hash-aaaaaaaa", location_ids: [DEMO_LOCATION_DOWNTOWN_ID], rows: [] }, limited)).status,
+    ).toBe(403);
     const dup = await put({
       version: "v3",
       payload_hash: "hash-aaaaaaaa",
@@ -463,9 +464,9 @@ describe("phone keys and country", () => {
     expect(phoneKey("0052 55 1234 5678")).toBe("525512345678");
     expect(phoneKey("12345")).toBeNull();
   });
-  it("countryOf returns null instead of US", () => {
-    expect(countryOf(null)).toBeNull();
-    expect(countryOf(undefined)).toBeNull();
+  it("countryOf: NULL reads as US at the boundary; a stored non-US country is never guessed over", () => {
+    expect(countryOf(null)).toBe("US");
+    expect(countryOf(undefined)).toBe("US");
     expect(countryOf("usa")).toBeNull();
     expect(countryOf("GB")).toBe("GB");
   });

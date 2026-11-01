@@ -66,7 +66,9 @@ function orderFigures(o: Order): SalesFigures {
   f.tax_cents = o.totals.tax_cents;
   f.tip_cents = o.totals.tip_cents;
   f.delivery_fee_cents = o.totals.delivery_fee_cents;
-  f.service_fee_cents = o.totals.service_fee_cents;
+  // Custom fee lines are service-fee revenue: net + tax + tip + delivery + service
+  // ties to the order total (and so to the tenders).
+  f.service_fee_cents = o.totals.service_fee_cents + (o.totals.fees_cents ?? 0);
   f.refund_cents = o.tenders.reduce((s, t) => s + t.refunded_cents, 0);
   return f;
 }

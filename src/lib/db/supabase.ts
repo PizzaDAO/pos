@@ -1170,6 +1170,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               slug,
               timezone: input.timezone ?? "America/New_York",
               address: input.address ?? null,
+              // Only sent when given: a database without the column keeps working.
+              ...(input.country ? { country: input.country } : {}),
               created_at: now,
             })
             .select()
@@ -2496,7 +2498,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         .from("orders")
         .select("*")
         .eq("status", "draft")
-        .eq("hold->>reason", "awaiting_payment")
+        .in("hold->>reason", ["awaiting_payment", "scheduled"])
         .lt("hold->>expires_at", now);
       if (opts?.after) {
         q = q.or(
@@ -2750,7 +2752,6 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       // the row's id (a signed-in shop customer) updates it.
       if (!byId && byEmail) return mapCustomer(byEmail);
       const base = byId ? mapCustomer(byId) : null;
-      const fillBlanksOnly = false;
       const now = nowIso();
       // A row with a PROVEN contact is frozen for contacts: a checkout must not
       // plant a phone/email on it (that is how a victim's row becomes reachable
@@ -2761,14 +2762,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         id: base?.id ?? customer.id,
         email: frozen ? (base?.email ?? email) : email,
         verified: customer.verified || base?.verified || false,
-        name: fillBlanksOnly
-          ? (base?.name ?? customer.name ?? null)
-          : (customer.name ?? base?.name ?? null),
-        phone: frozen
-          ? (base?.phone ?? null)
-          : fillBlanksOnly
-            ? (base?.phone ?? customer.phone ?? null)
-            : (customer.phone ?? base?.phone ?? null),
+        name: customer.name ?? base?.name ?? null,
+        phone: frozen ? (base?.phone ?? null) : (customer.phone ?? base?.phone ?? null),
         created_at: base?.created_at ?? now,
         updated_at: now,
       };

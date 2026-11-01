@@ -158,6 +158,7 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
   let grossCents = 0;
   let discountCents = 0;
   let taxCents = 0;
+  let orderFeesCents = 0;
   let tipCents = 0;
   let voidCount = 0;
   let voidCents = 0;
@@ -184,6 +185,7 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     grossCents += gross;
     discountCents += order.totals.discount_cents;
     taxCents += order.totals.tax_cents;
+    orderFeesCents += order.totals.fees_cents ?? 0;
     tipCents += order.totals.tip_cents;
 
     pushBucket(byDay, isoDate(order.created_at), isoDate(order.created_at), gross, 1);
@@ -265,6 +267,8 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     discount_cents: discountCents,
     net_cents: netCents,
     tax_cents: taxCents,
+    // Custom order fee lines (revenue the customer paid on top of net + tax).
+    order_fees_cents: orderFeesCents,
     // Order-level tips (online) + tender tips on orders without one (in-store).
     tip_cents: tipCents + tenderTipCents,
     fees_cents: feesCents,

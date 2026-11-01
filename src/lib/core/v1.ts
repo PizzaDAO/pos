@@ -227,6 +227,69 @@ async function readBody(req: Request, maxBytes: number = MAX_BODY_BYTES): Promis
   }
 }
 
+/**
+ * Fee lines raise what a customer pays and `scheduled` holds park an order for up
+ * to 30 days, so both are reserved for the catering module (and, for holds, the
+ * terminal). Same trust rule as `recordExternal`: the token's `sub` must be
+ * hub-signed (the hub vouches for `op_mod`) outside the zero-env simulation.
+ */
+function requireCateringModule(ctx: Ctx, what: string): void {
+  requireHubSigned(ctx);
+  const m = ctx.principal.module ?? null;
+  const ok = m === "catering" || (m === null && isSimulatedV1(process.env));
+  if (!ok) {
+    throw ProblemError.of("FORBIDDEN", {
+      detail: `${what} is only available to the catering module.`,
+      details: { reason: "module_not_allowed" },
+    });
+  }
+}
+
+/**
+ * Custom fee lines: catering only; no `gratuity` lines (a gratuity is a `tip`, and
+ * tips follow the tip rules: bounded by maxTipCents, per-tender tip facts, food-only
+ * amount due); the same code at most once.
+ */
+function checkFeeInput(ctx: Ctx, fees: readonly { kind?: string; code: string }[] | undefined): void {
+  if (!fees?.length) return;
+  requireCateringModule(ctx, "Custom fee lines");
+  fees.forEach((f, i) => {
+    if (f.kind === "gratuity") {
+      throw ProblemError.of("VALIDATION_FAILED", {
+        detail: "Gratuity fee lines are not accepted; send the gratuity as `tip`.",
+        path: `fees.${i}.kind`,
+      });
+    }
+  });
+  if (new Set(fees.map((f) => f.code)).size !== fees.length) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: "Fee line codes must be unique.",
+      path: "fees",
+    });
+  }
+}
+
+/**
+ * Fee cap: all fee lines together may not exceed 50% of the discounted subtotal
+ * (5000 bps). Catering service/setup charges sit around 15-30%; 50% leaves room
+ * for those while bounding a typo or a hostile caller (an extra $5000 on a $40
+ * order). A single percent line is already limited to 100% by the contract, so
+ * the total cap is the binding one. No per-tenant override exists yet (it needs a
+ * settings column); until then this is a constant.
+ */
+const MAX_FEES_BPS_OF_SUBTOTAL = 5000;
+function checkFeeCap(feesCents: number, subtotalAfterDiscountCents: number): void {
+  // Half-up, like core's applyBps, so a 50% percent line on an odd-cent subtotal is not refused.
+  const cap = Math.floor((subtotalAfterDiscountCents * MAX_FEES_BPS_OF_SUBTOTAL) / 10_000 + 0.5);
+  if (feesCents > cap) {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: `Fee lines total ${feesCents} cents; at most ${cap} cents (50% of the discounted subtotal) is allowed.`,
+      path: "fees",
+      details: { fees_cents: feesCents, max_fees_cents: cap },
+    });
+  }
+}
+
 function notFound(what: string): ProblemError {
   return ProblemError.of("NOT_FOUND", { detail: `${what} not found.` });
 }
@@ -530,6 +593,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
   "quotes.create": async (ctx) => {
     const parsed = QuoteRequestSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
+    checkFeeInput(ctx, parsed.data.fees);
     const bundle = await ownedLocation(ctx, parsed.data.location_id);
     const menu = await loadMenu(bundle, ctx.driver);
     const quote = priceCart({
@@ -540,6 +604,9 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       // In-store terminals bypass hours; everything else is gated.
       checkHours: true,
     });
+    if (quote.valid && quote.totals.fees_cents) {
+      checkFeeCap(quote.totals.fees_cents, quote.totals.subtotal_cents - quote.totals.discount_cents);
+    }
     // Persist a VALID quote so `quotes.get` and `orders.create{quote_id}` can
     // reload and re-price it. Only the request is kept; money is always re-derived.
     if (quote.valid) {
@@ -713,7 +780,15 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       return { body: await mapOrderFor(ctx, order.id) };
     }
     const expires = order.hold?.expires_at;
-    if (expires && new Date(expires).getTime() <= ctx.now().getTime()) {
+    // An expired hold that is FULLY PAID is not an expired order: the money is
+    // real (a card paid a `scheduled` hold, then the hold ran out before its
+    // release time), so it releases normally instead of being voided/stranded.
+    const expired = Boolean(expires) && new Date(expires!).getTime() <= ctx.now().getTime();
+    const paidInFull =
+      expired &&
+      netSettledBaseCents(await ctx.driver.listPaymentsForOrder(order.id), order.currency) >=
+        orderDueCents(order);
+    if (expired && !paidInFull) {
       // Void it the same way cancel does: close any open card session/intent on
       // the provider FIRST (an open Checkout link must not outlive the order),
       // then void atomically against the tender state.
@@ -1057,8 +1132,9 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       tags: (i.tags ?? []).map((t) => t.trim()).filter(Boolean),
       externalIds: i.external_ids ?? {},
       ...(verifiedContact ? { verifiedContact } : {}),
-      // National numbers are read in the tenant's country; unknown = null, which
-      // gives them no comparison key (we never guess a country).
+      // National numbers are read in the tenant's country: 'US' when its location
+      // stores none (the boundary default), the stored code otherwise (a non-US/CA
+      // country gives national numbers no comparison key, never a guess).
       country: await tenantCountry(tenantId, ctx.driver),
     });
     const body =
@@ -1258,6 +1334,15 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!rec || rec.tenant_id !== tenantId || !allowedLocation(ctx.principal, rec.location_id)) {
       throw notFound("Delivery");
     }
+    // Only providers whose state is PUSHED may be updated here. DoorDash Drive (and
+    // anything else that reports through its own tracking) owns its status and ids;
+    // a push must never overwrite them.
+    if (!PUSHED_DELIVERY_PROVIDERS.includes(rec.provider)) {
+      throw ProblemError.of("CONFLICT", {
+        detail: `This delivery is run by ${rec.provider}; its status comes from that provider, not from /v1.`,
+        details: { reason: "provider_owned" },
+      });
+    }
     const patch: DeliveryPatch = { status: u.status };
     if (u.driver !== undefined) {
       patch.driver_name = u.driver?.name ?? null;
@@ -1323,7 +1408,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
    * same version with another hash is IDEMPOTENCY_CONFLICT; a target (item, size or
    * modifier) or location that is not this tenant's is refused as a whole and
    * nothing is written (checked in SQL: the service key bypasses RLS). A token
-   * limited to some locations cannot publish a tenant-wide matrix.
+   * limited to some locations cannot publish (the matrix is tenant-wide).
    */
   "menu.publishAllergens": async (ctx) => {
     await requireActiveTenant(ctx);
@@ -1332,16 +1417,13 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     );
     if (!parsed.success) throw zodProblem(parsed.error);
     const i = parsed.data;
-    const limited = scopedLocationIds(ctx.principal);
-    if (limited) {
-      if (!i.location_ids?.length) {
-        throw ProblemError.of("FORBIDDEN", {
-          detail: "A location-limited token must name the locations it publishes for.",
-        });
-      }
-      for (const l of i.location_ids) {
-        if (!allowedLocation(ctx.principal, l)) throw notFound("Location");
-      }
+    // The matrix is tenant-wide and a publication REPLACES it, so a token limited
+    // to some locations may not publish at all (it would rewrite rows for
+    // locations it cannot see).
+    if (scopedLocationIds(ctx.principal)) {
+      throw ProblemError.of("FORBIDDEN", {
+        detail: "A location-limited token cannot publish the allergen matrix; it is tenant-wide.",
+      });
     }
     const res = await ctx.driver.publishAllergens(ctx.principal.tenant_id, {
       version: i.version,
@@ -1714,6 +1796,8 @@ function paddedRange(from: string, to: string): { createdFrom: string; createdTo
   return { createdFrom: t(from, -1), createdTo: t(to, 2) };
 }
 
+/** Delivery providers whose state partners push through deliveries.updateStatus. */
+const PUSHED_DELIVERY_PROVIDERS: readonly string[] = ["openpizza_driver", "in_house_manual"];
 const TERMINAL_DELIVERY: readonly string[] = ["delivered", "canceled", "failed"];
 
 const UNSUPPORTED: V1Operation[] = ["orders.updateStatus", "events.list"];
@@ -1844,9 +1928,49 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     let sentLines: { item_id: string; quantity: number }[] | null = input.lines?.length
       ? input.lines
       : null;
+    // Every priced input is part of "the same request": fees, tax status and tip
+    // (from the quote when the request carries a quote_id).
+    let sentFees = input.fees;
+    let sentExempt = input.tax_exempt;
+    let sentTip = input.tip;
     if (!sentLines && input.quote_id) {
       const q = await ctx.driver.getQuote(tenantId, input.quote_id);
-      if (q) sentLines = QuoteRequestSchema.parse(q.request).lines;
+      if (q) {
+        const qr = QuoteRequestSchema.parse(q.request);
+        sentLines = qr.lines;
+        sentFees = qr.fees;
+        sentExempt = input.tax_exempt || qr.tax_exempt;
+        sentTip = input.tip !== undefined ? input.tip : qr.tip;
+      }
+    }
+    if (sentLines) {
+      const feeKey = (f: { code: string; amount_cents?: number | null; percent_bps?: number | null; taxable?: boolean }) =>
+        `${f.code}|${f.amount_cents ?? ""}|${f.percent_bps ?? ""}|${f.taxable ? 1 : 0}`;
+      const sentFeeKeys = (sentFees ?? []).map(feeKey).sort().join(";");
+      // A stored percent line keeps its percent AND the resolved amount, so a
+      // replay of either spelling matches.
+      const hadFeeKeys = (existing.core_ext?.fees ?? [])
+        .map((f) =>
+          sentFees?.find((x) => x.code === f.code)?.percent_bps !== undefined
+            ? feeKey({ code: f.code, percent_bps: f.percent_bps, taxable: f.taxable })
+            : feeKey({ code: f.code, amount_cents: f.amount_cents, taxable: f.taxable }),
+        )
+        .sort()
+        .join(";");
+      if (sentFeeKeys !== hadFeeKeys) throw conflict();
+      if (Boolean(sentExempt) !== Boolean(existing.core_ext?.tax_exempt)) throw conflict();
+      const hadTip = existing.totals.tip_cents;
+      if (sentTip) {
+        if ("amount_cents" in sentTip) {
+          if (sentTip.amount_cents !== hadTip) throw conflict();
+        } else {
+          const base = existing.totals.subtotal_cents - existing.totals.discount_cents;
+          // Percent tips round in core; a one-cent tolerance covers the rounding mode.
+          if (Math.abs(hadTip - (base * sentTip.percent_bps) / 10_000) > 1) throw conflict();
+        }
+      } else if (hadTip !== 0) {
+        throw conflict();
+      }
     }
     if (sentLines) {
       const sent = signature(sentLines.map((l) => ({ item_id: l.item_id, quantity: l.quantity })));
@@ -1924,6 +2048,7 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
       path: "lines",
     });
   }
+  checkFeeInput(ctx, feesIn);
   if (fulfillmentIn?.type === "delivery") {
     throw unsupported("delivery orders", "Delivery orders cannot be created through /v1 yet.");
   }
@@ -2016,6 +2141,9 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
       })),
     };
   });
+  if (quote.totals.fees_cents) {
+    checkFeeCap(quote.totals.fees_cents, quote.totals.subtotal_cents - quote.totals.discount_cents);
+  }
   const feeLines: OrderFeeLine[] = (quote.fee_lines ?? []).map((f) => ({
     code: f.code,
     kind: f.kind,
@@ -2101,9 +2229,13 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     requestedReason !== "scheduled"
   ) {
     throw ProblemError.of("VALIDATION_FAILED", {
-      detail: `Hold reason "${requestedReason}" is only available to terminals; use awaiting_payment or scheduled.`,
+      detail: `Hold reason "${requestedReason}" is only available to terminals; use awaiting_payment (or scheduled, catering only).`,
       path: "hold.reason",
     });
+  }
+  if (wantsHold && !terminal && requestedReason === "scheduled") {
+    // A scheduled hold parks an order for up to 30 days: catering (or a terminal).
+    requireCateringModule(ctx, "A scheduled hold");
   }
   const holdReason = !wantsHold ? null : (requestedReason ?? "awaiting_payment");
   // The reason is what bounds the ttl: only `scheduled` may run up to 30 days.

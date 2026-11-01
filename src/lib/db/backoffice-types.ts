@@ -347,6 +347,8 @@ export interface SalesReport {
   tip_cents: number;
   /** Platform fees taken (Connect application_fee) across tenders, cents. */
   fees_cents: number;
+  /** Custom order fee lines (catering service fee, ...). Absent on reports closed before they existed. */
+  order_fees_cents?: number;
   void_count: number;
   void_cents: number;
   refund_count: number;

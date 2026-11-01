@@ -340,6 +340,8 @@ export interface OrderFulfillment {
   recovery_next_at?: string;
   /** Set once an order of another deployment mode was alerted on (not swept again). */
   foreign_alerted_at?: string;
+  /** A PAID `scheduled` hold ran past its expiry unreleased and staff were alerted (once). */
+  stranded_alerted_at?: string;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */

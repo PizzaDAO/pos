@@ -75,6 +75,12 @@ export interface CheckoutSessionParams {
   expiresAt: number;
   customerEmail?: string | null;
   description: string;
+  /**
+   * Custom fee lines included in `amountCents` (catering service fee, ...). They
+   * are shown to the payer as their own Checkout lines; the session total is
+   * unchanged (the lines are carved OUT of `amountCents`, never added to it).
+   */
+  feeLines?: { label: string; amountCents: number }[];
 }
 
 export interface StripeCheckoutSession {
@@ -107,16 +113,31 @@ export async function createCheckoutSession(
     throw new Error("createCheckoutSession called in simulated mode.");
   }
   const currency = p.currency.toLowerCase();
+  const feeLines = (p.feeLines ?? []).filter((f) => f.amountCents > 0);
+  const feeTotal = feeLines.reduce((s, f) => s + f.amountCents, 0);
+  const carve = feeLines.length > 0 && feeTotal < p.amountCents;
   const lineItems: Record<string, unknown>[] = [
     {
       price_data: {
         currency,
-        unit_amount: p.amountCents,
+        unit_amount: carve ? p.amountCents - feeTotal : p.amountCents,
         product_data: { name: p.description },
       },
       quantity: 1,
     },
   ];
+  if (carve) {
+    for (const f of feeLines) {
+      lineItems.push({
+        price_data: {
+          currency,
+          unit_amount: f.amountCents,
+          product_data: { name: f.label.slice(0, 120) },
+        },
+        quantity: 1,
+      });
+    }
+  }
   if (p.tipCents > 0) {
     lineItems.push({
       price_data: {

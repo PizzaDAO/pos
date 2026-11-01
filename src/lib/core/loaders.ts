@@ -302,11 +302,16 @@ export async function loadCustomer(
 }
 
 /**
- * A location's country, or null when POS has none (or an invalid one). Never
- * guessed: a null country leaves national-format phones unnormalised.
+ * A location's country as phones are read in it. A location with NO country
+ * stored (every row today: nothing wrote `locations.country`) is read as `US`,
+ * the market POS ships in; that is the documented boundary default and the only
+ * guess made. A country that IS stored but is not US/CA gets no guess (national
+ * numbers stay unnormalised and get no comparison key), and a malformed value is
+ * treated as unknown (null) rather than as US.
  */
 export function countryOf(country: string | null | undefined): string | null {
-  return country && /^[A-Z]{2}$/.test(country) ? country : null;
+  if (country === null || country === undefined || country === "") return "US";
+  return /^[A-Z]{2}$/.test(country) ? country : null;
 }
 
 /**
@@ -319,7 +324,7 @@ export async function tenantCountry(
   driver?: PosDriver,
 ): Promise<string | null> {
   const first = (await driverOf(driver).listLocations(tenantId))[0];
-  return first ? countryOf(first.country) : null;
+  return first ? countryOf(first.country) : "US";
 }
 
 export const NO_STATS = {

@@ -387,6 +387,12 @@ export async function createPaymentSession(
         expiresAt: Math.floor(expiryMs / 1000),
         customerEmail: input.customer_email ?? null,
         description: `Order ${order.order_number}`,
+        // The payer sees the fee as its own line when this session pays the whole
+        // order (a part payment cannot say how much of it is fee).
+        feeLines:
+          amount >= orderDueCents(order)
+            ? (order.core_ext?.fees ?? []).map((f) => ({ label: f.label, amountCents: f.amount_cents }))
+            : undefined,
       });
     } catch (err) {
       captureError(err, { scope: "v1.paymentSession.create", orderId: order.id });

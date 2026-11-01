@@ -216,7 +216,8 @@ describe("order mapping", () => {
     expect(mk("US").contact?.phone).toBe("+14155550199");
     expect(mk("CA").contact?.phone).toBe("+14155550199");
     expect(mk("GB").contact?.phone).toBeNull();
-    expect(mk(undefined).contact?.phone).toBeNull();
+    // A location that stores no country reads as US (the boundary default).
+    expect(mk(undefined).contact?.phone).toBe("+14155550199");
   });
 
   it("explicit source/channel from core wins over the POS channel", () => {

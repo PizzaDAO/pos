@@ -232,6 +232,8 @@ export interface CreateLocationInput {
   name: string;
   timezone?: string;
   address?: string | null;
+  /** ISO 3166-1 alpha-2 (e.g. "US"). Unset by default: phones then read as US. */
+  country?: string | null;
 }
 
 /**

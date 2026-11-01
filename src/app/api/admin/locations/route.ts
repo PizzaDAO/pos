@@ -41,6 +41,8 @@ interface AddLocationBody {
   name?: string;
   address?: string | null;
   timezone?: string;
+  /** ISO 3166-1 alpha-2; optional. Unset reads as US for phone numbers. */
+  country?: string | null;
 }
 
 export async function POST(request: Request) {
@@ -55,6 +57,10 @@ export async function POST(request: Request) {
       { error: "tenantId and name are required." },
       { status: 422 },
     );
+  }
+  const country = body.country ? String(body.country).trim().toUpperCase() : null;
+  if (country && !/^[A-Z]{2}$/.test(country)) {
+    return NextResponse.json({ error: "country must be a 2-letter ISO code." }, { status: 422 });
   }
   // Only an owner|manager of this tenant may add a location.
   const auth = await requireTenantAccess(body.tenantId, "admin");
@@ -81,6 +87,7 @@ export async function POST(request: Request) {
     name: body.name.trim(),
     address: body.address ?? null,
     timezone: body.timezone,
+    ...(country ? { country } : {}),
   });
   return NextResponse.json({ location }, { status: 201 });
 }

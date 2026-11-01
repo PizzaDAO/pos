@@ -374,7 +374,16 @@ export interface HeldExpireSummary {
   foreignSwept: number;
   /** Holds of another deployment mode holding real tenders (alerted once, not swept). */
   foreignAlerted: number;
+  /** PAID `scheduled` holds past expiry + grace, never released: staff alerted (once each). */
+  stranded: number;
 }
+
+/**
+ * How long a fully PAID `scheduled` hold may sit past its expiry before staff are
+ * alerted. `orders.release` still releases it (the money is real); this only
+ * catches an order nobody released.
+ */
+export const SCHEDULED_PAID_GRACE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * The held-order sweeper (`/v1` orders): a `draft` order held for payment
@@ -385,8 +394,14 @@ export interface HeldExpireSummary {
  * the payer is mid-payment, leaves the order alone), only this deployment's mode
  * is swept, and the void is `driver.cancelOrder` (atomic with the tender check).
  *
- * Never touched: parked in-store drafts (no hold), holds with another reason
- * (`scheduled`, `manual`), and orders of another deployment mode.
+ * `scheduled` holds (catering) are swept the same way once their hold lapses (the
+ * contract: unreleased holds auto-cancel), with one difference: if they are
+ * already PAID there is real money behind them, so they are never voided; once
+ * they are `SCHEDULED_PAID_GRACE_MS` past expiry staff are alerted (once) and
+ * `orders.release` still releases them.
+ *
+ * Never touched: parked in-store drafts (no hold), `manual` holds, and orders of
+ * another deployment mode.
  */
 export async function expireHeldOrders(
   now: Date = new Date(),
@@ -402,6 +417,7 @@ export async function expireHeldOrders(
     errors: 0,
     foreignSwept: 0,
     foreignAlerted: 0,
+    stranded: 0,
   };
   const mode = deploymentCheckoutMode();
   let after: { created_at: string; id: string } | undefined;
@@ -492,7 +508,7 @@ async function sweepHeldOne(
     if (
       !order ||
       order.status !== "draft" ||
-      order.hold?.reason !== "awaiting_payment" ||
+      (order.hold?.reason !== "awaiting_payment" && order.hold?.reason !== "scheduled") ||
       exp === null ||
       exp > now.getTime()
     ) {
@@ -528,15 +544,22 @@ async function sweepHeldOne(
     // did not cover the order is parked for a human.
     const left = await driver.listPaymentsForOrder(order.id);
     if (left.some((p) => p.status === "authorized" || p.status === "captured")) {
-      captureError(new Error("expired held order holds settled money"), {
-        scope: "expireHeldOrders.settled",
-        orderId: order.id,
-      });
+      if (order.hold?.reason === "scheduled") {
+        await alertStrandedScheduled(order, exp!, now, summary);
+      } else {
+        captureError(new Error("expired held order holds settled money"), {
+          scope: "expireHeldOrders.settled",
+          orderId: order.id,
+        });
+      }
       summary.skipped += 1;
       return;
     }
     for (const p of left) {
       if (p.status !== "pending") continue;
+      // A promised-but-unpaid external tender (an issued invoice) has no provider
+      // session to close; cancelOrder voids it with the order.
+      if (p.rail === "external") continue;
       const outcome = await cancelOpenTender(p);
       if (outcome === "in_flight") {
         summary.skipped += 1;
@@ -557,6 +580,31 @@ async function sweepHeldOne(
     summary.errors += 1;
     captureError(err, { scope: "expireHeldOrders", orderId: listed.id });
   }
+}
+
+/**
+ * A paid `scheduled` hold ran out unreleased. Within the grace the release is
+ * still expected; past it, alert staff once (`stranded_alerted_at`) through the
+ * same error sink the other sweeper alerts use.
+ */
+async function alertStrandedScheduled(
+  order: Order,
+  expiresMs: number,
+  now: Date,
+  summary: HeldExpireSummary,
+): Promise<void> {
+  if (now.getTime() < expiresMs + SCHEDULED_PAID_GRACE_MS) return;
+  if (order.fulfillment?.stranded_alerted_at) return;
+  captureError(new Error("paid scheduled hold expired without being released"), {
+    scope: "expireHeldOrders.stranded",
+    orderId: order.id,
+    tenantId: order.tenant_id,
+    expiredAt: new Date(expiresMs).toISOString(),
+  });
+  await getPosDriver().mergeOrderFulfillment(order.id, {
+    stranded_alerted_at: now.toISOString(),
+  });
+  summary.stranded += 1;
 }
 
 /**

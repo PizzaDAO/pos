@@ -128,13 +128,51 @@ describe("expireHeldOrders", () => {
     expect(await status(id)).toBe("draft");
   });
 
-  it("never touches a parked in-store draft (no hold) or another hold reason", async () => {
+  it("never touches a parked in-store draft (no hold) or a manual hold", async () => {
     const parked = await seedOrder({ hold: null });
     const manual = await seedOrder({ hold: { reason: "manual", expires_at: PAST } });
-    const scheduled = await seedOrder({ hold: { reason: "scheduled", expires_at: PAST } });
     const out = await expireHeldOrders(NOW);
     expect(out.checked).toBe(0);
-    for (const id of [parked, manual, scheduled]) expect(await status(id)).toBe("draft");
+    for (const id of [parked, manual]) expect(await status(id)).toBe("draft");
+  });
+
+  it("voids an UNPAID scheduled hold once it lapses (a 30-day hold, swept on day 40)", async () => {
+    const day = 86_400_000;
+    const created = new Date(NOW.getTime());
+    const id = await seedOrder({
+      hold: { reason: "scheduled", expires_at: new Date(created.getTime() + 30 * day).toISOString() },
+    });
+    // Day 29: still held. Day 40: gone.
+    expect((await expireHeldOrders(new Date(created.getTime() + 29 * day))).checked).toBe(0);
+    expect(await status(id)).toBe("draft");
+    const out = await expireHeldOrders(new Date(created.getTime() + 40 * day));
+    expect(out).toMatchObject({ checked: 1, voided: 1 });
+    expect(await status(id)).toBe("voided");
+  });
+
+  it("never voids a PAID scheduled hold; alerts staff once after the grace", async () => {
+    const { SCHEDULED_PAID_GRACE_MS } = await import("./lifecycle");
+    const id = await seedOrder({ hold: { reason: "scheduled", expires_at: PAST } });
+    await seedTender(id, { status: "captured", simulated: true });
+    // Inside the grace: left alone, no alert.
+    let out = await expireHeldOrders(NOW);
+    expect(out).toMatchObject({ voided: 0, stranded: 0 });
+    expect(await status(id)).toBe("draft");
+    // Past the grace: one alert, order still held (and releasable).
+    const later = new Date(Date.parse(PAST) + SCHEDULED_PAID_GRACE_MS + 1000);
+    out = await expireHeldOrders(later);
+    expect(out).toMatchObject({ voided: 0, stranded: 1 });
+    expect((await getPosDriver().getOrder(id))!.fulfillment?.stranded_alerted_at).toBeTruthy();
+    out = await expireHeldOrders(later);
+    expect(out.stranded).toBe(0);
+    expect(await status(id)).toBe("draft");
+  });
+
+  it("an unpaid scheduled hold with a pending invoice tender is voided with it", async () => {
+    const id = await seedOrder({ hold: { reason: "scheduled", expires_at: PAST } });
+    await seedTender(id, { rail: "external", status: "pending", simulated: false, raw: null });
+    expect((await expireHeldOrders(NOW)).voided).toBe(1);
+    expect(await status(id)).toBe("voided");
   });
 
   it("skips an order stamped by another deployment mode", async () => {

@@ -82,7 +82,9 @@ export function cleanPhone(
   if (!p) return null;
   const compact = p.replace(/[\s().-]/g, "");
   if (PHONE_RE.test(compact)) return compact;
-  if (country !== "US" && country !== "CA") return null;
+  // No country at all (a location that never stored one) reads as US.
+  const c = country === undefined ? "US" : country;
+  if (c !== "US" && c !== "CA") return null;
   if (/^[2-9]\d{9}$/.test(compact)) return `+1${compact}`;
   if (/^1[2-9]\d{9}$/.test(compact)) return `+${compact}`;
   return null;
@@ -931,7 +933,7 @@ export function toContractDailySales(
     tax_cents: r.tax_cents,
     tip_cents: r.tip_cents,
     delivery_fee_cents: 0,
-    service_fee_cents: 0,
+    service_fee_cents: r.order_fees_cents ?? 0,
     refund_cents: r.refund_cents,
     void_count: r.void_count,
     by_channel: r.byChannel.map((b) => ({

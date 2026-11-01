@@ -718,6 +718,7 @@ export const mockDriver: PosDriver = {
       slug,
       timezone: input.timezone ?? "America/New_York",
       address: input.address ?? null,
+      ...(input.country ? { country: input.country } : {}),
       created_at: now,
     };
     locations.push(location);
@@ -1886,7 +1887,7 @@ export const mockDriver: PosDriver = {
       .filter(
         (o) =>
           o.status === "draft" &&
-          o.hold?.reason === "awaiting_payment" &&
+          (o.hold?.reason === "awaiting_payment" || o.hold?.reason === "scheduled") &&
           !!o.hold.expires_at &&
           o.hold.expires_at < now &&
           (after === undefined ||
@@ -2071,7 +2072,6 @@ export const mockDriver: PosDriver = {
     // contact.
     if (!existingById && existingByEmail) return existingByEmail;
     const base = existingById;
-    const fillBlanksOnly = false;
     const now = nowIso();
     const merged: Customer = {
       ...customer,
@@ -2086,15 +2086,11 @@ export const mockDriver: PosDriver = {
       tags: base?.tags ?? [],
       external_ids: base?.external_ids ?? {},
       verified: customer.verified || base?.verified || false,
-      name: fillBlanksOnly
-        ? (base?.name ?? customer.name ?? null)
-        : (customer.name ?? base?.name ?? null),
+      name: customer.name ?? base?.name ?? null,
       phone:
         base?.email_verified_at || base?.phone_verified_at
           ? (base.phone ?? null)
-          : fillBlanksOnly
-            ? (base?.phone ?? customer.phone ?? null)
-            : (customer.phone ?? base?.phone ?? null),
+          : (customer.phone ?? base?.phone ?? null),
       created_at: base?.created_at ?? now,
       updated_at: now,
     };
