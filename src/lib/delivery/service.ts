@@ -719,10 +719,17 @@ export async function sweepDriverDispatches(
           ["refunded", "voided", "abandoned", "completed"].includes(order.status);
         if (closed) {
           // The driver never confirmed it (no provider id): retire it locally
-          // (compare-and-set) instead of pushing the row out another hour.
-          await driver.transitionDelivery(rec.id, rec.tenant_id, {
+          // instead of pushing the row out another hour. Compare-and-set on
+          // `quoted`, so a row the driver's push just moved is left alone.
+          const res = await driver.updateDriverDispatch(rec.id, rec.tenant_id, {
+            expect_status: "quoted",
             status: "canceled",
+            dispatch_next_at: null,
           });
+          if (!res.ok && res.delivery?.provider_delivery_id)
+            console.error(
+              `[pos][ALERT] delivery ${rec.id} on closed order ${rec.order_id} was picked up by the driver during the sweep; cancel it with the driver`,
+            );
           continue;
         }
         if (!closed && age >= DRIVER_GIVE_UP_MS) {

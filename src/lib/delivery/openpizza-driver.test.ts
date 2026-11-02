@@ -854,6 +854,30 @@ describe("stuck conflict rows (go-live follow-ups)", () => {
     }
   });
 
+  it("the sweep never cancels a closed-order row the driver's push just took", async () => {
+    const { orderId, rec, err } = await parked();
+    await getPosDriver().updateOrderStatus(orderId, "voided");
+    const db = getPosDriver();
+    const realGetOrder = db.getOrder.bind(db);
+    // The driver's push lands between the sweep's list and its cancel.
+    const spy = vi.spyOn(db, "getOrder").mockImplementation(async (id) => {
+      await db.updateDriverDispatch(rec.id, rec.tenant_id, {
+        expect_status: "quoted",
+        status: "dispatched",
+        provider_delivery_id: "drv_race",
+      });
+      return realGetOrder(id);
+    });
+    err.mockClear();
+    await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
+    spy.mockRestore();
+    expect((await db.getDelivery(rec.id))!).toMatchObject({
+      status: "dispatched",
+      provider_delivery_id: "drv_race",
+    });
+    expect(err.mock.calls.some((x) => String(x[0]).includes("picked up by the driver during the sweep"))).toBe(true);
+  });
+
   it("the sweep leaves a conflict row on a live order parked", async () => {
     const { rec } = await parked();
     await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
