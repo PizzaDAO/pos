@@ -59,6 +59,7 @@ import type {
   Shift,
   ShiftCashEvent,
   Staff,
+  StaffModuleRole,
   StaffSession,
   SizeInput,
 } from "./backoffice-types";
@@ -975,6 +976,15 @@ export interface PosDriver {
   /** Emails of the given auth users (one query), keyed by user id. Unknown ids are absent. */
   getUserEmails(userIds: string[]): Promise<Map<string, string>>;
   upsertStaff(staff: Staff): Promise<Staff>;
+  /**
+   * Set ONLY a staff member's module roles (targeted update scoped by tenant and
+   * id; no other column is written). null when no such staff in that tenant.
+   */
+  setStaffModuleRoles(
+    tenantId: string,
+    staffId: string,
+    roles: StaffModuleRole[],
+  ): Promise<Staff | null>;
 
   /**
    * Resolve a single active staff member for a tenant (incl. `pin_hash`) for

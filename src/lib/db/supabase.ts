@@ -3845,6 +3845,20 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       );
     },
 
+    async setStaffModuleRoles(tenantId, staffId, roles) {
+      // Targeted update: only module_roles, scoped by tenant AND id.
+      const r = unwrap(
+        await sb
+          .from("staff")
+          .update({ module_roles: roles })
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapStaff(r) : null;
+    },
+
     async getShift(id) {
       const r = unwrap(
         await sb.from("shifts").select("*").eq("id", id).maybeSingle(),
