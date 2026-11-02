@@ -32,6 +32,7 @@ export function DeliveryDispatch({
   const [draftDriver, setDraftDriver] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!tenantId || !locationId) return;
@@ -66,14 +67,19 @@ export function DeliveryDispatch({
     }
   }
 
-  async function dispatchManually(deliveryId: string) {
+  async function dispatchManually(deliveryId: string, confirmNotWithDriver = false) {
     setBusy(deliveryId);
     setNotice(null);
+    setConfirming(null);
     try {
       const res = await fetch("/api/delivery/dispatch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deliveryId, action: "dispatchManually" }),
+        body: JSON.stringify({
+          deliveryId,
+          action: "dispatchManually",
+          ...(confirmNotWithDriver ? { confirmNotWithDriver: true } : {}),
+        }),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -146,6 +152,48 @@ export function DeliveryDispatch({
                           >
                             Dispatch manually instead
                           </Button>
+                        </div>
+                      )}
+                      {attention.canOverrideConflict && (
+                        <div className="mt-2">
+                          {confirming === delivery.id ? (
+                            <div role="group" className="space-y-2">
+                              <p>
+                                Only continue if the driver confirmed it does
+                                NOT have this delivery. Otherwise two couriers
+                                may be sent.
+                              </p>
+                              <div className="flex gap-2">
+                                <Button
+                                  size="sm"
+                                  variant="destructive"
+                                  disabled={busy === delivery.id}
+                                  onClick={() =>
+                                    void dispatchManually(delivery.id, true)
+                                  }
+                                >
+                                  Yes, dispatch manually
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => setConfirming(null)}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </div>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={busy === delivery.id}
+                              onClick={() => setConfirming(delivery.id)}
+                            >
+                              Driver confirms it doesn&apos;t have it: dispatch
+                              manually
+                            </Button>
+                          )}
                         </div>
                       )}
                     </div>

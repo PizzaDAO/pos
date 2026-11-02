@@ -18,6 +18,7 @@ import { getPosDriver } from "@/lib/db";
 import type { DeliveryAddress, DeliveryRecord } from "@/lib/db";
 import { loadDelivery } from "@/lib/core/loaders";
 import { captureError } from "@/lib/observability";
+import { recordAudit } from "@/lib/security";
 import { DriverDispatchError } from "./providers/openpizza-driver";
 import { isDriverTenant } from "./driver-hub";
 import { DRIVER_CONFLICT_MARK } from "./attention";
@@ -408,6 +409,8 @@ export const DRIVER_GIVE_UP_MS = 15 * 60_000;
 /** The manual-fallback button is held this long on a record with no provider id. */
 /** Total wall-clock budget of one sweep (the cron has maxDuration 60 s). */
 export const DRIVER_SWEEP_BUDGET_MS = 20_000;
+/** A parked conflict row is looked at again this long after it was parked / last alerted. */
+export const CONFLICT_RECHECK_MS = 60 * 60_000;
 export const DRIVER_MANUAL_HOLD_MS = 2 * 60_000;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_MAX_MS = 5 * 60_000;
@@ -657,7 +660,8 @@ export async function attemptDriverDispatch(
         expect_status: "quoted",
         dispatch_attempts: attempts,
         dispatch_error: DRIVER_CONFLICT_MARK,
-        dispatch_next_at: null,
+        // Parked: the sweep looks at it again in an hour (no starvation of others).
+        dispatch_next_at: new Date(Date.now() + CONFLICT_RECHECK_MS).toISOString(),
       });
       return res.ok ? res.delivery : (res.delivery ?? record);
     }
@@ -707,12 +711,23 @@ export async function sweepDriverDispatches(
     const age = now.getTime() - new Date(rec.created_at).getTime();
     try {
       if (rec.dispatch_error === DRIVER_CONFLICT_MARK) {
-        // Never auto-fail or re-send: the driver may hold it. Alert only.
-        if (age >= DRIVER_GIVE_UP_MS) {
+        // Never auto-fail or re-send: the driver may hold it. Alert only (not for
+        // an order that is already closed), then look again in an hour.
+        const order = await driver.getOrder(rec.order_id);
+        const closed =
+          !order ||
+          ["refunded", "voided", "abandoned"].includes(order.status);
+        if (!closed && age >= DRIVER_GIVE_UP_MS) {
           console.error(
             `[pos][ALERT] delivery ${rec.id} (order ${rec.order_id}) still waiting for the driver's status push after a dispatch 409`,
           );
         }
+        await driver.updateDriverDispatch(rec.id, rec.tenant_id, {
+          expect_status: "quoted",
+          dispatch_next_at: new Date(
+            now.getTime() + CONFLICT_RECHECK_MS,
+          ).toISOString(),
+        });
         continue;
       }
       if (age >= DRIVER_GIVE_UP_MS) {
@@ -758,6 +773,10 @@ export type ManualFallbackResult =
 export async function dispatchManuallyInstead(
   deliveryId: string,
   now: Date = new Date(),
+  opts: {
+    confirmNotWithDriver?: boolean;
+    actor?: { id: string; label: string | null };
+  } = {},
 ): Promise<ManualFallbackResult> {
   const driver = getPosDriver();
   const rec = await driver.getDelivery(deliveryId);
@@ -775,12 +794,26 @@ export async function dispatchManuallyInstead(
     reason: "not_allowed",
     message,
   });
-  if (rec.dispatch_error === DRIVER_CONFLICT_MARK && rec.status === "quoted") {
-    return refuse(
-      "The driver answered with a conflict and may already hold this delivery; wait for its status update.",
-    );
+  const conflictRow =
+    rec.dispatch_error === DRIVER_CONFLICT_MARK &&
+    rec.status === "quoted" &&
+    rec.provider_delivery_id === null;
+  let overrideConflict = false;
+  if (conflictRow) {
+    const stuck =
+      now.getTime() - new Date(rec.created_at).getTime() >= DRIVER_GIVE_UP_MS;
+    if (!(stuck && opts.confirmNotWithDriver === true)) {
+      return refuse(
+        stuck
+          ? "The driver answered with a conflict and may hold this delivery. Confirm with the driver that it does not, then use the explicit override."
+          : "The driver answered with a conflict and may already hold this delivery; wait for its status update.",
+      );
+    }
+    overrideConflict = true;
   }
-  if (rec.status === "failed") {
+  if (overrideConflict) {
+    // Explicit, confirmed override: falls through to the order check and switch.
+  } else if (rec.status === "failed") {
     // The driver reported it failed (or the dispatch failed): safe to hand over.
   } else if (rec.provider_delivery_id === null) {
     if (rec.status === "quoted") {
@@ -815,6 +848,20 @@ export async function dispatchManuallyInstead(
       reason: "stale",
       message: "The delivery changed; reload and try again.",
     };
+  }
+  if (overrideConflict) {
+    const who = opts.actor?.label ?? opts.actor?.id ?? "unknown";
+    console.error(
+      `[pos][ALERT] manual override of driver conflict for delivery ${rec.id} by ${who}`,
+    );
+    // No dedicated audit action exists; `connect_change` ("integrations") is the
+    // closest existing value, and the detail says exactly what happened.
+    await recordAudit({
+      actor: { id: opts.actor?.id ?? "unknown", label: opts.actor?.label ?? "unknown" },
+      action: "connect_change",
+      tenantId: rec.tenant_id,
+      detail: `Manual override of driver conflict: delivery ${rec.id} (order ${rec.order_id}) switched to in-house; operator confirmed the driver does not have it`,
+    });
   }
   return { ok: true, delivery: switched };
 }

@@ -276,6 +276,23 @@ describe("deliveries.updateStatus", () => {
     expect((await post(manual.id, { status: "assigned" }, other)).status).toBe(200);
   });
 
+  it("the driver's push that carries its id clears a stale conflict mark", async () => {
+    const driver = getPosDriver();
+    const rec = await seedDelivery(41);
+    await driver.upsertDelivery({
+      ...rec,
+      status: "quoted",
+      dispatch_error: "driver conflict, waiting for its status push",
+      dispatch_next_at: new Date().toISOString(),
+    });
+    const r = await post(rec.id, { status: "assigned", provider_delivery_id: "drv_5" });
+    expect(r.status).toBe(200);
+    const stored = (await driver.getDelivery(rec.id))!;
+    expect(stored.provider_delivery_id).toBe("drv_5");
+    expect(stored.dispatch_error).toBeNull();
+    expect(stored.dispatch_next_at).toBeNull();
+  });
+
   it("is a no-op when replayed, and a finished delivery cannot change", async () => {
     const rec = await seedDelivery(2);
     await post(rec.id, { status: "delivered" });

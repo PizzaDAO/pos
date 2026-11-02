@@ -15,7 +15,14 @@ export interface DriverAttention {
   reason: string | null;
   /** Whether the "Dispatch manually instead" button may be shown (the server re-checks). */
   canDispatchManually: boolean;
+  /**
+   * A conflict row stuck past 15 minutes: offer the explicit override ("the
+   * driver confirms it does not have it"), behind a confirm step.
+   */
+  canOverrideConflict?: boolean;
 }
+
+const CONFLICT_OVERRIDE_AFTER_MS = 15 * 60_000;
 
 export function driverAttention(
   d: Pick<
@@ -40,9 +47,23 @@ export function driverAttention(
     return { reason: null, canDispatchManually: false };
   }
   const hasId = d.provider_delivery_id !== null;
-  if (d.dispatch_error === DRIVER_CONFLICT_MARK && d.status === "quoted") {
-    // The driver may hold it: no manual switch until its push lands.
-    return { reason: DRIVER_CONFLICT_MARK, canDispatchManually: false };
+  // The conflict mark only means something on a quoted row with no driver id;
+  // anywhere else it is stale and ignored.
+  const conflict =
+    d.dispatch_error === DRIVER_CONFLICT_MARK &&
+    d.status === "quoted" &&
+    !hasId;
+  if (d.dispatch_error === DRIVER_CONFLICT_MARK && !conflict) {
+    d = { ...d, dispatch_error: null };
+  }
+  if (conflict) {
+    // The driver may hold it: no plain manual switch until its push lands.
+    return {
+      reason: DRIVER_CONFLICT_MARK,
+      canDispatchManually: false,
+      canOverrideConflict:
+        now - new Date(d.created_at).getTime() >= CONFLICT_OVERRIDE_AFTER_MS,
+    };
   }
   const stuck =
     d.status === "quoted" &&
