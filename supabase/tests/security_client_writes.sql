@@ -3,8 +3,10 @@
 -- Run by scripts/pglite-migrate.mjs after the migrations + seed. Rolled back.
 --
 --   * an authenticated tenant member (owner AND kitchen) can no longer insert or
---     update payments / orders / order_items / deliveries / shift_cash_events,
+--     update payments / orders / order_items / order_item_modifiers / deliveries
+--     / shift_cash_events / shifts / inventory_movements / staff / customers,
 --     but can still SELECT them (realtime + tracking keep working)
+--   * magic_link_tokens: no client role can read, mint or un-consume a token
 --   * a signed-in non-member cannot insert a customers row "as self" binding
 --     another email at a tenant, nor edit one planted for them
 --   * a user cannot change their own public.users.email
@@ -33,6 +35,14 @@ values
   ('5ec0000b-0000-4000-8000-000000000001', '5ec0000a-0000-4000-8000-000000000001',
    '10000000-0000-0000-0000-000000000001', '10000000-0000-0000-0000-000000000101',
    'cash', 'pending', 1000, 'USD');
+
+-- A legacy shop magic-link token (server-minted) for a demo-tenant customer.
+insert into public.customers (id, tenant_id, email) values
+  ('5ec0000c-0000-4000-8000-000000000001', '10000000-0000-0000-0000-000000000001',
+   'mlt@x.example');
+insert into public.magic_link_tokens (token, tenant_id, email, customer_id, expires_at, consumed)
+values ('sectoken0001', '10000000-0000-0000-0000-000000000001', 'mlt@x.example',
+        '5ec0000c-0000-4000-8000-000000000001', now() - interval '1 hour', true);
 
 -- Runs p_sql as user p_uid (role authenticated) and reports whether it was
 -- refused with insufficient_privilege (42501: no grant, or an RLS check).
@@ -68,7 +78,9 @@ declare
   n int;
 begin
   -- ---- H1: grants are gone for both client roles ----------------------------
-  foreach tbl in array array['orders','order_items','payments','deliveries','shift_cash_events'] loop
+  foreach tbl in array array['orders','order_items','order_item_modifiers','payments','deliveries',
+                             'shift_cash_events','shifts','inventory_movements','staff',
+                             'customers','magic_link_tokens'] loop
     foreach priv in array array['INSERT','UPDATE','DELETE'] loop
       if has_table_privilege('authenticated', 'public.' || tbl, priv) then
         raise exception 'authenticated still has % on %', priv, tbl;
@@ -77,15 +89,25 @@ begin
         raise exception 'anon still has % on %', priv, tbl;
       end if;
     end loop;
-    if not has_table_privilege('authenticated', 'public.' || tbl, 'SELECT') then
+    if tbl <> 'magic_link_tokens'
+       and not has_any_column_privilege('authenticated', 'public.' || tbl, 'SELECT') then
       raise exception 'authenticated lost SELECT on % (realtime/tracking need it)', tbl;
     end if;
   end loop;
+  if has_table_privilege('authenticated', 'public.magic_link_tokens', 'SELECT')
+     or has_table_privilege('anon', 'public.magic_link_tokens', 'SELECT') then
+    raise exception 'a client role can still read magic_link_tokens';
+  end if;
   select count(*) into n from pg_policies
    where schemaname = 'public'
-     and policyname in ('orders_insert','orders_update','orders_delete','order_items_write',
-                        'payments_write','deliveries_write','shift_cash_events_write');
+     and tablename in ('orders','order_items','order_item_modifiers','payments','deliveries',
+                       'shift_cash_events','shifts','inventory_movements','staff',
+                       'customers','magic_link_tokens')
+     and cmd <> 'SELECT';
   if n <> 0 then raise exception '% write policies remain', n; end if;
+  if exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'magic_link_tokens') then
+    raise exception 'a magic_link_tokens policy remains';
+  end if;
 
   -- ---- H1: a tenant member (owner and kitchen) cannot write money rows ------
   foreach u in array array[owner_u, kitchen_u] loop
@@ -124,7 +146,81 @@ begin
       'delete from public.shift_cash_events where tenant_id = %L', t)) then
       raise exception 'member % deleted cash events', u;
     end if;
+    if not pg_temp.denied(u, format(
+      'insert into public.order_item_modifiers (id, order_item_id, group_id, group_name, modifier_id, modifier_name, price_cents)
+       select gen_random_uuid(), oi.id, gen_random_uuid(), %L, gen_random_uuid(), %L, -500 from public.order_items oi limit 1',
+      'g', 'discount')) then
+      raise exception 'member % inserted an order item modifier', u;
+    end if;
+    if not pg_temp.denied(u, format(
+      'insert into public.shifts (tenant_id, location_id, staff_id) values (%L, %L, %L)',
+      t, l, '80000000-0000-0000-0000-000000000004')) then
+      raise exception 'member % opened a shift', u;
+    end if;
+    if not pg_temp.denied(u, format(
+      'update public.shifts set opening_float_cents = 0 where tenant_id = %L', t)) then
+      raise exception 'member % updated shifts', u;
+    end if;
+    if not pg_temp.denied(u, format(
+      'insert into public.inventory_movements (tenant_id, location_id, inventory_item_id, reason, delta, resulting_on_hand)
+       select %L, %L, id, (enum_range(null::public.movement_reason))[1], 1000, 1000
+         from public.inventory_items limit 1', t, l)) then
+      raise exception 'member % inserted an inventory movement', u;
+    end if;
+    -- L4: a known pin_hash onto the owner's staff row, or a new staff row.
+    if not pg_temp.denied(u, format(
+      'update public.staff set pin_hash = %L where id = %L', 'scrypt$known', '80000000-0000-0000-0000-000000000001')) then
+      raise exception 'member % set a staff pin_hash', u;
+    end if;
+    if not pg_temp.denied(u, format(
+      'insert into public.staff (tenant_id, name, role) values (%L, %L, %L)', t, 'Ghost', 'owner')) then
+      raise exception 'member % inserted a staff row', u;
+    end if;
+    -- customers: no member write branch either.
+    if not pg_temp.denied(u, format(
+      'insert into public.customers (id, tenant_id, email) values (gen_random_uuid(), %L, %L)', t, 'crm@x.example')) then
+      raise exception 'member % inserted a customer', u;
+    end if;
+    if not pg_temp.denied(u, format(
+      'update public.customers set email = %L where id = %L', 'moved@x.example', '5ec0000c-0000-4000-8000-000000000001')) then
+      raise exception 'member % updated a customer', u;
+    end if;
+    -- magic_link_tokens: cannot mint, revive (un-consume / extend) or read one.
+    if not pg_temp.denied(u, format(
+      'insert into public.magic_link_tokens (token, tenant_id, email, customer_id, expires_at)
+       values (%L, %L, %L, %L, now() + interval %L)',
+      'minted-' || u, t, 'mlt@x.example', '5ec0000c-0000-4000-8000-000000000001', '1 day')) then
+      raise exception 'member % minted a magic-link token', u;
+    end if;
+    if not pg_temp.denied(u, format(
+      'update public.magic_link_tokens set consumed = false, expires_at = now() + interval %L where token = %L',
+      '1 day', 'sectoken0001')) then
+      raise exception 'member % revived a magic-link token', u;
+    end if;
+    if not pg_temp.denied(u, 'select token from public.magic_link_tokens') then
+      raise exception 'member % read magic-link tokens', u;
+    end if;
   end loop;
+
+  -- The stranger (signed in, no membership) cannot mint or read tokens either.
+  if not pg_temp.denied(stranger, format(
+    'insert into public.magic_link_tokens (token, tenant_id, email, customer_id, expires_at)
+     values (%L, %L, %L, %L, now() + interval %L)',
+    'minted-stranger', t, 'mlt@x.example', '5ec0000c-0000-4000-8000-000000000001', '1 day')) then
+    raise exception 'stranger minted a magic-link token';
+  end if;
+  if (select count(*) from public.magic_link_tokens where token like 'minted-%') <> 0 then
+    raise exception 'a client-minted token exists';
+  end if;
+  if (select consumed from public.magic_link_tokens where token = 'sectoken0001') is not true then
+    raise exception 'a consumed token was revived';
+  end if;
+  if exists (select 1 from public.staff where pin_hash = 'scrypt$known' or name = 'Ghost') then
+    raise exception 'staff row forged';
+  end if;
+  if (select email from public.customers where id = '5ec0000c-0000-4000-8000-000000000001') <> 'mlt@x.example' then
+    raise exception 'customer email changed';
+  end if;
 
   -- Nothing changed.
   if (select status from public.payments where id = p::uuid) <> 'pending' then
@@ -187,6 +283,8 @@ begin
 
   -- ---- The server path (table owner / service role) is unaffected -----------
   update public.payments set status = 'captured' where id = p::uuid;
+  update public.staff set pin_hash = null where id = '80000000-0000-0000-0000-000000000004';
+  update public.magic_link_tokens set consumed = true where token = 'sectoken0001';
   insert into public.customers (id, tenant_id, email)
     values (gen_random_uuid(), t::uuid, 'server-made@x.example');
 end
