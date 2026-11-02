@@ -24,7 +24,7 @@ import {
   sweepDriverDispatches,
   type DispatchDeliveryInput,
 } from "./service";
-import { driverAttention } from "./attention";
+import { DRIVER_CONFLICT_MARK, driverAttention } from "./attention";
 import { POST as dispatchRoute } from "@/app/api/delivery/dispatch/route";
 
 const HUB = "https://hub.test";
@@ -71,7 +71,9 @@ const json = (body: unknown, status = 200) =>
     status,
     headers: { "content-type": "application/json" },
   });
-const problem = (status: number, code = "X") => json({ code, title: code, status }, status);
+// The driver's real error shape: a NESTED {error:{code,message}} body.
+const problem = (status: number, code = "X") =>
+  json({ error: { code, message: code } }, status);
 
 const registration = (over: Record<string, unknown> = {}) => ({
   kind: "delivery",
@@ -366,7 +368,7 @@ describe("dispatch", () => {
     expect(driverCalls()).toHaveLength(n);
   });
 
-  it.each([401, 403, 404, 409, 422])("driver %i: failed + alert, never retried", async (status) => {
+  it.each([401, 403, 404, 422])("driver %i: failed + alert, never retried", async (status) => {
     const orderId = await seedOrder();
     const err = alerts();
     dispatchReply = () => problem(status, "NOPE");
@@ -693,22 +695,65 @@ describe("review fixes", () => {
     expect(calls.filter((c) => c.url.startsWith(`${HUB}/v1/providers`))).toHaveLength(1);
   });
 
-  it("a driver 409 IDEMPOTENCY_CONFLICT means it HAS the delivery: adopt it via GET by our id", async () => {
-    const orderId = await seedOrder();
-    dispatchReply = () => problem(409, "IDEMPOTENCY_CONFLICT");
-    trackReply = () => json(track({ provider_delivery_id: "drv_9", status: "assigned" }));
-    const rec = await dispatchDelivery(dispatchInput(orderId));
-    expect(rec).toMatchObject({ status: "assigned", provider_delivery_id: "drv_9" });
-    const get = calls.find((c) => c.method === "GET" && c.url.startsWith(`${DRIVER}/deliveries/`))!;
-    expect(get.url).toBe(`${DRIVER}/deliveries/${rec.id}`);
-  });
+  describe("a 409 from /dispatch (driver may already hold it)", () => {
+    const conflict = () => problem(409, "IDEMPOTENCY_CONFLICT");
 
-  it("an idempotency conflict that cannot be read back is retried, never failed", async () => {
-    const orderId = await seedOrder();
-    dispatchReply = () => problem(409, "IDEMPOTENCY_CONFLICT");
-    trackReply = () => problem(503, "UNAVAILABLE");
-    const rec = await dispatchDelivery(dispatchInput(orderId));
-    expect(rec.status).toBe("quoted");
+    it("push NOT landed: stays quoted with the conflict mark + alert; never failed, no adopt GET", async () => {
+      const orderId = await seedOrder();
+      const err = alerts();
+      dispatchReply = conflict;
+      const rec = await dispatchDelivery(dispatchInput(orderId));
+      expect(rec.status).toBe("quoted");
+      expect(rec.dispatch_error).toBe(DRIVER_CONFLICT_MARK);
+      expect(err.mock.calls.some((x) => String(x[0]).includes("[pos][ALERT]"))).toBe(true);
+      expect(calls.some((c) => c.method === "GET" && c.url.startsWith(`${DRIVER}/deliveries/`))).toBe(false);
+    });
+
+    it("push landed meanwhile: the row with the driver's id is kept", async () => {
+      const orderId = await seedOrder();
+      dispatchReply = async () => {
+        const r = (await getPosDriver().getDeliveryForOrder(orderId))!;
+        await getPosDriver().transitionDelivery(r.id, T, {
+          status: "assigned",
+          provider_delivery_id: "drv_7",
+        });
+        return conflict();
+      };
+      const rec = await dispatchDelivery(dispatchInput(orderId));
+      expect(rec).toMatchObject({ status: "assigned", provider_delivery_id: "drv_7" });
+    });
+
+    it("refuses the manual switch (route and service) and hides the button", async () => {
+      const orderId = await seedOrder();
+      alerts();
+      dispatchReply = conflict;
+      const rec = await dispatchDelivery(dispatchInput(orderId));
+      const later = new Date(Date.now() + 10 * 60_000);
+      expect((await dispatchManuallyInstead(rec.id, later)).ok).toBe(false);
+      expect(driverAttention(rec, later.getTime())).toEqual({
+        reason: DRIVER_CONFLICT_MARK,
+        canDispatchManually: false,
+      });
+      expect((await getPosDriver().getDelivery(rec.id))!.provider).toBe("openpizza_driver");
+    });
+
+    it("is never auto-failed or re-sent by the sweep (alert only), and a later push still lands", async () => {
+      const orderId = await seedOrder();
+      const err = alerts();
+      dispatchReply = conflict;
+      const rec = await dispatchDelivery(dispatchInput(orderId));
+      const n = driverCalls().length;
+      const s = await sweepDriverDispatches(new Date(Date.now() + 20 * 60_000));
+      expect(s.failed).toBe(0);
+      expect(driverCalls()).toHaveLength(n);
+      expect((await getPosDriver().getDelivery(rec.id))!.status).toBe("quoted");
+      expect(err.mock.calls.some((x) => String(x[0]).includes("still waiting"))).toBe(true);
+      const push = await getPosDriver().transitionDelivery(rec.id, T, {
+        status: "assigned",
+        provider_delivery_id: "drv_7",
+      });
+      expect(push.ok).toBe(true);
+    });
   });
 
   it("the sweep honors its total time budget", async () => {

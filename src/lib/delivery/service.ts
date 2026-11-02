@@ -20,6 +20,7 @@ import { loadDelivery } from "@/lib/core/loaders";
 import { captureError } from "@/lib/observability";
 import { DriverDispatchError } from "./providers/openpizza-driver";
 import { isDriverTenant } from "./driver-hub";
+import { DRIVER_CONFLICT_MARK } from "./attention";
 import type {
   Address,
   Delivery,
@@ -545,7 +546,9 @@ export async function attemptDriverDispatch(
   if (
     !fresh ||
     fresh.provider !== "openpizza_driver" ||
-    fresh.status !== "quoted"
+    fresh.status !== "quoted" ||
+    // Waiting on the driver's push after a 409: do not send it again.
+    fresh.dispatch_error === DRIVER_CONFLICT_MARK
   ) {
     return fresh ?? record;
   }
@@ -642,6 +645,22 @@ export async function attemptDriverDispatch(
             err instanceof Error ? err.message : String(err),
             true,
           );
+    if (e.conflict) {
+      // The driver may already hold it. Re-read: if its status push landed (it
+      // carries the provider id) keep that; otherwise park it as `quoted` and wait.
+      const cur = await driver.getDelivery(record.id);
+      if (cur && cur.provider_delivery_id !== null) return cur;
+      console.error(
+        `[pos][ALERT] driver answered 409 to the dispatch of delivery ${record.id} (order ${record.order_id}); it may already hold it, waiting for its status push`,
+      );
+      const res = await driver.updateDriverDispatch(record.id, record.tenant_id, {
+        expect_status: "quoted",
+        dispatch_attempts: attempts,
+        dispatch_error: DRIVER_CONFLICT_MARK,
+        dispatch_next_at: null,
+      });
+      return res.ok ? res.delivery : (res.delivery ?? record);
+    }
     if (!e.retryable) {
       return failDriverDispatch(
         record,
@@ -687,6 +706,15 @@ export async function sweepDriverDispatches(
     if (rec.provider_delivery_id !== null) continue;
     const age = now.getTime() - new Date(rec.created_at).getTime();
     try {
+      if (rec.dispatch_error === DRIVER_CONFLICT_MARK) {
+        // Never auto-fail or re-send: the driver may hold it. Alert only.
+        if (age >= DRIVER_GIVE_UP_MS) {
+          console.error(
+            `[pos][ALERT] delivery ${rec.id} (order ${rec.order_id}) still waiting for the driver's status push after a dispatch 409`,
+          );
+        }
+        continue;
+      }
       if (age >= DRIVER_GIVE_UP_MS) {
         await failDriverDispatch(
           rec,
@@ -747,6 +775,11 @@ export async function dispatchManuallyInstead(
     reason: "not_allowed",
     message,
   });
+  if (rec.dispatch_error === DRIVER_CONFLICT_MARK && rec.status === "quoted") {
+    return refuse(
+      "The driver answered with a conflict and may already hold this delivery; wait for its status update.",
+    );
+  }
   if (rec.status === "failed") {
     // The driver reported it failed (or the dispatch failed): safe to hand over.
   } else if (rec.provider_delivery_id === null) {

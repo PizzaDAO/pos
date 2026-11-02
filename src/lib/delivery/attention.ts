@@ -4,6 +4,10 @@
  */
 import type { DeliveryRecord } from "@/lib/db";
 
+/** Stored in `dispatch_error` while a dispatch 409 waits for the driver's status push. */
+export const DRIVER_CONFLICT_MARK =
+  "driver conflict, waiting for its status push";
+
 const QUOTED_GRACE_MS = 2 * 60_000;
 
 export interface DriverAttention {
@@ -36,6 +40,10 @@ export function driverAttention(
     return { reason: null, canDispatchManually: false };
   }
   const hasId = d.provider_delivery_id !== null;
+  if (d.dispatch_error === DRIVER_CONFLICT_MARK && d.status === "quoted") {
+    // The driver may hold it: no manual switch until its push lands.
+    return { reason: DRIVER_CONFLICT_MARK, canDispatchManually: false };
+  }
   const stuck =
     d.status === "quoted" &&
     !hasId &&

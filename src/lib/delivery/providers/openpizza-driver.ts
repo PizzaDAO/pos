@@ -54,6 +54,8 @@ export class DriverDispatchError extends Error {
     readonly retryable: boolean,
     readonly status: number | null = null,
     readonly code: string | null = null,
+    /** A 409 from /dispatch: the driver may already have this delivery. */
+    readonly conflict: boolean = false,
   ) {
     super(message);
     this.name = "DriverDispatchError";
@@ -150,32 +152,20 @@ export const openPizzaDriverProvider: DeliveryProvider = {
         false,
       );
     }
-    let remote;
     try {
-      remote = await remoteFor(req.context.tenantId);
+      const remote = await remoteFor(req.context.tenantId);
       const raw = await remote.dispatch(
         req.payload,
         `pos-delivery:${req.deliveryId}`,
       );
       return trackToDelivery(parseTrack(raw));
     } catch (err) {
+      // ANY 409 from /dispatch (the driver's idempotency conflict arrives as a
+      // nested {error:{code}} body that core maps to a generic CONFLICT) means the
+      // driver may already hold this delivery: never fail it, wait for its push.
       const e = classify(err);
-      // The driver already holds a delivery under this key but with a different
-      // body (the order changed after the first attempt). It HAS the delivery:
-      // adopt it (GET by our id) instead of failing a delivery that exists.
-      if (remote && e.status === 409 && e.code === "IDEMPOTENCY_CONFLICT") {
-        try {
-          return trackToDelivery(parseTrack(await remote.track(req.deliveryId)));
-        } catch (adoptErr) {
-          const a = classify(adoptErr);
-          // Could not read it back: keep retrying (never fail a delivery the driver has).
-          throw new DriverDispatchError(
-            `driver has this delivery (idempotency conflict) but it could not be read: ${a.message}`,
-            true,
-            a.status,
-            a.code,
-          );
-        }
+      if (e.status === 409) {
+        throw new DriverDispatchError(e.message, true, 409, e.code, true);
       }
       throw e;
     }
