@@ -627,6 +627,21 @@ export function withOutbox(
       return result;
     },
 
+    async setStaffModuleRoles(tenantId, staffId, roles) {
+      const result = await inner.setStaffModuleRoles(tenantId, staffId, roles);
+      if (result) {
+        box.append({
+          tenant_id: result.tenant_id,
+          location_id: null,
+          event_type: "staff.updated",
+          subject_type: "staff",
+          subject_id: result.id,
+          row_snapshot: { id: result.id },
+        });
+      }
+      return result;
+    },
+
     async openShift(input) {
       const shift: Shift = await inner.openShift(input);
       box.append({

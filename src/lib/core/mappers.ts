@@ -801,7 +801,9 @@ export function toContractStaff(
     tenant_id: s.tenant_id,
     name: s.name,
     role: s.role,
-    roles: [s.role],
+    // The POS role first, then module roles (driver, dispatcher) so other
+    // modules see them; deduped.
+    roles: [...new Set<CoreStaffMember["role"]>([s.role, ...(s.module_roles ?? [])])],
     active: s.active,
     user_id: s.user_id ?? null,
     location_ids: s.location_ids ?? [],

@@ -14,6 +14,7 @@ import type {
   DrawerReconciliation,
   Shift,
   Staff,
+  StaffModuleRole,
 } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
@@ -31,6 +32,11 @@ interface StaffData {
   reconciliations: { shiftId: string; reconciliation: DrawerReconciliation }[];
 }
 
+const MODULE_ROLE_LABELS: { role: StaffModuleRole; label: string }[] = [
+  { role: "driver", label: "Driver" },
+  { role: "dispatcher", label: "Dispatcher" },
+];
+
 function dollarsToCents(v: string): number {
   const n = Number.parseFloat(v);
   return Number.isNaN(n) ? 0 : Math.round(n * 100);
@@ -39,6 +45,7 @@ function dollarsToCents(v: string): number {
 export function StaffShifts({ tenantId, locationId }: Props) {
   const [data, setData] = useState<StaffData | null>(null);
   const [busy, setBusy] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
   const [floatDraft, setFloatDraft] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
@@ -69,6 +76,33 @@ export function StaffShifts({ tenantId, locationId }: Props) {
     }
   }
 
+  async function toggleModuleRole(
+    s: Staff,
+    role: StaffModuleRole,
+    checked: boolean,
+  ) {
+    const current = s.module_roles ?? [];
+    const next = checked
+      ? [...new Set([...current, role])]
+      : current.filter((r) => r !== role);
+    setBusy(true);
+    try {
+      setRoleError(null);
+      const res = await fetch("/api/admin/staff", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tenantId, staffId: s.id, moduleRoles: next }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setRoleError(data.error ?? "Could not update module roles.");
+      }
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!data) return <p className="text-sm text-muted-foreground">Loading…</p>;
 
   const reconById = new Map(
@@ -81,6 +115,12 @@ export function StaffShifts({ tenantId, locationId }: Props) {
         <Users className="h-5 w-5" />
         <h2 className="text-base font-semibold">Staff &amp; drawer</h2>
       </div>
+
+      {roleError && (
+        <p role="alert" className="text-sm text-destructive">
+          {roleError}
+        </p>
+      )}
 
       <div className="grid gap-3 sm:grid-cols-2">
         {data.staff.map((s) => {
@@ -105,6 +145,26 @@ export function StaffShifts({ tenantId, locationId }: Props) {
                   {open ? "Drawer open" : "Drawer closed"}
                 </span>
               </div>
+
+              <fieldset
+                className="mt-3 flex items-center gap-4 text-xs"
+                aria-label={`Open Pizza module roles for ${s.name}`}
+              >
+                <legend className="sr-only">Module roles</legend>
+                {MODULE_ROLE_LABELS.map(({ role, label }) => (
+                  <label key={role} className="flex items-center gap-1.5">
+                    <input
+                      type="checkbox"
+                      disabled={busy}
+                      checked={(s.module_roles ?? []).includes(role)}
+                      onChange={(e) =>
+                        void toggleModuleRole(s, role, e.target.checked)
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+              </fieldset>
 
               {open ? (
                 <p className="mt-2 text-xs text-muted-foreground">
