@@ -23,8 +23,16 @@ export function driverAttention(
     | "created_at"
   >,
   now: number = Date.now(),
+  /** The order's status: a closed order (POS canceled it itself) needs no one. */
+  orderStatus?: string | null,
 ): DriverAttention {
   if (d.provider !== "openpizza_driver") {
+    return { reason: null, canDispatchManually: false };
+  }
+  if (
+    orderStatus &&
+    ["voided", "abandoned", "refunded", "completed"].includes(orderStatus)
+  ) {
     return { reason: null, canDispatchManually: false };
   }
   const hasId = d.provider_delivery_id !== null;
@@ -35,7 +43,8 @@ export function driverAttention(
   if (d.status === "failed") {
     return {
       reason: d.dispatch_error ?? "The driver delivery failed.",
-      canDispatchManually: !hasId,
+      // The driver reported it failed (or the dispatch did): a person may take over.
+      canDispatchManually: true,
     };
   }
   if (stuck) {

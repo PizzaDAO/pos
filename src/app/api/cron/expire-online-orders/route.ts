@@ -42,13 +42,6 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const summary = await expireOnlineOrders();
-  // Open Pizza Driver dispatches that were not confirmed (driver or hub down):
-  // retry with the same idempotency key, give up after 15 minutes. A no-op when
-  // no driver delivery is waiting. Failure here must not fail the sweep.
-  const driverDispatch = await sweepDriverDispatches().catch((err) => {
-    captureError(err, { scope: "driver-dispatch-sweep-cron" });
-    return null;
-  });
   // Stored /v1 quotes long past their validity window.
   const quotesPruned = await getPosDriver()
     .pruneExpiredQuotes(new Date(startedAt - 60 * 60_000).toISOString())
@@ -73,6 +66,18 @@ export async function GET(request: Request) {
     budgetMs: Math.max(3_000, 55_000 - (Date.now() - startedAt)),
   }).catch((err) => {
     captureError(err, { scope: "expire-held-orders-cron" });
+    return null;
+  });
+  // Open Pizza Driver dispatches that were not confirmed (driver or hub down):
+  // retry with the same idempotency key, give up after 15 minutes. A no-op when
+  // no driver delivery is waiting. Failure here must not fail the sweep.
+  const driverDispatch = await sweepDriverDispatches(
+    new Date(),
+    10,
+    // Last, inside maxDuration: whatever the sweeps above left (<= 20 s, >= 3 s).
+    Math.max(3_000, Math.min(20_000, 57_000 - (Date.now() - startedAt))),
+  ).catch((err) => {
+    captureError(err, { scope: "driver-dispatch-sweep-cron" });
     return null;
   });
   return NextResponse.json(

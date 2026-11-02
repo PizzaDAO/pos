@@ -53,6 +53,7 @@ export class DriverDispatchError extends Error {
     /** true: try again later with the same idempotency key. false: fail closed. */
     readonly retryable: boolean,
     readonly status: number | null = null,
+    readonly code: string | null = null,
   ) {
     super(message);
     this.name = "DriverDispatchError";
@@ -69,7 +70,11 @@ function classify(err: unknown): DriverDispatchError {
   // Timeouts / network errors surface as hub-unavailable (503) problems, or as
   // plain errors without a status: both are transient.
   const retryable = status === null || status === 429 || status >= 500;
-  return new DriverDispatchError(message, retryable, status);
+  const code =
+    typeof (err as { code?: unknown })?.code === "string"
+      ? (err as { code: string }).code
+      : null;
+  return new DriverDispatchError(message, retryable, status, code);
 }
 
 /** Resolve the tenant's driver deployment and a ready remote client. */
@@ -145,15 +150,34 @@ export const openPizzaDriverProvider: DeliveryProvider = {
         false,
       );
     }
+    let remote;
     try {
-      const remote = await remoteFor(req.context.tenantId);
+      remote = await remoteFor(req.context.tenantId);
       const raw = await remote.dispatch(
         req.payload,
         `pos-delivery:${req.deliveryId}`,
       );
       return trackToDelivery(parseTrack(raw));
     } catch (err) {
-      throw classify(err);
+      const e = classify(err);
+      // The driver already holds a delivery under this key but with a different
+      // body (the order changed after the first attempt). It HAS the delivery:
+      // adopt it (GET by our id) instead of failing a delivery that exists.
+      if (remote && e.status === 409 && e.code === "IDEMPOTENCY_CONFLICT") {
+        try {
+          return trackToDelivery(parseTrack(await remote.track(req.deliveryId)));
+        } catch (adoptErr) {
+          const a = classify(adoptErr);
+          // Could not read it back: keep retrying (never fail a delivery the driver has).
+          throw new DriverDispatchError(
+            `driver has this delivery (idempotency conflict) but it could not be read: ${a.message}`,
+            true,
+            a.status,
+            a.code,
+          );
+        }
+      }
+      throw e;
     }
   },
 

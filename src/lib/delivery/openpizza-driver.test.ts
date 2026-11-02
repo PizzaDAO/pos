@@ -42,6 +42,7 @@ const dropoff: DeliveryAddress = {
 
 interface Call {
   url: string;
+  signal?: AbortSignal | null;
   method: string;
   headers: Record<string, string>;
   body: string | undefined;
@@ -50,6 +51,7 @@ interface Call {
 let calls: Call[] = [];
 /** Driver /dispatch behaviour: a status code, or a function for custom replies. */
 let dispatchReply: (call: Call) => Response | Promise<Response>;
+let trackReply: (call: Call) => Response | Promise<Response> = () => json(track());
 let cancelReply: (call: Call) => Response | Promise<Response>;
 let providersReply: () => Response;
 
@@ -86,6 +88,7 @@ beforeEach(async () => {
   calls = [];
   dispatchReply = () => json(track());
   cancelReply = () => json(track({ status: "canceled" }));
+  trackReply = () => json(track());
   providersReply = () => json({ data: [registration()] });
   vi.stubEnv("OPENPIZZA_DRIVER_TENANTS", T);
   vi.stubEnv("OPENPIZZA_HUB_URL", HUB);
@@ -97,6 +100,7 @@ beforeEach(async () => {
       const url = String(input);
       const call: Call = {
         url,
+        signal: init?.signal,
         method: init?.method ?? "GET",
         headers: Object.fromEntries(
           Object.entries((init?.headers ?? {}) as Record<string, string>).map(([k, v]) => [
@@ -113,6 +117,7 @@ beforeEach(async () => {
       if (url.startsWith(`${HUB}/v1/providers`)) return providersReply();
       if (url === `${DRIVER}/dispatch`) return dispatchReply(call);
       if (url.includes("/cancel")) return cancelReply(call);
+      if (url.startsWith(`${DRIVER}/deliveries/`)) return trackReply(call);
       throw new Error(`unexpected fetch ${url}`);
     }),
   );
@@ -416,7 +421,8 @@ describe("dispatch", () => {
     const rec = await dispatchDelivery(dispatchInput(orderId));
     vi.stubEnv("OPENPIZZA_DRIVER_TENANTS", "");
     const n = calls.length;
-    await sweepDriverDispatches(new Date(Date.now() + 6 * 60_000));
+    const off = await sweepDriverDispatches(new Date(Date.now() + 6 * 60_000));
+    expect(off.retried).toBe(0); // a switched-off tenant is not counted
     expect(calls).toHaveLength(n);
     alerts();
     await sweepDriverDispatches(new Date(Date.now() + 16 * 60_000));
@@ -532,12 +538,13 @@ describe("assign route (M8) and the manual fallback", () => {
     expect(stored).toMatchObject({ provider: "in_house_manual", status: "pending_assignment" });
   });
 
-  it("manual fallback is allowed after the driver canceled, refused for a failed delivery the driver has", async () => {
+  it("manual fallback is allowed after the driver canceled, and for a driver-reported failure even with a provider id", async () => {
     const orderId = await seedOrder();
     const rec = await dispatchDelivery(dispatchInput(orderId));
-    // The driver reports a failed stop: it has the delivery, so no switch.
+    // The driver reports a failed stop: it said failed, so a person may take over.
     await getPosDriver().transitionDelivery(rec.id, T, { status: "failed" });
-    expect((await dispatchManuallyInstead(rec.id)).ok).toBe(false);
+    const failedSwitch = await dispatchManuallyInstead(rec.id);
+    expect(failedSwitch.ok).toBe(true);
 
     const orderId2 = await seedOrder();
     const rec2 = await dispatchDelivery(dispatchInput(orderId2));
@@ -555,8 +562,10 @@ describe("assign route (M8) and the manual fallback", () => {
     alerts();
     dispatchReply = () => problem(422, "BAD");
     const failed = await dispatchDelivery(dispatchInput(o2));
-    await getPosDriver().updateOrderStatus(o2, "voided");
-    expect((await dispatchManuallyInstead(failed.id)).ok).toBe(false);
+    for (const closed of ["voided", "completed", "refunded", "abandoned"] as const) {
+      await getPosDriver().updateOrderStatus(o2, closed);
+      expect((await dispatchManuallyInstead(failed.id)).ok).toBe(false);
+    }
   });
 });
 
@@ -593,7 +602,16 @@ describe("driverAttention", () => {
     expect(driverAttention({ ...base, status: "failed", provider_delivery_id: null }, now)).toMatchObject({
       canDispatchManually: true,
     });
-    expect(driverAttention({ ...base, status: "failed" }, now).canDispatchManually).toBe(false);
+    expect(driverAttention({ ...base, status: "failed" }, now).canDispatchManually).toBe(true);
+    // A row POS canceled itself (order voided) needs no one.
+    for (const os of ["voided", "abandoned", "refunded"]) {
+      expect(driverAttention({ ...base, status: "failed" }, now, os)).toEqual({
+        reason: null,
+        canDispatchManually: false,
+      });
+      expect(driverAttention({ ...base, status: "canceled" }, now, os).reason).toBeNull();
+    }
+    expect(driverAttention({ ...base, status: "failed" }, now, "paid").reason).toBeTruthy();
     expect(
       driverAttention({ ...base, status: "quoted", provider_delivery_id: null }, 60_000).reason,
     ).toBeNull();
@@ -615,5 +633,91 @@ describe("attemptDriverDispatch on a record that is not the driver's", () => {
     });
     expect(res.ok).toBe(false);
     void attemptDriverDispatch;
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("review fixes", () => {
+  it("the post-dispatch CAS loses to a local cancel: the driver delivery is canceled and alerted", async () => {
+    const orderId = await seedOrder();
+    const err = alerts();
+    dispatchReply = async () => {
+      // POS cancels (no provider id yet -> local cancel) while the call is in flight.
+      await cancelDeliveryForOrder(orderId);
+      return json(track());
+    };
+    const rec = await dispatchDelivery(dispatchInput(orderId));
+    expect(rec.status).toBe("canceled");
+    const c = calls.find((x) => x.url.includes("/cancel"))!;
+    expect(c.url).toBe(`${DRIVER}/deliveries/drv_1/cancel`);
+    expect(err.mock.calls.some((x) => String(x[0]).includes("[pos][ALERT]"))).toBe(true);
+  });
+
+  it("the post-dispatch CAS loses to a manual switch: the driver delivery is canceled", async () => {
+    const orderId = await seedOrder();
+    alerts();
+    dispatchReply = async () => {
+      const r = (await getPosDriver().getDeliveryForOrder(orderId))!;
+      await getPosDriver().switchDeliveryToManual(r.id, T, { status: "quoted", provider_delivery_id: null });
+      return json(track());
+    };
+    const rec = await dispatchDelivery(dispatchInput(orderId));
+    expect(rec.provider).toBe("in_house_manual");
+    expect(calls.some((x) => x.url.includes("/cancel"))).toBe(true);
+  });
+
+  it("a stale copy is re-read right before the call: switched-to-manual or canceled rows are not sent", async () => {
+    const orderId = await seedOrder();
+    dispatchReply = () => problem(503, "UNAVAILABLE");
+    const stale = await dispatchDelivery(dispatchInput(orderId));
+    await getPosDriver().switchDeliveryToManual(stale.id, T, { status: "quoted", provider_delivery_id: null });
+    dispatchReply = () => json(track());
+    const out = await attemptDriverDispatch(stale);
+    expect(out.provider).toBe("in_house_manual");
+    expect(driverCalls()).toHaveLength(1);
+  });
+
+  it("the hub token request has a 5 s abort signal", async () => {
+    await pickProvider(T, L).catch(() => undefined);
+    await setProviders(["openpizza_driver", "in_house_manual"]);
+    resetDriverHubCache();
+    await pickProvider(T, L);
+    const tok = calls.find((c) => c.url === `${HUB}/oauth/token`)!;
+    expect(tok.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("a hub failure is cached as none for 30 s (one hub call, not one per quote)", async () => {
+    await setProviders(["openpizza_driver", "in_house_manual"]);
+    providersReply = () => problem(503, "UNAVAILABLE");
+    for (let i = 0; i < 3; i++) expect(await pickProvider(T, L)).toBe("in_house_manual");
+    expect(calls.filter((c) => c.url.startsWith(`${HUB}/v1/providers`))).toHaveLength(1);
+  });
+
+  it("a driver 409 IDEMPOTENCY_CONFLICT means it HAS the delivery: adopt it via GET by our id", async () => {
+    const orderId = await seedOrder();
+    dispatchReply = () => problem(409, "IDEMPOTENCY_CONFLICT");
+    trackReply = () => json(track({ provider_delivery_id: "drv_9", status: "assigned" }));
+    const rec = await dispatchDelivery(dispatchInput(orderId));
+    expect(rec).toMatchObject({ status: "assigned", provider_delivery_id: "drv_9" });
+    const get = calls.find((c) => c.method === "GET" && c.url.startsWith(`${DRIVER}/deliveries/`))!;
+    expect(get.url).toBe(`${DRIVER}/deliveries/${rec.id}`);
+  });
+
+  it("an idempotency conflict that cannot be read back is retried, never failed", async () => {
+    const orderId = await seedOrder();
+    dispatchReply = () => problem(409, "IDEMPOTENCY_CONFLICT");
+    trackReply = () => problem(503, "UNAVAILABLE");
+    const rec = await dispatchDelivery(dispatchInput(orderId));
+    expect(rec.status).toBe("quoted");
+  });
+
+  it("the sweep honors its total time budget", async () => {
+    const orderId = await seedOrder();
+    dispatchReply = () => problem(503, "UNAVAILABLE");
+    await dispatchDelivery(dispatchInput(orderId));
+    const n = driverCalls().length;
+    const s = await sweepDriverDispatches(new Date(Date.now() + 61_000), 10, 0);
+    expect(s.retried).toBe(0);
+    expect(driverCalls()).toHaveLength(n);
   });
 });

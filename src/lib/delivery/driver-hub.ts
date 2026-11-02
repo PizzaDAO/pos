@@ -22,6 +22,12 @@ import { captureError } from "@/lib/observability";
 export const DRIVER_KEY = "openpizza_driver";
 export const REGISTRATION_TTL_MS = 60_000;
 const HUB_TIMEOUT_MS = 5_000;
+/** A hub registration/token failure is remembered (as "none") this long. */
+export const FAILURE_TTL_MS = 30_000;
+
+/** Global fetch with a hard timeout (the token source has none of its own). */
+const timeoutFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, signal: AbortSignal.timeout(HUB_TIMEOUT_MS) });
 
 export interface DriverHubConfig {
   hubUrl: string;
@@ -68,6 +74,7 @@ export function hubTokenFor(
       clientSecret: cfg.clientSecret,
       tenantId,
       scope: "deliveries:write providers:read",
+      fetch: timeoutFetch,
     });
     src = async () => {
       try {
@@ -96,7 +103,7 @@ export interface DriverRegistration {
 
 const registrations = new Map<
   string,
-  { at: number; value: DriverRegistration | null }
+  { at: number; ttl: number; value: DriverRegistration | null }
 >();
 
 /** Test hook: forget cached tokens and registrations. */
@@ -129,22 +136,30 @@ export async function lookupDriverRegistration(
 ): Promise<DriverRegistration | null> {
   const key = `${cfg.hubUrl}|${tenantId}`;
   const hit = registrations.get(key);
-  if (hit && now - hit.at < REGISTRATION_TTL_MS) return hit.value;
+  if (hit && now - hit.at < hit.ttl) return hit.value;
 
-  const token = await hubTokenFor(tenantId, cfg)();
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), HUB_TIMEOUT_MS);
-  let res: Response;
+  let json: unknown;
   try {
-    res = await fetchImpl(`${cfg.hubUrl}/v1/providers?kind=delivery`, {
-      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-      signal: ctrl.signal,
-    });
-  } finally {
-    clearTimeout(timer);
+    const token = await hubTokenFor(tenantId, cfg)();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HUB_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetchImpl(`${cfg.hubUrl}/v1/providers?kind=delivery`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        signal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) throw new Error(`hub providers.list failed: HTTP ${res.status}`);
+    json = await res.json().catch(() => null);
+  } catch (err) {
+    // Remember the failure as "none" for 30 s so a down hub is not hammered by
+    // every quote and retry. The first caller still sees the error.
+    registrations.set(key, { at: now, ttl: FAILURE_TTL_MS, value: null });
+    throw err;
   }
-  if (!res.ok) throw new Error(`hub providers.list failed: HTTP ${res.status}`);
-  const json: unknown = await res.json().catch(() => null);
   const found = rows(json).find((r) => {
     const o = r as Record<string, unknown>;
     return (
@@ -168,7 +183,7 @@ export async function lookupDriverRegistration(
       /* not a URL: unavailable */
     }
   }
-  registrations.set(key, { at: now, value });
+  registrations.set(key, { at: now, ttl: REGISTRATION_TTL_MS, value });
   return value;
 }
 

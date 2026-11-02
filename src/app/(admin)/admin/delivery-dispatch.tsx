@@ -104,8 +104,8 @@ export function DeliveryDispatch({
           </p>
         ) : (
           <ul className="space-y-3">
-            {rows.map(({ delivery, orderNumber }) => {
-              const attention = driverAttention(delivery);
+            {rows.map(({ delivery, orderNumber, orderStatus }) => {
+              const attention = driverAttention(delivery, Date.now(), orderStatus);
               return (
                 <li key={delivery.id} className="rounded-xl border p-4 text-sm">
                   <div className="flex items-center justify-between">

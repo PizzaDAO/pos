@@ -405,6 +405,8 @@ export const DRIVER_RETRY_MIN_AGE_MS = 30_000;
 /** After this long without a confirmed dispatch the record is failed (and alerted). */
 export const DRIVER_GIVE_UP_MS = 15 * 60_000;
 /** The manual-fallback button is held this long on a record with no provider id. */
+/** Total wall-clock budget of one sweep (the cron has maxDuration 60 s). */
+export const DRIVER_SWEEP_BUDGET_MS = 20_000;
 export const DRIVER_MANUAL_HOLD_MS = 2 * 60_000;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_MAX_MS = 5 * 60_000;
@@ -537,6 +539,17 @@ export async function attemptDriverDispatch(
   if (!provider)
     return failDriverDispatch(record, attempts, "provider not registered");
 
+  // Re-read right before calling out: a person may have switched it to manual, or
+  // the order may have been canceled, since this copy was read.
+  const fresh = await driver.getDelivery(record.id);
+  if (
+    !fresh ||
+    fresh.provider !== "openpizza_driver" ||
+    fresh.status !== "quoted"
+  ) {
+    return fresh ?? record;
+  }
+
   const payload = await buildDriverPayload(record);
   if (!payload) {
     return failDriverDispatch(record, attempts, "order or location not found");
@@ -579,6 +592,33 @@ export async function attemptDriverDispatch(
     // that newer status), or a person switched it. Fill in the ids only if still
     // missing on a live driver record.
     const cur = res.delivery;
+    if (
+      !cur ||
+      cur.provider !== "openpizza_driver" ||
+      cur.status === "canceled" ||
+      cur.status === "failed"
+    ) {
+      // The driver accepted a delivery POS no longer wants (canceled, failed, or
+      // switched to manual meanwhile): cancel it there so no courier is sent twice.
+      console.error(
+        `[pos][ALERT] driver accepted delivery ${record.id} (driver id ${result.deliveryId}) after POS moved on (${cur ? `${cur.provider}/${cur.status}` : "row gone"}); canceling it at the driver`,
+      );
+      try {
+        await provider.cancel(
+          {
+            tenantId: record.tenant_id,
+            locationId: record.location_id,
+            idempotencyKey: record.id,
+          },
+          result.deliveryId,
+        );
+      } catch (cancelErr) {
+        console.error(
+          `[pos][ALERT] could not cancel orphaned driver delivery ${result.deliveryId} for ${record.id}: ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`,
+        );
+      }
+      return cur ?? record;
+    }
     if (
       cur &&
       cur.provider === "openpizza_driver" &&
@@ -634,12 +674,16 @@ export interface DriverSweepSummary {
  */
 export async function sweepDriverDispatches(
   now: Date = new Date(),
-  limit = 25,
+  limit = 10,
+  budgetMs = DRIVER_SWEEP_BUDGET_MS,
 ): Promise<DriverSweepSummary> {
   const driver = getPosDriver();
   const summary: DriverSweepSummary = { retried: 0, dispatched: 0, failed: 0 };
+  const startedAt = Date.now();
   const due = await driver.listDriverDispatchRetries(now.toISOString(), limit);
   for (const rec of due) {
+    // Total time budget: each driver call can take its full timeout.
+    if (Date.now() - startedAt >= budgetMs) break;
     if (rec.provider_delivery_id !== null) continue;
     const age = now.getTime() - new Date(rec.created_at).getTime();
     try {
@@ -653,11 +697,11 @@ export async function sweepDriverDispatches(
         continue;
       }
       if (age < DRIVER_RETRY_MIN_AGE_MS) continue;
+      // Switched off (rollback): do not call out (and do not count it); the
+      // record ages to `failed`.
+      if (!isDriverTenant(rec.tenant_id)) continue;
       summary.retried += 1;
-      // Switched off (rollback): do not call out; the record ages to `failed`.
-      const next = isDriverTenant(rec.tenant_id)
-        ? await attemptDriverDispatch(rec)
-        : rec;
+      const next = await attemptDriverDispatch(rec);
       if (next.status === "failed") summary.failed += 1;
       else if (next.status !== "quoted") summary.dispatched += 1;
     } catch (err) {
@@ -703,7 +747,9 @@ export async function dispatchManuallyInstead(
     reason: "not_allowed",
     message,
   });
-  if (rec.provider_delivery_id === null) {
+  if (rec.status === "failed") {
+    // The driver reported it failed (or the dispatch failed): safe to hand over.
+  } else if (rec.provider_delivery_id === null) {
     if (rec.status === "quoted") {
       const age = now.getTime() - new Date(rec.created_at).getTime();
       if (age < DRIVER_MANUAL_HOLD_MS) {
@@ -711,7 +757,7 @@ export async function dispatchManuallyInstead(
           "The driver may still accept this delivery; wait 2 minutes before switching.",
         );
       }
-    } else if (rec.status !== "failed") {
+    } else {
       return refuse(`The delivery is ${rec.status}; it cannot be switched.`);
     }
   } else if (rec.status !== "canceled") {
@@ -720,7 +766,10 @@ export async function dispatchManuallyInstead(
     );
   }
   const order = await driver.getOrder(rec.order_id);
-  if (!order || order.status === "voided" || order.status === "completed") {
+  if (
+    !order ||
+    ["voided", "completed", "refunded", "abandoned"].includes(order.status)
+  ) {
     return refuse("The order is no longer open for delivery.");
   }
   const switched = await driver.switchDeliveryToManual(rec.id, rec.tenant_id, {
