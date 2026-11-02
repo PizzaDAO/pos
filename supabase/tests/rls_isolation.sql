@@ -419,7 +419,7 @@ end $$;
 
 -- 17) A signed-in CUSTOMER cannot insert an order (even their own, in a tenant
 --     where they are a customer): online orders are written server-side after
---     repricing. A tenant member still can.
+--     repricing (by the service role).
 select pg_temp.act_as('c0a00001-0000-0000-0000-000000000001');
 do $$
 declare blocked boolean := false;
@@ -445,18 +445,23 @@ begin
   assert n = 0, format('Blocked customer order insert must leave no row, found %s', n);
 end $$;
 
+-- A tenant member cannot insert one either (20261112000000, audit H1): every
+-- order write goes through the service-role driver.
 select pg_temp.act_as('11111111-1111-1111-1111-111111111111');
 do $$
-declare n int;
+declare blocked boolean := false;
 begin
-  insert into public.orders
-    (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
-  values
-    ('0ada7777-0000-0000-0000-000000000078', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
-     'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'placed', 'in_store', 'USD', 0,
-     '{"total_cents":1}'::jsonb, 'MEMBEROK');
-  select count(*) into n from public.orders where order_number = 'MEMBEROK';
-  assert n = 1, 'a tenant member must still be able to insert an order';
+  begin
+    insert into public.orders
+      (id, tenant_id, location_id, status, channel, currency, discount_cents, totals, order_number)
+    values
+      ('0ada7777-0000-0000-0000-000000000078', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+       'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1', 'placed', 'in_store', 'USD', 0,
+       '{"total_cents":1}'::jsonb, 'MEMBERHACK');
+  exception when insufficient_privilege then
+    blocked := true;
+  end;
+  assert blocked, 'a tenant member must NOT be able to insert an order directly';
 end $$;
 reset role;
 

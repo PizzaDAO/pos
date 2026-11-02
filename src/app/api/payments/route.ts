@@ -48,6 +48,11 @@ import {
   onlineRailAvailable,
 } from "@/lib/payments/online-rails";
 import { cardRailsSimulated } from "@/lib/payments/env";
+import {
+  ONLINE_PAYMENT_UNAVAILABLE_CODE,
+  ONLINE_PAYMENT_UNAVAILABLE_MESSAGE,
+  onlinePaymentAllowed,
+} from "@/lib/shop/training-online";
 import { closeOpenCardTender } from "@/lib/payments/terminal/flow";
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 
@@ -286,6 +291,18 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { error: "That payment method is not available right now." },
         { status: 409 },
+      );
+    }
+    // Training on a live database: a simulated online tender would mark a real
+    // storefront's order paid for free (audit H3). Refused unless the tenant is
+    // the demo tenant or in TRAINING_ONLINE_TENANTS (src/lib/shop/training-online).
+    if (!onlinePaymentAllowed(tenantId, body.rail)) {
+      return NextResponse.json(
+        {
+          error: ONLINE_PAYMENT_UNAVAILABLE_MESSAGE,
+          code: ONLINE_PAYMENT_UNAVAILABLE_CODE,
+        },
+        { status: 503 },
       );
     }
     // Exactly one rail is live per order: every OTHER open tender (card intent,

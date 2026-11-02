@@ -13,6 +13,7 @@ import { getPosDriver } from "@/lib/db";
 import { isCardReady } from "@/lib/payments/connect";
 import { onlineRailAvailable } from "@/lib/payments/online-rails";
 import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
+import { onlinePaymentAllowed } from "@/lib/shop/training-online";
 
 export const runtime = "nodejs";
 
@@ -47,12 +48,19 @@ export async function GET(request: Request) {
       menu,
       settings,
       paymentSettings,
-      cardReady,
+      // A rail the training gate refuses (simulated on a live database, audit
+      // H3) is reported not ready, so the storefront hides it.
+      cardReady:
+        cardReady && onlinePaymentAllowed(location.tenant_id, "stripe_online"),
       // Unconfigured crypto rails are hidden (they would simulate; the payments
       // route refuses them unless the whole environment is a simulation).
       cryptoReady: {
-        crypto_onchain_usdc: onlineRailAvailable("crypto_onchain_usdc"),
-        crypto_coinbase: onlineRailAvailable("crypto_coinbase"),
+        crypto_onchain_usdc:
+          onlineRailAvailable("crypto_onchain_usdc") &&
+          onlinePaymentAllowed(location.tenant_id, "crypto_onchain_usdc"),
+        crypto_coinbase:
+          onlineRailAvailable("crypto_coinbase") &&
+          onlinePaymentAllowed(location.tenant_id, "crypto_coinbase"),
       },
       driver: driver.name,
     },
