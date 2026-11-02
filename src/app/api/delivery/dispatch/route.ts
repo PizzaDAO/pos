@@ -9,6 +9,14 @@
  *   Assigns a driver to an in-house delivery (pending_assignment → assigned) and
  *   flips the order to `out_for_delivery` (surfaces on the KDS + customer tracker).
  *
+ *   An `openpizza_driver` delivery is refused (409): its state comes from the
+ *   driver module, and a hand-assignment would fork it.
+ *
+ * POST /api/delivery/dispatch  body: { deliveryId, action: "dispatchManually" }
+ *   "Dispatch manually instead": the explicit, manager-only fallback that turns
+ *   an `openpizza_driver` delivery into an in-house one (`pending_assignment`).
+ *   Refused while the driver may still be carrying it. Never automatic.
+ *
  * Auth: owner|manager (admin surface) of the tenant. Assignment resolves the
  * delivery first and authorizes against ITS tenant.
  *
@@ -16,7 +24,11 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { assignDriver } from "@/lib/delivery/service";
+import {
+  DeliveryNotAssignableError,
+  assignDriver,
+  dispatchManuallyInstead,
+} from "@/lib/delivery/service";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 
 export const runtime = "nodejs";
@@ -61,6 +73,14 @@ function isValid(body: unknown): body is AssignBody {
   return typeof b.deliveryId === "string" && typeof b.driverName === "string";
 }
 
+function isManualSwitch(
+  body: unknown,
+): body is { deliveryId: string; action: "dispatchManually" } {
+  if (!body || typeof body !== "object") return false;
+  const b = body as Record<string, unknown>;
+  return typeof b.deliveryId === "string" && b.action === "dispatchManually";
+}
+
 export async function POST(request: Request) {
   let body: unknown;
   try {
@@ -68,7 +88,7 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
-  if (!isValid(body)) {
+  if (!isValid(body) && !isManualSwitch(body)) {
     return NextResponse.json(
       { error: "deliveryId and driverName are required." },
       { status: 422 },
@@ -85,11 +105,29 @@ export async function POST(request: Request) {
   const auth = await requireTenantAccess(existing.tenant_id, "admin");
   if (!auth.ok) return auth.res;
 
-  const updated = await assignDriver({
-    deliveryId: body.deliveryId,
-    driverName: body.driverName,
-    driverPhone: body.driverPhone,
-  });
+  if (isManualSwitch(body)) {
+    const res = await dispatchManuallyInstead(body.deliveryId);
+    if (!res.ok) {
+      const status =
+        res.reason === "not_found" ? 404 : res.reason === "not_driver" ? 422 : 409;
+      return NextResponse.json({ error: res.message }, { status });
+    }
+    return NextResponse.json({ delivery: res.delivery });
+  }
+
+  let updated;
+  try {
+    updated = await assignDriver({
+      deliveryId: body.deliveryId,
+      driverName: body.driverName,
+      driverPhone: body.driverPhone,
+    });
+  } catch (err) {
+    if (err instanceof DeliveryNotAssignableError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
+    throw err;
+  }
   if (!updated) {
     return NextResponse.json({ error: "Delivery not found." }, { status: 404 });
   }

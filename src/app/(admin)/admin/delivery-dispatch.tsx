@@ -13,6 +13,7 @@ import { Truck } from "lucide-react";
 import type { DeliveryRecord } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
+import { driverAttention } from "@/lib/delivery/attention";
 
 interface Row {
   delivery: DeliveryRecord;
@@ -30,6 +31,7 @@ export function DeliveryDispatch({
   const [rows, setRows] = useState<Row[]>([]);
   const [draftDriver, setDraftDriver] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!tenantId || !locationId) return;
@@ -64,6 +66,25 @@ export function DeliveryDispatch({
     }
   }
 
+  async function dispatchManually(deliveryId: string) {
+    setBusy(deliveryId);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/delivery/dispatch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deliveryId, action: "dispatchManually" }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setNotice(data.error ?? "Could not switch this delivery.");
+      }
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <section className="border-t p-6">
       <div className="mx-auto max-w-3xl">
@@ -71,76 +92,102 @@ export function DeliveryDispatch({
           <Truck className="h-5 w-5" />
           <h2 className="text-lg font-bold">Delivery dispatch (in-house)</h2>
         </div>
+        {notice && (
+          <p role="alert" className="mb-3 text-sm text-destructive">
+            {notice}
+          </p>
+        )}
         {rows.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            No deliveries yet. Place an online delivery order from the shop to see
-            it here.
+            No deliveries yet. Place an online delivery order from the shop to
+            see it here.
           </p>
         ) : (
           <ul className="space-y-3">
-            {rows.map(({ delivery, orderNumber }) => (
-              <li
-                key={delivery.id}
-                className="rounded-xl border p-4 text-sm"
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="font-semibold">
-                      Order {orderNumber ?? delivery.order_id.slice(0, 8)}
-                    </span>
-                    <span className="ml-2 rounded-full bg-secondary px-2 py-0.5 text-xs capitalize text-secondary-foreground">
-                      {delivery.status.replace(/_/g, " ")}
-                    </span>
-                  </div>
-                  <span className="text-muted-foreground">
-                    {formatMoney(delivery.fee_cents, delivery.currency)}
-                    {delivery.eta_minutes != null &&
-                      ` · ~${delivery.eta_minutes} min`}
-                  </span>
-                </div>
-                <p className="mt-1 text-muted-foreground">
-                  {delivery.dropoff.line1}, {delivery.dropoff.city}{" "}
-                  {delivery.dropoff.postal_code} · via{" "}
-                  {delivery.provider.replace(/_/g, " ")}
-                  {delivery.simulated && " (simulated)"}
-                </p>
-
-                {delivery.status === "pending_assignment" ? (
-                  <div className="mt-3 flex gap-2">
-                    <input
-                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm"
-                      placeholder="Driver name"
-                      value={draftDriver[delivery.id] ?? ""}
-                      onChange={(e) =>
-                        setDraftDriver((d) => ({
-                          ...d,
-                          [delivery.id]: e.target.value,
-                        }))
-                      }
-                    />
-                    <Button
-                      size="sm"
-                      disabled={
-                        busy === delivery.id ||
-                        !(draftDriver[delivery.id] ?? "").trim()
-                      }
-                      onClick={() => assign(delivery.id)}
-                    >
-                      Assign driver
-                    </Button>
-                  </div>
-                ) : (
-                  delivery.driver_name && (
-                    <p className="mt-2 text-xs">
-                      Driver:{" "}
-                      <span className="font-medium">
-                        {delivery.driver_name}
+            {rows.map(({ delivery, orderNumber }) => {
+              const attention = driverAttention(delivery);
+              return (
+                <li key={delivery.id} className="rounded-xl border p-4 text-sm">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="font-semibold">
+                        Order {orderNumber ?? delivery.order_id.slice(0, 8)}
                       </span>
-                    </p>
-                  )
-                )}
-              </li>
-            ))}
+                      <span className="ml-2 rounded-full bg-secondary px-2 py-0.5 text-xs capitalize text-secondary-foreground">
+                        {delivery.status.replace(/_/g, " ")}
+                      </span>
+                    </div>
+                    <span className="text-muted-foreground">
+                      {formatMoney(delivery.fee_cents, delivery.currency)}
+                      {delivery.eta_minutes != null &&
+                        ` · ~${delivery.eta_minutes} min`}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-muted-foreground">
+                    {delivery.dropoff.line1}, {delivery.dropoff.city}{" "}
+                    {delivery.dropoff.postal_code} · via{" "}
+                    {delivery.provider.replace(/_/g, " ")}
+                    {delivery.simulated && " (simulated)"}
+                  </p>
+
+                  {attention.reason && (
+                    <div className="mt-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-xs">
+                      <span className="mr-2 rounded-full bg-amber-500/20 px-2 py-0.5 font-semibold text-amber-800">
+                        Needs attention
+                      </span>
+                      {attention.reason}
+                      {attention.canDispatchManually && (
+                        <div className="mt-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={busy === delivery.id}
+                            onClick={() => void dispatchManually(delivery.id)}
+                          >
+                            Dispatch manually instead
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {delivery.status === "pending_assignment" ? (
+                    <div className="mt-3 flex gap-2">
+                      <input
+                        className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm"
+                        placeholder="Driver name"
+                        value={draftDriver[delivery.id] ?? ""}
+                        onChange={(e) =>
+                          setDraftDriver((d) => ({
+                            ...d,
+                            [delivery.id]: e.target.value,
+                          }))
+                        }
+                      />
+                      <Button
+                        size="sm"
+                        disabled={
+                          busy === delivery.id ||
+                          !(draftDriver[delivery.id] ?? "").trim()
+                        }
+                        onClick={() => assign(delivery.id)}
+                      >
+                        Assign driver
+                      </Button>
+                    </div>
+                  ) : (
+                    delivery.driver_name && (
+                      <p className="mt-2 text-xs">
+                        Driver:{" "}
+                        <span className="font-medium">
+                          {delivery.driver_name}
+                        </span>
+                      </p>
+                    )
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>

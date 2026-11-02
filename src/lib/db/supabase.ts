@@ -414,6 +414,9 @@ function mapDelivery(r: Row): DeliveryRecord {
     driver_name: (r.driver_name as string | null) ?? null,
     driver_phone: (r.driver_phone as string | null) ?? null,
     simulated: r.simulated as boolean,
+    dispatch_attempts: (r.dispatch_attempts as number | null) ?? 0,
+    dispatch_error: (r.dispatch_error as string | null) ?? null,
+    dispatch_next_at: (r.dispatch_next_at as string | null) ?? null,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -2932,6 +2935,77 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       ) as Row | null;
       if (!cur) return { ok: false, reason: "not_found" } as const;
       return { ok: false, reason: "terminal", delivery: mapDelivery(cur) } as const;
+    },
+
+    async updateDriverDispatch(id, tenantId, u) {
+      const { expect_status, ...rest } = u;
+      const changes: Row = { updated_at: nowIso() };
+      for (const [k, v] of Object.entries(rest)) {
+        if (v !== undefined) changes[k] = v;
+      }
+      // ONE conditional UPDATE: still this provider's and still `expect_status`.
+      const updated = unwrap(
+        await sb
+          .from("deliveries")
+          .update(changes)
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .eq("provider", "openpizza_driver")
+          .eq("status", expect_status)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      if (updated) return { ok: true, delivery: mapDelivery(updated) } as const;
+      const cur = unwrap(
+        await sb
+          .from("deliveries")
+          .select("*")
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .maybeSingle(),
+      ) as Row | null;
+      return { ok: false, delivery: cur ? mapDelivery(cur) : null } as const;
+    },
+
+    async switchDeliveryToManual(id, tenantId, expect) {
+      let q = sb
+        .from("deliveries")
+        .update({
+          provider: "in_house_manual",
+          status: "pending_assignment",
+          provider_delivery_id: null,
+          tracking_ref: null,
+          driver_name: null,
+          driver_phone: null,
+          dispatch_error: null,
+          dispatch_next_at: null,
+          updated_at: nowIso(),
+        })
+        .eq("id", id)
+        .eq("tenant_id", tenantId)
+        .eq("provider", "openpizza_driver")
+        .eq("status", expect.status);
+      q =
+        expect.provider_delivery_id === null
+          ? q.is("provider_delivery_id", null)
+          : q.eq("provider_delivery_id", expect.provider_delivery_id);
+      const r = unwrap(await q.select().maybeSingle()) as Row | null;
+      return r ? mapDelivery(r) : null;
+    },
+
+    async listDriverDispatchRetries(now, limit) {
+      return (
+        unwrap(
+          await sb
+            .from("deliveries")
+            .select("*")
+            .eq("provider", "openpizza_driver")
+            .eq("status", "quoted")
+            .or(`dispatch_next_at.is.null,dispatch_next_at.lte.${now}`)
+            .order("created_at", { ascending: true })
+            .limit(limit),
+        ) as Row[]
+      ).map(mapDelivery);
     },
 
     async getDeliveryForOrder(orderId) {

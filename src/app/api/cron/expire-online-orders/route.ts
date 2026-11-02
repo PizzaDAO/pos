@@ -19,6 +19,7 @@ import { expireHeldOrders, expireOnlineOrders } from "@/lib/shop/lifecycle";
 import { usingMockDriver } from "@/lib/payments/env";
 import { reconcileTerminalTenders } from "@/lib/payments/terminal/flow";
 import { captureError } from "@/lib/observability";
+import { sweepDriverDispatches } from "@/lib/delivery/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -41,6 +42,13 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
   const summary = await expireOnlineOrders();
+  // Open Pizza Driver dispatches that were not confirmed (driver or hub down):
+  // retry with the same idempotency key, give up after 15 minutes. A no-op when
+  // no driver delivery is waiting. Failure here must not fail the sweep.
+  const driverDispatch = await sweepDriverDispatches().catch((err) => {
+    captureError(err, { scope: "driver-dispatch-sweep-cron" });
+    return null;
+  });
   // Stored /v1 quotes long past their validity window.
   const quotesPruned = await getPosDriver()
     .pruneExpiredQuotes(new Date(startedAt - 60 * 60_000).toISOString())
@@ -68,7 +76,7 @@ export async function GET(request: Request) {
     return null;
   });
   return NextResponse.json(
-    { ...summary, held, quotesPruned, terminal },
+    { ...summary, held, quotesPruned, terminal, driverDispatch },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

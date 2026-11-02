@@ -10,10 +10,14 @@
  * Implementations land in Phase 4. Do not add provider SDKs here yet.
  */
 
+import type { DeliveryDispatchRequest } from "@openpizza/core";
 import type { Money } from "@/lib/payments/PaymentRail";
 
 /** Stable identifiers for the delivery providers the platform supports. */
-export type DeliveryProviderKey = "in_house_manual" | "doordash_drive" | "openpizza_driver";
+export type DeliveryProviderKey =
+  | "in_house_manual"
+  | "doordash_drive"
+  | "openpizza_driver";
 
 export interface Address {
   line1: string;
@@ -72,6 +76,14 @@ export interface DispatchRequest {
   /** Quote handle from a prior `quote()` call, when the provider requires one. */
   quoteId?: string;
   scheduledFor?: string;
+  /**
+   * The POS delivery record id, for providers that report back by it (the
+   * `openpizza_driver` module pushes status to `/v1/deliveries/{id}/status`).
+   * Other providers ignore it.
+   */
+  deliveryId?: string;
+  /** A pre-built contract dispatch body (`openpizza_driver`); others ignore it. */
+  payload?: DeliveryDispatchRequest;
 }
 
 export interface Delivery {
@@ -93,6 +105,13 @@ export interface Delivery {
  */
 export interface DeliveryProvider {
   readonly key: DeliveryProviderKey;
+
+  /**
+   * Optional gate. When present, `pickProvider` skips the provider unless this
+   * resolves true (e.g. the driver module is switched on AND reachable for the
+   * tenant). Providers without it are available once registered.
+   */
+  available?(tenantId: string, locationId: string): Promise<boolean>;
 
   /** Price a delivery for the given pickup/dropoff (and optional schedule). */
   quote(req: DeliveryQuoteRequest): Promise<DeliveryQuote>;

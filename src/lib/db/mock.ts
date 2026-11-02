@@ -2170,6 +2170,62 @@ export const mockDriver: PosDriver = {
     return { ok: true, delivery: next };
   },
 
+  async updateDriverDispatch(id, tenantId, u) {
+    const cur = deliveries.get(id);
+    if (!cur || cur.tenant_id !== tenantId) return { ok: false, delivery: null };
+    if (cur.provider !== "openpizza_driver" || cur.status !== u.expect_status) {
+      return { ok: false, delivery: cur };
+    }
+    const { expect_status: _expect, ...changes } = u;
+    void _expect;
+    const next: DeliveryRecord = { ...cur, updated_at: nowIso() };
+    for (const [k, v] of Object.entries(changes)) {
+      if (v !== undefined) (next as unknown as Record<string, unknown>)[k] = v;
+    }
+    deliveries.set(id, next);
+    return { ok: true, delivery: next };
+  },
+
+  async switchDeliveryToManual(id, tenantId, expect) {
+    const cur = deliveries.get(id);
+    if (
+      !cur ||
+      cur.tenant_id !== tenantId ||
+      cur.provider !== "openpizza_driver" ||
+      cur.status !== expect.status ||
+      cur.provider_delivery_id !== expect.provider_delivery_id
+    ) {
+      return null;
+    }
+    const next: DeliveryRecord = {
+      ...cur,
+      provider: "in_house_manual",
+      status: "pending_assignment",
+      provider_delivery_id: null,
+      tracking_ref: null,
+      driver_name: null,
+      driver_phone: null,
+      eta_minutes: cur.eta_minutes,
+      dispatch_error: null,
+      dispatch_next_at: null,
+      updated_at: nowIso(),
+    };
+    deliveries.set(id, next);
+    return next;
+  },
+
+  async listDriverDispatchRetries(nowIso: string, limit: number) {
+    return [...deliveries.values()]
+      .filter(
+        (d) =>
+          d.provider === "openpizza_driver" &&
+          d.status === "quoted" &&
+          (!d.dispatch_next_at || d.dispatch_next_at <= nowIso),
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .slice(0, limit);
+  },
+
   async getDeliveryForOrder(orderId: string): Promise<DeliveryRecord | null> {
     for (const d of deliveries.values()) {
       if (d.order_id === orderId) return d;

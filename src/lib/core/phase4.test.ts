@@ -493,20 +493,22 @@ describe("phone keys and country", () => {
 
 // ---------------------------------------------------------------------------
 describe("openpizza_driver delivery provider", () => {
-  it("is registered and dispatches as 'dispatched' with no outbound call or tracking", async () => {
+  it("is registered, inert by default (gated), and needs a record id + payload to dispatch", async () => {
     const { getDeliveryProvider, isDeliveryProviderAvailable } = await import("@/lib/delivery/registry");
     await import("@/lib/delivery/providers");
     expect(isDeliveryProviderAvailable("openpizza_driver")).toBe(true);
     const p = getDeliveryProvider("openpizza_driver")!;
+    // No OPENPIZZA_DRIVER_TENANTS / hub env: never available, never calls out.
+    expect(await p.available!(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID)).toBe(false);
     const a = { line1: "a", city: "b", region: "c", postalCode: "1", country: "US" };
-    const d = await p.dispatch({
-      context: { tenantId: DEMO_TENANT_ID, locationId: DEMO_LOCATION_DOWNTOWN_ID, idempotencyKey: "k" },
-      orderId: "o1",
-      pickup: a,
-      dropoff: a,
-    });
-    expect(d.status).toBe("dispatched");
-    expect(d.trackingRef).toBeUndefined();
+    await expect(
+      p.dispatch({
+        context: { tenantId: DEMO_TENANT_ID, locationId: DEMO_LOCATION_DOWNTOWN_ID, idempotencyKey: "k" },
+        orderId: "o1",
+        pickup: a,
+        dropoff: a,
+      }),
+    ).rejects.toMatchObject({ retryable: false });
     const { mapToRecordStatus } = await import("@/lib/delivery/service");
     expect(mapToRecordStatus("openpizza_driver", "dispatched")).toBe("dispatched");
   });
