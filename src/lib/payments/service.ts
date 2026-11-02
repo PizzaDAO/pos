@@ -137,11 +137,23 @@ async function listOrderCurrencyPayments(order: Order): Promise<Payment[]> {
   return all.filter((p) => p.currency.toUpperCase() === cur);
 }
 
+/**
+ * Pure balance rule behind `getOrderBalance`: amount due minus covering tenders
+ * in the ORDER's currency (never negative).
+ */
+export function orderBalanceFromPayments(
+  order: Order,
+  all: Payment[],
+): number {
+  const cur = order.currency.toUpperCase();
+  const payments = all.filter((p) => p.currency.toUpperCase() === cur);
+  return Math.max(0, orderDueCents(order) - coveredCents(payments));
+}
+
 /** Remaining unpaid balance on an order, in cents (never negative). */
 export async function getOrderBalance(order: Order): Promise<number> {
-  const payments = await listOrderCurrencyPayments(order);
-  const balance = orderDueCents(order) - coveredCents(payments);
-  return Math.max(0, balance);
+  const payments = await getPosDriver().listPaymentsForOrder(order.id);
+  return orderBalanceFromPayments(order, payments);
 }
 
 /**

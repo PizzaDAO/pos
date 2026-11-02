@@ -140,6 +140,12 @@ export function ReceiptView({
           </div>
         )}
 
+        {r.refundedCents > 0 && !r.fullyRefunded && (
+          <div className="mt-3 flex justify-between font-bold text-red-700">
+            <span>Refunded</span>
+            <span>{formatMoney(r.refundedCents, c)}</span>
+          </div>
+        )}
         {r.fullyRefunded ? (
           <div className="mt-3 text-center text-sm font-bold uppercase text-red-700">
             Refunded

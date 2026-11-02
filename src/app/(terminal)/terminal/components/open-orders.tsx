@@ -7,55 +7,38 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { X } from "lucide-react";
-import type { Order } from "@/lib/db";
+import type { OrderStatus } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { formatMoney } from "@/lib/pricing";
 import { statusLabel } from "@/lib/kds/status";
 
 export interface OpenOrder {
-  order: Order;
+  id: string;
+  order_number: string;
+  status: OrderStatus;
+  currency: string;
   balanceCents: number;
 }
 
-const OPEN_STATUSES = new Set(["placed", "in_kitchen", "ready", "recall"]);
-const MAX_ORDERS = 15;
-
-/** Unpaid in-store orders for a location (polled; refresh() after paying). */
+/** Unpaid in-store orders for a location (one server call, polled; refresh() after paying). */
 export function useOpenOrders(
-  tenantId: string,
-  locationId: string,
-  pollMs = 20_000,
+  tenantId: string | undefined,
+  locationId: string | undefined,
+  pollMs = 30_000,
 ) {
   const [open, setOpen] = useState<OpenOrder[]>([]);
 
   const refresh = useCallback(async () => {
+    if (!tenantId || !locationId) return;
     try {
       const res = await fetch(
-        `/api/orders?tenantId=${encodeURIComponent(tenantId)}&locationId=${encodeURIComponent(locationId)}`,
+        `/api/orders/open?tenantId=${encodeURIComponent(tenantId)}&locationId=${encodeURIComponent(locationId)}`,
+        { cache: "no-store" },
       );
       if (!res.ok) return;
-      const { orders } = (await res.json()) as { orders: Order[] };
-      const candidates = orders
-        .filter((o) => o.channel === "in_store" && OPEN_STATUSES.has(o.status))
-        .slice(0, MAX_ORDERS);
-      const withBalance = await Promise.all(
-        candidates.map(async (order): Promise<OpenOrder | null> => {
-          try {
-            const r = await fetch(
-              `/api/payments?orderId=${encodeURIComponent(order.id)}`,
-            );
-            if (!r.ok) return null;
-            const d = (await r.json()) as { balanceCents: number };
-            return d.balanceCents > 0
-              ? { order, balanceCents: d.balanceCents }
-              : null;
-          } catch {
-            return null;
-          }
-        }),
-      );
-      setOpen(withBalance.filter((x): x is OpenOrder => x !== null));
+      const { orders } = (await res.json()) as { orders: OpenOrder[] };
+      setOpen(orders);
     } catch {
       // Offline or transient: keep the last known list.
     }
@@ -104,7 +87,7 @@ export function OpenOrdersPanel({
           </p>
         ) : (
           <ul className="space-y-2">
-            {orders.map(({ order, balanceCents }) => (
+            {orders.map((order) => (
               <li
                 key={order.id}
                 className="flex items-center justify-between gap-3 rounded-lg border p-3"
@@ -113,7 +96,7 @@ export function OpenOrdersPanel({
                   <div className="font-semibold">{order.order_number}</div>
                   <div className="text-xs text-muted-foreground">
                     {statusLabel(order.status)} · due{" "}
-                    {formatMoney(balanceCents, currency)}
+                    {formatMoney(order.balanceCents, currency)}
                   </div>
                 </div>
                 <Button

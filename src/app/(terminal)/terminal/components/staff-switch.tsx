@@ -6,7 +6,7 @@
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActiveStaff } from "@/lib/store/use-active-staff";
 import { Delete } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -35,11 +35,20 @@ export function StaffSwitch({
   onClose: () => void;
 }) {
   const [staff, setStaff] = useState<StaffOption[]>([]);
+  const [staffState, setStaffState] = useState<"loading" | "ready" | "error">(
+    "loading",
+  );
+  const [reloadKey, setReloadKey] = useState(0);
+  const busyRef = useRef(false);
+  const submitRef = useRef<() => void>(() => {});
   const [selected, setSelected] = useState<string>(current?.id ?? "");
   const [pin, setPin] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [shake, setShake] = useState(false);
+
+  /** Keypad keys never take focus on click, so a later Enter/Space can't re-press one. */
+  const noFocus = (e: React.MouseEvent) => e.preventDefault();
 
   function addDigit(d: string) {
     setError(null);
@@ -49,8 +58,15 @@ export function StaffSwitch({
   // Hardware keyboard still works (digits, Backspace).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      if (busyRef.current) return;
+      // A focused control (keypad key, Close, tile) handles Enter/Space natively.
+      const onButton = e.target instanceof HTMLButtonElement;
       if (/^[0-9]$/.test(e.key)) addDigit(e.key);
       else if (e.key === "Backspace") setPin((p) => p.slice(0, -1));
+      else if (e.key === "Enter" && !onButton) {
+        e.preventDefault();
+        submitRef.current();
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -58,24 +74,31 @@ export function StaffSwitch({
 
   useEffect(() => {
     let alive = true;
+    setStaffState("loading");
     fetch(
       tenantId
         ? `/api/terminal/pin?tenantId=${encodeURIComponent(tenantId)}`
         : "/api/terminal/pin",
     )
-      .then((r) => (r.ok ? r.json() : { staff: [] }))
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then((d: { staff?: StaffOption[] }) => {
-        if (alive) setStaff(d.staff ?? []);
+        if (!alive) return;
+        setStaff(d.staff ?? []);
+        setStaffState("ready");
       })
       .catch(() => {
-        if (alive) setStaff([]);
+        if (alive) setStaffState("error");
       });
     return () => {
       alive = false;
     };
-  }, [tenantId]);
+  }, [tenantId, reloadKey]);
 
   async function submit() {
+    if (busyRef.current) return;
     setError(null);
     if (!selected) {
       setError("Choose a staff member.");
@@ -85,6 +108,7 @@ export function StaffSwitch({
       setError("Enter a 4–8 digit PIN.");
       return;
     }
+    busyRef.current = true;
     setBusy(true);
     try {
       const ok = await onVerify(selected, pin);
@@ -98,9 +122,11 @@ export function StaffSwitch({
         setTimeout(() => setShake(false), 500);
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
+  submitRef.current = () => void submit();
 
   return (
     <Dialog onClose={onClose} labelledBy="staff-switch-title">
@@ -133,9 +159,26 @@ export function StaffSwitch({
           aria-labelledby="staff-tiles-label"
           className="mb-4 grid grid-cols-2 gap-2"
         >
-          {staff.length === 0 && (
+          {staffState === "loading" && (
             <p className="col-span-2 text-sm text-muted-foreground">
               Loading staff…
+            </p>
+          )}
+          {staffState === "error" && (
+            <div role="alert" className="col-span-2 text-sm text-destructive">
+              Couldn&apos;t load staff.{" "}
+              <button
+                type="button"
+                className="underline"
+                onClick={() => setReloadKey((k) => k + 1)}
+              >
+                Try again
+              </button>
+            </div>
+          )}
+          {staffState === "ready" && staff.length === 0 && (
+            <p className="col-span-2 text-sm text-muted-foreground">
+              No staff with a PIN are set up for this location.
             </p>
           )}
           {staff.map((s) => (
@@ -162,13 +205,12 @@ export function StaffSwitch({
           ))}
         </div>
 
-        <div className="mb-1 text-sm font-medium" id="staff-pin-label">
+        <div className="mb-1 text-sm font-medium" aria-hidden="true">
           PIN
         </div>
         <div
           id="staff-pin"
           role="img"
-          aria-labelledby="staff-pin-label"
           aria-label={`PIN, ${pin.length} digit${pin.length === 1 ? "" : "s"} entered`}
           aria-describedby={error ? "staff-pin-error" : undefined}
           className={cn(
@@ -197,6 +239,7 @@ export function StaffSwitch({
               type="button"
               aria-label={d}
               disabled={busy}
+              onMouseDown={noFocus}
               onClick={() => addDigit(d)}
               className="h-16 rounded-lg border text-2xl font-semibold touch-manipulation hover:bg-secondary active:bg-secondary disabled:opacity-50"
             >
@@ -207,6 +250,7 @@ export function StaffSwitch({
             type="button"
             aria-label="Clear"
             disabled={busy}
+            onMouseDown={noFocus}
             onClick={() => setPin("")}
             className="h-16 rounded-lg border text-base font-medium touch-manipulation hover:bg-secondary disabled:opacity-50"
           >
@@ -216,6 +260,7 @@ export function StaffSwitch({
             type="button"
             aria-label="0"
             disabled={busy}
+            onMouseDown={noFocus}
             onClick={() => addDigit("0")}
             className="h-16 rounded-lg border text-2xl font-semibold touch-manipulation hover:bg-secondary active:bg-secondary disabled:opacity-50"
           >
@@ -225,6 +270,7 @@ export function StaffSwitch({
             type="button"
             aria-label="Backspace"
             disabled={busy}
+            onMouseDown={noFocus}
             onClick={() => setPin((p) => p.slice(0, -1))}
             className="flex h-16 items-center justify-center rounded-lg border touch-manipulation hover:bg-secondary disabled:opacity-50"
           >
@@ -260,6 +306,7 @@ export function StaffSwitch({
           <Button
             className="h-12 px-8 text-base"
             disabled={busy}
+            onMouseDown={noFocus}
             onClick={() => void submit()}
           >
             {busy ? "Verifying…" : "Switch"}

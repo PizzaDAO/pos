@@ -125,10 +125,7 @@ export function TerminalClient({
   const [placed, setPlaced] = useState<PlacedOrderSummary | null>(null);
   /** Order awaiting payment (opens the checkout screen). */
   const [payOrderId, setPayOrderId] = useState<string | null>(null);
-  const openOrders = useOpenOrders(
-    initialTenantId ?? "",
-    initialLocationId ?? "",
-  );
+  const openOrders = useOpenOrders(data?.menu.tenantId, data?.menu.locationId);
 
   if (isLoading) {
     return (

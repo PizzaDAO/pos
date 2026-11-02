@@ -25,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
+import { isFullyRefunded } from "@/lib/payments/refund-state";
 import {
   PAYMENT_RAIL_KEYS,
   tenderRailLabel,
@@ -91,10 +92,7 @@ export function PaymentScreen({
 
   const balance = checkout.balanceCents;
   // Fully refunded: the order is closed out, so never re-offer "Charge".
-  const refunded =
-    checkout.order?.status === "refunded" ||
-    (checkout.payments.length > 0 &&
-      checkout.payments.every((p) => p.status === "refunded"));
+  const refunded = isFullyRefunded(checkout.order, checkout.payments);
   const paid = balance === 0 && checkout.payments.length > 0 && !refunded;
   const finished = paid || refunded;
   const changeGivenCents = checkout.payments

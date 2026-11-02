@@ -8,6 +8,7 @@
  */
 import type { Order, OrderItem, Payment } from "@/lib/db";
 import { tenderRailLabel } from "./registry";
+import { isFullyRefunded, liveTenders } from "./refund-state";
 
 export interface ReceiptLine {
   name: string;
@@ -164,13 +165,11 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
   const grandTotalCents = order.totals.total_cents + tipCents;
   const balanceCents = Math.max(0, order.totals.total_cents - coveredCents);
 
-  const live = payments.filter(
-    (p) => p.status !== "failed" && p.status !== "canceled",
+  const refundedCents = liveTenders(payments).reduce(
+    (sum, p) => sum + p.refunded_cents,
+    0,
   );
-  const refundedCents = live.reduce((sum, p) => sum + p.refunded_cents, 0);
-  const fullyRefunded =
-    order.status === "refunded" ||
-    (live.length > 0 && live.every((p) => p.status === "refunded"));
+  const fullyRefunded = isFullyRefunded(order, payments);
 
   return {
     refundedCents,
