@@ -19,6 +19,7 @@ import { expireHeldOrders, expireOnlineOrders } from "@/lib/shop/lifecycle";
 import { usingMockDriver } from "@/lib/payments/env";
 import { reconcileTerminalTenders } from "@/lib/payments/terminal/flow";
 import { captureError } from "@/lib/observability";
+import { sweepDriverDispatches } from "@/lib/delivery/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -67,8 +68,20 @@ export async function GET(request: Request) {
     captureError(err, { scope: "expire-held-orders-cron" });
     return null;
   });
+  // Open Pizza Driver dispatches that were not confirmed (driver or hub down):
+  // retry with the same idempotency key, give up after 15 minutes. A no-op when
+  // no driver delivery is waiting. Failure here must not fail the sweep.
+  const driverDispatch = await sweepDriverDispatches(
+    new Date(),
+    10,
+    // Last, inside maxDuration: whatever the sweeps above left (<= 20 s, >= 3 s).
+    Math.max(3_000, Math.min(20_000, 57_000 - (Date.now() - startedAt))),
+  ).catch((err) => {
+    captureError(err, { scope: "driver-dispatch-sweep-cron" });
+    return null;
+  });
   return NextResponse.json(
-    { ...summary, held, quotesPruned, terminal },
+    { ...summary, held, quotesPruned, terminal, driverDispatch },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

@@ -1395,6 +1395,31 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
         details: { reason: "provider_owned" },
       });
     }
+    // The driver module may only report on deliveries POS handed to it: a delivery
+    // switched to manual (or run by anyone else), or one the driver reports under
+    // a different delivery id than the stored one, is refused (409). Other callers
+    // are unchanged.
+    if (ctx.principal.module === "driver") {
+      const wrongId =
+        u.provider_delivery_id &&
+        rec.provider_delivery_id !== null &&
+        rec.provider_delivery_id !== u.provider_delivery_id;
+      if (rec.provider !== "openpizza_driver" || wrongId) {
+        console.error(
+          `[pos][ALERT] driver status push refused for delivery ${id}: ${
+            rec.provider !== "openpizza_driver"
+              ? `delivery is run by ${rec.provider}`
+              : "provider_delivery_id does not match the stored one"
+          }`,
+        );
+        throw ProblemError.of("INVALID_TRANSITION", {
+          detail:
+            rec.provider !== "openpizza_driver"
+              ? `This delivery is run by ${rec.provider}, not the driver module.`
+              : "The driver's delivery id does not match this delivery.",
+        });
+      }
+    }
     const patch: DeliveryPatch = { status: u.status };
     if (u.driver !== undefined) {
       patch.driver_name = u.driver?.name ?? null;

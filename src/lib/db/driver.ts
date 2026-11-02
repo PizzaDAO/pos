@@ -38,6 +38,9 @@ import type {
   Customer,
   CustomerIdentityWrite,
   DeliveryRecord,
+  DriverDispatchResult,
+  DriverDispatchUpdate,
+  ManualSwitchExpect,
   MagicLinkToken,
 } from "./customer-types";
 import type {
@@ -832,6 +835,39 @@ export interface PosDriver {
     tenantId: string,
     patch: DeliveryPatch,
   ): Promise<DeliveryTransitionResult>;
+
+  /**
+   * Compare-and-set the outbound dispatch of an `openpizza_driver` delivery:
+   * applied only while the record is that provider's AND still
+   * `update.expect_status` (so a manager's manual switch, or a driver push that
+   * already moved it on, is never overwritten). `ok:false` carries the stored row.
+   */
+  updateDriverDispatch(
+    id: string,
+    tenantId: string,
+    update: DriverDispatchUpdate,
+  ): Promise<DriverDispatchResult>;
+
+  /**
+   * Compare-and-set a driver delivery over to manual (in-house) dispatch:
+   * provider `in_house_manual`, status `pending_assignment`, driver fields and
+   * dispatch bookkeeping cleared. Applied only while the record is still the
+   * driver's AND matches `expect` exactly. `null` when it no longer matches.
+   */
+  switchDeliveryToManual(
+    id: string,
+    tenantId: string,
+    expect: ManualSwitchExpect,
+  ): Promise<DeliveryRecord | null>;
+
+  /**
+   * `openpizza_driver` deliveries still `quoted` (dispatch not confirmed) whose
+   * retry time has come (`dispatch_next_at` null or <= `nowIso`), oldest first.
+   */
+  listDriverDispatchRetries(
+    nowIso: string,
+    limit: number,
+  ): Promise<DeliveryRecord[]>;
 
   /** Fetch the delivery for an order, or null. */
   getDeliveryForOrder(orderId: string): Promise<DeliveryRecord | null>;

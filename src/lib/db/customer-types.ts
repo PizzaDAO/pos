@@ -135,6 +135,41 @@ export interface DeliveryRecord {
   driver_phone: string | null;
   /** Whether this delivery was quoted/dispatched on a simulated provider. */
   simulated: boolean;
+  /**
+   * Outbound dispatch bookkeeping (`openpizza_driver` only; null/absent for
+   * every other provider): attempts made, the last error, and when the sweep
+   * may try again.
+   */
+  dispatch_attempts?: number;
+  dispatch_error?: string | null;
+  dispatch_next_at?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Compare-and-set progress of an outbound `openpizza_driver` dispatch: written
+ * only while the record is still that provider's AND still `expect_status`.
+ */
+export interface DriverDispatchUpdate {
+  expect_status: DeliveryRecord["status"];
+  status?: DeliveryRecord["status"];
+  provider_delivery_id?: string | null;
+  tracking_ref?: string | null;
+  eta_minutes?: number | null;
+  driver_name?: string | null;
+  driver_phone?: string | null;
+  dispatch_attempts?: number;
+  dispatch_error?: string | null;
+  dispatch_next_at?: string | null;
+}
+
+export type DriverDispatchResult =
+  | { ok: true; delivery: DeliveryRecord }
+  | { ok: false; delivery: DeliveryRecord | null };
+
+/** What the record must still look like for the manual-fallback switch to apply. */
+export interface ManualSwitchExpect {
+  status: DeliveryRecord["status"];
+  provider_delivery_id: string | null;
 }

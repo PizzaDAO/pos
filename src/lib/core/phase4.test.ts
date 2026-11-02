@@ -255,6 +255,27 @@ describe("deliveries.updateStatus", () => {
     expect((await getPosDriver().getOrder(rec.order_id))!.status).toBe("completed");
   });
 
+  it("the driver module may only report on its own deliveries, under the stored id", async () => {
+    const driver = getPosDriver();
+    const rec = await seedDelivery(31);
+    await driver.upsertDelivery({ ...rec, provider_delivery_id: "drv_a" });
+    // Same id: fine. A different id: refused, and the row is untouched.
+    expect((await post(rec.id, { status: "assigned", provider_delivery_id: "drv_a" })).status).toBe(200);
+    const bad = await post(rec.id, { status: "picked_up", provider_delivery_id: "drv_b" });
+    expect(bad.status).toBe(409);
+    expect(bad.json.code).toBe("INVALID_TRANSITION");
+    expect((await driver.getDelivery(rec.id))!.status).toBe("assigned");
+    // A delivery switched to manual no longer accepts the driver module's pushes ...
+    const manual = await seedDelivery(32);
+    await driver.upsertDelivery({ ...manual, provider: "in_house_manual" });
+    const refused = await post(manual.id, { status: "picked_up" });
+    expect(refused.status).toBe(409);
+    expect((await driver.getDelivery(manual.id))!.status).toBe("dispatched");
+    // ... but other callers are unchanged.
+    const other = principal(["deliveries:write", "orders:read"], { module: "catering" });
+    expect((await post(manual.id, { status: "assigned" }, other)).status).toBe(200);
+  });
+
   it("is a no-op when replayed, and a finished delivery cannot change", async () => {
     const rec = await seedDelivery(2);
     await post(rec.id, { status: "delivered" });
@@ -493,20 +514,22 @@ describe("phone keys and country", () => {
 
 // ---------------------------------------------------------------------------
 describe("openpizza_driver delivery provider", () => {
-  it("is registered and dispatches as 'dispatched' with no outbound call or tracking", async () => {
+  it("is registered, inert by default (gated), and needs a record id + payload to dispatch", async () => {
     const { getDeliveryProvider, isDeliveryProviderAvailable } = await import("@/lib/delivery/registry");
     await import("@/lib/delivery/providers");
     expect(isDeliveryProviderAvailable("openpizza_driver")).toBe(true);
     const p = getDeliveryProvider("openpizza_driver")!;
+    // No OPENPIZZA_DRIVER_TENANTS / hub env: never available, never calls out.
+    expect(await p.available!(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID)).toBe(false);
     const a = { line1: "a", city: "b", region: "c", postalCode: "1", country: "US" };
-    const d = await p.dispatch({
-      context: { tenantId: DEMO_TENANT_ID, locationId: DEMO_LOCATION_DOWNTOWN_ID, idempotencyKey: "k" },
-      orderId: "o1",
-      pickup: a,
-      dropoff: a,
-    });
-    expect(d.status).toBe("dispatched");
-    expect(d.trackingRef).toBeUndefined();
+    await expect(
+      p.dispatch({
+        context: { tenantId: DEMO_TENANT_ID, locationId: DEMO_LOCATION_DOWNTOWN_ID, idempotencyKey: "k" },
+        orderId: "o1",
+        pickup: a,
+        dropoff: a,
+      }),
+    ).rejects.toMatchObject({ retryable: false });
     const { mapToRecordStatus } = await import("@/lib/delivery/service");
     expect(mapToRecordStatus("openpizza_driver", "dispatched")).toBe("dispatched");
   });
