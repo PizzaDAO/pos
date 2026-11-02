@@ -84,6 +84,7 @@ import type {
   Staff,
   StaffSession,
 } from "./backoffice-types";
+import { normalizeModuleRoles } from "./backoffice-types";
 import type {
   InventoryOwner,
   Location,
@@ -356,6 +357,7 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
       : undefined,
     user_id: (r.user_id as string | null) ?? null,
     location_ids: (r.location_ids as string[] | null) ?? [],
+    module_roles: normalizeModuleRoles(r.module_roles),
     created_at: r.created_at as string,
   };
 }

@@ -14,6 +14,7 @@ import type {
   DrawerReconciliation,
   Shift,
   Staff,
+  StaffModuleRole,
 } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
@@ -30,6 +31,11 @@ interface StaffData {
   openShifts: Record<string, Shift | null>;
   reconciliations: { shiftId: string; reconciliation: DrawerReconciliation }[];
 }
+
+const MODULE_ROLE_LABELS: { role: StaffModuleRole; label: string }[] = [
+  { role: "driver", label: "Driver" },
+  { role: "dispatcher", label: "Dispatcher" },
+];
 
 function dollarsToCents(v: string): number {
   const n = Number.parseFloat(v);
@@ -62,6 +68,28 @@ export function StaffShifts({ tenantId, locationId }: Props) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenantId, ...body }),
+      });
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleModuleRole(
+    s: Staff,
+    role: StaffModuleRole,
+    checked: boolean,
+  ) {
+    const current = s.module_roles ?? [];
+    const next = checked
+      ? [...new Set([...current, role])]
+      : current.filter((r) => r !== role);
+    setBusy(true);
+    try {
+      await fetch("/api/admin/staff", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tenantId, staffId: s.id, moduleRoles: next }),
       });
       await load();
     } finally {
@@ -105,6 +133,26 @@ export function StaffShifts({ tenantId, locationId }: Props) {
                   {open ? "Drawer open" : "Drawer closed"}
                 </span>
               </div>
+
+              <fieldset
+                className="mt-3 flex items-center gap-4 text-xs"
+                aria-label={`Open Pizza module roles for ${s.name}`}
+              >
+                <legend className="sr-only">Module roles</legend>
+                {MODULE_ROLE_LABELS.map(({ role, label }) => (
+                  <label key={role} className="flex items-center gap-1.5">
+                    <input
+                      type="checkbox"
+                      disabled={busy}
+                      checked={(s.module_roles ?? []).includes(role)}
+                      onChange={(e) =>
+                        void toggleModuleRole(s, role, e.target.checked)
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+              </fieldset>
 
               {open ? (
                 <p className="mt-2 text-xs text-muted-foreground">

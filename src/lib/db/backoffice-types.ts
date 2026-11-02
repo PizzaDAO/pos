@@ -209,6 +209,19 @@ export interface PinAttempt extends PinLockState {
   justLocked: boolean;
 }
 
+/**
+ * Extra roles for other Open Pizza modules (the driver module reads them from
+ * the contract staff `roles`). They grant nothing inside POS.
+ */
+export const STAFF_MODULE_ROLES = ["driver", "dispatcher"] as const;
+export type StaffModuleRole = (typeof STAFF_MODULE_ROLES)[number];
+
+/** Keep only known module roles, de-duplicated, in canonical order. */
+export function normalizeModuleRoles(input: unknown): StaffModuleRole[] {
+  if (!Array.isArray(input)) return [];
+  return STAFF_MODULE_ROLES.filter((r) => input.includes(r));
+}
+
 /** A staff member of a tenant. Role reuses the tenancy membership roles. */
 export interface Staff {
   id: string;
@@ -229,6 +242,8 @@ export interface Staff {
   user_id?: string | null;
   /** Locations this person works at; empty/absent = all (POS-7). */
   location_ids?: string[];
+  /** Roles for other modules (driver, dispatcher); empty/absent = none. */
+  module_roles?: StaffModuleRole[];
   created_at: string;
 }
 
