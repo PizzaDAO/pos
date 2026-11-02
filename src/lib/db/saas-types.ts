@@ -197,7 +197,9 @@ export type AuditAction =
   // Scheduled (catering) holds: an unpaid expired order canceled by staff, no money moved.
   | "scheduled_order_canceled"
   // A location's country (how phone numbers are read) was changed.
-  | "location_country_change";
+  | "location_country_change"
+  // A manager overrode a stuck driver conflict and dispatched in-house instead.
+  | "delivery_manual_override";
 
 /**
  * An append-only audit entry written when a platform operator takes a

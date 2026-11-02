@@ -79,6 +79,7 @@ import { deploymentCheckoutMode } from "@/lib/payments/env";
 import { isGuid, isIsoTimestamp } from "@/lib/db/paging";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import { cancelDeliveryForOrder } from "@/lib/delivery/service";
+import { DRIVER_CONFLICT_MARK } from "@/lib/delivery/attention";
 import { captureError } from "@/lib/observability";
 import {
   SCHEDULED_PAID_GRACE_MS,
@@ -1462,7 +1463,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (
       rec.provider === "openpizza_driver" &&
       u.provider_delivery_id &&
-      current.dispatch_error
+      current.dispatch_error === DRIVER_CONFLICT_MARK
     ) {
       await ctx.driver.updateDriverDispatch(id, tenantId, {
         expect_status: current.status,
