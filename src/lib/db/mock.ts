@@ -2774,6 +2774,14 @@ export const mockDriver: PosDriver = {
     return { ...merged, pin_hash: undefined };
   },
 
+  async setStaffModuleRoles(tenantId, staffId, roles) {
+    const cur = staffById.get(staffId);
+    if (!cur || cur.tenant_id !== tenantId) return null;
+    const next: Staff = { ...cur, module_roles: [...roles] };
+    staffById.set(staffId, next);
+    return { ...next, pin_hash: undefined };
+  },
+
   async getShift(id: string): Promise<Shift | null> {
     const shift = shifts.get(id);
     return shift ? { ...shift } : null;

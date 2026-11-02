@@ -82,6 +82,34 @@ describe("staff module roles", () => {
     }
   });
 
+  it("422s a staffId that is not a UUID", async () => {
+    for (const bad of ["nope", 5, "80000000-0000-4000-8000-0000000000d1'--"]) {
+      const res = await patch({ tenantId: DEMO_TENANT_ID, staffId: bad, moduleRoles: [] });
+      expect(res.status).toBe(422);
+    }
+  });
+
+  it("audits the change as membership_change and writes nothing but module_roles", async () => {
+    const before = await getPosDriver().getStaffById(DEMO_TENANT_ID, STAFF);
+    await patch({ tenantId: DEMO_TENANT_ID, staffId: STAFF, moduleRoles: ["driver"] });
+    const after = await getPosDriver().getStaffById(DEMO_TENANT_ID, STAFF);
+    expect({ ...after, module_roles: undefined }).toEqual({ ...before, module_roles: undefined });
+    const log = (await getPosDriver().listAuditLog(DEMO_TENANT_ID)).filter(
+      (e) =>
+        e.action === "membership_change" &&
+        e.detail === `Staff ${STAFF} module_roles [] -> [driver]`,
+    );
+    expect(log.length).toBeGreaterThan(0);
+    expect(log.at(-1)!.actor_user_id).toBe("u");
+  });
+
+  it("targeted update is tenant-scoped at the driver", async () => {
+    expect(
+      await getPosDriver().setStaffModuleRoles("20000000-0000-4000-8000-0000000000bb", STAFF, ["driver"]),
+    ).toBeNull();
+    expect((await getPosDriver().getStaffById(DEMO_TENANT_ID, STAFF))?.module_roles ?? []).toEqual([]);
+  });
+
   it("404s staff from another tenant and 403s non-admins", async () => {
     const other = await patch({
       tenantId: DEMO_TENANT_ID,

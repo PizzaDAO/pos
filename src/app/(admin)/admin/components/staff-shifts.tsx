@@ -45,6 +45,7 @@ function dollarsToCents(v: string): number {
 export function StaffShifts({ tenantId, locationId }: Props) {
   const [data, setData] = useState<StaffData | null>(null);
   const [busy, setBusy] = useState(false);
+  const [roleError, setRoleError] = useState<string | null>(null);
   const [floatDraft, setFloatDraft] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
@@ -86,11 +87,16 @@ export function StaffShifts({ tenantId, locationId }: Props) {
       : current.filter((r) => r !== role);
     setBusy(true);
     try {
-      await fetch("/api/admin/staff", {
+      setRoleError(null);
+      const res = await fetch("/api/admin/staff", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenantId, staffId: s.id, moduleRoles: next }),
       });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setRoleError(data.error ?? "Could not update module roles.");
+      }
       await load();
     } finally {
       setBusy(false);
@@ -109,6 +115,12 @@ export function StaffShifts({ tenantId, locationId }: Props) {
         <Users className="h-5 w-5" />
         <h2 className="text-base font-semibold">Staff &amp; drawer</h2>
       </div>
+
+      {roleError && (
+        <p role="alert" className="text-sm text-destructive">
+          {roleError}
+        </p>
+      )}
 
       <div className="grid gap-3 sm:grid-cols-2">
         {data.staff.map((s) => {

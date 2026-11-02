@@ -7,8 +7,10 @@
 --   * deliveries.dispatch_attempts / dispatch_error / dispatch_next_at: retry
 --     bookkeeping for outbound dispatch to the driver module (used by a later PR).
 --
--- Additive and live-safe: new columns with constant defaults (no table rewrite),
--- a CHECK added NOT VALID then validated, an idempotent partial index. Re-runnable.
+-- Additive: new columns with constant defaults (no table rewrite), a CHECK added
+-- NOT VALID then validated, an idempotent partial index. Re-runnable. The CHECK
+-- add and VALIDATE run in the same transaction (so the table lock is held through
+-- the validation scan); that is fine because staff is tiny.
 -- DEPLOY ORDER migration first, then code. lock_timeout bounds the catalog locks.
 -- ============================================================================
 
