@@ -20,6 +20,7 @@ import { resetMockOnline, resetMockOrders, resetMockPayments } from "@/lib/db/mo
 import { phoneKey } from "@/lib/db/customer-identity";
 import { DEV_TOKEN } from "./auth";
 import { countryOf } from "./loaders";
+import { DRIVER_CONFLICT_MARK } from "@/lib/delivery/attention";
 import { handleV1 } from "./v1";
 import { hydrateEvent, memoryOutbox } from "./outbox";
 
@@ -282,7 +283,7 @@ describe("deliveries.updateStatus", () => {
     await driver.upsertDelivery({
       ...rec,
       status: "quoted",
-      dispatch_error: "driver conflict, waiting for its status push",
+      dispatch_error: DRIVER_CONFLICT_MARK,
       dispatch_next_at: new Date().toISOString(),
     });
     const r = await post(rec.id, { status: "assigned", provider_delivery_id: "drv_5" });
@@ -291,6 +292,20 @@ describe("deliveries.updateStatus", () => {
     expect(stored.provider_delivery_id).toBe("drv_5");
     expect(stored.dispatch_error).toBeNull();
     expect(stored.dispatch_next_at).toBeNull();
+  });
+
+  it("the driver's push keeps a dispatch_error that is not the conflict mark", async () => {
+    const driver = getPosDriver();
+    const rec = await seedDelivery(42);
+    await driver.upsertDelivery({
+      ...rec,
+      status: "quoted",
+      dispatch_error: "some other failure",
+      dispatch_next_at: new Date().toISOString(),
+    });
+    const r = await post(rec.id, { status: "assigned", provider_delivery_id: "drv_6" });
+    expect(r.status).toBe(200);
+    expect((await driver.getDelivery(rec.id))!.dispatch_error).toBe("some other failure");
   });
 
   it("is a no-op when replayed, and a finished delivery cannot change", async () => {

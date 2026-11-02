@@ -816,7 +816,7 @@ describe("stuck conflict rows (go-live follow-ups)", () => {
       ),
     ).toBe(true);
     const log = await getPosDriver().listAuditLog(T);
-    expect(log.some((e) => e.action === "connect_change" && e.detail?.includes(rec.id))).toBe(true);
+    expect(log.some((e) => e.action === "delivery_manual_override" && e.detail?.includes(rec.id))).toBe(true);
   });
 
   it("the sweep alerts and pushes dispatch_next_at out another hour (no starvation)", async () => {
@@ -832,7 +832,7 @@ describe("stuck conflict rows (go-live follow-ups)", () => {
   });
 
   it("the sweep does not alert for a closed order", async () => {
-    for (const closed of ["refunded", "voided", "abandoned"] as const) {
+    for (const closed of ["refunded", "voided", "abandoned", "completed"] as const) {
       resetMockOnline();
       const { orderId, err } = await parked();
       await getPosDriver().updateOrderStatus(orderId, closed);
@@ -840,6 +840,24 @@ describe("stuck conflict rows (go-live follow-ups)", () => {
       await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
       expect(err.mock.calls.some((x) => String(x[0]).includes("still waiting"))).toBe(false);
     }
+  });
+
+  it("the sweep cancels a conflict row locally when its order is closed", async () => {
+    for (const closed of ["refunded", "voided", "abandoned", "completed"] as const) {
+      resetMockOnline();
+      const { orderId, rec } = await parked();
+      await getPosDriver().updateOrderStatus(orderId, closed);
+      await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
+      const stored = (await getPosDriver().getDelivery(rec.id))!;
+      expect(stored.status).toBe("canceled");
+      expect(stored.provider_delivery_id).toBeNull();
+    }
+  });
+
+  it("the sweep leaves a conflict row on a live order parked", async () => {
+    const { rec } = await parked();
+    await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
+    expect((await getPosDriver().getDelivery(rec.id))!.status).toBe("quoted");
   });
 
   it("attention: the mark counts only on a quoted row without a driver id; override after 15 min", async () => {

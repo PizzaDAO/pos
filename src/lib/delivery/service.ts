@@ -716,7 +716,15 @@ export async function sweepDriverDispatches(
         const order = await driver.getOrder(rec.order_id);
         const closed =
           !order ||
-          ["refunded", "voided", "abandoned"].includes(order.status);
+          ["refunded", "voided", "abandoned", "completed"].includes(order.status);
+        if (closed) {
+          // The driver never confirmed it (no provider id): retire it locally
+          // (compare-and-set) instead of pushing the row out another hour.
+          await driver.transitionDelivery(rec.id, rec.tenant_id, {
+            status: "canceled",
+          });
+          continue;
+        }
         if (!closed && age >= DRIVER_GIVE_UP_MS) {
           console.error(
             `[pos][ALERT] delivery ${rec.id} (order ${rec.order_id}) still waiting for the driver's status push after a dispatch 409`,
@@ -854,11 +862,9 @@ export async function dispatchManuallyInstead(
     console.error(
       `[pos][ALERT] manual override of driver conflict for delivery ${rec.id} by ${who}`,
     );
-    // No dedicated audit action exists; `connect_change` ("integrations") is the
-    // closest existing value, and the detail says exactly what happened.
     await recordAudit({
       actor: { id: opts.actor?.id ?? "unknown", label: opts.actor?.label ?? "unknown" },
-      action: "connect_change",
+      action: "delivery_manual_override",
       tenantId: rec.tenant_id,
       detail: `Manual override of driver conflict: delivery ${rec.id} (order ${rec.order_id}) switched to in-house; operator confirmed the driver does not have it`,
     });
