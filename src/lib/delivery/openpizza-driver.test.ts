@@ -730,7 +730,7 @@ describe("review fixes", () => {
       const rec = await dispatchDelivery(dispatchInput(orderId));
       const later = new Date(Date.now() + 10 * 60_000);
       expect((await dispatchManuallyInstead(rec.id, later)).ok).toBe(false);
-      expect(driverAttention(rec, later.getTime())).toEqual({
+      expect(driverAttention(rec, later.getTime())).toMatchObject({
         reason: DRIVER_CONFLICT_MARK,
         canDispatchManually: false,
       });
@@ -743,7 +743,7 @@ describe("review fixes", () => {
       dispatchReply = conflict;
       const rec = await dispatchDelivery(dispatchInput(orderId));
       const n = driverCalls().length;
-      const s = await sweepDriverDispatches(new Date(Date.now() + 20 * 60_000));
+      const s = await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
       expect(s.failed).toBe(0);
       expect(driverCalls()).toHaveLength(n);
       expect((await getPosDriver().getDelivery(rec.id))!.status).toBe("quoted");
@@ -764,5 +764,113 @@ describe("review fixes", () => {
     const s = await sweepDriverDispatches(new Date(Date.now() + 61_000), 10, 0);
     expect(s.retried).toBe(0);
     expect(driverCalls()).toHaveLength(n);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("stuck conflict rows (go-live follow-ups)", () => {
+  const conflict = () => problem(409, "IDEMPOTENCY_CONFLICT");
+  const ACTOR = { id: "user-1", label: "mgr@example.com" };
+
+  async function parked() {
+    const orderId = await seedOrder();
+    const err = alerts();
+    dispatchReply = conflict;
+    const rec = await dispatchDelivery(dispatchInput(orderId));
+    return { orderId, rec, err };
+  }
+
+  it("parking sets dispatch_next_at about an hour out", async () => {
+    const { rec } = await parked();
+    const next = new Date(rec.dispatch_next_at!).getTime();
+    expect(next - Date.now()).toBeGreaterThan(59 * 60_000);
+    expect(next - Date.now()).toBeLessThanOrEqual(60 * 60_000);
+  });
+
+  it("override needs a row older than 15 min AND confirmNotWithDriver", async () => {
+    const { rec } = await parked();
+    const old = new Date(Date.now() + 16 * 60_000);
+    expect((await dispatchManuallyInstead(rec.id, old)).ok).toBe(false);
+    expect((await dispatchManuallyInstead(rec.id, old, { confirmNotWithDriver: false })).ok).toBe(false);
+    // Too young, even when confirmed.
+    expect(
+      (await dispatchManuallyInstead(rec.id, new Date(Date.now() + 5 * 60_000), { confirmNotWithDriver: true })).ok,
+    ).toBe(false);
+    expect((await getPosDriver().getDelivery(rec.id))!.provider).toBe("openpizza_driver");
+  });
+
+  it("confirmed override switches, logs the ALERT with the user, and audits", async () => {
+    const { rec, err } = await parked();
+    const res = await dispatchManuallyInstead(rec.id, new Date(Date.now() + 16 * 60_000), {
+      confirmNotWithDriver: true,
+      actor: ACTOR,
+    });
+    expect(res.ok).toBe(true);
+    expect(await getPosDriver().getDelivery(rec.id)).toMatchObject({
+      provider: "in_house_manual",
+      status: "pending_assignment",
+    });
+    expect(
+      err.mock.calls.some((c) =>
+        String(c[0]).includes(`[pos][ALERT] manual override of driver conflict for delivery ${rec.id} by mgr@example.com`),
+      ),
+    ).toBe(true);
+    const log = await getPosDriver().listAuditLog(T);
+    expect(log.some((e) => e.action === "connect_change" && e.detail?.includes(rec.id))).toBe(true);
+  });
+
+  it("the sweep alerts and pushes dispatch_next_at out another hour (no starvation)", async () => {
+    const { rec, err } = await parked();
+    const at = new Date(Date.now() + 2 * 60 * 60_000);
+    const s = await sweepDriverDispatches(at);
+    expect(s.failed).toBe(0);
+    expect(err.mock.calls.some((x) => String(x[0]).includes("still waiting"))).toBe(true);
+    const stored = (await getPosDriver().getDelivery(rec.id))!;
+    expect(new Date(stored.dispatch_next_at!).getTime()).toBeGreaterThanOrEqual(at.getTime() + 59 * 60_000);
+    // Not due again right away.
+    expect(await getPosDriver().listDriverDispatchRetries(at.toISOString(), 10)).toHaveLength(0);
+  });
+
+  it("the sweep does not alert for a closed order", async () => {
+    for (const closed of ["refunded", "voided", "abandoned"] as const) {
+      resetMockOnline();
+      const { orderId, err } = await parked();
+      await getPosDriver().updateOrderStatus(orderId, closed);
+      err.mockClear();
+      await sweepDriverDispatches(new Date(Date.now() + 2 * 60 * 60_000));
+      expect(err.mock.calls.some((x) => String(x[0]).includes("still waiting"))).toBe(false);
+    }
+  });
+
+  it("attention: the mark counts only on a quoted row without a driver id; override after 15 min", async () => {
+    const base = {
+      provider: "openpizza_driver",
+      status: "quoted" as const,
+      provider_delivery_id: null as string | null,
+      dispatch_error: DRIVER_CONFLICT_MARK as string | null,
+      created_at: new Date(0).toISOString(),
+    };
+    expect(driverAttention(base, 5 * 60_000)).toMatchObject({ canDispatchManually: false, canOverrideConflict: false });
+    expect(driverAttention(base, 16 * 60_000)).toMatchObject({ canDispatchManually: false, canOverrideConflict: true });
+    for (const over of [
+      { status: "assigned" as const },
+      { provider_delivery_id: "drv_1" },
+    ]) {
+      const a = driverAttention({ ...base, ...over }, 60 * 60_000);
+      expect(a.canOverrideConflict).toBeFalsy();
+      expect(a.reason).toBeNull();
+    }
+  });
+
+  it("the route passes the confirm flag through (refused when the row is young)", async () => {
+    const { rec } = await parked();
+    const res = await dispatchRoute(
+      new Request("https://pos.test/api/delivery/dispatch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deliveryId: rec.id, action: "dispatchManually", confirmNotWithDriver: true }),
+      }),
+    );
+    expect(res.status).toBe(409);
   });
 });

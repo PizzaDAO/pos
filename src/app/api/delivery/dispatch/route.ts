@@ -75,7 +75,11 @@ function isValid(body: unknown): body is AssignBody {
 
 function isManualSwitch(
   body: unknown,
-): body is { deliveryId: string; action: "dispatchManually" } {
+): body is {
+  deliveryId: string;
+  action: "dispatchManually";
+  confirmNotWithDriver?: boolean;
+} {
   if (!body || typeof body !== "object") return false;
   const b = body as Record<string, unknown>;
   return typeof b.deliveryId === "string" && b.action === "dispatchManually";
@@ -106,7 +110,10 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.res;
 
   if (isManualSwitch(body)) {
-    const res = await dispatchManuallyInstead(body.deliveryId);
+    const res = await dispatchManuallyInstead(body.deliveryId, new Date(), {
+      confirmNotWithDriver: body.confirmNotWithDriver === true,
+      actor: { id: auth.user.id, label: auth.user.email },
+    });
     if (!res.ok) {
       const status =
         res.reason === "not_found" ? 404 : res.reason === "not_driver" ? 422 : 409;

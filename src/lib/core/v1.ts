@@ -1458,6 +1458,19 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
       }
     }
 
+    // The driver's push carries its id: any "waiting for the push" conflict mark is stale.
+    if (
+      rec.provider === "openpizza_driver" &&
+      u.provider_delivery_id &&
+      current.dispatch_error
+    ) {
+      await ctx.driver.updateDriverDispatch(id, tenantId, {
+        expect_status: current.status,
+        dispatch_error: null,
+        dispatch_next_at: null,
+      });
+    }
+
     const target =
       patch.status === "picked_up" || patch.status === "delivering"
         ? "out_for_delivery"
