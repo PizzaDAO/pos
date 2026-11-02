@@ -499,7 +499,7 @@ export function PaymentScreen({
                   <div
                     data-testid="change-due"
                     role="status"
-                    className="rounded-xl bg-emerald-600 px-4 py-5 text-center text-white"
+                    className="rounded-xl bg-emerald-700 px-4 py-5 text-center text-white"
                   >
                     <div className="text-sm font-medium uppercase tracking-wide">
                       Change due

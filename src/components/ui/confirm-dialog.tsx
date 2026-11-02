@@ -34,7 +34,7 @@ export function ConfirmDialog({
     >
       <div
         role="alertdialog"
-        className="w-full max-w-sm rounded-xl bg-background p-5 shadow-xl"
+        className="w-full max-w-sm rounded-xl border bg-background p-5 shadow-xl"
       >
         <h2 id={`${id}-title`} className="text-lg font-semibold">
           {title}

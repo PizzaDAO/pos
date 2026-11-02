@@ -83,7 +83,7 @@ export function OpenOrdersPanel({
 }) {
   return (
     <Dialog onClose={onClose} labelledBy="open-orders-title">
-      <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-lg bg-background p-6 shadow-xl">
+      <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-lg border bg-background p-6 shadow-xl">
         <div className="mb-4 flex items-center justify-between">
           <h2 id="open-orders-title" className="text-lg font-semibold">
             Open orders ({orders.length})
