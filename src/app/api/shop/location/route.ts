@@ -10,6 +10,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { demoModeInfo } from "@/lib/demo/mode";
 import { isCardReady } from "@/lib/payments/connect";
 import { onlineRailAvailable } from "@/lib/payments/online-rails";
 import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
@@ -63,6 +64,8 @@ export async function GET(request: Request) {
           onlinePaymentAllowed(location.tenant_id, "crypto_coinbase"),
       },
       driver: driver.name,
+      // Display only: the "payments are simulated" note shows just in training.
+      demo: demoModeInfo().banner,
     },
     { headers: { "Cache-Control": "no-store" } },
   );

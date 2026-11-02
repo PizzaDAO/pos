@@ -18,7 +18,7 @@ export async function TrainingBanner() {
     <aside
       aria-label="Training mode"
       data-testid="training-banner"
-      className="shrink-0 bg-amber-400 px-3 py-0.5 text-center text-[11px] font-bold uppercase tracking-wide text-amber-950"
+      className="shrink-0 bg-amber-400 px-3 py-0.5 text-center text-xs font-bold uppercase tracking-wide text-amber-950"
     >
       <p role="status">{banner}</p>
     </aside>

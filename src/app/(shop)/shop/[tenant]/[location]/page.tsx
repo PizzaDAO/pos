@@ -3,10 +3,10 @@
  * `/shop/{tenantSlug}/{locationSlug}` pair via the DB abstraction, then renders
  * the mobile-first customer-facing client. Location slugs are only unique
  * within a tenant, so the tenant slug is part of every storefront URL. A bad
- * pair 404s. No env vars required.
+ * location redirects to the tenant's store chooser. No env vars required.
  */
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
+import { redirect } from "next/navigation";
 import { getPosDriver } from "@/lib/db";
 import { storefrontPath } from "@/lib/shop/storefront";
 import { ShopClient } from "./components/shop-client";
@@ -63,7 +63,9 @@ export default async function ShopPage({ params }: { params: Params }) {
     tenantSlug,
     locationSlug,
   );
-  if (!location) notFound();
+  // A bad location under a real tenant lands on that tenant's store chooser
+  // (which 404s itself if the tenant is unknown), not the SaaS home page.
+  if (!location) redirect(`/shop/${encodeURIComponent(tenantSlug)}`);
 
   return (
     <ShopClient

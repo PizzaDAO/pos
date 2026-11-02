@@ -182,6 +182,7 @@ export function PizzaBuilder({
           <Button
             variant="ghost"
             size="icon"
+            className="h-11 w-11"
             onClick={onCancel}
             aria-label="Close"
           >
@@ -305,7 +306,7 @@ export function PizzaBuilder({
                               )
                             }
                             className={cn(
-                              "min-w-[44px] px-2 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
+                              "h-11 min-w-[44px] px-2.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
                               placement === p.value
                                 ? "bg-primary text-primary-foreground"
                                 : "bg-background hover:bg-accent",
@@ -331,6 +332,7 @@ export function PizzaBuilder({
               <Button
                 variant="outline"
                 size="icon"
+                className="h-11 w-11"
                 onClick={() => setQty((q) => Math.max(1, q - 1))}
                 aria-label="Decrease quantity"
               >
@@ -342,6 +344,7 @@ export function PizzaBuilder({
               <Button
                 variant="outline"
                 size="icon"
+                className="h-11 w-11"
                 onClick={() => setQty((q) => Math.min(MAX_LINE_QUANTITY, q + 1))}
                 disabled={qty >= MAX_LINE_QUANTITY}
                 aria-label="Increase quantity"
@@ -357,10 +360,11 @@ export function PizzaBuilder({
               Special instructions
             </h3>
             <textarea
+              aria-label="Special instructions"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               placeholder="e.g. well done, cut in squares"
-              className="min-h-[60px] w-full rounded-lg border bg-background p-2 text-sm"
+              className="min-h-[60px] w-full rounded-lg border bg-background p-2 text-base sm:text-sm"
             />
           </section>
         </div>

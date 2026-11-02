@@ -123,10 +123,15 @@ export function ShopClient({
               Order online
             </p>
             <h1 className="truncate text-lg font-bold">{locationName}</h1>
+            {data.location.address && (
+              <p className="truncate text-sm text-muted-foreground">
+                {data.location.address}
+              </p>
+            )}
           </div>
           <Button
             variant="outline"
-            className="relative"
+            className="relative h-11"
             aria-label={`Open cart, ${itemCount} item${itemCount === 1 ? "" : "s"}, ${formatMoney(subtotalCents, currency)}`}
             onClick={() => setCartOpen(true)}
           >

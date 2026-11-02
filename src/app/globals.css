@@ -13,18 +13,23 @@
     --secondary: 240 4.8% 95.9%;
     --secondary-foreground: 240 5.9% 10%;
     --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
+    --muted-foreground: 240 5% 36%;
     --accent: 240 4.8% 95.9%;
     --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
+    --destructive: 0 72% 45%;
     --destructive-foreground: 0 0% 98%;
     --border: 240 5.9% 90%;
     --input: 240 5.9% 90%;
     --ring: 240 5.9% 10%;
     --radius: 0.5rem;
+    color-scheme: light;
   }
 
-  .dark {
+  /* Dark theme follows the OS (tailwind darkMode: "media"). Tokens only: every
+     surface that uses the semantic colours switches with no component edits. */
+  @media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
     --background: 240 10% 3.9%;
     --foreground: 0 0% 98%;
     --card: 240 10% 3.9%;
@@ -34,14 +39,15 @@
     --secondary: 240 3.7% 15.9%;
     --secondary-foreground: 0 0% 98%;
     --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
+    --muted-foreground: 240 5% 70%;
     --accent: 240 3.7% 15.9%;
     --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
+    --destructive: 0 72% 62%;
+    --destructive-foreground: 240 10% 3.9%;
+    --border: 240 3.7% 22%;
+    --input: 240 3.7% 22%;
     --ring: 240 4.9% 83.9%;
+  }
   }
 }
 
@@ -65,6 +71,79 @@
   [tabindex]:focus-visible {
     @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
   }
+
+  /* Stop double-tap zoom on controls without disabling pinch-zoom (WCAG 1.4.4). */
+  a,
+  button,
+  input,
+  select,
+  textarea,
+  label,
+  summary,
+  [role="button"] {
+    touch-action: manipulation;
+  }
+}
+
+/* ---- Status-colour text contrast ----------------------------------------- */
+/* Hardcoded 500/600-level status text fails 4.5:1 on white (red-500 3.8:1,
+   amber-600 3.2:1). Re-point the text utilities at AA-passing shades in light
+   mode and at lighter shades in dark mode, centrally, instead of editing every
+   component. Fills (bg-*) are untouched. */
+@layer utilities {
+  .text-red-500,
+  .text-red-600 {
+    color: #b91c1c;
+  }
+  .text-amber-500,
+  .text-amber-600 {
+    color: #b45309;
+  }
+  .text-emerald-600 {
+    color: #047857;
+  }
+}
+@layer utilities {
+  @media (prefers-color-scheme: dark) {
+    /* Pale light-mode fills become translucent tints over the dark surface. */
+    .bg-red-100 {
+      background-color: rgb(239 68 68 / 0.22);
+    }
+    .bg-amber-50,
+    .bg-amber-100 {
+      background-color: rgb(245 158 11 / 0.18);
+    }
+    .bg-emerald-50,
+    .bg-emerald-100 {
+      background-color: rgb(16 185 129 / 0.18);
+    }
+    /* Dark-on-pale text becomes light-on-dark. (amber-950 is deliberately left
+       alone: it sits on the solid amber-400/500 training and trial banners.) */
+    .text-red-500,
+    .text-red-600,
+    .text-red-700,
+    .text-red-800,
+    .text-red-900 {
+      color: #fca5a5;
+    }
+    .text-amber-500,
+    .text-amber-600,
+    .text-amber-700,
+    .text-amber-800,
+    .text-amber-900 {
+      color: #fcd34d;
+    }
+    .text-emerald-500,
+    .text-emerald-600,
+    .text-emerald-700,
+    .text-emerald-800,
+    .text-emerald-900 {
+      color: #6ee7b7;
+    }
+    .text-sky-700 {
+      color: #7dd3fc;
+    }
+  }
 }
 
 /* ---- Kitchen ticket print (Phase 3) -------------------------------------- */
@@ -74,6 +153,9 @@
 @media print {
   @page {
     margin: 6mm;
+  }
+  :root {
+    color-scheme: light;
   }
   body {
     background: #fff;
