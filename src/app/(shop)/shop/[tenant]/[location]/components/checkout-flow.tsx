@@ -110,6 +110,8 @@ export function CheckoutFlow({
         ? true
         : shop.cryptoReady?.[r.key] !== false),
   );
+  // Nothing the customer could pay with (e.g. training mode on a live store).
+  const noOnlinePayment = availableRails.length === 0;
   const [rail, setRail] = useState<PaymentRailKey>(
     availableRails[0]?.key ?? "stripe_online",
   );
@@ -345,6 +347,17 @@ export function CheckoutFlow({
           {checkout.error && step !== "done" && (
             <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive">
               {checkout.error}
+            </div>
+          )}
+
+          {noOnlinePayment && step !== "done" && step !== "waiting" && (
+            <div
+              role="status"
+              data-testid="online-payment-unavailable"
+              className="rounded-md border border-amber-500/60 bg-amber-500/10 p-3 text-sm"
+            >
+              Online payment is unavailable at this store right now. Please
+              order in person or by phone.
             </div>
           )}
 
@@ -688,7 +701,9 @@ export function CheckoutFlow({
                 </Button>
                 <Button
                   className="flex-1"
-                  disabled={checkout.loading || priceChange !== null}
+                  disabled={
+                    checkout.loading || priceChange !== null || noOnlinePayment
+                  }
                   onClick={handlePlaceAndPay}
                 >
                   {checkout.loading ? (

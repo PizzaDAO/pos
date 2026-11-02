@@ -40,6 +40,11 @@ import {
 } from "@/lib/shop/scheduling";
 import { quoteDelivery } from "@/lib/delivery/service";
 import { deploymentCheckoutMode } from "@/lib/payments/env";
+import {
+  ONLINE_PAYMENT_UNAVAILABLE_CODE,
+  ONLINE_PAYMENT_UNAVAILABLE_MESSAGE,
+  anyOnlinePaymentAllowed,
+} from "@/lib/shop/training-online";
 import { DeliveryUnavailableError } from "@/lib/delivery";
 import {
   canUseOnlineOrdering,
@@ -135,6 +140,18 @@ export async function POST(request: Request) {
   const location = resolved.location;
   const tenantId = location.tenant_id;
   const locationId = location.id;
+
+  // Training on a live database: no online rail could take real money here, so
+  // refuse before an unpayable order is created (audit H3).
+  if (!anyOnlinePaymentAllowed(tenantId)) {
+    return NextResponse.json(
+      {
+        error: ONLINE_PAYMENT_UNAVAILABLE_MESSAGE,
+        code: ONLINE_PAYMENT_UNAVAILABLE_CODE,
+      },
+      { status: 503 },
+    );
+  }
 
   // ---- Plan gate: online ordering requires the Pro plan or higher. ----------
   // The tenant's subscription tier gates customer online ordering (Phase 6). A
