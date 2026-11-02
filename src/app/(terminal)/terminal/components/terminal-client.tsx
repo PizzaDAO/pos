@@ -35,6 +35,7 @@ import {
   OrderConfirmation,
   type PlacedOrderSummary,
 } from "./order-confirmation";
+import { OpenOrdersPanel, useOpenOrders } from "./open-orders";
 import { PaymentScreen } from "./payment-screen";
 
 function newUuid(): string {
@@ -66,7 +67,10 @@ export function TerminalClient({
   cardReady = true,
   deviceRole,
   requireActiveStaff = false,
+  locationName = "Register",
 }: {
+  /** Display name of the active location (server-resolved). */
+  locationName?: string;
   initialTenantId?: string;
   initialLocationId?: string;
   /** Server-computed: false hides card tenders (see isCardReady). */
@@ -87,6 +91,7 @@ export function TerminalClient({
   const { activeStaff, signOut: signOutStaff, verifyPin } = useActiveStaff();
   const [showStaffSwitch, setShowStaffSwitch] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
+  const [showOpenOrders, setShowOpenOrders] = useState(false);
   const toast = useToast();
   const queuedStaff: QueuedStaff | null = activeStaff
     ? {
@@ -120,14 +125,18 @@ export function TerminalClient({
   const [placed, setPlaced] = useState<PlacedOrderSummary | null>(null);
   /** Order awaiting payment (opens the checkout screen). */
   const [payOrderId, setPayOrderId] = useState<string | null>(null);
+  const openOrders = useOpenOrders(
+    initialTenantId ?? "",
+    initialLocationId ?? "",
+  );
 
   if (isLoading) {
     return (
-      <div
-        className="grid h-full grid-cols-1 lg:grid-cols-[1fr_400px]"
-        aria-busy="true"
-        aria-label="Loading terminal"
-      >
+      <div className="flex h-full flex-col" aria-busy="true" aria-label="Loading terminal">
+      <div className="h-[61px] shrink-0 border-b px-4 py-3">
+        <Skeleton className="h-5 w-40" />
+      </div>
+      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1.2fr)] lg:grid-cols-[1fr_400px] lg:grid-rows-1">
         <div className="space-y-3 border-r p-4">
           <div className="flex gap-2">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -143,6 +152,7 @@ export function TerminalClient({
         <div className="hidden p-4 lg:block">
           <Skeleton className="h-full w-full rounded-lg" />
         </div>
+      </div>
       </div>
     );
   }
@@ -269,9 +279,12 @@ export function TerminalClient({
   }
 
   return (
-    <div id="main-content" className="flex h-full flex-col">
+    <main id="main-content" className="flex h-full flex-col">
+      <h1 className="sr-only">Register</h1>
       <StatusBar
-        locationName={"Tony's Downtown"}
+        locationName={locationName}
+        openOrdersCount={openOrders.open.length}
+        onOpenOrders={() => setShowOpenOrders(true)}
         online={sync.online}
         pendingCount={sync.pendingCount}
         attentionCount={sync.attentionCount}
@@ -283,7 +296,7 @@ export function TerminalClient({
         readerScope={{ tenantId: menu.tenantId, locationId: location }}
       />
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[1fr_400px]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1.2fr)] lg:grid-cols-[1fr_400px] lg:grid-rows-1">
         {/* Menu */}
         <div className="min-h-0 border-r">
           <MenuBrowse
@@ -329,8 +342,27 @@ export function TerminalClient({
           locationId={location}
           paymentSettings={paymentSettings}
           cardReady={cardReady}
-          onClose={() => setPayOrderId(null)}
-          onPaid={() => setPayOrderId(null)}
+          locationName={locationName}
+          onClose={() => {
+            setPayOrderId(null);
+            void openOrders.refresh();
+          }}
+          onPaid={() => {
+            setPayOrderId(null);
+            void openOrders.refresh();
+          }}
+        />
+      )}
+
+      {showOpenOrders && (
+        <OpenOrdersPanel
+          orders={openOrders.open}
+          currency={settings.currency}
+          onPay={(id) => {
+            setShowOpenOrders(false);
+            setPayOrderId(id);
+          }}
+          onClose={() => setShowOpenOrders(false)}
         />
       )}
 
@@ -355,6 +387,6 @@ export function TerminalClient({
           onClose={() => setShowStaffSwitch(false)}
         />
       )}
-    </div>
+    </main>
   );
 }

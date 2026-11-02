@@ -15,11 +15,29 @@ import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 import { driverAttention } from "@/lib/delivery/attention";
 
+interface DriverOption {
+  id: string;
+  name: string;
+  clockedIn: boolean;
+}
+
+const OTHER = "__other__";
+
 interface Row {
   delivery: DeliveryRecord;
   orderNumber: string | null;
   orderStatus: string | null;
 }
+
+const STATUS_LABELS: Record<string, string> = {
+  pending_assignment: "Needs a driver",
+  assigned: "Assigned",
+  picked_up: "Picked up",
+  en_route: "On the way",
+  delivered: "Delivered",
+  failed: "Failed",
+  canceled: "Canceled",
+};
 
 export function DeliveryDispatch({
   tenantId,
@@ -33,6 +51,41 @@ export function DeliveryDispatch({
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
+  /** Staff tagged with the Driver role (clocked-in first). */
+  const [drivers, setDrivers] = useState<DriverOption[]>([]);
+  /** Rows where the dispatcher picked "Other…" and types a name. */
+  const [other, setOther] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (!tenantId || !locationId) return;
+    let alive = true;
+    fetch(
+      `/api/admin/staff?tenantId=${encodeURIComponent(tenantId)}&locationId=${encodeURIComponent(locationId)}`,
+      { cache: "no-store" },
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then(
+        (d: {
+          staff: { id: string; name: string; module_roles?: string[] }[];
+          openShifts: Record<string, unknown>;
+        } | null) => {
+          if (!alive || !d) return;
+          const list = d.staff
+            .filter((s) => (s.module_roles ?? []).includes("driver"))
+            .map((s) => ({
+              id: s.id,
+              name: s.name,
+              clockedIn: Boolean(d.openShifts?.[s.id]),
+            }))
+            .sort((a, b) => Number(b.clockedIn) - Number(a.clockedIn));
+          setDrivers(list);
+        },
+      )
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [tenantId, locationId]);
 
   const load = useCallback(async () => {
     if (!tenantId || !locationId) return;
@@ -55,12 +108,19 @@ export function DeliveryDispatch({
     const driverName = (draftDriver[deliveryId] ?? "").trim();
     if (!driverName) return;
     setBusy(deliveryId);
+    setNotice(null);
     try {
-      await fetch("/api/delivery/dispatch", {
+      const res = await fetch("/api/delivery/dispatch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ deliveryId, driverName }),
       });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setNotice(data.error ?? "Could not assign the driver.");
+      } else {
+        setNotice(`Assigned ${driverName}.`);
+      }
       await load();
     } finally {
       setBusy(null);
@@ -92,14 +152,21 @@ export function DeliveryDispatch({
   }
 
   return (
-    <section className="border-t p-6">
+    <section>
       <div className="mx-auto max-w-3xl">
         <div className="mb-4 flex items-center gap-2">
           <Truck className="h-5 w-5" />
-          <h2 className="text-lg font-bold">Delivery dispatch (in-house)</h2>
+          <h2 className="text-base font-semibold">Delivery dispatch (in-house)</h2>
         </div>
         {notice && (
-          <p role="alert" className="mb-3 text-sm text-destructive">
+          <p
+            role="alert"
+            className={
+              notice.startsWith("Assigned ")
+                ? "mb-3 text-sm text-emerald-700"
+                : "mb-3 text-sm text-destructive"
+            }
+          >
             {notice}
           </p>
         )}
@@ -119,8 +186,9 @@ export function DeliveryDispatch({
                       <span className="font-semibold">
                         Order {orderNumber ?? delivery.order_id.slice(0, 8)}
                       </span>
-                      <span className="ml-2 rounded-full bg-secondary px-2 py-0.5 text-xs capitalize text-secondary-foreground">
-                        {delivery.status.replace(/_/g, " ")}
+                      <span className="ml-2 rounded-full bg-secondary px-2 py-0.5 text-xs text-secondary-foreground">
+                        {STATUS_LABELS[delivery.status] ??
+                          delivery.status.replace(/_/g, " ")}
                       </span>
                     </div>
                     <span className="text-muted-foreground">
@@ -145,7 +213,7 @@ export function DeliveryDispatch({
                       {attention.canDispatchManually && (
                         <div className="mt-2">
                           <Button
-                            size="sm"
+                            className="h-11"
                             variant="outline"
                             disabled={busy === delivery.id}
                             onClick={() => void dispatchManually(delivery.id)}
@@ -200,20 +268,51 @@ export function DeliveryDispatch({
                   )}
 
                   {delivery.status === "pending_assignment" ? (
-                    <div className="mt-3 flex gap-2">
-                      <input
-                        className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm"
-                        placeholder="Driver name"
-                        value={draftDriver[delivery.id] ?? ""}
-                        onChange={(e) =>
-                          setDraftDriver((d) => ({
-                            ...d,
-                            [delivery.id]: e.target.value,
-                          }))
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <select
+                        aria-label={`Driver for order ${orderNumber ?? delivery.order_id.slice(0, 8)}`}
+                        className="h-11 min-w-48 flex-1 rounded-md border bg-background px-3 text-sm"
+                        value={
+                          other[delivery.id]
+                            ? OTHER
+                            : (draftDriver[delivery.id] ?? "")
                         }
-                      />
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (v === OTHER) {
+                            setOther((o) => ({ ...o, [delivery.id]: true }));
+                            setDraftDriver((d) => ({ ...d, [delivery.id]: "" }));
+                          } else {
+                            setOther((o) => ({ ...o, [delivery.id]: false }));
+                            setDraftDriver((d) => ({ ...d, [delivery.id]: v }));
+                          }
+                        }}
+                      >
+                        <option value="">Choose a driver…</option>
+                        {drivers.map((d) => (
+                          <option key={d.id} value={d.name}>
+                            {d.name}
+                            {d.clockedIn ? " (clocked in)" : ""}
+                          </option>
+                        ))}
+                        <option value={OTHER}>Other…</option>
+                      </select>
+                      {other[delivery.id] && (
+                        <input
+                          aria-label="Driver name"
+                          className="h-11 flex-1 rounded-md border bg-background px-3 text-sm"
+                          placeholder="Driver name"
+                          value={draftDriver[delivery.id] ?? ""}
+                          onChange={(e) =>
+                            setDraftDriver((d) => ({
+                              ...d,
+                              [delivery.id]: e.target.value,
+                            }))
+                          }
+                        />
+                      )}
                       <Button
-                        size="sm"
+                        className="h-11 px-5"
                         disabled={
                           busy === delivery.id ||
                           !(draftDriver[delivery.id] ?? "").trim()

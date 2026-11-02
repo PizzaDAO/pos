@@ -14,6 +14,7 @@ import { Loader2, MapPin, Plus, ShieldAlert } from "lucide-react";
 import type { Entitlements } from "@/lib/saas/entitlements";
 import type { Location } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 interface Props {
   tenantId: string;
@@ -30,6 +31,12 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
   const [address, setAddress] = useState("");
   const [country, setCountry] = useState("");
   const [busy, setBusy] = useState(false);
+  /** Country change awaiting an explicit confirmation (server states the effect). */
+  const [pendingCountry, setPendingCountry] = useState<{
+    locationId: string;
+    value: string;
+    message: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -85,33 +92,42 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
     }
   }
 
-  async function saveCountry(locationId: string, value: string) {
+  async function confirmCountry(p: {
+    locationId: string;
+    value: string;
+  }) {
+    setPendingCountry(null);
+    await saveCountry(p.locationId, p.value, true);
+  }
+
+  async function saveCountry(
+    locationId: string,
+    value: string,
+    confirmPhoneEffects = false,
+  ) {
     setError(null);
     const first = await fetch("/api/admin/locations", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tenantId, locationId, country: value.trim() || null }),
+      body: JSON.stringify({
+        tenantId,
+        locationId,
+        country: value.trim() || null,
+        ...(confirmPhoneEffects ? { confirmPhoneEffects: true } : {}),
+      }),
     });
-    let res = first;
+    const res = first;
     if (first.status === 422) {
       // The server states what changing the country does to phone numbers; the
       // owner must confirm it explicitly before it is saved.
       const d = (await first.clone().json().catch(() => ({}))) as { error?: string; code?: string };
       if (d.code === "confirm_required") {
-        if (!window.confirm(`${d.error}\n\nChange the country?`)) {
-          await load();
-          return;
-        }
-        res = await fetch("/api/admin/locations", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            tenantId,
-            locationId,
-            country: value.trim() || null,
-            confirmPhoneEffects: true,
-          }),
+        setPendingCountry({
+          locationId,
+          value,
+          message: d.error ?? "Changing the country affects phone numbers.",
         });
+        return;
       }
     }
     if (!res.ok) {
@@ -219,6 +235,19 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
             </p>
           </div>
         </div>
+      )}
+      {pendingCountry && (
+        <ConfirmDialog
+          title="Change the country?"
+          description={pendingCountry.message}
+          confirmLabel="Change country"
+          destructive={false}
+          onCancel={() => {
+            setPendingCountry(null);
+            void load();
+          }}
+          onConfirm={() => void confirmCountry(pendingCountry)}
+        />
       )}
     </div>
   );

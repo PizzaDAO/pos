@@ -102,6 +102,10 @@ export interface Receipt {
   totalChangeCents: number;
   balanceCents: number;
   paid: boolean;
+  /** Total refunded back across tenders (tip included in each tender's amount). */
+  refundedCents: number;
+  /** Every non-failed tender has been refunded (the order is closed out). */
+  fullyRefunded: boolean;
 }
 
 function placementSuffix(placement: OrderItem["modifiers"][number]["placement"]): string {
@@ -160,7 +164,17 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
   const grandTotalCents = order.totals.total_cents + tipCents;
   const balanceCents = Math.max(0, order.totals.total_cents - coveredCents);
 
+  const live = payments.filter(
+    (p) => p.status !== "failed" && p.status !== "canceled",
+  );
+  const refundedCents = live.reduce((sum, p) => sum + p.refunded_cents, 0);
+  const fullyRefunded =
+    order.status === "refunded" ||
+    (live.length > 0 && live.every((p) => p.status === "refunded"));
+
   return {
+    refundedCents,
+    fullyRefunded,
     orderNumber: order.order_number,
     currency: order.currency,
     lines,

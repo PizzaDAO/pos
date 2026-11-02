@@ -15,9 +15,8 @@ export const viewport: Viewport = {
   themeColor: "#dc2626",
   width: "device-width",
   initialScale: 1,
-  // Prevent accidental pinch-zoom on the terminal during fast order entry.
-  maximumScale: 1,
-  userScalable: false,
+  // Pinch-zoom stays enabled (WCAG 1.4.4); double-tap zoom is suppressed per
+  // control with `touch-action: manipulation`.
 };
 
 export default function TerminalLayout({
@@ -30,7 +29,7 @@ export default function TerminalLayout({
       <RegisterServiceWorker />
       {/* Column shell: the in-flow banner takes its height, the terminal (h-full)
           fills the rest, so the full-height POS grid never overflows. */}
-      <div className="flex h-screen flex-col">
+      <div className="flex h-dvh flex-col">
         <TrainingBanner />
         <div className="min-h-0 flex-1">{children}</div>
       </div>

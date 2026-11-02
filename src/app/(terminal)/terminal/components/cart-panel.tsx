@@ -121,18 +121,18 @@ export function CartPanel({
                     <div className="flex items-center overflow-hidden rounded-md border">
                       <button
                         type="button"
-                        className="px-3 py-1 text-sm hover:bg-accent"
+                        className="h-11 w-11 text-lg hover:bg-accent touch-manipulation"
                         aria-label="Decrease quantity"
                         onClick={() => setQuantity(item.id, item.quantity - 1)}
                       >
                         −
                       </button>
-                      <span className="min-w-[2ch] px-2 text-center text-sm">
+                      <span className="min-w-[2.5ch] px-2 text-center text-base font-medium">
                         {item.quantity}
                       </span>
                       <button
                         type="button"
-                        className="px-3 py-1 text-sm hover:bg-accent"
+                        className="h-11 w-11 text-lg hover:bg-accent touch-manipulation"
                         aria-label="Increase quantity"
                         onClick={() => setQuantity(item.id, item.quantity + 1)}
                       >
@@ -141,14 +141,14 @@ export function CartPanel({
                     </div>
                     <Button
                       variant="ghost"
-                      size="sm"
+                      className="h-11 px-3"
                       onClick={() => onEditLine(item)}
                     >
                       <Pencil className="mr-1 h-3.5 w-3.5" /> Edit
                     </Button>
                     <Button
                       variant="ghost"
-                      size="sm"
+                      className="h-11 px-3"
                       onClick={() => voidLine(item.id)}
                     >
                       <Ban className="mr-1 h-3.5 w-3.5" /> Void
@@ -156,6 +156,7 @@ export function CartPanel({
                     <Button
                       variant="ghost"
                       size="icon"
+                      className="h-11 w-11"
                       aria-label="Remove line"
                       onClick={() => removeLine(item.id)}
                     >

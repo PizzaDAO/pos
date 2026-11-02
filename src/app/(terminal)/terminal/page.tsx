@@ -39,6 +39,9 @@ export default async function TerminalPage({
       cardReady={await isInStoreCardReady(ctx.tenantId, ctx.locationId)}
       deviceRole={roleInTenant(ctx.user, ctx.tenantId) ?? undefined}
       requireActiveStaff={await requiresPinStaff(ctx.tenantId)}
+      locationName={
+        ctx.locations.find((l) => l.id === ctx.locationId)?.name ?? undefined
+      }
     />
   );
 }

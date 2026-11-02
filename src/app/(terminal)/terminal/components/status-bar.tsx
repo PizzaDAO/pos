@@ -33,7 +33,7 @@ function ReaderChip({
     return (
       <span
         data-testid="reader-chip"
-        className="flex items-center gap-1 rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800"
+        className="hidden items-center gap-1 rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800 sm:flex"
         title="Card needs internet: take cash"
       >
         <CreditCard className="h-3.5 w-3.5" />
@@ -48,7 +48,7 @@ function ReaderChip({
     <span
       data-testid="reader-chip"
       className={cn(
-        "flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium",
+        "hidden items-center gap-1 rounded-full px-2 py-1 text-xs font-medium sm:flex",
         up ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800",
       )}
       title={`Card reader ${reader.label}: ${reader.status}`}
@@ -74,6 +74,9 @@ export interface StatusBarProps {
   activeStaffName?: string | null;
   /** Open the staff PIN switcher. */
   onSwitchStaff?: () => void;
+  /** Unpaid in-store orders (opens the open-orders list). */
+  openOrdersCount?: number;
+  onOpenOrders?: () => void;
   /** Show the card-reader chip for this tenant + location. */
   readerScope?: { tenantId: string; locationId: string };
 }
@@ -89,12 +92,15 @@ export function StatusBar({
   activeStaffName,
   onSwitchStaff,
   readerScope,
+  openOrdersCount = 0,
+  onOpenOrders,
 }: StatusBarProps) {
   return (
-    <header className="flex items-center justify-between gap-3 border-b bg-background px-4 py-2">
-      <div className="flex items-center gap-2">
+    <>
+    <header className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b bg-background px-4 py-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
         <span className="text-sm font-semibold">{locationName}</span>
-        {driverName && (
+        {driverName === "mock" && (
           <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-secondary-foreground">
             {driverName} data
           </span>
@@ -103,7 +109,7 @@ export function StatusBar({
           <button
             type="button"
             onClick={onSwitchStaff}
-            className="rounded-full border px-2 py-0.5 text-xs font-medium hover:bg-secondary"
+            className="h-11 rounded-full border px-4 text-sm font-medium hover:bg-secondary touch-manipulation"
             title="Switch the active staff member (PIN)"
           >
             {activeStaffName ? `Staff: ${activeStaffName}` : "Sign in staff"}
@@ -111,7 +117,19 @@ export function StatusBar({
         )}
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        {onOpenOrders && (
+          <button
+            type="button"
+            onClick={onOpenOrders}
+            className={cn(
+              "h-11 rounded-full border px-4 text-sm font-medium touch-manipulation hover:bg-secondary",
+              openOrdersCount > 0 && "border-amber-500 bg-amber-100 text-amber-900",
+            )}
+          >
+            Open orders ({openOrdersCount})
+          </button>
+        )}
         {readerScope && <ReaderChip {...readerScope} />}
         {attentionCount > 0 && (
           <button
@@ -148,9 +166,20 @@ export function StatusBar({
           ) : (
             <CloudOff className="h-3.5 w-3.5" />
           )}
-          {online ? "Online" : "Offline"}
+          <span className="sr-only sm:not-sr-only">
+            {online ? "Online" : "Offline"}
+          </span>
         </span>
       </div>
     </header>
+    {!online && (
+      <div
+        role="alert"
+        className="bg-red-600 px-4 py-2 text-center text-sm font-semibold text-white"
+      >
+        Offline: orders are queued, card payments unavailable
+      </div>
+    )}
+    </>
   );
 }

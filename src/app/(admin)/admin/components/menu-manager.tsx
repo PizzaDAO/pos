@@ -11,7 +11,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Ban, Pencil, Plus, RotateCcw, Trash2 } from "lucide-react";
+import { Ban, Pencil, Plus, RotateCcw } from "lucide-react";
 import type {
   LocationMenuOverride,
   MenuCategory,
@@ -23,6 +23,7 @@ import type {
   Station,
 } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { ConfirmDeleteButton } from "@/components/ui/confirm-dialog";
 import { formatMoney } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
 
@@ -144,7 +145,7 @@ export function MenuManager({ tenantId, locationId }: Props) {
 
   return (
     <div className="space-y-8">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-base font-semibold">Menu management</h2>
           <p className="text-sm text-muted-foreground">
@@ -286,19 +287,23 @@ function CategoryCard({
           <h3 className="font-semibold">{category.name}</h3>
         )}
         <div className="flex gap-1">
-          <Button variant="ghost" size="icon" onClick={() => setEditing((v) => !v)}>
-            <Pencil className="h-4 w-4" />
-          </Button>
           <Button
             variant="ghost"
             size="icon"
+            className="h-11 w-11"
+            aria-label={`Edit ${category.name}`}
+            onClick={() => setEditing((v) => !v)}
+          >
+            <Pencil className="h-4 w-4" aria-hidden="true" />
+          </Button>
+          <ConfirmDeleteButton
+            label={category.name}
+            detail={`This also removes ${menuCategory?.items.length ?? 0} item${(menuCategory?.items.length ?? 0) === 1 ? "" : "s"} in it. This can't be undone.`}
             disabled={busy}
-            onClick={() =>
+            onConfirm={() =>
               onMutate({ entity: "category", action: "delete", id: category.id })
             }
-          >
-            <Trash2 className="h-4 w-4 text-destructive" />
-          </Button>
+          />
         </div>
       </div>
 
@@ -381,8 +386,8 @@ function ItemRow({
 
   return (
     <div className={cn("px-4 py-3", eightySixed && "bg-destructive/5")}>
-      <div className="flex items-center justify-between">
-        <button className="text-left" onClick={() => setOpen((v) => !v)}>
+      <div className="flex items-center justify-between gap-2">
+        <button className="min-w-0 flex-1 text-left" onClick={() => setOpen((v) => !v)}>
           <span className="font-medium">{item.name}</span>
           {eightySixed && (
             <span className="ml-2 rounded-full bg-destructive/15 px-2 py-0.5 text-xs font-semibold text-destructive">
@@ -409,14 +414,12 @@ function ItemRow({
             {eightySixed ? <RotateCcw className="h-4 w-4" /> : <Ban className="h-4 w-4" />}
             {eightySixed ? "Un-86" : "86"}
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
+          <ConfirmDeleteButton
+            label={item.name}
+            detail="This removes the item with its sizes. This can't be undone."
             disabled={busy}
-            onClick={() => onMutate({ entity: "item", action: "delete", id: item.id })}
-          >
-            <Trash2 className="h-4 w-4 text-destructive" />
-          </Button>
+            onConfirm={() => onMutate({ entity: "item", action: "delete", id: item.id })}
+          />
         </div>
       </div>
 
@@ -531,14 +534,12 @@ function ItemEditor({
                     <RotateCcw className="h-3.5 w-3.5" /> reset
                   </Button>
                 )}
-                <Button
-                  variant="ghost"
-                  size="icon"
+                <ConfirmDeleteButton
+                  label={`${size.name} size`}
+                  iconClassName="h-3.5 w-3.5"
                   disabled={busy}
-                  onClick={() => onMutate({ entity: "size", action: "delete", id: size.id })}
-                >
-                  <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                </Button>
+                  onConfirm={() => onMutate({ entity: "size", action: "delete", id: size.id })}
+                />
               </div>
             );
           })}
@@ -623,7 +624,7 @@ function ModifierGroupsSection({
 
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-base font-semibold">Modifier groups</h2>
         <AddModifierGroup
           busy={busy}
@@ -646,16 +647,14 @@ function ModifierGroupsSection({
                 {group.supports_half && " · supports ½&½"}
               </span>
             </div>
-            <Button
-              variant="ghost"
-              size="icon"
+            <ConfirmDeleteButton
+              label={group.name}
+              detail={`This also removes its ${(modsByGroup.get(group.id) ?? []).length} modifier(s). This can't be undone.`}
               disabled={busy}
-              onClick={() =>
+              onConfirm={() =>
                 onMutate({ entity: "modifierGroup", action: "delete", id: group.id })
               }
-            >
-              <Trash2 className="h-4 w-4 text-destructive" />
-            </Button>
+            />
           </div>
           <div className="divide-y px-4 text-sm">
             {(modsByGroup.get(group.id) ?? []).map((mod) => {
@@ -695,14 +694,12 @@ function ModifierGroupsSection({
                     {off ? <RotateCcw className="h-3.5 w-3.5" /> : <Ban className="h-3.5 w-3.5" />}
                     {off ? "Un-86" : "86"}
                   </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
+                  <ConfirmDeleteButton
+                    label={mod.name}
+                    iconClassName="h-3.5 w-3.5"
                     disabled={busy}
-                    onClick={() => onMutate({ entity: "modifier", action: "delete", id: mod.id })}
-                  >
-                    <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                  </Button>
+                    onConfirm={() => onMutate({ entity: "modifier", action: "delete", id: mod.id })}
+                  />
                 </div>
               );
             })}

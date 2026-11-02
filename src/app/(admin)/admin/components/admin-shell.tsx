@@ -236,7 +236,7 @@ export function AdminShell({
 
           <nav
             aria-label="Back office sections"
-            className="mt-3 flex flex-wrap gap-1"
+            className="-mx-4 mt-3 flex gap-1 overflow-x-auto px-4 pb-1 sm:mx-0 sm:flex-wrap sm:overflow-visible sm:px-0"
           >
             {tabs.map((t) => {
               const Icon = t.icon;
@@ -247,7 +247,7 @@ export function AdminShell({
                   onClick={() => setTab(t.id)}
                   aria-current={active ? "page" : undefined}
                   className={cn(
-                    "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                    "inline-flex min-h-11 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
                     active
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",

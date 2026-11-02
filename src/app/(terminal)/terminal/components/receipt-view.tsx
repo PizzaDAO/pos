@@ -14,9 +14,12 @@ import { buildReceipt } from "@/lib/payments/receipt";
 export function ReceiptView({
   order,
   payments,
+  businessName,
 }: {
   order: Order;
   payments: Payment[];
+  /** Business/location name for the receipt header. */
+  businessName?: string;
 }) {
   const r = buildReceipt(order, payments);
   const c = r.currency;
@@ -30,7 +33,7 @@ export function ReceiptView({
     <div className="space-y-4">
       <div className="rounded-lg border bg-background p-4 font-mono text-sm">
         <div className="text-center">
-          <div className="text-base font-bold">Tony&apos;s Pizza</div>
+          <div className="text-base font-bold">{businessName ?? "Receipt"}</div>
           <div className="text-xs text-muted-foreground">Order {r.orderNumber}</div>
         </div>
         <hr className="my-3 border-dashed" />
@@ -89,11 +92,11 @@ export function ReceiptView({
                     <dt>
                       {t.label}
                       {t.simulated && (
-                        <span className="ml-1 text-[10px] uppercase text-amber-600">
+                        <span className="ml-1 text-xs uppercase text-amber-700">
                           sim
                         </span>
                       )}
-                      <span className="ml-1 text-[10px] uppercase text-muted-foreground">
+                      <span className="ml-1 text-xs uppercase text-muted-foreground">
                         {t.status}
                       </span>
                     </dt>
@@ -116,7 +119,9 @@ export function ReceiptView({
                       {t.card.authCode && <div>Auth: {t.card.authCode}</div>}
                     </div>
                   )}
-                  {t.changeCents !== null && t.changeCents > 0 && (
+                  {t.changeCents !== null &&
+                    t.changeCents > 0 &&
+                    t.status !== "refunded" && (
                     <div className="flex justify-between text-xs text-muted-foreground">
                       <dt>Change</dt>
                       <dd>{formatMoney(t.changeCents, c)}</dd>
@@ -129,14 +134,19 @@ export function ReceiptView({
         )}
 
         {r.applicationFeeCents > 0 && (
-          <div className="mt-2 flex justify-between text-[10px] text-muted-foreground">
+          <div className="mt-2 flex justify-between text-xs text-muted-foreground">
             <span>Platform fee (incl.)</span>
             <span>{formatMoney(r.applicationFeeCents, c)}</span>
           </div>
         )}
 
-        {r.balanceCents > 0 ? (
-          <div className="mt-3 flex justify-between font-bold text-amber-600">
+        {r.fullyRefunded ? (
+          <div className="mt-3 text-center text-sm font-bold uppercase text-red-700">
+            Refunded
+            {r.refundedCents > 0 && ` ${formatMoney(r.refundedCents, c)}`}
+          </div>
+        ) : r.balanceCents > 0 ? (
+          <div className="mt-3 flex justify-between font-bold text-amber-700">
             <span>Balance due</span>
             <span>{formatMoney(r.balanceCents, c)}</span>
           </div>

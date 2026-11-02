@@ -27,13 +27,13 @@ function ModifierList({
 }) {
   if (mods.length === 0) return null;
   return (
-    <div className="text-sm leading-snug">
+    <div className="text-base leading-snug">
       {label && (
         <span className="mr-1 font-semibold uppercase tracking-wide text-foreground">
           {label}:
         </span>
       )}
-      <span className="text-muted-foreground">
+      <span className="text-foreground">
         {mods.map((m) => m.modifier_name).join(", ")}
       </span>
     </div>
@@ -47,7 +47,7 @@ function LineRow({ line }: { line: OrderItem }) {
   return (
     <li className="border-b border-dashed py-2 last:border-b-0">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-semibold">
+        <span className="text-xl font-semibold">
           {line.quantity > 1 && (
             <span className="mr-1 rounded bg-foreground px-1.5 text-background">
               {line.quantity}×

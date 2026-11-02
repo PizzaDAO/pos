@@ -27,7 +27,6 @@ import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
 import {
   PAYMENT_RAIL_KEYS,
-  PAYMENT_RAIL_LABELS,
   tenderRailLabel,
 } from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
@@ -35,7 +34,27 @@ import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
 import { TipSelector } from "./tip-selector";
 import { ReceiptView } from "./receipt-view";
 
+/** Short staff-facing method names (provider detail lives in Admin). */
+const STAFF_RAIL_LABELS: Record<PaymentRailKey, string> = {
+  cash: "Cash",
+  stripe_terminal: "Card",
+  stripe_online: "Card (online)",
+  crypto_onchain_usdc: "USDC",
+  crypto_coinbase: "Coinbase",
+};
+
+/** Quick-cash note choices at or above what is owed (plus Exact, always). */
+function quickCashChoices(dueCents: number): number[] {
+  const notes = [2000, 5000, 10000].filter((n) => n >= dueCents);
+  if (notes.length === 0 && dueCents > 0) {
+    notes.push(Math.ceil(dueCents / 10000) * 10000);
+  }
+  return notes;
+}
+
 export interface PaymentScreenProps {
+  /** Location display name for the receipt header. */
+  locationName?: string;
   orderId: string;
   tenantId: string;
   locationId: string;
@@ -52,6 +71,7 @@ export function PaymentScreen({
   locationId,
   paymentSettings,
   cardReady = true,
+  locationName,
   onClose,
   onPaid,
 }: PaymentScreenProps) {
@@ -67,8 +87,19 @@ export function PaymentScreen({
   const [tipCents, setTipCents] = useState(0);
   const [cashTendered, setCashTendered] = useState("");
 
+  const [confirmRefundId, setConfirmRefundId] = useState<string | null>(null);
+
   const balance = checkout.balanceCents;
-  const paid = balance === 0 && checkout.payments.length > 0;
+  // Fully refunded: the order is closed out, so never re-offer "Charge".
+  const refunded =
+    checkout.order?.status === "refunded" ||
+    (checkout.payments.length > 0 &&
+      checkout.payments.every((p) => p.status === "refunded"));
+  const paid = balance === 0 && checkout.payments.length > 0 && !refunded;
+  const finished = paid || refunded;
+  const changeGivenCents = checkout.payments
+    .filter((p) => p.status === "captured")
+    .reduce((sum, p) => sum + (p.cash_change_cents ?? 0), 0);
 
   // --- Card reader ---------------------------------------------------------
   const card = checkout.card;
@@ -134,23 +165,33 @@ export function PaymentScreen({
       onClose={onClose}
       labelledBy="payment-screen-title"
       closeOnBackdrop={false}
+      // While a balance is due, Esc must not silently drop the sale (the X
+      // still works, and the order stays in Open orders).
+      closeOnEsc={finished}
     >
       <div className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-background shadow-xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b p-4">
           <div>
             <h2 id="payment-screen-title" className="text-lg font-bold">
-              {paid ? "Payment complete" : "Take payment"}
+              {refunded
+                ? "Order refunded"
+                : paid
+                  ? "Payment complete"
+                  : "Take payment"}
             </h2>
             <p className="text-sm text-muted-foreground">
-              {paid
-                ? "Order paid in full."
-                : `Balance due ${formatMoney(balance, currency)}`}
+              {refunded
+                ? "All tenders on this order were refunded."
+                : paid
+                  ? "Order paid in full."
+                  : `Balance due ${formatMoney(balance, currency)}`}
             </p>
           </div>
           <Button
             variant="ghost"
             size="icon"
+            className="h-11 w-11"
             aria-label="Close payment"
             onClick={onClose}
           >
@@ -182,14 +223,14 @@ export function PaymentScreen({
                 ),
             )}
 
-            {!paid && (
+            {!finished && (
               <>
                 {/* Rail picker */}
                 <div>
                   <div className="mb-2 text-sm font-medium text-muted-foreground">
                     Payment method
                   </div>
-                  <div className="grid grid-cols-1 gap-2">
+                  <div className="grid grid-cols-2 gap-2">
                     {/* "Card — Stripe (online)" makes no sense at the till. */}
                     {PAYMENT_RAIL_KEYS.filter(
                       (key) => key !== "stripe_online",
@@ -201,12 +242,14 @@ export function PaymentScreen({
                           setRail(key);
                           card.clearError();
                         }}
+                        aria-pressed={rail === key}
                         className={cn(
-                          "rounded-md border px-3 py-2 text-left text-sm",
-                          rail === key && "border-primary bg-primary/10",
+                          "h-16 rounded-lg border px-3 text-center text-base font-semibold touch-manipulation hover:bg-secondary",
+                          rail === key &&
+                            "border-primary bg-primary/10 ring-2 ring-primary",
                         )}
                       >
-                        {PAYMENT_RAIL_LABELS[key]}
+                        {STAFF_RAIL_LABELS[key]}
                       </button>
                     ))}
                   </div>
@@ -341,25 +384,59 @@ export function PaymentScreen({
 
                 {/* Cash entry */}
                 {rail === "cash" && (
-                  <div className="space-y-2 rounded-md border p-3">
-                    <label className="text-sm text-muted-foreground">
+                  <div className="space-y-3 rounded-md border p-3">
+                    <label
+                      htmlFor="cash-tendered"
+                      className="text-sm text-muted-foreground"
+                    >
                       Amount tendered
                     </label>
                     <div className="flex items-center gap-2">
-                      <span className="text-sm text-muted-foreground">$</span>
+                      <span className="text-lg text-muted-foreground">$</span>
                       <input
+                        id="cash-tendered"
                         type="number"
+                        inputMode="decimal"
                         min={0}
                         step="0.01"
                         value={cashTendered}
                         onChange={(e) => setCashTendered(e.target.value)}
                         placeholder={(dueWithTip / 100).toFixed(2)}
-                        className="w-32 rounded-md border bg-background px-2 py-1 text-right text-sm"
+                        className="h-12 w-full max-w-40 rounded-md border bg-background px-3 text-right text-lg"
                       />
                     </div>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Change due</span>
-                      <span className="font-semibold">
+                    <div
+                      className="flex flex-wrap gap-2"
+                      role="group"
+                      aria-label="Quick cash"
+                    >
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="h-12 px-5 text-base"
+                        onClick={() =>
+                          setCashTendered((dueWithTip / 100).toFixed(2))
+                        }
+                      >
+                        Exact
+                      </Button>
+                      {quickCashChoices(dueWithTip).map((n) => (
+                        <Button
+                          key={n}
+                          type="button"
+                          variant="outline"
+                          className="h-12 px-5 text-base"
+                          onClick={() => setCashTendered((n / 100).toFixed(2))}
+                        >
+                          {formatMoney(n, currency)}
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-sm text-muted-foreground">
+                        Change due
+                      </span>
+                      <span className="text-2xl font-bold">
                         {formatMoney(changeDue, currency)}
                       </span>
                     </div>
@@ -416,14 +493,34 @@ export function PaymentScreen({
               </>
             )}
 
-            {paid && (
+            {finished && (
               <div className="space-y-3">
+                {paid && changeGivenCents > 0 && (
+                  <div
+                    data-testid="change-due"
+                    role="status"
+                    className="rounded-xl bg-emerald-600 px-4 py-5 text-center text-white"
+                  >
+                    <div className="text-sm font-medium uppercase tracking-wide">
+                      Change due
+                    </div>
+                    <div className="text-5xl font-bold tabular-nums">
+                      {formatMoney(changeGivenCents, currency)}
+                    </div>
+                  </div>
+                )}
                 <Button className="h-14 w-full text-base" onClick={onPaid}>
                   Done — new order
                 </Button>
-                <Button variant="outline" className="w-full" onClick={onClose}>
-                  Keep order open
-                </Button>
+                {!refunded && (
+                  <Button
+                    variant="outline"
+                    className="h-12 w-full"
+                    onClick={onClose}
+                  >
+                    Keep order open
+                  </Button>
+                )}
               </div>
             )}
           </div>
@@ -434,6 +531,7 @@ export function PaymentScreen({
               <ReceiptView
                 order={checkout.order}
                 payments={checkout.payments}
+                businessName={locationName}
               />
             )}
 
@@ -451,20 +549,48 @@ export function PaymentScreen({
                     .map((p) => (
                       <li
                         key={p.id}
-                        className="flex items-center justify-between text-sm"
+                        className="flex flex-wrap items-center justify-between gap-2 text-sm"
                       >
                         <span>
-                          {tenderRailLabel(p.rail)} ·{" "}
-                          {formatMoney(p.amount_cents + p.tip_cents, currency)}
+                          {confirmRefundId === p.id
+                            ? `Refund ${formatMoney(p.amount_cents + p.tip_cents, currency)} ${STAFF_RAIL_LABELS[p.rail as PaymentRailKey]?.toLowerCase() ?? ""}?`
+                            : `${STAFF_RAIL_LABELS[p.rail as PaymentRailKey] ?? tenderRailLabel(p.rail)} · ${formatMoney(p.amount_cents + p.tip_cents, currency)}`}
                         </span>
-                        <Button
-                          variant="destructive"
-                          size="sm"
-                          disabled={checkout.loading}
-                          onClick={() => checkout.refund(p.id)}
-                        >
-                          <RotateCcw className="mr-1 h-3.5 w-3.5" /> Refund
-                        </Button>
+                        {confirmRefundId === p.id ? (
+                          <span
+                            role="group"
+                            aria-label="Confirm refund"
+                            className="flex items-center gap-2"
+                          >
+                            <Button
+                              variant="destructive"
+                              className="h-11 px-4"
+                              disabled={checkout.loading}
+                              onClick={() => {
+                                setConfirmRefundId(null);
+                                void checkout.refund(p.id);
+                              }}
+                            >
+                              Confirm refund
+                            </Button>
+                            <Button
+                              variant="outline"
+                              className="h-11 px-4"
+                              onClick={() => setConfirmRefundId(null)}
+                            >
+                              Cancel
+                            </Button>
+                          </span>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            className="h-11 border-destructive px-4 text-destructive"
+                            disabled={checkout.loading}
+                            onClick={() => setConfirmRefundId(p.id)}
+                          >
+                            <RotateCcw className="mr-1 h-3.5 w-3.5" /> Refund
+                          </Button>
+                        )}
                       </li>
                     ))}
                 </ul>

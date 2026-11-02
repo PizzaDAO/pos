@@ -18,6 +18,10 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { StationFilterBar } from "./station-filter";
 import { TicketCard } from "./ticket-card";
 
+function isHandoff(status: string): boolean {
+  return status === "ready" || status === "completed";
+}
+
 const STATION_VALUES: StationFilter[] = [
   "all",
   "oven",
@@ -35,7 +39,9 @@ const STATION_VALUES: StationFilter[] = [
 export function KitchenBoard({
   initialTenantId,
   initialLocationId,
+  locationName = "Kitchen",
 }: {
+  locationName?: string;
   initialTenantId?: string;
   initialLocationId?: string;
 } = {}) {
@@ -71,6 +77,18 @@ export function KitchenBoard({
     );
   }, [tickets, station]);
 
+  // Live tickets (oldest first) stay in the main grid; Ready/Done tickets are
+  // waiting for hand-off, so they move to their own lane below and stop
+  // pushing live tickets down the board.
+  const liveTickets = useMemo(
+    () => visibleTickets.filter((t) => !isHandoff(t.order.status)),
+    [visibleTickets],
+  );
+  const readyTickets = useMemo(
+    () => visibleTickets.filter((t) => isHandoff(t.order.status)),
+    [visibleTickets],
+  );
+
   // Announce newly-arrived tickets to assistive tech via a polite live region.
   // Track known order ids across snapshots; when an id appears that wasn't there
   // before (and it isn't the very first load), announce the order number.
@@ -100,6 +118,18 @@ export function KitchenBoard({
     }
   }
 
+  const renderTicket = (ticket: (typeof tickets)[number]) => (
+    <TicketCard
+      key={ticket.order.id}
+      ticket={ticket}
+      thresholds={thresholds}
+      stationFilter={station}
+      busy={busyId === ticket.order.id}
+      onBump={(id) => void withBusy(id, () => bump(id))}
+      onRecall={(id) => void withBusy(id, () => recall(id))}
+    />
+  );
+
   return (
     <main
       id="main-content"
@@ -117,13 +147,14 @@ export function KitchenBoard({
               Kitchen Display
             </h1>
             <p className="text-xs text-muted-foreground">
-              Tony&apos;s Downtown ·{" "}
-              <span className="font-medium">
-                {source === "poll"
-                  ? "Live (polling)"
-                  : (source ?? "connecting")}
+              {locationName} ·{" "}
+              <span className="inline-flex items-center gap-1 font-medium">
+                <span
+                  aria-hidden="true"
+                  className={`inline-block h-2 w-2 rounded-full ${source ? "bg-emerald-500" : "bg-amber-500"}`}
+                />
+                {source ? "Live" : "Connecting"}
               </span>
-              {board ? ` · ${board.driver} driver` : ""}
               {lastUpdated
                 ? ` · updated ${new Date(lastUpdated).toLocaleTimeString()}`
                 : ""}
@@ -158,18 +189,29 @@ export function KitchenBoard({
             description="New orders will appear here automatically as they come in."
           />
         ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {visibleTickets.map((ticket) => (
-              <TicketCard
-                key={ticket.order.id}
-                ticket={ticket}
-                thresholds={thresholds}
-                stationFilter={station}
-                busy={busyId === ticket.order.id}
-                onBump={(id) => void withBusy(id, () => bump(id))}
-                onRecall={(id) => void withBusy(id, () => recall(id))}
-              />
-            ))}
+          <div className="space-y-6">
+            {liveTickets.length === 0 ? (
+              <p className="rounded-lg border border-dashed p-6 text-center text-muted-foreground">
+                No live tickets. New orders will appear here automatically.
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                {liveTickets.map(renderTicket)}
+              </div>
+            )}
+            {readyTickets.length > 0 && (
+              <section aria-labelledby="ready-lane-title">
+                <h2
+                  id="ready-lane-title"
+                  className="mb-3 text-lg font-semibold text-muted-foreground"
+                >
+                  Ready for hand-off ({readyTickets.length})
+                </h2>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {readyTickets.map(renderTicket)}
+                </div>
+              </section>
+            )}
           </div>
         )}
       </section>
