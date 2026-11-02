@@ -15,9 +15,8 @@ export const viewport: Viewport = {
   themeColor: "#dc2626",
   width: "device-width",
   initialScale: 1,
-  // Prevent accidental pinch-zoom on the terminal during fast order entry.
-  maximumScale: 1,
-  userScalable: false,
+  // Pinch-zoom stays enabled (WCAG 1.4.4); double-tap zoom on controls is
+  // suppressed with `touch-action: manipulation` in globals.css instead.
 };
 
 export default function TerminalLayout({

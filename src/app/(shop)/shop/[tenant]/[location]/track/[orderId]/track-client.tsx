@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
 import { useOrderTracking } from "@/lib/store/use-order-tracking";
+import { useShop } from "@/lib/store/use-shop";
 import { storefrontPath, type StorefrontRef } from "@/lib/shop/storefront";
 
 /** Pickup vs delivery timelines (delivery adds out_for_delivery). */
@@ -32,6 +33,24 @@ function steps(isDelivery: boolean): { status: OrderStatus; label: string }[] {
   }
   base.push({ status: "completed", label: "Completed" });
   return base;
+}
+
+/** Customer-facing delivery status copy (never the raw enum). */
+const DELIVERY_STATUS_COPY: Record<string, string> = {
+  pending_assignment: "Finding a driver",
+  assigned: "Driver assigned",
+  picked_up: "On the way",
+  en_route: "On the way",
+  out_for_delivery: "On the way",
+  delivered: "Delivered",
+  cancelled: "Cancelled",
+  failed: "Delivery problem",
+};
+function deliveryStatusLabel(status: string): string {
+  return (
+    DELIVERY_STATUS_COPY[status] ??
+    status.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase())
+  );
 }
 
 /** Index of the current status within the timeline (paid counts as placed). */
@@ -53,6 +72,7 @@ export function TrackClient({
   orderId: string;
 }) {
   const { data, loading } = useOrderTracking(orderId);
+  const storeName = useShop(store).data?.location.name ?? "the menu";
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const awaiting = data?.order.status === "awaiting_payment";
@@ -220,7 +240,7 @@ export function TrackClient({
                 active ? (
                   <Loader2 className="h-6 w-6 animate-spin text-primary" />
                 ) : (
-                  <CheckCircle2 className="h-6 w-6 text-emerald-500" />
+                  <CheckCircle2 className="h-6 w-6 text-emerald-600" />
                 )
               ) : (
                 <Circle className="h-6 w-6 text-muted-foreground/40" />
@@ -245,12 +265,19 @@ export function TrackClient({
           <div className="flex items-center gap-2 font-medium">
             <Truck className="h-4 w-4" /> Delivery
           </div>
+          {order.fulfillment?.address && (
+            <p className="mt-2 text-sm text-muted-foreground">
+              {[
+                order.fulfillment.address.line1,
+                order.fulfillment.address.line2,
+                order.fulfillment.address.city,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            </p>
+          )}
           <dl className="mt-2 space-y-1 text-sm">
-            <Row label="Status" value={delivery.status.replace(/_/g, " ")} />
-            <Row
-              label="Provider"
-              value={delivery.provider.replace(/_/g, " ")}
-            />
+            <Row label="Status" value={deliveryStatusLabel(delivery.status)} />
             {delivery.eta_minutes != null && (
               <Row label="ETA" value={`~${delivery.eta_minutes} min`} />
             )}
@@ -264,25 +291,25 @@ export function TrackClient({
               />
             )}
           </dl>
-          {delivery.status === "pending_assignment" && (
-            <p className="mt-2 text-xs text-muted-foreground">
-              Finding a driver…
-            </p>
-          )}
         </div>
       )}
 
       {/* Total */}
       <div className="mt-6 rounded-xl border p-4 text-sm">
-        <Row
-          label="Order total"
-          value={formatMoney(order.totals.total_cents, order.currency)}
-        />
+        <dl>
+          <Row
+            label="Order total"
+            value={formatMoney(order.totals.total_cents, order.currency)}
+          />
+        </dl>
       </div>
 
       <div className="mt-6 text-center">
-        <Link href={storefrontPath(store)} className="text-sm underline">
-          ← Back to {store.locationSlug}
+        <Link
+          href={storefrontPath(store)}
+          className="inline-flex min-h-11 items-center text-sm underline"
+        >
+          ← Back to {storeName}
         </Link>
       </div>
     </main>
@@ -292,8 +319,8 @@ export function TrackClient({
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex justify-between">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="font-medium capitalize">{value}</span>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="font-medium">{value}</dd>
     </div>
   );
 }

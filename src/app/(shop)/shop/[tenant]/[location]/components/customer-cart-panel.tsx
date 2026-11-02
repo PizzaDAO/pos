@@ -23,12 +23,12 @@ function placementLabel(placement: string): string {
 function LineModifiers({ line }: { line: OrderItem }) {
   if (line.modifiers.length === 0) return null;
   return (
-    <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+    <ul className="mt-1 space-y-0.5 text-sm text-muted-foreground">
       {line.modifiers.map((m, idx) => (
         <li key={`${m.modifier_id}-${m.placement}-${idx}`}>
           {m.modifier_name}
           {m.placement !== "whole" && (
-            <span className="ml-1 rounded bg-secondary px-1 text-[10px] font-medium text-secondary-foreground">
+            <span className="ml-1 rounded bg-secondary px-1 text-xs font-medium text-secondary-foreground">
               {placementLabel(m.placement)}
             </span>
           )}
@@ -66,6 +66,7 @@ export function CustomerCart({
           <Button
             variant="ghost"
             size="icon"
+            className="h-11 w-11"
             aria-label="Close cart"
             onClick={onClose}
           >
@@ -115,7 +116,7 @@ export function CustomerCart({
                       <Button
                         variant="outline"
                         size="icon"
-                        className="h-8 w-8"
+                        className="h-11 w-11"
                         aria-label="Decrease quantity"
                         onClick={() =>
                           setQuantity(line.id, line.quantity - 1)
@@ -129,7 +130,7 @@ export function CustomerCart({
                       <Button
                         variant="outline"
                         size="icon"
-                        className="h-8 w-8"
+                        className="h-11 w-11"
                         aria-label="Increase quantity"
                         onClick={() =>
                           setQuantity(line.id, line.quantity + 1)
@@ -140,8 +141,7 @@ export function CustomerCart({
                     </div>
                     <Button
                       variant="ghost"
-                      size="sm"
-                      className="text-destructive"
+                      className="h-11 text-destructive"
                       onClick={() => removeLine(line.id)}
                     >
                       <Trash2 className="mr-1 h-3.5 w-3.5" /> Remove

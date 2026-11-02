@@ -16,13 +16,15 @@
  */
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import Link from "next/link";
-import { CheckCircle2, Loader2, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Loader2, X } from "lucide-react";
 import type { DeliveryAddress, Order } from "@/lib/db";
 import { hasProgressedPastPayment } from "@/lib/shop/order-status";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
+import { canEscDismissCheckout } from "@/lib/shop/checkout-dismiss";
 import { cn } from "@/lib/utils";
 import { computeOrderTotals, formatMoney } from "@/lib/pricing";
 import { useCustomerCart } from "@/lib/store/customer-cart";
@@ -58,7 +60,7 @@ export function CheckoutFlow({
   tenantSlug: string;
   slug: string;
   shop: ShopResponse;
-  onClose: () => void;
+  onClose: (placed?: { id: string; number: string | null }) => void;
 }) {
   const checkout = useShopCheckout();
   // Location slugs are unique only within a tenant: key the stored checkout
@@ -123,6 +125,8 @@ export function CheckoutFlow({
     null,
   );
 
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim());
+
   const now = useMemo(() => new Date(), []);
   const asap = fulfillmentSettings
     ? asapAvailability(fulfillmentSettings, now)
@@ -182,7 +186,7 @@ export function CheckoutFlow({
       fulfillmentType: fulfillment,
       scheduledFor: when,
       address: fulfillment === "delivery" ? address : undefined,
-      email,
+      email: email.trim(),
       name,
       phone,
       notes: undefined,
@@ -203,7 +207,7 @@ export function CheckoutFlow({
         items,
         fulfillmentType: fulfillment,
         scheduledFor: when,
-        customer: { email, name: name || undefined, phone: phone || undefined },
+        customer: { email: email.trim(), name: name || undefined, phone: phone || undefined },
         address: fulfillment === "delivery" ? address : undefined,
         notes: undefined,
         tipCents,
@@ -321,31 +325,56 @@ export function CheckoutFlow({
   }
 
   async function handleMagicLink() {
-    if (!email) return;
+    if (!emailValid) return;
     const res = await fetch("/api/shop/auth/magic-link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tenantSlug, locationSlug: slug, email, name }),
+      body: JSON.stringify({ tenantSlug, locationSlug: slug, email: email.trim(), name }),
     });
     const data = (await res.json()) as { magicLinkUrl?: string };
     setMagicLinkUrl(data.magicLinkUrl ?? null);
   }
 
+  // Closing the confirmation hands the order back so the storefront can keep a
+  // "Track your order" link.
+  const close = () =>
+    onClose(
+      step === "done" && placedOrderId
+        ? { id: placedOrderId, number: placedOrderNumber }
+        : undefined,
+    );
+
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 sm:items-center">
-      <div className="flex max-h-[94vh] w-full max-w-lg flex-col overflow-hidden rounded-t-2xl bg-background shadow-xl sm:rounded-2xl">
+    <Dialog
+      onClose={close}
+      labelledBy="checkout-title"
+      placement="center"
+      closeOnBackdrop={false}
+      closeOnEsc={canEscDismissCheckout(step, checkout.loading)}
+      className="bg-black/50"
+    >
+      <div className="flex max-h-[94vh] w-screen max-w-lg flex-col overflow-hidden rounded-t-2xl bg-background shadow-xl sm:w-[32rem] sm:max-w-[calc(100vw-2rem)] sm:rounded-2xl">
         <div className="flex items-center justify-between border-b p-4">
-          <h2 className="text-lg font-bold">
+          <h2 id="checkout-title" className="text-lg font-bold">
             {step === "done" ? "Order confirmed" : "Checkout"}
           </h2>
-          <Button variant="ghost" size="icon" aria-label="Close" onClick={onClose}>
-            <X className="h-5 w-5" />
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-11 w-11"
+            aria-label="Close checkout"
+            onClick={close}
+          >
+            <X className="h-5 w-5" aria-hidden="true" />
           </Button>
         </div>
 
         <div className="flex-1 space-y-5 overflow-y-auto p-4">
           {checkout.error && step !== "done" && (
-            <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive">
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-sm text-destructive"
+            >
               {checkout.error}
             </div>
           )}
@@ -354,10 +383,21 @@ export function CheckoutFlow({
             <div
               role="status"
               data-testid="online-payment-unavailable"
-              className="rounded-md border border-amber-500/60 bg-amber-500/10 p-3 text-sm"
+              className="flex items-start gap-3 rounded-lg border border-amber-500/60 bg-amber-500/10 p-4"
             >
-              Online payment is unavailable at this store right now. Please
-              order in person or by phone.
+              <AlertTriangle
+                className="mt-0.5 h-5 w-5 shrink-0 text-amber-600"
+                aria-hidden="true"
+              />
+              <div className="text-sm">
+                <p className="font-semibold">
+                  Online payment is unavailable right now
+                </p>
+                <p className="mt-1 text-muted-foreground">
+                  {location.name} can’t take online payments at the moment.
+                  Please order in person or call the store.
+                </p>
+              </div>
             </div>
           )}
 
@@ -374,7 +414,7 @@ export function CheckoutFlow({
                     disabled={!pickupAllowed}
                     onClick={() => setFulfillment("pickup")}
                     className={cn(
-                      "rounded-lg border p-3 text-sm font-medium disabled:opacity-40",
+                      "min-h-11 rounded-lg border p-3 text-sm font-medium disabled:opacity-40",
                       fulfillment === "pickup" &&
                         "border-primary bg-primary/10",
                     )}
@@ -386,14 +426,14 @@ export function CheckoutFlow({
                     disabled={!deliveryAllowed}
                     onClick={() => setFulfillment("delivery")}
                     className={cn(
-                      "rounded-lg border p-3 text-sm font-medium disabled:opacity-40",
+                      "min-h-11 rounded-lg border p-3 text-sm font-medium disabled:opacity-40",
                       fulfillment === "delivery" &&
                         "border-primary bg-primary/10",
                     )}
                   >
                     Delivery
                     {!deliveryAllowed && (
-                      <span className="block text-[10px] text-muted-foreground">
+                      <span className="block text-xs text-muted-foreground">
                         not available here
                       </span>
                     )}
@@ -407,45 +447,69 @@ export function CheckoutFlow({
                   <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                     Delivery address
                   </h3>
-                  <input
-                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                    placeholder="Street address"
-                    value={address.line1}
-                    onChange={(e) => {
-                      setAddress({ ...address, line1: e.target.value });
-                      setQuote(null);
-                    }}
-                  />
+                  <Field label="Street address" htmlFor="co-line1">
+                    <input
+                      id="co-line1"
+                      className={INPUT}
+                      autoComplete="address-line1"
+                      value={address.line1}
+                      onChange={(e) => {
+                        setAddress({ ...address, line1: e.target.value });
+                        setQuote(null);
+                      }}
+                    />
+                  </Field>
+                  <Field label="Apt / unit (optional)" htmlFor="co-line2">
+                    <input
+                      id="co-line2"
+                      className={INPUT}
+                      autoComplete="address-line2"
+                      value={address.line2 ?? ""}
+                      onChange={(e) =>
+                        setAddress({ ...address, line2: e.target.value })
+                      }
+                    />
+                  </Field>
                   <div className="grid grid-cols-2 gap-2">
-                    <input
-                      className="rounded-md border bg-background px-3 py-2 text-sm"
-                      placeholder="City"
-                      value={address.city}
-                      onChange={(e) =>
-                        setAddress({ ...address, city: e.target.value })
-                      }
-                    />
-                    <input
-                      className="rounded-md border bg-background px-3 py-2 text-sm"
-                      placeholder="State"
-                      value={address.region}
-                      onChange={(e) =>
-                        setAddress({ ...address, region: e.target.value })
-                      }
-                    />
+                    <Field label="City" htmlFor="co-city">
+                      <input
+                        id="co-city"
+                        className={INPUT}
+                        autoComplete="address-level2"
+                        value={address.city}
+                        onChange={(e) =>
+                          setAddress({ ...address, city: e.target.value })
+                        }
+                      />
+                    </Field>
+                    <Field label="State" htmlFor="co-region">
+                      <input
+                        id="co-region"
+                        className={INPUT}
+                        autoComplete="address-level1"
+                        value={address.region}
+                        onChange={(e) =>
+                          setAddress({ ...address, region: e.target.value })
+                        }
+                      />
+                    </Field>
                   </div>
-                  <input
-                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                    placeholder="ZIP / postal code"
-                    value={address.postal_code}
-                    onChange={(e) => {
-                      setAddress({ ...address, postal_code: e.target.value });
-                      setQuote(null);
-                    }}
-                  />
+                  <Field label="ZIP / postal code" htmlFor="co-zip">
+                    <input
+                      id="co-zip"
+                      className={INPUT}
+                      autoComplete="postal-code"
+                      inputMode="numeric"
+                      value={address.postal_code}
+                      onChange={(e) => {
+                        setAddress({ ...address, postal_code: e.target.value });
+                        setQuote(null);
+                      }}
+                    />
+                  </Field>
                   <Button
                     variant="outline"
-                    className="w-full"
+                    className="h-11 w-full"
                     disabled={!address.line1 || !address.postal_code}
                     onClick={handleGetQuote}
                   >
@@ -460,14 +524,8 @@ export function CheckoutFlow({
                       {quote.etaMinutes != null && (
                         <span> · ~{quote.etaMinutes} min</span>
                       )}
-                      <span className="block text-[11px] text-muted-foreground">
-                        via {quote.provider.replace(/_/g, " ")}
-                      </span>
                     </div>
                   )}
-                  <p className="text-xs text-muted-foreground">
-                    Tip: in-zone ZIPs include 10001–10003 and 10010–10012.
-                  </p>
                 </section>
               )}
 
@@ -482,23 +540,24 @@ export function CheckoutFlow({
                     disabled={!asap.available}
                     onClick={() => setWhen("asap")}
                     className={cn(
-                      "flex-1 rounded-lg border p-3 text-sm font-medium disabled:opacity-40",
+                      "min-h-11 flex-1 rounded-lg border p-3 text-sm font-medium disabled:opacity-40",
                       when === "asap" && "border-primary bg-primary/10",
                     )}
                   >
                     ASAP
                     {!asap.available && (
-                      <span className="block text-[10px] text-muted-foreground">
+                      <span className="block text-xs text-muted-foreground">
                         {asap.reason}
                       </span>
                     )}
                   </button>
                   <select
+                    aria-label="Schedule for later"
                     value={when === "asap" ? "" : when}
                     onChange={(e) =>
                       setWhen(e.target.value || "asap")
                     }
-                    className="flex-1 rounded-lg border bg-background px-2 text-sm"
+                    className="min-h-11 flex-1 rounded-lg border bg-background px-2 text-base sm:text-sm"
                   >
                     <option value="">Schedule for later…</option>
                     {slots.map((s) => (
@@ -527,45 +586,65 @@ export function CheckoutFlow({
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                   Your details
                 </h3>
-                <input
-                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                  placeholder="Email"
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-                <input
-                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                  placeholder="Name (optional)"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                />
-                <input
-                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                  placeholder="Phone (optional)"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Checkout as a guest, or create an account via a magic link.
+                <Field label="Email" htmlFor="co-email">
+                  <input
+                    id="co-email"
+                    className={INPUT}
+                    type="email"
+                    autoComplete="email"
+                    inputMode="email"
+                    required
+                    aria-invalid={email !== "" && !emailValid}
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                  />
+                </Field>
+                <Field label="Name (optional)" htmlFor="co-name">
+                  <input
+                    id="co-name"
+                    className={INPUT}
+                    autoComplete="name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                  />
+                </Field>
+                <Field label="Phone (optional)" htmlFor="co-phone">
+                  <input
+                    id="co-phone"
+                    className={INPUT}
+                    type="tel"
+                    inputMode="tel"
+                    autoComplete="tel"
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                  />
+                </Field>
+                {email !== "" && !emailValid && (
+                  <p role="alert" className="text-sm text-destructive">
+                    Enter a valid email address.
+                  </p>
+                )}
+                <p className="text-sm text-muted-foreground">
+                  Checking out as a guest. You can also save your details for
+                  next time.
                 </p>
                 <Button
                   variant="outline"
-                  size="sm"
-                  disabled={!email}
+                  className="h-11"
+                  disabled={!emailValid}
                   onClick={handleMagicLink}
                 >
-                  Email me a sign-in link (optional)
+                  Save my details (we’ll email a sign-in link)
                 </Button>
                 {magicLinkUrl && (
-                  <div className="rounded-md border bg-muted p-2 text-xs">
-                    Simulated magic link (no email sent):{" "}
+                  <div className="rounded-md border bg-muted p-2 text-sm">
+                    {shop.demo ? "Demo sign-in link (no email sent): " : "Sign-in link: "}
                     <Link
                       href={magicLinkUrl}
                       className="break-all underline"
                       target="_blank"
                     >
-                      verify account
+                      {shop.demo ? "open sign-in link" : "verify account"}
                     </Link>
                   </div>
                 )}
@@ -573,14 +652,14 @@ export function CheckoutFlow({
               <div className="flex gap-2">
                 <Button
                   variant="outline"
-                  className="flex-1"
+                  className="h-11 flex-1"
                   onClick={() => setStep("fulfillment")}
                 >
                   Back
                 </Button>
                 <Button
-                  className="flex-1"
-                  disabled={!email}
+                  className="h-11 flex-1"
+                  disabled={!emailValid}
                   onClick={() => setStep("payment")}
                 >
                   Continue
@@ -603,7 +682,8 @@ export function CheckoutFlow({
                       type="button"
                       onClick={() => setRail(r.key)}
                       className={cn(
-                        "rounded-md border px-3 py-2 text-left text-sm",
+                        "min-h-11 rounded-md border px-3 py-2 text-left text-sm",
+                        r.key === rail && "font-semibold",
                         rail === r.key && "border-primary bg-primary/10",
                       )}
                     >
@@ -630,11 +710,16 @@ export function CheckoutFlow({
                         type="button"
                         onClick={() => setTipCents(cents)}
                         className={cn(
-                          "flex-1 rounded-md border py-2 text-sm",
+                          "min-h-11 flex-1 rounded-md border py-1 text-sm",
                           tipCents === cents && "border-primary bg-primary/10",
                         )}
                       >
                         {bps === 0 ? "None" : `${bps / 100}%`}
+                        {bps !== 0 && (
+                          <span className="block text-xs text-muted-foreground">
+                            {formatMoney(cents, currency)}
+                          </span>
+                        )}
                       </button>
                     );
                   })}
@@ -694,13 +779,13 @@ export function CheckoutFlow({
               <div className="flex gap-2">
                 <Button
                   variant="outline"
-                  className="flex-1"
+                  className="h-11 flex-1"
                   onClick={() => setStep("identity")}
                 >
                   Back
                 </Button>
                 <Button
-                  className="flex-1"
+                  className="h-11 flex-1"
                   disabled={
                     checkout.loading || priceChange !== null || noOnlinePayment
                   }
@@ -715,9 +800,11 @@ export function CheckoutFlow({
                   )}
                 </Button>
               </div>
-              <p className="text-center text-[11px] text-muted-foreground">
-                Payments are simulated in this preview (no live keys).
-              </p>
+              {shop.demo && (
+                <p className="text-center text-xs text-muted-foreground">
+                  {shop.demo}
+                </p>
+              )}
             </>
           )}
 
@@ -761,16 +848,40 @@ export function CheckoutFlow({
                     : "We'll have it ready for pickup."}
                 </p>
               </div>
-              <Link href={`/shop/${tenantSlug}/${slug}/track/${placedOrderId}`}>
-                <Button className="h-12 w-full">Track your order</Button>
-              </Link>
-              <Button variant="outline" className="w-full" onClick={onClose}>
+              <Button asChild className="h-12 w-full">
+                <Link href={`/shop/${tenantSlug}/${slug}/track/${placedOrderId}`}>
+                  Track your order
+                </Link>
+              </Button>
+              <Button variant="outline" className="w-full" onClick={close}>
                 Back to menu
               </Button>
             </div>
           )}
         </div>
       </div>
+    </Dialog>
+  );
+}
+
+const INPUT =
+  "h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm";
+
+function Field({
+  label,
+  htmlFor,
+  children,
+}: {
+  label: string;
+  htmlFor: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <label htmlFor={htmlFor} className="mb-1 block text-sm font-medium">
+        {label}
+      </label>
+      {children}
     </div>
   );
 }

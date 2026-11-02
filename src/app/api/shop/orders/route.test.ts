@@ -71,6 +71,22 @@ describe("POST /api/shop/orders", () => {
     );
   });
 
+  it("rejects a malformed or oversized email and address with 422", async () => {
+    for (const email of ["nope", "a@b", "a b@c.com", `${"x".repeat(250)}@e.com`]) {
+      const res = await POST(
+        req(order({ customer: { email } }), `8.8.8.${seq}`),
+      );
+      expect(res.status).toBe(422);
+    }
+    const res = await POST(
+      req(
+        order({ address: { line1: "x".repeat(500), city: "", region: "" } }),
+        "8.8.9.1",
+      ),
+    );
+    expect(res.status).toBe(422);
+  });
+
   it("rejects an unknown item with 422", async () => {
     const res = await POST(
       req(order({ items: [tamperedLine({ item_id: "nope" })] })),

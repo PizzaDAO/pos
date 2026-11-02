@@ -18,6 +18,20 @@ import {
   isSupabaseAuthConfigured,
 } from "@/lib/auth/supabase-browser";
 
+/** Map raw Supabase auth strings to plain copy. */
+function friendlyAuthError(raw: string): string {
+  const m = raw.toLowerCase();
+  if (m.includes("invalid login") || m.includes("invalid credentials"))
+    return "That email and password don’t match. Try again or use an email link.";
+  if (m.includes("rate limit") || m.includes("too many"))
+    return "Too many attempts. Please wait a minute and try again.";
+  if (m.includes("email") && m.includes("invalid"))
+    return "Enter a valid email address.";
+  if (m.includes("network") || m.includes("fetch"))
+    return "Couldn’t reach the server. Check your connection and try again.";
+  return "Something went wrong signing you in. Please try again.";
+}
+
 export function SignInForm({
   redirect = "/admin",
   heading = "Sign in",
@@ -72,7 +86,7 @@ export function SignInForm({
     });
     if (error) {
       setStatus("error");
-      setMessage(error.message);
+      setMessage(friendlyAuthError(error.message));
     } else {
       setStatus("sent");
       setMessage("Check your email for a sign-in link.");
@@ -90,7 +104,7 @@ export function SignInForm({
     });
     if (error) {
       setStatus("error");
-      setMessage(error.message);
+      setMessage(friendlyAuthError(error.message));
     } else {
       window.location.assign(redirect);
     }
@@ -107,11 +121,14 @@ export function SignInForm({
         <p className="mb-4 text-sm text-muted-foreground">{subheading}</p>
       )}
 
-      <label className="mb-1 block text-sm font-medium">Email</label>
+      <label htmlFor="signin-email" className="mb-1 block text-sm font-medium">
+        Email
+      </label>
       <input
+        id="signin-email"
         type="email"
         autoComplete="email"
-        className="mb-3 w-full rounded-md border px-3 py-2"
+        className="mb-3 h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
         value={email}
         onChange={(e) => setEmail(e.target.value)}
         placeholder="you@pizzeria.com"
@@ -119,11 +136,17 @@ export function SignInForm({
 
       {usePassword && (
         <>
-          <label className="mb-1 block text-sm font-medium">Password</label>
+          <label
+            htmlFor="signin-password"
+            className="mb-1 block text-sm font-medium"
+          >
+            Password
+          </label>
           <input
+            id="signin-password"
             type="password"
             autoComplete="current-password"
-            className="mb-3 w-full rounded-md border px-3 py-2"
+            className="mb-3 h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
@@ -132,6 +155,7 @@ export function SignInForm({
 
       {message && (
         <p
+          role={status === "error" ? "alert" : "status"}
           className={`mb-3 text-sm ${status === "error" ? "text-red-600" : "text-emerald-600"}`}
         >
           {message}
@@ -139,7 +163,7 @@ export function SignInForm({
       )}
 
       <button
-        className="mb-2 w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+        className="mb-2 h-11 w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
         disabled={status === "sending" || !email}
         onClick={() =>
           void (usePassword ? signInWithPassword() : sendMagicLink())
@@ -153,7 +177,7 @@ export function SignInForm({
       </button>
 
       <button
-        className="w-full text-center text-xs text-muted-foreground hover:underline"
+        className="min-h-11 w-full text-center text-sm text-muted-foreground hover:underline"
         onClick={() => {
           setUsePassword((v) => !v);
           setMessage(null);
