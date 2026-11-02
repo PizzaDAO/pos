@@ -94,6 +94,11 @@ test("online order — PICKUP — places and tracks", async ({ page }) => {
 
   await fillIdentityAndPay(page);
 
+  // Esc and a backdrop click must not dismiss the confirmation.
+  await page.keyboard.press("Escape");
+  await page.mouse.click(5, 5);
+  await expect(page.getByText("Thanks for your order!")).toBeVisible();
+
   // Track.
   await page.getByRole("link", { name: "Track your order" }).click();
   await expect(page).toHaveURL(/\/shop\/.+\/track\/.+/);

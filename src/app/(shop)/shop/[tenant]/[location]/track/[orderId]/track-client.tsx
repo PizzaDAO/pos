@@ -35,7 +35,6 @@ function steps(isDelivery: boolean): { status: OrderStatus; label: string }[] {
   return base;
 }
 
-/** Index of the current status within the timeline (paid counts as placed). */
 /** Customer-facing delivery status copy (never the raw enum). */
 const DELIVERY_STATUS_COPY: Record<string, string> = {
   pending_assignment: "Finding a driver",
@@ -54,6 +53,7 @@ function deliveryStatusLabel(status: string): string {
   );
 }
 
+/** Index of the current status within the timeline (paid counts as placed). */
 function currentIndex(
   status: OrderStatus,
   list: { status: OrderStatus }[],

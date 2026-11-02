@@ -12,6 +12,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { AlertTriangle, ShoppingBag } from "lucide-react";
 import type { MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,10 @@ export function ShopClient({
   const [editingLine, setEditingLine] = useState<OrderItem | null>(null);
   const [cartOpen, setCartOpen] = useState(false);
   const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [lastOrder, setLastOrder] = useState<{
+    id: string;
+    number: string | null;
+  } | null>(null);
 
   // Bind the cart to this location (clears if switching shops).
   useEffect(() => {
@@ -146,6 +151,20 @@ export function ShopClient({
         </div>
       </header>
 
+      {lastOrder && (
+        <div className="border-b bg-muted">
+          <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-2 text-sm">
+            <span>Order {lastOrder.number ?? ""} placed.</span>
+            <Link
+              href={`/shop/${store.tenantSlug}/${store.locationSlug}/track/${lastOrder.id}`}
+              className="inline-flex min-h-11 items-center font-medium underline"
+            >
+              Track your order
+            </Link>
+          </div>
+        </div>
+      )}
+
       {/* Menu */}
       <main id="main-content" className="mx-auto w-full max-w-5xl flex-1">
         <MenuBrowse menu={menu} currency={currency} onSelectItem={openBuilder} />
@@ -204,7 +223,10 @@ export function ShopClient({
           tenantSlug={store.tenantSlug}
           slug={store.locationSlug}
           shop={data}
-          onClose={() => setCheckoutOpen(false)}
+          onClose={(placed) => {
+            if (placed) setLastOrder(placed);
+            setCheckoutOpen(false);
+          }}
         />
       )}
     </div>

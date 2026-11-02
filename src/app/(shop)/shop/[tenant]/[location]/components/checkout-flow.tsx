@@ -24,6 +24,7 @@ import { hasProgressedPastPayment } from "@/lib/shop/order-status";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
+import { canEscDismissCheckout } from "@/lib/shop/checkout-dismiss";
 import { cn } from "@/lib/utils";
 import { computeOrderTotals, formatMoney } from "@/lib/pricing";
 import { useCustomerCart } from "@/lib/store/customer-cart";
@@ -59,7 +60,7 @@ export function CheckoutFlow({
   tenantSlug: string;
   slug: string;
   shop: ShopResponse;
-  onClose: () => void;
+  onClose: (placed?: { id: string; number: string | null }) => void;
 }) {
   const checkout = useShopCheckout();
   // Location slugs are unique only within a tenant: key the stored checkout
@@ -185,7 +186,7 @@ export function CheckoutFlow({
       fulfillmentType: fulfillment,
       scheduledFor: when,
       address: fulfillment === "delivery" ? address : undefined,
-      email,
+      email: email.trim(),
       name,
       phone,
       notes: undefined,
@@ -206,7 +207,7 @@ export function CheckoutFlow({
         items,
         fulfillmentType: fulfillment,
         scheduledFor: when,
-        customer: { email, name: name || undefined, phone: phone || undefined },
+        customer: { email: email.trim(), name: name || undefined, phone: phone || undefined },
         address: fulfillment === "delivery" ? address : undefined,
         notes: undefined,
         tipCents,
@@ -328,17 +329,28 @@ export function CheckoutFlow({
     const res = await fetch("/api/shop/auth/magic-link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tenantSlug, locationSlug: slug, email, name }),
+      body: JSON.stringify({ tenantSlug, locationSlug: slug, email: email.trim(), name }),
     });
     const data = (await res.json()) as { magicLinkUrl?: string };
     setMagicLinkUrl(data.magicLinkUrl ?? null);
   }
 
+  // Closing the confirmation hands the order back so the storefront can keep a
+  // "Track your order" link.
+  const close = () =>
+    onClose(
+      step === "done" && placedOrderId
+        ? { id: placedOrderId, number: placedOrderNumber }
+        : undefined,
+    );
+
   return (
     <Dialog
-      onClose={onClose}
+      onClose={close}
       labelledBy="checkout-title"
       placement="center"
+      closeOnBackdrop={false}
+      closeOnEsc={canEscDismissCheckout(step, checkout.loading)}
       className="bg-black/50"
     >
       <div className="flex max-h-[94vh] w-screen max-w-lg flex-col overflow-hidden rounded-t-2xl bg-background shadow-xl sm:w-[32rem] sm:max-w-[calc(100vw-2rem)] sm:rounded-2xl">
@@ -351,7 +363,7 @@ export function CheckoutFlow({
             size="icon"
             className="h-11 w-11"
             aria-label="Close checkout"
-            onClick={onClose}
+            onClick={close}
           >
             <X className="h-5 w-5" aria-hidden="true" />
           </Button>
@@ -841,7 +853,7 @@ export function CheckoutFlow({
                   Track your order
                 </Link>
               </Button>
-              <Button variant="outline" className="w-full" onClick={onClose}>
+              <Button variant="outline" className="w-full" onClick={close}>
                 Back to menu
               </Button>
             </div>

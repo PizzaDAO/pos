@@ -27,7 +27,7 @@
 
   /* Dark theme follows the OS (tailwind darkMode: "media"). Tokens only: every
      surface that uses the semantic colours switches with no component edits. */
-  @media (prefers-color-scheme: dark) {
+  @media screen and (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
     --background: 240 10% 3.9%;
@@ -104,7 +104,7 @@
   }
 }
 @layer utilities {
-  @media (prefers-color-scheme: dark) {
+  @media screen and (prefers-color-scheme: dark) {
     /* Pale light-mode fills become translucent tints over the dark surface. */
     .bg-red-100 {
       background-color: rgb(239 68 68 / 0.22);

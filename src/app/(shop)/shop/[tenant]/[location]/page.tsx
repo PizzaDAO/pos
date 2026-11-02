@@ -65,7 +65,7 @@ export default async function ShopPage({ params }: { params: Params }) {
   );
   // A bad location under a real tenant lands on that tenant's store chooser
   // (which 404s itself if the tenant is unknown), not the SaaS home page.
-  if (!location) redirect(`/shop/${encodeURIComponent(tenantSlug)}`);
+  if (!location) redirect(`/shop/${tenantSlug}`);
 
   return (
     <ShopClient
