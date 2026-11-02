@@ -33,6 +33,7 @@ function MenuBrowseImpl({ menu, currency, onSelectItem }: MenuBrowseProps) {
     <div className="flex h-full flex-col">
       {/* Category filter buttons */}
       <div
+        role="group"
         aria-label="Menu categories"
         className="flex gap-2 overflow-x-auto border-b p-3"
       >
@@ -45,7 +46,7 @@ function MenuBrowseImpl({ menu, currency, onSelectItem }: MenuBrowseProps) {
               aria-pressed={selected}
               onClick={() => setActiveCategoryId(c.id)}
               className={cn(
-                "shrink-0 rounded-full px-4 py-2 text-sm font-medium transition-colors",
+                "min-h-11 shrink-0 rounded-full px-4 py-2 text-sm font-medium transition-colors",
                 selected
                   ? "bg-primary text-primary-foreground"
                   : "bg-secondary text-secondary-foreground hover:bg-accent",
@@ -86,7 +87,7 @@ function MenuBrowseImpl({ menu, currency, onSelectItem }: MenuBrowseProps) {
                     : "Select"}
                 </span>
                 {item.is_half_and_half_capable && (
-                  <span className="mt-1 rounded-full bg-secondary px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-secondary-foreground">
+                  <span className="mt-1 rounded-full bg-secondary px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-secondary-foreground">
                     half &amp; half
                   </span>
                 )}

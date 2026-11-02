@@ -10,6 +10,7 @@
 "use client";
 
 import * as React from "react";
+import { usePathname } from "next/navigation";
 import { CheckCircle2, AlertCircle, Info, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -70,7 +71,8 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
         title: input.title,
         description: input.description,
         variant: input.variant ?? "info",
-        durationMs: input.durationMs ?? 4000,
+        durationMs:
+          input.durationMs ?? (input.variant === "success" ? 2500 : 4000),
       };
       setToasts((prev) => [...prev, record]);
       if (record.durationMs > 0) {
@@ -80,13 +82,21 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     [remove],
   );
 
+  const pathname = usePathname();
+  const onRegister = pathname?.startsWith("/terminal") ?? false;
+
   return (
     <ToastContext.Provider value={toast}>
       {children}
       <div
         aria-live="polite"
         aria-atomic="false"
-        className="pointer-events-none fixed inset-x-0 bottom-0 z-[100] flex flex-col items-center gap-2 p-4 sm:items-end"
+        className={cn(
+          "pointer-events-none fixed inset-x-0 z-[100] flex flex-col items-center gap-2 p-4",
+          // On the register the bottom-right is the Place order / Charge area:
+          // keep toasts out of the way at the top.
+          onRegister ? "top-0" : "bottom-0 sm:items-end",
+        )}
       >
         {toasts.map((t) => {
           const Icon = ICONS[t.variant];
@@ -114,7 +124,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
                 type="button"
                 onClick={() => remove(t.id)}
                 aria-label="Dismiss notification"
-                className="shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="-m-2 flex h-11 w-11 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <X className="h-4 w-4" aria-hidden="true" />
               </button>

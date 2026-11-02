@@ -66,7 +66,7 @@ async function chooseWhen(page: Page) {
 
 async function fillIdentityAndPay(page: Page) {
   // STEP 2 — identity (guest): email is required to continue.
-  await page.getByPlaceholder("Email").fill("e2e-customer@example.com");
+  await page.getByLabel("Email").fill("e2e-customer@example.com");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
 
   // STEP 3 — payment: default rail "Card", simulated. Place + pay.
@@ -94,8 +94,13 @@ test("online order — PICKUP — places and tracks", async ({ page }) => {
 
   await fillIdentityAndPay(page);
 
+  // Esc and a backdrop click must not dismiss the confirmation.
+  await page.keyboard.press("Escape");
+  await page.mouse.click(5, 5);
+  await expect(page.getByText("Thanks for your order!")).toBeVisible();
+
   // Track.
-  await page.getByRole("button", { name: "Track your order" }).click();
+  await page.getByRole("link", { name: "Track your order" }).click();
   await expect(page).toHaveURL(/\/shop\/.+\/track\/.+/);
   await expect(page.getByText("Order received")).toBeVisible({
     timeout: 30_000,
@@ -112,10 +117,10 @@ test("online order — DELIVERY — in-zone quote, places and tracks", async ({
   // STEP 1 — fulfillment: choose Delivery, fill an IN-ZONE address (ZIP 10001),
   // get a quote, then Continue.
   await page.getByRole("button", { name: "Delivery", exact: true }).click();
-  await page.getByPlaceholder("Street address").fill("123 Main St");
-  await page.getByPlaceholder("City").fill("New York");
-  await page.getByPlaceholder("State").fill("NY");
-  await page.getByPlaceholder("ZIP / postal code").fill("10001");
+  await page.getByLabel("Street address").fill("123 Main St");
+  await page.getByLabel("City").fill("New York");
+  await page.getByLabel("State").fill("NY");
+  await page.getByLabel("ZIP / postal code").fill("10001");
   await page
     .getByRole("button", { name: "Check delivery & get a quote" })
     .click();
@@ -130,7 +135,7 @@ test("online order — DELIVERY — in-zone quote, places and tracks", async ({
   await fillIdentityAndPay(page);
 
   // Track — delivery timeline includes "Out for delivery".
-  await page.getByRole("button", { name: "Track your order" }).click();
+  await page.getByRole("link", { name: "Track your order" }).click();
   await expect(page).toHaveURL(/\/shop\/.+\/track\/.+/);
   await expect(page.getByText("Order received")).toBeVisible({
     timeout: 30_000,

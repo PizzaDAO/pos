@@ -83,6 +83,29 @@ function isValid(body: unknown): body is ShopOrderBody {
   );
 }
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+const ADDRESS_MAX: Record<string, number> = {
+  line1: 120,
+  line2: 80,
+  city: 80,
+  region: 40,
+  postal_code: 20,
+  country: 2,
+};
+
+/** Every present address field must be a string within its length cap. */
+function addressWithinLimits(address: unknown): boolean {
+  if (!address || typeof address !== "object") return false;
+  const a = address as Record<string, unknown>;
+  return Object.entries(ADDRESS_MAX).every(
+    ([k, max]) =>
+      a[k] === undefined ||
+      a[k] === null ||
+      (typeof a[k] === "string" && (a[k] as string).length <= max),
+  );
+}
+
 /** A trimmed, length-bounded optional string from client input, else null. */
 function cleanText(v: unknown, max: number): string | null {
   return typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null;
@@ -102,6 +125,21 @@ export async function POST(request: Request) {
   if (!isValid(body)) {
     return NextResponse.json(
       { error: "Malformed order payload." },
+      { status: 422 },
+    );
+  }
+
+  const email = body.customer.email.trim();
+  if (email.length > 254 || !EMAIL_RE.test(email)) {
+    return NextResponse.json(
+      { error: "Enter a valid email address." },
+      { status: 422 },
+    );
+  }
+  body.customer.email = email;
+  if (body.address && !addressWithinLimits(body.address)) {
+    return NextResponse.json(
+      { error: "Delivery address fields are too long." },
       { status: 422 },
     );
   }

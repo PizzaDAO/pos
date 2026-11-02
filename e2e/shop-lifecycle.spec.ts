@@ -51,7 +51,7 @@ async function reachUsdcPayment(page: Page) {
   const cont = page.getByRole("button", { name: "Continue", exact: true });
   await expect(cont).toBeEnabled({ timeout: 15_000 });
   await cont.click();
-  await page.getByPlaceholder("Email").fill("e2e-lifecycle@example.com");
+  await page.getByLabel("Email").fill("e2e-lifecycle@example.com");
   await page.getByRole("button", { name: "Continue", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Payment" })).toBeVisible();
   await page.getByRole("button", { name: /Crypto/ }).click();
