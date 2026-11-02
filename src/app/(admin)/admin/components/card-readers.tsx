@@ -15,6 +15,7 @@ import { useCallback, useEffect, useState } from "react";
 import { CreditCard, Loader2, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
 
 type Mode = "simulated" | "stripe_test" | "stripe_live";
@@ -82,6 +83,7 @@ export function CardReaders({
   const [showAdd, setShowAdd] = useState(false);
   const [code, setCode] = useState("");
   const [label, setLabel] = useState("");
+  const [removing, setRemoving] = useState<Reader | null>(null);
 
   const query = `tenantId=${encodeURIComponent(tenantId)}&locationId=${encodeURIComponent(locationId)}`;
 
@@ -169,9 +171,7 @@ export function CardReaders({
   }
 
   function removeReader(r: Reader) {
-    if (!window.confirm(`Remove ${r.label}? It will stop taking card payments here.`)) {
-      return;
-    }
+    setRemoving(null);
     void run(() =>
       fetch(`/api/admin/terminal/readers/${encodeURIComponent(r.id)}?${query}`, {
         method: "DELETE",
@@ -367,7 +367,7 @@ export function CardReaders({
                         size="icon"
                         aria-label={`Remove ${r.label}`}
                         disabled={busy}
-                        onClick={() => removeReader(r)}
+                        onClick={() => setRemoving(r)}
                       >
                         <Trash2 className="h-4 w-4" aria-hidden="true" />
                       </Button>
@@ -421,6 +421,15 @@ export function CardReaders({
             </div>
           </div>
         </Dialog>
+      )}
+      {removing && (
+        <ConfirmDialog
+          title={`Remove ${removing.label}?`}
+          description="It will stop taking card payments here."
+          confirmLabel="Remove"
+          onCancel={() => setRemoving(null)}
+          onConfirm={() => removeReader(removing)}
+        />
       )}
     </div>
   );

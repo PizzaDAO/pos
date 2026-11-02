@@ -32,6 +32,9 @@ export default async function KitchenPage({
     <KitchenBoard
       initialTenantId={ctx.tenantId}
       initialLocationId={ctx.locationId ?? undefined}
+      locationName={
+        ctx.locations.find((l) => l.id === ctx.locationId)?.name ?? undefined
+      }
     />
   );
 }

@@ -73,7 +73,8 @@ export function statusLabel(status: OrderStatus): string {
     case "placed":
       return "New";
     case "paid":
-      return "Paid";
+      // Cooks don't care about payment state; paid-at-counter is a new ticket.
+      return "New";
     case "in_kitchen":
       return "In kitchen";
     case "ready":

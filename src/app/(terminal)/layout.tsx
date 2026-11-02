@@ -29,7 +29,7 @@ export default function TerminalLayout({
       <RegisterServiceWorker />
       {/* Column shell: the in-flow banner takes its height, the terminal (h-full)
           fills the rest, so the full-height POS grid never overflows. */}
-      <div className="flex h-screen flex-col">
+      <div className="flex h-dvh flex-col">
         <TrainingBanner />
         <div className="min-h-0 flex-1">{children}</div>
       </div>

@@ -137,7 +137,12 @@ export function InventoryManager({ tenantId, locationId }: Props) {
 
       <div>
         <h3 className="mb-2 text-sm font-semibold">Movement ledger</h3>
-        <div className="max-h-72 overflow-auto rounded-xl border">
+        <div
+          role="region"
+          aria-label="Movement ledger"
+          tabIndex={0}
+          className="max-h-72 overflow-auto rounded-xl border"
+        >
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-muted/40 text-left text-xs uppercase text-muted-foreground">
               <tr>
@@ -327,6 +332,7 @@ function NewInventoryItem({
         onChange={(e) => setName(e.target.value)}
       />
       <select
+        aria-label="Unit"
         className="rounded-md border bg-background px-2 py-1.5 text-sm"
         value={unit}
         onChange={(e) => setUnit(e.target.value as InventoryUnit)}

@@ -36,6 +36,11 @@ const AGE_STYLES: Record<AgeLevel, { card: string; header: string }> = {
   },
 };
 
+const READY_STYLE = {
+  card: "border-muted-foreground/40 opacity-80",
+  header: "bg-muted text-foreground",
+};
+
 /** Elapsed seconds right now, anchored on created_at (independent of polls). */
 function useLiveElapsed(createdAtIso: string): number {
   const compute = () =>
@@ -71,9 +76,10 @@ function TicketCardImpl({
   const { order } = ticket;
   const elapsed = useLiveElapsed(order.created_at);
   const ageLevel = ageLevelFor(elapsed, thresholds);
-  const styles = AGE_STYLES[ageLevel];
-
   const isBumped = order.status === "ready" || order.status === "completed";
+  // Ready/done tickets are waiting for hand-off, not aging in the kitchen, so
+  // they are greyed out instead of turning amber/red.
+  const styles = isBumped ? READY_STYLE : AGE_STYLES[ageLevel];
   const isRecalled = order.status === "recall";
 
   return (
@@ -86,7 +92,7 @@ function TicketCardImpl({
     >
       <header className={cn("px-3 py-2", styles.header)}>
         <div className="flex items-center justify-between">
-          <span className="text-lg font-bold tracking-tight">
+          <span className="text-2xl font-bold tracking-tight">
             {order.order_number}
           </span>
           <span className="font-mono text-lg font-bold tabular-nums">
@@ -123,8 +129,8 @@ function TicketCardImpl({
         {isBumped ? (
           <Button
             variant="outline"
-            size="sm"
-            className="flex-1"
+            size="lg"
+            className="h-14 flex-1 text-lg"
             disabled={busy}
             aria-label={`Recall order ${order.order_number}`}
             onClick={() => onRecall(order.id)}
@@ -133,8 +139,8 @@ function TicketCardImpl({
           </Button>
         ) : (
           <Button
-            size="sm"
-            className="flex-1"
+            size="lg"
+            className="h-14 flex-1 text-lg"
             disabled={busy}
             aria-label={`Bump order ${order.order_number}`}
             onClick={() => onBump(order.id)}
@@ -142,7 +148,7 @@ function TicketCardImpl({
             Bump
           </Button>
         )}
-        <Button asChild variant="ghost" size="sm">
+        <Button asChild variant="ghost" size="lg" className="h-14 px-4 text-base">
           <a
             href={`/kitchen/ticket/${order.id}`}
             target="_blank"

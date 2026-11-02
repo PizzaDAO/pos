@@ -44,23 +44,23 @@ test.describe("terminal order → payment → receipt", () => {
       page.getByRole("heading", { name: "Switch staff" }),
     ).toBeVisible();
 
-    // Wait for the staff picker to populate (GET /api/terminal/pin), then pick
+    // Wait for the staff tiles to populate (GET /api/terminal/pin), then pick
     // the staff member that the configured PIN belongs to. Demo PIN 1111 → Tony;
-    // when E2E_STAFF_PIN is overridden, fall back to the first real option.
-    const select = page.locator("select").first();
-    await expect
-      .poll(async () => select.locator("option").count())
-      .toBeGreaterThan(1);
-    const labels = await select.locator("option").allTextContents();
-    const realLabels = labels.filter((o) => o && !/select/i.test(o));
-    test.skip(realLabels.length === 0, "No staff options available.");
-    const target =
+    // when E2E_STAFF_PIN is overridden, fall back to the first real tile.
+    const tiles = page.getByRole("group", { name: "Staff member" }).getByRole("button");
+    await expect.poll(async () => tiles.count()).toBeGreaterThan(0);
+    const labels = await tiles.allTextContents();
+    test.skip(labels.length === 0, "No staff options available.");
+    const idx =
       STAFF_PIN === "1111"
-        ? (realLabels.find((o) => /tony/i.test(o)) ?? realLabels[0]!)
-        : realLabels[0]!;
-    await select.selectOption({ label: target });
+        ? Math.max(0, labels.findIndex((o) => /tony/i.test(o)))
+        : 0;
+    await tiles.nth(idx).click();
 
-    await page.getByPlaceholder("••••").fill(STAFF_PIN);
+    // Enter the PIN on the on-screen keypad.
+    for (const digit of STAFF_PIN) {
+      await page.getByRole("button", { name: digit, exact: true }).click();
+    }
     await page.getByRole("button", { name: "Switch", exact: true }).click();
 
     // On success the dialog closes; the status bar shows the active staff.
@@ -138,7 +138,7 @@ test.describe("terminal card reader (simulated)", () => {
     // Wait for the balance to load, then pick Card.
     const charge = page.getByRole("button", { name: /^Charge / });
     await expect(charge).toBeEnabled({ timeout: 20_000 });
-    await page.getByRole("button", { name: /^Card — Stripe Terminal/ }).click();
+    await page.getByRole("button", { name: /^Card/ }).click();
     // No "Card — Stripe (online)" at the till.
     await expect(
       page.getByRole("button", { name: /Stripe \(online\)/ }),

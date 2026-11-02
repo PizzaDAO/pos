@@ -37,6 +37,11 @@ const MODULE_ROLE_LABELS: { role: StaffModuleRole; label: string }[] = [
   { role: "dispatcher", label: "Dispatcher" },
 ];
 
+const ROLE_HINTS: Record<StaffModuleRole, string> = {
+  driver: "Can be assigned deliveries",
+  dispatcher: "Can assign drivers to deliveries",
+};
+
 function dollarsToCents(v: string): number {
   const n = Number.parseFloat(v);
   return Number.isNaN(n) ? 0 : Math.round(n * 100);
@@ -46,6 +51,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
   const [data, setData] = useState<StaffData | null>(null);
   const [busy, setBusy] = useState(false);
   const [roleError, setRoleError] = useState<string | null>(null);
+  const [savedFor, setSavedFor] = useState<string | null>(null);
   const [floatDraft, setFloatDraft] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
@@ -88,6 +94,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
     setBusy(true);
     try {
       setRoleError(null);
+      setSavedFor(null);
       const res = await fetch("/api/admin/staff", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -96,6 +103,8 @@ export function StaffShifts({ tenantId, locationId }: Props) {
       if (!res.ok) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
         setRoleError(data.error ?? "Could not update module roles.");
+      } else {
+        setSavedFor(s.id);
       }
       await load();
     } finally {
@@ -147,14 +156,20 @@ export function StaffShifts({ tenantId, locationId }: Props) {
               </div>
 
               <fieldset
-                className="mt-3 flex items-center gap-4 text-xs"
+                className="mt-3 flex flex-wrap items-center gap-2 text-sm"
                 aria-label={`Open Pizza module roles for ${s.name}`}
               >
                 <legend className="sr-only">Module roles</legend>
                 {MODULE_ROLE_LABELS.map(({ role, label }) => (
-                  <label key={role} className="flex items-center gap-1.5">
+                  <label
+                    key={role}
+                    title={ROLE_HINTS[role]}
+                    className="flex min-h-11 cursor-pointer items-center gap-2 rounded-full border px-4 has-[:checked]:border-primary has-[:checked]:bg-primary/10"
+                  >
                     <input
                       type="checkbox"
+                      className="h-5 w-5"
+                      aria-describedby={`${s.id}-${role}-hint`}
                       disabled={busy}
                       checked={(s.module_roles ?? []).includes(role)}
                       onChange={(e) =>
@@ -162,8 +177,16 @@ export function StaffShifts({ tenantId, locationId }: Props) {
                       }
                     />
                     {label}
+                    <span id={`${s.id}-${role}-hint`} className="sr-only">
+                      {ROLE_HINTS[role]}
+                    </span>
                   </label>
                 ))}
+                {savedFor === s.id && (
+                  <span role="status" className="text-xs text-emerald-700">
+                    Saved
+                  </span>
+                )}
               </fieldset>
 
               {open ? (

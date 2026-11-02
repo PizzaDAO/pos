@@ -8,6 +8,7 @@
  */
 import type { Order, OrderItem, Payment } from "@/lib/db";
 import { tenderRailLabel } from "./registry";
+import { isFullyRefunded, liveTenders } from "./refund-state";
 
 export interface ReceiptLine {
   name: string;
@@ -102,6 +103,10 @@ export interface Receipt {
   totalChangeCents: number;
   balanceCents: number;
   paid: boolean;
+  /** Total refunded back across tenders (tip included in each tender's amount). */
+  refundedCents: number;
+  /** Every non-failed tender has been refunded (the order is closed out). */
+  fullyRefunded: boolean;
 }
 
 function placementSuffix(placement: OrderItem["modifiers"][number]["placement"]): string {
@@ -160,7 +165,15 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
   const grandTotalCents = order.totals.total_cents + tipCents;
   const balanceCents = Math.max(0, order.totals.total_cents - coveredCents);
 
+  const refundedCents = liveTenders(payments).reduce(
+    (sum, p) => sum + p.refunded_cents,
+    0,
+  );
+  const fullyRefunded = isFullyRefunded(order, payments);
+
   return {
+    refundedCents,
+    fullyRefunded,
     orderNumber: order.order_number,
     currency: order.currency,
     lines,
