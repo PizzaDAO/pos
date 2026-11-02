@@ -43,6 +43,8 @@ export function StaffSwitch({
   const submitRef = useRef<() => void>(() => {});
   const [selected, setSelected] = useState<string>(current?.id ?? "");
   const [pin, setPin] = useState("");
+  const pinRef = useRef("");
+  pinRef.current = pin;
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [shake, setShake] = useState(false);
@@ -59,11 +61,12 @@ export function StaffSwitch({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (busyRef.current) return;
-      // A focused control (keypad key, Close, tile) handles Enter/Space natively.
+      // With digits typed, Enter always submits (even if Close or a tile has
+      // focus); with none, a focused control handles Enter natively.
       const onButton = e.target instanceof HTMLButtonElement;
       if (/^[0-9]$/.test(e.key)) addDigit(e.key);
       else if (e.key === "Backspace") setPin((p) => p.slice(0, -1));
-      else if (e.key === "Enter" && !onButton) {
+      else if (e.key === "Enter" && (!onButton || pinRef.current.length > 0)) {
         e.preventDefault();
         submitRef.current();
       }
@@ -186,6 +189,7 @@ export function StaffSwitch({
               key={s.id}
               type="button"
               aria-pressed={selected === s.id}
+              onMouseDown={noFocus}
               onClick={() => {
                 setSelected(s.id);
                 setError(null);
