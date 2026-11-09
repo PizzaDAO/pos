@@ -707,6 +707,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     table: string,
     column: string,
     ids: string[],
+    tieBreak = "id",
   ): Promise<Row[]> {
     const out: Row[] = [];
     for (let i = 0; i < ids.length; i += 100) {
@@ -719,7 +720,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               .select("*")
               .in(column, chunk)
               .order(column)
-              .order("id")
+              .order(tieBreak)
               .range(from, to),
           ) as Row[],
         )),
@@ -3085,54 +3086,94 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async getMenuSnapshot(tenantId) {
-      const [cats, items, groups] = await Promise.all([
-        sb.from("menu_categories").select("id,name,sort_order").eq("tenant_id", tenantId),
-        sb.from("menu_items").select("id,category_id,name").eq("tenant_id", tenantId),
-        sb.from("modifier_groups").select("id,name").eq("tenant_id", tenantId),
+      // Every read is paged (PostgREST caps responses at max_rows ~ 1000) and
+      // every `in` list is chunked.
+      const tenantRows = (
+        table: string,
+        cols: string,
+        order: string,
+        extra?: (q: any) => any, // eslint-disable-line @typescript-eslint/no-explicit-any
+      ) =>
+        fetchAllPages<Row>(async (from, to) => {
+          let q = sb.from(table).select(cols).eq("tenant_id", tenantId);
+          if (extra) q = extra(q);
+          return unwrap(await q.order(order).range(from, to)) as unknown as Row[];
+        });
+      const [cats, items, groups, recipes, allergens] = await Promise.all([
+        tenantRows("menu_categories", "id,name,sort_order", "id"),
+        tenantRows(
+          "menu_items",
+          "id,category_id,name,description,is_half_and_half_capable,station",
+          "id",
+        ),
+        tenantRows(
+          "modifier_groups",
+          "id,name,min_select,max_select,supports_half",
+          "id",
+        ),
+        tenantRows("item_inventory_links", "id,source_id", "id"),
+        tenantRows("menu_allergen_rows", "publication_id,target_id,target_type", "target_id"),
       ]);
-      const groupRows = unwrap(groups) as Row[];
-      const groupIds = groupRows.map((g) => g.id as string);
-      const mods = groupIds.length
-        ? (unwrap(
-            await sb
-              .from("modifiers")
-              .select("id,group_id,name,sort_order")
-              .in("group_id", groupIds),
-          ) as Row[])
-        : [];
+      const itemIds = items.map((r) => r.id as string);
+      const groupIds = groups.map((r) => r.id as string);
+      const [sizes, mods, links] = await Promise.all([
+        selectIn("item_sizes", "item_id", itemIds),
+        selectIn("modifiers", "group_id", groupIds),
+        selectIn("item_modifier_groups", "item_id", itemIds, "group_id"),
+      ]);
       return {
-        categories: (unwrap(cats) as Row[]).map((r) => ({
+        categories: cats.map((r) => ({
           id: r.id as string,
           name: r.name as string,
           sort_order: r.sort_order as number,
         })),
-        items: (unwrap(items) as Row[]).map((r) => ({
+        items: items.map((r) => ({
           id: r.id as string,
           category_id: r.category_id as string,
           name: r.name as string,
+          description: (r.description as string | null) ?? null,
+          is_half_and_half_capable: r.is_half_and_half_capable as boolean,
+          station: r.station as MenuItem["station"],
         })),
-        modifierGroups: groupRows.map((r) => ({
+        sizes: sizes.map((r) => ({
+          id: r.id as string,
+          item_id: r.item_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        modifierGroups: groups.map((r) => ({
           id: r.id as string,
           name: r.name as string,
+          min_select: r.min_select as number,
+          max_select: r.max_select as number,
+          supports_half: r.supports_half as boolean,
         })),
         modifiers: mods.map((r) => ({
           id: r.id as string,
           group_id: r.group_id as string,
           name: r.name as string,
+          price_cents: r.price_cents as number,
           sort_order: r.sort_order as number,
         })),
+        links: links.map((r) => ({
+          item_id: r.item_id as string,
+          group_id: r.group_id as string,
+          sort_order: r.sort_order as number,
+        })),
+        inventoryLinkSourceIds: recipes.map((r) => r.source_id as string),
+        allergenTargetIds: allergens.map((r) => r.target_id as string),
       };
     },
 
     // ONE transaction inside public.import_menu() (migration
     // 20261113000100): a PostgREST client can't span statements, so the whole
     // replace/insert runs server-side and rolls back as a unit.
-    async applyMenuImport(tenantId, rows, replace) {
+    async applyMenuImport(tenantId, changes) {
       unwrap(
         await sb.rpc("import_menu", {
           p_tenant_id: tenantId,
-          p_replace: replace,
-          p_rows: rows,
+          p_changes: changes,
         }),
       );
     },

@@ -1,7 +1,7 @@
 /** Table + column map -> normalized {@link MenuImportPlan} with warnings. */
 import type { Station } from "@/lib/db/menu-types";
 import { detectFormat, mapColumns, type Field } from "./formats";
-import { parsePriceCents } from "./price";
+import { looksAmbiguousPrice, parsePriceCents } from "./price";
 import type { MenuTable } from "./table";
 import {
   IMPORT_LIMITS,
@@ -150,12 +150,19 @@ export function buildPlan(
     const price = parsePriceCents(priceRaw);
     if (price === null) {
       warn({
-        code: priceRaw === "" ? "missing_price" : "invalid_price",
+        code:
+          priceRaw === ""
+            ? "missing_price"
+            : looksAmbiguousPrice(priceRaw)
+              ? "ambiguous_price"
+              : "invalid_price",
         row,
         message:
           priceRaw === ""
             ? `"${name}" has no price (variable-price items can't be imported); skipped.`
-            : `"${name}" has an unreadable price "${priceRaw}"; skipped.`,
+            : looksAmbiguousPrice(priceRaw)
+              ? `"${name}" has an ambiguous price "${priceRaw}" (use 12.50 or 12,50); skipped.`
+              : `"${name}" has an unreadable price "${priceRaw}"; skipped.`,
       });
       skippedRows++;
       continue;
@@ -215,29 +222,6 @@ export function buildPlan(
       `The file has more than ${IMPORT_LIMITS.maxItems} items. Split it and import in parts.`,
       413,
     );
-  }
-
-  // Modifier groups an item references but the file never defines options for
-  // (Square / Clover item exports carry only the group NAMES): drop the link
-  // and tell the user, rather than creating empty groups that clutter the
-  // builder.
-  const unlinked = new Map<string, { name: string; items: number }>();
-  for (const category of categories.values()) {
-    for (const item of category.items) {
-      item.modifier_groups = item.modifier_groups.filter((g) => {
-        if ((groups.get(key(g))?.modifiers.length ?? 0) > 0) return true;
-        const ref = unlinked.get(key(g)) ?? { name: g, items: 0 };
-        ref.items++;
-        unlinked.set(key(g), ref);
-        return false;
-      });
-    }
-  }
-  for (const ref of unlinked.values()) {
-    warn({
-      code: "modifiers_without_options",
-      message: `Modifier group "${ref.name}" is used by ${ref.items} item${ref.items === 1 ? "" : "s"} but this file has no options for it. Add the group in Menu manager after importing.`,
-    });
   }
 
   // Drop items whose every row was skipped (no valid size), then empty categories.

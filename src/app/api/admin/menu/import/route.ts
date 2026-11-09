@@ -1,8 +1,8 @@
 /**
  * Menu import — POST /api/admin/menu/import (multipart/form-data).
  *
- * Fields: `file` (CSV or XLSX), `tenantId`, `action` = "preview" | "apply",
- * `format` = auto|square|toast|clover|generic, and for apply `mode` = "add" |
+ * Query: `tenantId` (authorized BEFORE the body is read). Fields: `file` (CSV or
+ * XLSX), `action` = "preview" | "apply", `format` = auto|square|toast|clover|generic, and for apply `mode` = "add" |
  * "replace" (+ `confirmReplace=yes`, the server-side echo of the UI's
  * ConfirmDialog). The file is re-parsed on apply, so the server never trusts a
  * client-built plan.
@@ -36,6 +36,15 @@ function fail(error: string, status: number) {
 }
 
 export async function POST(request: Request) {
+  // Authorize first: the tenant comes from the query string so nothing is
+  // buffered or parsed for a caller who may not import.
+  const auth = await requireTenantAccess(
+    new URL(request.url).searchParams.get("tenantId"),
+    "admin",
+  );
+  if (!auth.ok) return auth.res;
+  const tenantId = auth.tenantId;
+
   // Reject oversized bodies before buffering them (multipart adds a little).
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (declared > IMPORT_LIMITS.maxFileBytes + 64 * 1024) {
@@ -48,14 +57,6 @@ export async function POST(request: Request) {
   } catch {
     return fail("Expected a multipart form upload.", 400);
   }
-
-  const tenantField = form.get("tenantId");
-  const auth = await requireTenantAccess(
-    typeof tenantField === "string" ? tenantField : null,
-    "admin",
-  );
-  if (!auth.ok) return auth.res;
-  const tenantId = auth.tenantId;
 
   const action = form.get("action");
   if (action !== "preview" && action !== "apply") {
@@ -83,11 +84,15 @@ export async function POST(request: Request) {
 
     if (action === "preview") {
       const snapshot = await driver.getMenuSnapshot(tenantId);
-      const add = buildImportRows(tenantId, snapshot, plan, "add").summary;
-      const replace = buildImportRows(tenantId, snapshot, plan, "replace").summary;
+      const add = buildImportRows(tenantId, snapshot, plan, "add");
+      const replace = buildImportRows(tenantId, snapshot, plan, "replace");
       return NextResponse.json({
-        plan: { ...plan, formatLabel: FORMAT_LABELS[plan.format] },
-        summary: { add, replace },
+        plan: {
+          ...plan,
+          warnings: [...plan.warnings, ...add.warnings],
+          formatLabel: FORMAT_LABELS[plan.format],
+        },
+        summary: { add: add.summary, replace: replace.summary },
         existing: {
           categories: snapshot.categories.length,
           items: snapshot.items.length,
@@ -104,13 +109,13 @@ export async function POST(request: Request) {
       return fail("Replacing the menu needs confirmation.", 422);
     }
     const snapshot = await driver.getMenuSnapshot(tenantId);
-    const { rows, summary } = buildImportRows(
+    const { changes, summary } = buildImportRows(
       tenantId,
       snapshot,
       plan,
       mode as ImportMode,
     );
-    await driver.applyMenuImport(tenantId, rows, mode === "replace");
+    await driver.applyMenuImport(tenantId, changes);
     await recordAudit({
       actor: { id: auth.user.id, label: auth.user.email },
       action: "menu_import",
@@ -121,12 +126,15 @@ export async function POST(request: Request) {
         `${summary.modifierGroups} modifier groups` +
         (summary.skippedItems ? `, ${summary.skippedItems} existing skipped` : "") +
         (mode === "replace"
-          ? `; replaced ${snapshot.items.length} items / ${snapshot.categories.length} categories.`
+          ? `; updated ${summary.updatedItems} in place, removed ${summary.removed.items} items / ${summary.removed.categories} categories.`
           : "."),
     });
     return NextResponse.json({ ok: true, mode, summary });
   } catch (err) {
     if (err instanceof MenuImportError) return fail(err.message, err.status);
+    if (err instanceof Error && /menu changed/i.test(err.message)) {
+      return fail("Your menu changed while importing. Nothing was changed; preview again.", 409);
+    }
     return fail("Menu import failed. Nothing was changed.", 500);
   }
 }

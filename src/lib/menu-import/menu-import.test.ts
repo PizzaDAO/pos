@@ -6,6 +6,7 @@ import { parseCsv } from "./csv";
 import { parsePriceCents } from "./price";
 import { parseMenuImport } from "./index";
 import { IMPORT_LIMITS, MenuImportError } from "./types";
+import { buildImportRows, emptySnapshot } from "./apply";
 import { GENERIC_TEMPLATE_CSV } from "./template";
 
 const fixture = (name: string) =>
@@ -45,10 +46,13 @@ describe("parsePriceCents", () => {
     ["0", 0],
     ["19.99", 1999],
     ["(3.00)", -300],
+    ["1.234,50", 123450],
+    ["1,234.5", 123450],
+    [".5", 50],
   ])("%s -> %i", (raw, cents) => {
     expect(parsePriceCents(raw)).toBe(cents);
   });
-  it.each(["", "abc", "12.3.4", "$"])("rejects %j", (raw) => {
+  it.each(["", "abc", "12.3.4", "$", "12.345", "1.234", "1,23,456", "12.3456"])("rejects %j", (raw) => {
     expect(parsePriceCents(raw)).toBeNull();
   });
 });
@@ -79,11 +83,16 @@ describe("Square item library", () => {
     expect(plan.categories.find((c) => c.name === "Desserts")?.items[0]?.name).toBe("Tiramisu");
   });
   it("warns about modifier sets with no options and unknown columns", () => {
-    const messages = plan.warnings.filter((w) => w.code === "modifiers_without_options");
-    expect(messages.map((w) => w.message).join(" ")).toMatch(/Toppings/);
-    expect(messages.map((w) => w.message).join(" ")).toMatch(/Crust/);
+    // Group names are kept on items; the "no options for it" warning is raised
+    // against the existing menu when the change set is built.
+    expect(plan.categories[0]?.items[0]?.modifier_groups).toEqual(["Toppings", "Crust"]);
+    const { warnings, changes } = buildImportRows("t", emptySnapshot(), plan, "add");
+    const text = warnings.map((w) => w.message).join(" ");
+    expect(text).toMatch(/Toppings/);
+    expect(text).toMatch(/Crust/);
+    expect(changes.insert.modifierGroups).toEqual([]);
+    expect(changes.insert.itemModifierGroups).toEqual([]);
     expect(plan.unknownColumns).toEqual(["Mystery Column"]);
-    expect(plan.categories[0]?.items.every((i) => i.modifier_groups.length === 0)).toBe(true);
   });
 });
 
@@ -166,8 +175,10 @@ describe("Clover inventory", () => {
     expect(sizesOf(plan, "Retired Dish")).toBeNull();
     expect(sizesOf(plan, "Market Item")).toBeNull();
     expect(plan.warnings.map((w) => w.code)).toEqual(
-      expect.arrayContaining(["missing_price", "skipped_archived", "modifiers_without_options"]),
+      expect.arrayContaining(["missing_price", "skipped_archived"]),
     );
+    const { warnings } = buildImportRows("t", emptySnapshot(), plan, "add");
+    expect(warnings.map((w) => w.code)).toContain("modifiers_without_options");
   });
 });
 
@@ -237,5 +248,61 @@ describe("limits and errors", () => {
     const p = parseMenuImport(bytes(`item,price\n${"x".repeat(300)},1\n`));
     expect(p.categories[0]?.items[0]?.name).toHaveLength(IMPORT_LIMITS.maxNameLength);
     expect(p.warnings.some((w) => w.code === "truncated")).toBe(true);
+  });
+});
+
+describe("hostile XLSX input", () => {
+  const WB = `<workbook xmlns:r="x"><sheets><sheet name="Items" sheetId="1" r:id="rId1"/></sheets></workbook>`;
+  const RELS = `<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>`;
+  function xlsx(sheet: string, sst = "<sst/>") {
+    return zipSync({
+      "xl/workbook.xml": strToU8(WB),
+      "xl/_rels/workbook.xml.rels": strToU8(RELS),
+      "xl/sharedStrings.xml": strToU8(sst),
+      "xl/worksheets/sheet1.xml": strToU8(sheet),
+    });
+  }
+  const sheetWith = (cells: string) =>
+    `<worksheet><sheetData><row r="1">${cells}</row></sheetData></worksheet>`;
+  const timed = (fn: () => unknown) => {
+    const t = performance.now();
+    try {
+      fn();
+    } catch (e) {
+      expect(e).toBeInstanceOf(MenuImportError);
+    }
+    return performance.now() - t;
+  };
+
+  it("rejects a cell with an absurd column index instead of allocating it", () => {
+    for (const ref of ["ZZZZZZ1", "ZZZZ1", "XFE1", "GR1"]) {
+      expect(() => parseMenuImport(xlsx(sheetWith(`<c r="${ref}"/>`)))).toThrow(MenuImportError);
+    }
+  });
+
+  it("is linear on unclosed tags (no quadratic regex backtracking)", () => {
+    const evil = "<si>".repeat(100_000);
+    expect(timed(() => parseMenuImport(xlsx(sheetWith(`<c r="A1"/>`), `<sst>${evil}</sst>`)))).toBeLessThan(1000);
+    expect(timed(() => parseMenuImport(xlsx(`<worksheet><sheetData>${"<row>".repeat(100_000)}</sheetData></worksheet>`)))).toBeLessThan(1000);
+    expect(timed(() => parseMenuImport(xlsx(sheetWith("<c r=\"A1\">".repeat(100_000)))))).toBeLessThan(1000);
+    expect(timed(() => parseMenuImport(xlsx(sheetWith(`<c r="A1" t="inlineStr"><is>${"<t>".repeat(100_000)}</is></c>`))))).toBeLessThan(1000);
+  });
+
+  it("caps shared strings, cells and unpacked size", () => {
+    const many = `<sst>${"<si><t>x</t></si>".repeat(IMPORT_LIMITS.maxXlsxSharedStrings + 1)}</sst>`;
+    expect(() => parseMenuImport(xlsx(sheetWith(`<c r="A1"/>`), many))).toThrow(/too many strings|too large/);
+    const bomb = zipSync({
+      "xl/workbook.xml": strToU8(WB),
+      "xl/_rels/workbook.xml.rels": strToU8(RELS),
+      "xl/worksheets/sheet1.xml": new Uint8Array(IMPORT_LIMITS.maxXlsxUncompressedBytes + 1),
+    });
+    expect(bomb.length).toBeLessThan(IMPORT_LIMITS.maxFileBytes);
+    expect(() => parseMenuImport(bomb)).toThrow(/too large/);
+  });
+
+  it("turns invalid numeric entities into a replacement char, not a crash", () => {
+    const sheet = `<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>item</t></is></c><c r="B1" t="inlineStr"><is><t>price</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Pie&#x110000;&#xD800;&#99999999999;</t></is></c><c r="B2"><v>5</v></c></row></sheetData></worksheet>`;
+    const plan = parseMenuImport(xlsx(sheet));
+    expect(plan.categories[0]?.items[0]?.name).toContain("Pie\ufffd");
   });
 });

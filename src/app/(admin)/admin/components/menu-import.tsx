@@ -76,7 +76,6 @@ export function MenuImportDialog({
   const send = async (action: "preview" | "apply") => {
     if (!file) return null;
     const form = new FormData();
-    form.set("tenantId", tenantId);
     form.set("action", action);
     form.set("format", format);
     form.set("file", file);
@@ -84,7 +83,7 @@ export function MenuImportDialog({
       form.set("mode", mode);
       if (mode === "replace") form.set("confirmReplace", "yes");
     }
-    const res = await fetch("/api/admin/menu/import", {
+    const res = await fetch(`/api/admin/menu/import?tenantId=${encodeURIComponent(tenantId)}`, {
       method: "POST",
       body: form,
     });
@@ -228,12 +227,37 @@ export function MenuImportDialog({
             </p>
 
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-              <Stat label="Categories" value={chosen.categories} />
-              <Stat label="Items" value={chosen.items} />
-              <Stat label="Sizes" value={chosen.sizes} />
-              <Stat label="Modifier groups" value={chosen.modifierGroups} />
-              <Stat label="Modifiers" value={chosen.modifiers} />
+              <Stat label="Categories" value={preview.plan.stats.categories} />
+              <Stat label="Items" value={preview.plan.stats.items} />
+              <Stat label="Sizes" value={preview.plan.stats.sizes} />
+              <Stat label="Modifier groups" value={preview.plan.stats.modifierGroups} />
+              <Stat label="Modifiers" value={preview.plan.stats.modifiers} />
             </div>
+            <p className="text-sm text-muted-foreground">
+              {mode === "add"
+                ? `${chosen.items} new item${chosen.items === 1 ? "" : "s"} will be created.`
+                : `${chosen.updatedItems} item${chosen.updatedItems === 1 ? "" : "s"} updated in place, ${chosen.items} created.`}
+            </p>
+            {mode === "replace" && chosen.removed.items > 0 && (
+              <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm">
+                <p className="font-medium">
+                  {chosen.removed.items} item{chosen.removed.items === 1 ? "" : "s"} not in
+                  the file will be removed
+                  {chosen.removed.itemNames.length > 0 && (
+                    <>: {chosen.removed.itemNames.join(", ")}
+                      {chosen.removed.items > chosen.removed.itemNames.length ? ", ..." : ""}</>
+                  )}
+                </p>
+                {(chosen.removed.itemsWithRecipes > 0 || chosen.removed.itemsWithAllergens > 0) && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {chosen.removed.itemsWithRecipes} have inventory recipes and{" "}
+                    {chosen.removed.itemsWithAllergens} have allergen rows; those are
+                    deleted with them. Per-location prices and 86s for removed items are
+                    cleared too.
+                  </p>
+                )}
+              </div>
+            )}
             {mode === "add" && chosen.skippedItems > 0 && (
               <p className="text-sm text-muted-foreground">
                 {chosen.skippedItems} item{chosen.skippedItems === 1 ? "" : "s"} already
@@ -322,9 +346,9 @@ export function MenuImportDialog({
                 <span>
                   <strong>Replace menu</strong>
                   <span className="block text-xs text-muted-foreground">
-                    Removes your current {preview.existing.items} items and{" "}
-                    {preview.existing.categories} categories first. Past orders
-                    keep their names and prices.
+                    Makes your menu match the file. Matching items keep their
+                    history and are updated in place; items missing from the
+                    file are removed. Past orders keep their names and prices.
                   </span>
                 </span>
               </label>
@@ -348,7 +372,7 @@ export function MenuImportDialog({
         {confirming && (
           <ConfirmDialog
             title="Replace your whole menu?"
-            description={`This removes all ${preview?.existing.items ?? 0} current items, categories, modifier groups and per-location price/availability overrides, then imports ${chosen?.items ?? 0} items. Past orders are not affected. This can't be undone.`}
+            description={`This removes ${chosen?.removed.items ?? 0} items (and ${chosen?.removed.categories ?? 0} categories) that are not in the file and updates the rest. Open carts and offline orders that contain a removed item will be rejected, so do this while the shop is closed. Past orders are not affected. This can't be undone.`}
             confirmLabel="Replace menu"
             onCancel={() => setConfirming(false)}
             onConfirm={() => {

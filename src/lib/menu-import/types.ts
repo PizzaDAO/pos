@@ -22,7 +22,12 @@ export const IMPORT_LIMITS = {
   /** Largest price accepted, in cents ($100,000.00). */
   maxPriceCents: 10_000_000,
   /** Total uncompressed XLSX payload we are willing to inflate. */
-  maxXlsxUncompressedBytes: 20 * 1024 * 1024,
+  maxXlsxUncompressedBytes: 8 * 1024 * 1024,
+  /** Widest sheet we read (a real menu export has ~40 columns). */
+  maxColumns: 200,
+  /** Non-empty cells + shared strings we will materialise from one workbook. */
+  maxXlsxCells: 600_000,
+  maxXlsxSharedStrings: 300_000,
 } as const;
 
 export interface PlanSize {
@@ -36,7 +41,7 @@ export interface PlanItem {
   station: Station;
   half_and_half: boolean;
   sizes: PlanSize[];
-  /** Names of modifier groups (all defined in {@link MenuImportPlan.modifierGroups}). */
+  /** Names of modifier groups to attach; resolved against the file + existing menu on apply. */
   modifier_groups: string[];
 }
 
@@ -70,7 +75,8 @@ export interface ImportWarning {
     | "truncated"
     | "duplicate_modifier"
     | "name_in_multiple_categories"
-    | "uncategorized";
+    | "uncategorized"
+    | "ambiguous_price";
   message: string;
   /** 1-based spreadsheet row (header = row 1), when tied to one row. */
   row?: number;
@@ -108,10 +114,41 @@ export class MenuImportError extends Error {
   }
 }
 
-/** The raw rows of a menu already in the database (add-mode matching). */
+/** The raw rows of a menu already in the database (matching + impact preview). */
 export interface MenuSnapshot {
   categories: { id: string; name: string; sort_order: number }[];
-  items: { id: string; category_id: string; name: string }[];
-  modifierGroups: { id: string; name: string }[];
-  modifiers: { id: string; group_id: string; name: string; sort_order: number }[];
+  items: {
+    id: string;
+    category_id: string;
+    name: string;
+    description: string | null;
+    is_half_and_half_capable: boolean;
+    station: Station;
+  }[];
+  sizes: {
+    id: string;
+    item_id: string;
+    name: string;
+    price_cents: number;
+    sort_order: number;
+  }[];
+  modifierGroups: {
+    id: string;
+    name: string;
+    min_select: number;
+    max_select: number;
+    supports_half: boolean;
+  }[];
+  modifiers: {
+    id: string;
+    group_id: string;
+    name: string;
+    price_cents: number;
+    sort_order: number;
+  }[];
+  links: { item_id: string; group_id: string; sort_order: number }[];
+  /** source_id of every inventory recipe link (items + modifiers). */
+  inventoryLinkSourceIds: string[];
+  /** target_id of every row in the latest allergen matrix. */
+  allergenTargetIds: string[];
 }
