@@ -705,13 +705,6 @@ export const mockDriver: PosDriver = {
     return { ...locations[i]! };
   },
 
-  async setLocationBusinessDayCutoff(tenantId, locationId, minutes) {
-    const i = locations.findIndex((l) => l.id === locationId && l.tenant_id === tenantId);
-    if (i < 0) return null;
-    locations[i] = { ...locations[i]!, business_day_cutoff_minutes: minutes };
-    return { ...locations[i]! };
-  },
-
   async createLocation(input: CreateLocationInput): Promise<Location> {
     const now = nowIso();
     // Slugs are unique WITHIN a tenant (DB: unique (tenant_id, slug)) — two

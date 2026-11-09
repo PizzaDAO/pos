@@ -1158,19 +1158,6 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return r ? mapLocation(r) : null;
     },
 
-    async setLocationBusinessDayCutoff(tenantId, locationId, minutes) {
-      const r = unwrap(
-        await sb
-          .from("locations")
-          .update({ business_day_cutoff_minutes: minutes })
-          .eq("id", locationId)
-          .eq("tenant_id", tenantId)
-          .select()
-          .maybeSingle(),
-      ) as Row | null;
-      return r ? mapLocation(r) : null;
-    },
-
     async createLocation(input) {
       const now = nowIso();
       // Slugs are unique per tenant (unique (tenant_id, slug)); "track" is

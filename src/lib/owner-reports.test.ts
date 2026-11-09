@@ -8,9 +8,11 @@ import {
   compareSummaries,
   csvCell,
   heatmapGrid,
+  isValidTimezone,
   previousRange,
   rangeError,
   reportChannel,
+  splitRefund,
   summarize,
   tenderKey,
 } from "./owner-reports";
@@ -103,6 +105,10 @@ describe("businessDay (timezone + cutoff)", () => {
     expect(sat0130).toEqual({ date: "2026-03-06", dow: 5, hour: 1 });
     expect(businessDay("2026-03-07T09:00:00Z", "America/New_York", 240).date).toBe("2026-03-07"); // 04:00 EST
   });
+  it("rejects unknown zones in isValidTimezone and reads them as UTC", () => {
+    expect(isValidTimezone("America/Chicago")).toBe(true);
+    expect(isValidTimezone("Nope/Zone")).toBe(false);
+  });
   it("falls back to UTC for an unknown zone", () => {
     expect(businessDay("2026-03-09T03:30:00Z", "Nope/Zone", 0).hour).toBe(3);
   });
@@ -134,7 +140,7 @@ describe("buildOwnerBundle money math", () => {
   const payments = [
     pay(a, { amount_cents: 1080 }),
     pay(b, { rail: "stripe_online", amount_cents: 2160, tip_cents: 200 }),
-    pay(refunded, { rail: "external", method: "card", processor: "kiosk reader", amount_cents: 540, tip_cents: 50, refunded_cents: 540, status: "refunded" }),
+    pay(refunded, { rail: "external", method: "card", processor: "kiosk reader", amount_cents: 540, tip_cents: 50, refunded_cents: 590, status: "refunded" }),
     pay(unpaid, { status: "pending", amount_cents: 999 }),
   ];
   const bundle = buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders, payments });
@@ -144,11 +150,14 @@ describe("buildOwnerBundle money math", () => {
     expect(s.orders).toBe(3);
     expect(s.gross_cents).toBe(1100 + 2000 + 500);
     expect(s.discount_cents).toBe(100);
-    expect(s.refund_cents).toBe(540);
-    expect(s.net_cents).toBe(3600 - 100 - 540);
-    expect(s.tax_cents).toBe(80 + 160 + 40);
-    // order-level tip wins over the tender tip; refunded order has only a tender tip
-    expect(s.tip_cents).toBe(200 + 50);
+    // the $5.90 refund = $0.50 tip + $0.40 tax + $5.00 sales
+    expect(s.refund_cents).toBe(590);
+    expect(s.refund_sales_cents).toBe(500);
+    expect(s.net_cents).toBe(3600 - 100 - 500);
+    // the fully refunded order contributes no tax and no tip
+    expect(s.tax_cents).toBe(80 + 160);
+    // order-level tip wins over the tender tip; refunded order's tender tip is refunded
+    expect(s.tip_cents).toBe(200);
     expect(s.avg_ticket_cents).toBe(Math.round(s.net_cents / 3));
   });
   it("tallies voids separately and excludes unpaid/draft", () => {
@@ -173,8 +182,24 @@ describe("buildOwnerBundle money math", () => {
   });
   it("staff rows include voids and unattributed orders", () => {
     const sam = bundle.staff.find((x) => x.name === "Sam")!;
-    expect(sam).toMatchObject({ orders: 2, void_count: 1, refund_cents: 540 });
+    expect(sam).toMatchObject({ orders: 2, void_count: 1, refund_cents: 590, tip_cents: 0 });
     expect(bundle.staff.find((x) => x.staff_id === null)).toMatchObject({ orders: 1, tip_cents: 200 });
+  });
+  it("a fully refunded order contributes $0 net, tax and tip", () => {
+    const o = order({ price: 500, totals: { subtotal_cents: 500, discount_cents: 0, taxable_cents: 500, tax_cents: 40, tip_cents: 0, total_cents: 540 } });
+    const p = pay(o, { amount_cents: 540, tip_cents: 50, refunded_cents: 590, status: "refunded" });
+    const r = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [p] }).daily);
+    expect(r).toMatchObject({ net_cents: 0, tax_cents: 0, tip_cents: 0, refund_cents: 590 });
+  });
+  it("splits a partial refund pro-rata (tip first, then tax share, rest sales)", () => {
+    // paid $10.80 (sales 10.00 + tax 0.80) + tip 1.00; refund $3.20: 1.00 tip, then 2.20 -> tax 0.16, sales 2.04
+    expect(splitRefund([{ amount_cents: 1080, tip_cents: 100, refunded_cents: 320 }], 80, 100)).toEqual({
+      total: 320, tip: 100, tax: 16, sales: 204,
+    });
+    const o = order({ price: 1000, totals: { subtotal_cents: 1000, discount_cents: 0, taxable_cents: 1000, tax_cents: 80, tip_cents: 0, total_cents: 1080 } });
+    const p = pay(o, { amount_cents: 1080, tip_cents: 100, refunded_cents: 320 });
+    const r = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [p] }).daily);
+    expect(r).toMatchObject({ net_cents: 1000 - 204, tax_cents: 80 - 16, tip_cents: 0, refund_cents: 320 });
   });
   it("excludes voided lines from gross and counts them against staff", () => {
     const o = order({ staff_id: "s1" });
@@ -250,15 +275,16 @@ describe("comparison + csv", () => {
     const o = order({ totals: { subtotal_cents: 1000, discount_cents: 0, taxable_cents: 1000, tax_cents: 80, tip_cents: 0, total_cents: 1080 } });
     const bundle = buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [pay(o)] });
     const lines = bundleToCsv("accountant", bundle, (k) => k).trim().split("\r\n");
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3);
     expect(lines[1]).toBe("2026-03-10,NY,1,10.00,0.00,0.00,10.00,0.80,0.00,0,0.00,10.80,0.00,0.00,0.00");
+    expect(lines[2]).toMatch(/^# Refunds are dated to the original order's business day/);
   });
 });
 
 function emptyDay() {
   return {
     location_id: "x", location_name: "x", business_date: "2026-03-10", orders: 0, gross_cents: 0, discount_cents: 0,
-    refund_cents: 0, tax_cents: 0, tip_cents: 0, void_count: 0, void_cents: 0, cash_cents: 0, card_cents: 0,
+    refund_cents: 0, refund_sales_cents: 0, refund_tax_cents: 0, refund_tip_cents: 0, tax_cents: 0, tip_cents: 0, void_count: 0, void_cents: 0, cash_cents: 0, card_cents: 0,
     crypto_cents: 0, other_cents: 0,
   };
 }

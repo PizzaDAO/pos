@@ -18,13 +18,29 @@
 --   sale     = order status not in (draft, awaiting_payment, abandoned, voided)
 --   gross    = sum(unit_price_cents * quantity) of non-voided lines
 --   discount = orders.totals.discount_cents
---   refunds  = sum(payments.refunded_cents) on the order's tenders
---   net      = gross - discount - refunds
---   tips     = order-level tip, else the tenders' tips (never both)
+--   refunds  = sum(payments.refunded_cents) on the order's tenders (cash back to
+--              the customer: sales + tax + tip), split per order into
+--                tip   = per tender, refunded up to the tender's tip first
+--                tax   = the rest, pro-rata to the order's tax share of paid amount
+--                sales = whatever remains
+--              and each part comes off its own column: a fully refunded order
+--              contributes 0 net, 0 tax and 0 tip. refund_cents stays the total.
+--              TODO(refunds-voids-comps): refunds are dated to the ORIGINAL
+--              order's business day because no refund timestamp exists yet; use
+--              the refund row's timestamp once that branch adds it.
+--   net      = gross - discount - refund sales part
+--   tips     = order-level tip, else the tenders' tips (never both), less tip refunds
 --   tenders  = payments in status captured | refunded
 --   channel  = orders.source.channel when it is kiosk/catering/marketplace/
 --              phone/agent, else online_delivery -> delivery, online_pickup ->
 --              online, in_store -> terminal
+--
+-- An unknown location timezone falls back to UTC (same as owner-reports.ts), so
+-- one bad zone cannot break a tenant-wide report.
+--
+-- NOTE: the cutoff column is NOT yet exposed in the UI/API: core's businessDate
+-- (day close, outbox facts) uses local midnight, so the cutoff must be threaded
+-- through core first. Default 0 keeps reports aligned with core.
 --
 -- Additive: one column with a default, two functions. Callable by the service
 -- role only (the API route does the owner/manager + tenant check first).
@@ -67,6 +83,30 @@ with
 params as (
   select least(greatest(coalesce(p_top_n, 50), 1), 200) as top_n
 ),
+-- Locations of this tenant; an unknown timezone reads as UTC.
+locs as (
+  select l.id, l.name, l.business_day_cutoff_minutes as cutoff,
+         case when exists (select 1 from pg_timezone_names z where z.name = l.timezone)
+              then l.timezone else 'UTC' end as tz
+  from public.locations l
+  where l.tenant_id = p_tenant_id
+),
+-- Two branches so a single-location report can use orders_created_at_idx
+-- (tenant_id, location_id, created_at); the other branch is pruned at run time.
+ord_raw as (
+  select ord.* from public.orders ord
+  where p_location_id is not null
+    and ord.tenant_id = p_tenant_id and ord.location_id = p_location_id
+    -- coarse index-friendly window; the exact business-day filter is below
+    and ord.created_at >= (p_from::timestamp at time zone 'UTC') - interval '2 days'
+    and ord.created_at <  (p_to::timestamp at time zone 'UTC') + interval '4 days'
+  union all
+  select ord.* from public.orders ord
+  where p_location_id is null
+    and ord.tenant_id = p_tenant_id
+    and ord.created_at >= (p_from::timestamp at time zone 'UTC') - interval '2 days'
+    and ord.created_at <  (p_to::timestamp at time zone 'UTC') + interval '4 days'
+),
 -- One row per order in range, bucketed by its own location's business day.
 o as (
   select
@@ -75,9 +115,9 @@ o as (
     l.name as location_name,
     ord.status::text as status,
     ord.staff_id,
-    ((ord.created_at at time zone l.timezone)
-       - make_interval(mins => l.business_day_cutoff_minutes))::date as bd,
-    extract(hour from (ord.created_at at time zone l.timezone))::int as hr,
+    ((ord.created_at at time zone l.tz)
+       - make_interval(mins => l.cutoff))::date as bd,
+    extract(hour from (ord.created_at at time zone l.tz))::int as hr,
     case
       when ord.source ->> 'channel' in ('kiosk', 'catering', 'marketplace', 'phone', 'agent')
         then ord.source ->> 'channel'
@@ -91,22 +131,19 @@ o as (
     public.report_cents(ord.totals -> 'tax_cents') as tax,
     public.report_cents(ord.totals -> 'tip_cents') as order_tip,
     public.report_cents(ord.totals -> 'total_cents') as total
-  from public.orders ord
-  join public.locations l on l.id = ord.location_id and l.tenant_id = ord.tenant_id
-  where ord.tenant_id = p_tenant_id
-    and (p_location_id is null or ord.location_id = p_location_id)
-    -- coarse index-friendly window; the exact business-day filter is below
-    and ord.created_at >= (p_from::timestamp at time zone 'UTC') - interval '2 days'
-    and ord.created_at <  (p_to::timestamp at time zone 'UTC') + interval '4 days'
+  from ord_raw ord
+  join locs l on l.id = ord.location_id
 ),
 ob as (select * from o where bd between p_from and p_to and (is_sale or is_void)),
 -- Money per order: lines + tenders.
-f as (
+f0 as (
   select
     ob.*,
     coalesce(li.gross, 0) as gross,
     coalesce(li.voided_lines, 0) as voided_lines,
     coalesce(pay.refunded, 0) as refunded,
+    coalesce(pay.tip_ref_raw, 0) as tip_ref_raw,
+    coalesce(pay.amt, 0) as amt,
     case when ob.order_tip > 0 then ob.order_tip else coalesce(pay.tip, 0) end as tip,
     coalesce(pay.cash, 0) as t_cash,
     coalesce(pay.card, 0) as t_card,
@@ -123,6 +160,8 @@ f as (
   left join lateral (
     select
       sum(p.refunded_cents) as refunded,
+      sum(least(p.refunded_cents, p.tip_cents)) as tip_ref_raw,
+      sum(p.amount_cents) as amt,
       sum(p.tip_cents) as tip,
       sum(p.amount_cents) filter (where p.rail::text = 'cash' or (p.rail::text = 'external' and p.method = 'cash')) as cash,
       sum(p.amount_cents) filter (where p.rail::text in ('stripe_terminal', 'stripe_online') or (p.rail::text = 'external' and p.method = 'card')) as card,
@@ -130,11 +169,23 @@ f as (
       sum(p.amount_cents) filter (where not (
             p.rail::text in ('cash', 'stripe_terminal', 'stripe_online')
          or p.rail::text like 'crypto%'
-         or (p.rail::text = 'external' and p.method in ('cash', 'card', 'crypto')))) as other
+         or (p.rail::text = 'external' and coalesce(p.method, '') in ('cash', 'card', 'crypto')))) as other
     from public.payments p
     where p.order_id = ob.id and p.tenant_id = p_tenant_id
       and p.status::text in ('captured', 'refunded')
   ) pay on true
+),
+-- Split each order's refunds into tip / tax / sales parts (see header).
+f as (
+  select f0.*,
+         least(f0.tip_ref_raw, f0.tip) as ref_tip_c,
+         r2.ref_tax as ref_tax_c,
+         (r1.rest - r2.ref_tax) as ref_sales_c
+  from f0
+  cross join lateral (select f0.refunded - f0.tip_ref_raw as rest) r1
+  cross join lateral (
+    select least(f0.tax, coalesce(round(r1.rest * f0.tax::numeric / nullif(f0.amt, 0)), 0))::bigint as ref_tax
+  ) r2
 ),
 sales as (select * from f where is_sale),
 daily as (
@@ -144,8 +195,11 @@ daily as (
     coalesce(sum(gross) filter (where is_sale), 0) as gross_cents,
     coalesce(sum(discount) filter (where is_sale), 0) as discount_cents,
     coalesce(sum(refunded) filter (where is_sale), 0) as refund_cents,
-    coalesce(sum(tax) filter (where is_sale), 0) as tax_cents,
-    coalesce(sum(tip) filter (where is_sale), 0) as tip_cents,
+    coalesce(sum(ref_sales_c) filter (where is_sale), 0) as refund_sales_cents,
+    coalesce(sum(ref_tax_c) filter (where is_sale), 0) as refund_tax_cents,
+    coalesce(sum(ref_tip_c) filter (where is_sale), 0) as refund_tip_cents,
+    coalesce(sum(tax - ref_tax_c) filter (where is_sale), 0) as tax_cents,
+    coalesce(sum(tip - ref_tip_c) filter (where is_sale), 0) as tip_cents,
     count(*) filter (where is_void) as void_count,
     coalesce(sum(total) filter (where is_void), 0) as void_cents,
     coalesce(sum(t_cash) filter (where is_sale), 0) as cash_cents,
@@ -157,7 +211,8 @@ daily as (
 ),
 channels as (
   select channel, count(*) as orders,
-         sum(gross) as gross_cents, sum(discount) as discount_cents, sum(refunded) as refund_cents
+         sum(gross) as gross_cents, sum(discount) as discount_cents, sum(refunded) as refund_cents,
+         sum(ref_sales_c) as refund_sales_cents
   from sales group by channel
 ),
 tenders as (
@@ -208,8 +263,8 @@ cats as (
 staff_rows as (
   select f.staff_id, coalesce(max(st.name), 'Unattributed') as name,
          count(*) filter (where f.is_sale) as orders,
-         coalesce(sum(f.gross - f.discount) filter (where f.is_sale), 0) as sales_cents,
-         coalesce(sum(f.tip) filter (where f.is_sale), 0) as tip_cents,
+         coalesce(sum(f.gross - f.discount - f.ref_sales_c) filter (where f.is_sale), 0) as sales_cents,
+         coalesce(sum(f.tip - f.ref_tip_c) filter (where f.is_sale), 0) as tip_cents,
          coalesce(sum(f.refunded) filter (where f.is_sale), 0) as refund_cents,
          count(*) filter (where f.is_void) + coalesce(sum(f.voided_lines) filter (where f.is_sale), 0) as void_count
   from f

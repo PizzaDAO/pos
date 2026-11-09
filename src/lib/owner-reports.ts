@@ -9,9 +9,17 @@
  *   sale     = order status not in draft / awaiting_payment / abandoned / voided
  *   gross    = Σ unit_price × quantity of non-voided lines
  *   discount = order totals.discount_cents
- *   refunds  = Σ tender refunded_cents
- *   net      = gross − discount − refunds
- *   tips     = order-level tip, else the tenders' tips (never both)
+ *   refunds  = Σ tender refunded_cents (cash back: sales + tax + tip), split per
+ *              order into tip (per tender, up to its tip first), tax (the rest,
+ *              pro-rata to the order's tax share of the paid amount) and sales
+ *              (remainder). Each part comes off its own column, so a fully
+ *              refunded order contributes 0 net, 0 tax, 0 tip; `refund_cents`
+ *              stays the total. See {@link splitRefund}.
+ *              TODO(refunds-voids-comps): refunds are dated to the ORIGINAL
+ *              order's business day (no refund timestamp exists yet); switch to
+ *              the refund row's timestamp when that branch adds it.
+ *   net      = gross − discount − refund sales part
+ *   tips     = order-level tip, else the tenders' tips (never both), less tip refunds
  *   tenders  = payments in status captured | refunded
  *
  * Time: every order is bucketed in ITS OWN location's timezone, and the business
@@ -41,8 +49,14 @@ export interface OwnerDailyRow {
   orders: number;
   gross_cents: number;
   discount_cents: number;
+  /** Total cash refunded (sales + tax + tip parts). */
   refund_cents: number;
+  refund_sales_cents: number;
+  refund_tax_cents: number;
+  refund_tip_cents: number;
+  /** Net of refunded tax. */
   tax_cents: number;
+  /** Net of refunded tips. */
   tip_cents: number;
   void_count: number;
   void_cents: number;
@@ -58,6 +72,7 @@ export interface OwnerChannelRow {
   gross_cents: number;
   discount_cents: number;
   refund_cents: number;
+  refund_sales_cents: number;
 }
 
 export interface OwnerTenderRow {
@@ -122,7 +137,9 @@ export interface OwnerSummary {
   discount_cents: number;
   /** Comps are folded into discounts until the comps ledger lands. */
   comp_cents: number;
+  /** Total cash refunded. */
   refund_cents: number;
+  refund_sales_cents: number;
   net_cents: number;
   tax_cents: number;
   tip_cents: number;
@@ -299,6 +316,24 @@ export function tenderKey(p: Pick<Payment, "rail" | "method" | "processor">): st
   return `external:${clean(p.method) || "other"}:${clean(p.processor)}`;
 }
 
+/**
+ * Split an order's refunds into tip / tax / sales parts (mirrors the SQL).
+ * `tenders` are the order's counted tenders; `tip` is the tip counted for the
+ * order, `tax` its tax.
+ */
+export function splitRefund(
+  tenders: Pick<Payment, "amount_cents" | "tip_cents" | "refunded_cents">[],
+  tax: number,
+  tip: number,
+): { total: number; tip: number; tax: number; sales: number } {
+  const total = tenders.reduce((s, p) => s + p.refunded_cents, 0);
+  const tipRaw = tenders.reduce((s, p) => s + Math.min(p.refunded_cents, p.tip_cents), 0);
+  const paid = tenders.reduce((s, p) => s + p.amount_cents, 0);
+  const rest = total - tipRaw;
+  const taxPart = paid > 0 ? Math.min(tax, Math.round((rest * tax) / paid)) : 0;
+  return { total, tip: Math.min(tipRaw, tip), tax: taxPart, sales: rest - taxPart };
+}
+
 export interface BuildBundleInput {
   tenantId: string;
   /** null = every location of the tenant. */
@@ -358,6 +393,9 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
         gross_cents: 0,
         discount_cents: 0,
         refund_cents: 0,
+        refund_sales_cents: 0,
+        refund_tax_cents: 0,
+        refund_tip_cents: 0,
         tax_cents: 0,
         tip_cents: 0,
         void_count: 0,
@@ -394,16 +432,21 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     const gross = live.reduce((s, i) => s + i.unit_price_cents * i.quantity, 0);
     const discount = cents(o.totals?.discount_cents);
     const counted = (paysByOrder.get(o.id) ?? []).filter((p) => COUNTED_TENDER.has(p.status));
-    const refunded = counted.reduce((s, p) => s + p.refunded_cents, 0);
     const orderTip = cents(o.totals?.tip_cents);
     const tip = orderTip > 0 ? orderTip : counted.reduce((s, p) => s + p.tip_cents, 0);
+    const tax = cents(o.totals?.tax_cents);
+    const ref = splitRefund(counted, tax, tip);
+    const refunded = ref.total;
 
     d.orders += 1;
     d.gross_cents += gross;
     d.discount_cents += discount;
     d.refund_cents += refunded;
-    d.tax_cents += cents(o.totals?.tax_cents);
-    d.tip_cents += tip;
+    d.refund_sales_cents += ref.sales;
+    d.refund_tax_cents += ref.tax;
+    d.refund_tip_cents += ref.tip;
+    d.tax_cents += tax - ref.tax;
+    d.tip_cents += tip - ref.tip;
     for (const p of counted) {
       d[`${tenderFamily(p)}_cents`] += p.amount_cents;
       const tk = tenderKey(p);
@@ -416,11 +459,14 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     }
 
     const ch = reportChannel(o);
-    const c = channels.get(ch) ?? { channel: ch, orders: 0, gross_cents: 0, discount_cents: 0, refund_cents: 0 };
+    const c =
+      channels.get(ch) ??
+      { channel: ch, orders: 0, gross_cents: 0, discount_cents: 0, refund_cents: 0, refund_sales_cents: 0 };
     c.orders += 1;
     c.gross_cents += gross;
     c.discount_cents += discount;
     c.refund_cents += refunded;
+    c.refund_sales_cents += ref.sales;
     channels.set(ch, c);
 
     const hk = `${when.dow}|${when.hour}`;
@@ -430,8 +476,8 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     hourly.set(hk, h);
 
     st.orders += 1;
-    st.sales_cents += gross - discount;
-    st.tip_cents += tip;
+    st.sales_cents += gross - discount - ref.sales;
+    st.tip_cents += tip - ref.tip;
     st.refund_cents += refunded;
     st.void_count += o.items.length - live.length;
 
@@ -480,6 +526,7 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     discount_cents: 0,
     comp_cents: 0,
     refund_cents: 0,
+    refund_sales_cents: 0,
     net_cents: 0,
     tax_cents: 0,
     tip_cents: 0,
@@ -496,6 +543,7 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     s.gross_cents += d.gross_cents;
     s.discount_cents += d.discount_cents;
     s.refund_cents += d.refund_cents;
+    s.refund_sales_cents += d.refund_sales_cents;
     s.tax_cents += d.tax_cents;
     s.tip_cents += d.tip_cents;
     s.void_count += d.void_count;
@@ -505,7 +553,7 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     s.crypto_cents += d.crypto_cents;
     s.other_cents += d.other_cents;
   }
-  s.net_cents = s.gross_cents - s.discount_cents - s.refund_cents;
+  s.net_cents = s.gross_cents - s.discount_cents - s.refund_sales_cents;
   s.avg_ticket_cents = s.orders > 0 ? Math.round(s.net_cents / s.orders) : 0;
   return s;
 }
@@ -582,6 +630,10 @@ export function toCsv(header: string[], rows: (string | number | null | undefine
   return [header, ...rows].map((r) => r.map(csvCell).join(",")).join("\r\n") + "\r\n";
 }
 
+/** Printed under every CSV that carries refunds. */
+export const REFUND_NOTE =
+  "# Refunds are dated to the original order's business day (refund timestamps are not recorded yet). Refunded tax and tips are removed from tax and tips; net_sales = gross - discounts - refunded sales.";
+
 const dollars = (c: number): string => (c / 100).toFixed(2);
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -608,18 +660,23 @@ export const REPORT_KINDS: OwnerReportKind[] = [
 
 /** CSV text for one report. Money columns are dollars with two decimals. */
 export function bundleToCsv(kind: OwnerReportKind, b: OwnerReportBundle, tenderLabel: (key: string) => string): string {
+  const csv = bundleToCsvBody(kind, b, tenderLabel);
+  return kind === "hourly" || kind === "items" || kind === "categories" ? csv : `${csv}${REFUND_NOTE}\r\n`;
+}
+
+function bundleToCsvBody(kind: OwnerReportKind, b: OwnerReportBundle, tenderLabel: (key: string) => string): string {
   switch (kind) {
     case "summary":
     case "accountant": {
       // Accountant export: one row per location per business day.
       return toCsv(
         [
-          "business_date", "location", "orders", "gross_sales", "discounts", "refunds", "net_sales", "tax",
-          "tips", "voids", "void_amount", "cash", "card", "crypto", "other_tenders",
+          "business_date", "location", "orders", "gross_sales", "discounts", "refunds_total", "net_sales", "tax_net_of_refunds",
+          "tips_net_of_refunds", "voids", "void_amount", "cash", "card", "crypto", "other_tenders",
         ],
         b.daily.map((d) => [
           d.business_date, d.location_name, d.orders, dollars(d.gross_cents), dollars(d.discount_cents),
-          dollars(d.refund_cents), dollars(d.gross_cents - d.discount_cents - d.refund_cents), dollars(d.tax_cents),
+          dollars(d.refund_cents), dollars(d.gross_cents - d.discount_cents - d.refund_sales_cents), dollars(d.tax_cents),
           dollars(d.tip_cents), d.void_count, dollars(d.void_cents), dollars(d.cash_cents), dollars(d.card_cents),
           dollars(d.crypto_cents), dollars(d.other_cents),
         ]),
@@ -630,7 +687,7 @@ export function bundleToCsv(kind: OwnerReportKind, b: OwnerReportBundle, tenderL
         ["channel", "orders", "gross_sales", "discounts", "refunds", "net_sales"],
         b.channels.map((c) => [
           CHANNEL_LABELS[c.channel] ?? c.channel, c.orders, dollars(c.gross_cents), dollars(c.discount_cents),
-          dollars(c.refund_cents), dollars(c.gross_cents - c.discount_cents - c.refund_cents),
+          dollars(c.refund_cents), dollars(c.gross_cents - c.discount_cents - c.refund_sales_cents),
         ]),
       );
     case "tenders":

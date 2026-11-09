@@ -40,7 +40,7 @@ begin
   insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
    (gen_random_uuid(), oa, t, loc, 'cash', 'captured', 1080, 0, 0, false),
    (gen_random_uuid(), ob, t, loc, 'stripe_online', 'captured', 2160, 200, 0, false),
-   (gen_random_uuid(), oc, t, loc, 'external', 'refunded', 540, 50, 540, false),
+   (gen_random_uuid(), oc, t, loc, 'external', 'refunded', 540, 50, 590, false),
    (gen_random_uuid(), ou, t, loc, 'stripe_online', 'pending', 900, 0, 0, false);
   update public.payments set method = 'card', processor = 'kiosk_reader' where order_id = oc;
 
@@ -49,9 +49,13 @@ begin
   select (d ->> 'orders')::int into n from jsonb_array_elements(r -> 'daily') d;
   if n <> 2 then raise exception 'Mar 8 orders expected 2, got %', n; end if;
   if (r -> 'daily' -> 0 ->> 'gross_cents')::int <> 2500 then raise exception 'gross %', r -> 'daily' -> 0; end if;  -- 2000 + 500, voided line excluded
-  if (r -> 'daily' -> 0 ->> 'refund_cents')::int <> 540 then raise exception 'refund %', r -> 'daily' -> 0; end if;
-  if (r -> 'daily' -> 0 ->> 'tip_cents')::int <> 250 then raise exception 'tips %', r -> 'daily' -> 0; end if;  -- 200 order-level + 50 tender
-  if (r -> 'daily' -> 0 ->> 'tax_cents')::int <> 200 then raise exception 'tax %', r -> 'daily' -> 0; end if;
+  -- full refund 590 = 50 tip + 40 tax + 500 sales, each off its own column
+  if (r -> 'daily' -> 0 ->> 'refund_cents')::int <> 590 or (r -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 500
+     or (r -> 'daily' -> 0 ->> 'refund_tax_cents')::int <> 40 or (r -> 'daily' -> 0 ->> 'refund_tip_cents')::int <> 50 then
+    raise exception 'refund %', r -> 'daily' -> 0;
+  end if;
+  if (r -> 'daily' -> 0 ->> 'tip_cents')::int <> 200 then raise exception 'tips %', r -> 'daily' -> 0; end if;  -- 200 order-level; refunded order tip is 0
+  if (r -> 'daily' -> 0 ->> 'tax_cents')::int <> 160 then raise exception 'tax %', r -> 'daily' -> 0; end if;
   if (r -> 'daily' -> 0 ->> 'void_count')::int <> 1 or (r -> 'daily' -> 0 ->> 'void_cents')::int <> 700 then
     raise exception 'voids %', r -> 'daily' -> 0;
   end if;
@@ -81,6 +85,40 @@ begin
                  where s ->> 'name' = 'Christopher M.' and (s ->> 'orders')::int = 1 and (s ->> 'void_count')::int = 1) then
     raise exception 'staff %', r -> 'staff';
   end if;
+
+  -- ---- partial refund: tip first, then tax pro-rata, rest sales --------------
+  declare
+    op uuid := gen_random_uuid();
+    ot uuid := gen_random_uuid();
+    rp jsonb;
+  begin
+    insert into public.orders (id, tenant_id, location_id, status, channel, currency, totals, order_number, created_at) values
+     (op, t, loc, 'completed', 'in_store', 'USD', '{"discount_cents":0,"tax_cents":80,"tip_cents":0,"total_cents":1080}', 'R6', '2026-04-10T16:00:00Z'),
+     (ot, t, loc, 'completed', 'in_store', 'USD', '{"discount_cents":0,"tax_cents":0,"tip_cents":0,"total_cents":300}', 'R7', '2026-04-10T17:00:00Z');
+    insert into public.order_items (id, order_id, item_id, item_name, quantity, unit_price_cents, line_total_cents) values
+     (gen_random_uuid(), op, item, 'Margherita', 1, 1000, 1000),
+     (gen_random_uuid(), ot, item, 'Margherita', 1, 300, 300);
+    insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
+     (gen_random_uuid(), op, t, loc, 'cash', 'captured', 1080, 100, 320, false);
+    -- external tender with NULL method must land in "other", not vanish
+    insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
+     (gen_random_uuid(), ot, t, loc, 'external', 'captured', 300, 0, 0, false);
+    rp := public.report_sales_bundle(t, loc, '2026-04-10', '2026-04-10', 50);
+    if (rp -> 'daily' -> 0 ->> 'refund_tip_cents')::int <> 100 or (rp -> 'daily' -> 0 ->> 'refund_tax_cents')::int <> 16
+       or (rp -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 204 then
+      raise exception 'partial refund split %', rp -> 'daily' -> 0;
+    end if;
+    if (rp -> 'daily' -> 0 ->> 'tax_cents')::int <> 64 or (rp -> 'daily' -> 0 ->> 'tip_cents')::int <> 0 then
+      raise exception 'partial refund columns %', rp -> 'daily' -> 0;
+    end if;
+    if (rp -> 'daily' -> 0 ->> 'other_cents')::int <> 300 then raise exception 'null-method external %', rp -> 'daily' -> 0; end if;
+
+    -- unknown timezone reads as UTC instead of failing the report
+    update public.locations set timezone = 'Nope/Zone', business_day_cutoff_minutes = 0 where id = loc;
+    rp := public.report_sales_bundle(t, null, '2026-04-10', '2026-04-10', 50);
+    if (rp -> 'daily' -> 0 ->> 'orders')::int <> 2 then raise exception 'bad tz report %', rp -> 'daily'; end if;
+    update public.locations set timezone = 'America/New_York', business_day_cutoff_minutes = 240 where id = loc;
+  end;
 
   -- ---- Mar 7 business day holds A (01:30 EST, before the 04:00 cutoff) ----
   r := public.report_sales_bundle(t, loc, '2026-03-07', '2026-03-07', 50);

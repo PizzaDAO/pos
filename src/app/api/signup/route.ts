@@ -22,6 +22,7 @@
  * be used to bypass plan gating (extra locations) or to re-activate a tenant
  * the platform suspended.
  */
+import { isValidTimezone } from "@/lib/owner-reports";
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { effectiveConnectAccount } from "@/lib/payments/connect";
@@ -199,6 +200,12 @@ export async function POST(request: Request) {
           return NextResponse.json(
             { error: gate.reason, code: "plan_limit", entitlements },
             { status: 402 },
+          );
+        }
+        if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+          return NextResponse.json(
+            { error: "timezone must be a valid IANA zone, e.g. America/New_York." },
+            { status: 422 },
           );
         }
         const location = await driver.createLocation({

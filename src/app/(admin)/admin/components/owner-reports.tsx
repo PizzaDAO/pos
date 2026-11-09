@@ -310,7 +310,7 @@ function SummaryTab({ d, csv }: TabProps) {
   const byDay = useMemo(() => {
     const m = new Map<string, number>();
     for (const r of d.bundle.daily) {
-      m.set(r.business_date, (m.get(r.business_date) ?? 0) + r.gross_cents - r.discount_cents - r.refund_cents);
+      m.set(r.business_date, (m.get(r.business_date) ?? 0) + r.gross_cents - r.discount_cents - r.refund_sales_cents);
     }
     return [...m.entries()].map(([k, v]) => ({ key: k, label: k, value: v }));
   }, [d.bundle.daily]);
@@ -332,7 +332,9 @@ function SummaryTab({ d, csv }: TabProps) {
         <Kpi label="Tips" cents={s.tip_cents} delta={dl.tip_cents} />
       </div>
       <p className="text-xs text-muted-foreground">
-        Voids: {s.void_count} orders, {formatMoney(s.void_cents)} (not in sales). Net = gross − discounts − refunds.
+        Voids: {s.void_count} orders, {formatMoney(s.void_cents)} (not in sales). Net = gross − discounts − refunded sales.
+        Refunded tax and tips come off tax and tips. Refunds ({formatMoney(s.refund_cents)} total) are dated to the
+        original order&apos;s day, not the day the refund was issued.
       </p>
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel title="By tender" action={<CsvLink href={csv("tenders")} label="CSV" />}>
@@ -350,7 +352,7 @@ function SummaryTab({ d, csv }: TabProps) {
             rows={d.bundle.channels.map((c) => ({
               key: c.channel,
               label: CHANNEL_LABELS[c.channel] ?? c.channel,
-              value: c.gross_cents - c.discount_cents - c.refund_cents,
+              value: c.gross_cents - c.discount_cents - c.refund_sales_cents,
               note: `×${c.orders}`,
             }))}
           />
@@ -450,6 +452,9 @@ function StaffTab({ d, csv }: TabProps) {
 function AccountantTab({ d, csv }: TabProps) {
   return (
     <Panel title="Accountant export: daily summary per location" action={<CsvLink href={csv("accountant")} label="Download CSV" />}>
+      <p className="mb-2 text-xs text-muted-foreground">
+        Refunds are dated to the original order&apos;s business day. Tax and tips are net of refunds.
+      </p>
       <Table
         head={["Date", "Location", "Orders", "Gross", "Disc.", "Refunds", "Net", "Tax", "Tips", "Cash", "Card"]}
         rows={d.bundle.daily.map((r) => [
@@ -459,7 +464,7 @@ function AccountantTab({ d, csv }: TabProps) {
           formatMoney(r.gross_cents),
           formatMoney(r.discount_cents),
           formatMoney(r.refund_cents),
-          formatMoney(r.gross_cents - r.discount_cents - r.refund_cents),
+          formatMoney(r.gross_cents - r.discount_cents - r.refund_sales_cents),
           formatMoney(r.tax_cents),
           formatMoney(r.tip_cents),
           formatMoney(r.cash_cents),

@@ -205,17 +205,6 @@ export interface PosDriver {
     country: string | null,
   ): Promise<Location | null>;
 
-  /**
-   * Set when a location's business day starts (minutes after local midnight,
-   * 0-719). One conditional update scoped to `tenantId`; null when the location
-   * is not this tenant's.
-   */
-  setLocationBusinessDayCutoff(
-    tenantId: string,
-    locationId: string,
-    minutes: number,
-  ): Promise<Location | null>;
-
   /** Replace a new tenant's menu with the starter template (onboarding import). */
   importStarterMenu(tenantId: string): Promise<void>;
 

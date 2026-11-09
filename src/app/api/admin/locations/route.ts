@@ -3,7 +3,6 @@
  *
  * GET  ?tenantId=  → the tenant's locations + entitlement usage (count vs cap).
  * PATCH { tenantId, locationId, country } → set an existing location's country.
- * PATCH { tenantId, locationId, businessDayCutoffMinutes } → when the business day starts.
  * POST { tenantId, name, address?, country? } → add a location, GATED by the plan's
  *      `max_locations` entitlement. Adding beyond the cap returns 402 with the
  *      upgrade reason — this is the canonical "plan gating blocks an over-limit
@@ -18,6 +17,7 @@ import { getPosDriver } from "@/lib/db";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { recordAudit } from "@/lib/security";
+import { isValidTimezone } from "@/lib/owner-reports";
 
 /** What changing a location's country does to phone numbers (shown before saving). */
 const COUNTRY_CHANGE_WARNING =
@@ -68,28 +68,11 @@ export async function PATCH(request: Request) {
     locationId?: string;
     country?: string | null;
     confirmPhoneEffects?: boolean;
-    businessDayCutoffMinutes?: number;
   };
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
-  }
-  // { tenantId, locationId, businessDayCutoffMinutes } -> when the business day
-  // starts (minutes after local midnight; 0-719). Reports bucket orders by it.
-  if (body.businessDayCutoffMinutes !== undefined) {
-    const m = body.businessDayCutoffMinutes;
-    if (!body.tenantId || !body.locationId || !Number.isInteger(m) || m < 0 || m > 719) {
-      return NextResponse.json(
-        { error: "tenantId, locationId and businessDayCutoffMinutes (integer 0-719) are required." },
-        { status: 422 },
-      );
-    }
-    const cutoffAuth = await requireTenantAccess(body.tenantId, "admin");
-    if (!cutoffAuth.ok) return cutoffAuth.res;
-    const updated = await getPosDriver().setLocationBusinessDayCutoff(cutoffAuth.tenantId, body.locationId, m);
-    if (!updated) return NextResponse.json({ error: "Location not found." }, { status: 404 });
-    return NextResponse.json({ location: updated });
   }
   if (!body.tenantId || !body.locationId || body.country === undefined) {
     return NextResponse.json(
@@ -140,6 +123,9 @@ export async function POST(request: Request) {
   const country = body.country ? String(body.country).trim().toUpperCase() : null;
   if (country && !/^[A-Z]{2}$/.test(country)) {
     return NextResponse.json({ error: "country must be a 2-letter ISO code." }, { status: 422 });
+  }
+  if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+    return NextResponse.json({ error: "timezone must be a valid IANA zone, e.g. America/New_York." }, { status: 422 });
   }
   // Only an owner|manager of this tenant may add a location.
   const auth = await requireTenantAccess(body.tenantId, "admin");
