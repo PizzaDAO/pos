@@ -23,6 +23,7 @@
  *
  * Money is always integer minor units; nothing here uses floats.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
@@ -224,6 +225,7 @@ function mapStoreSettings(r: Row): StoreSettings {
     kds_thresholds:
       (r.kds_thresholds as StoreSettings["kds_thresholds"]) ?? undefined,
     fulfillment: (r.fulfillment as StoreSettings["fulfillment"]) ?? undefined,
+    marketplace: (r.marketplace as StoreSettings["marketplace"]) ?? undefined,
   };
 }
 
@@ -1692,6 +1694,99 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         tip_presets_bps: [1500, 1800, 2000],
         kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
       };
+    },
+
+    async setMarketplaceSettings(tenantId, locationId, marketplace) {
+      // Touch ONLY the marketplace column: never rewrite tax/tips/currency from a
+      // possibly stale read.
+      const updated = unwrap(
+        await sb
+          .from("store_settings")
+          .update({ marketplace })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .select(),
+      ) as Row[];
+      if (updated[0]) return mapStoreSettings(updated[0]);
+      // No settings row yet: create it from the defaults.
+      const base = await this.getStoreSettings(tenantId, locationId);
+      const r = unwrap(
+        await sb
+          .from("store_settings")
+          .upsert(
+            {
+              tenant_id: tenantId,
+              location_id: locationId,
+              currency: base.currency,
+              tax_rate_bps: base.tax_rate_bps,
+              tip_presets_bps: base.tip_presets_bps,
+              kds_thresholds: base.kds_thresholds ?? null,
+              marketplace,
+            },
+            { onConflict: "tenant_id,location_id", ignoreDuplicates: true },
+          )
+          .select(),
+      ) as Row[];
+      return r[0] ? mapStoreSettings(r[0]) : { ...base, marketplace };
+    },
+
+    async findMarketplaceLocations(provider, storeId) {
+      const rows = unwrap(
+        await sb
+          .from("marketplace_stores")
+          .select("tenant_id,location_id")
+          .eq("provider", provider)
+          .eq("store_id", storeId)
+          .limit(2),
+      ) as Row[];
+      return rows.map((r) => ({
+        tenant_id: r.tenant_id as string,
+        location_id: r.location_id as string,
+      }));
+    },
+
+    async assignMarketplaceStore(input) {
+      if (input.storeId === null) {
+        unwrap(
+          await sb
+            .from("marketplace_stores")
+            .delete()
+            .eq("provider", input.provider)
+            .eq("location_id", input.locationId),
+        );
+        return;
+      }
+      // ONE upsert on (location_id, provider): it replaces this location's store,
+      // and a clash with another location's store id (primary key) fails the whole
+      // statement, leaving the old assignment intact.
+      const { error } = await sb.from("marketplace_stores").upsert(
+        {
+          provider: input.provider,
+          store_id: input.storeId,
+          tenant_id: input.tenantId,
+          location_id: input.locationId,
+          assigned_by: input.assignedBy ?? null,
+          assigned_at: new Date().toISOString(),
+        },
+        { onConflict: "location_id,provider" },
+      );
+      if (error) {
+        if (error.code === "23505") throw new MarketplaceStoreTakenError();
+        throw new Error(error.message);
+      }
+    },
+
+    async findMarketplaceOrdersByRef(provider, externalId) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .eq("source->>type", "marketplace")
+          .eq("source->>module", provider)
+          .eq("source->>external_ref", externalId)
+          .limit(5),
+      ) as Row[];
+      return readOrderRows(rows);
     },
 
     // -- Orders ------------------------------------------------------------

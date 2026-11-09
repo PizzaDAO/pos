@@ -21,6 +21,7 @@ import type {
   OrderStatus,
   OrderTotals,
   StoreSettings,
+  MarketplaceSettings,
 } from "./menu-types";
 import type {
   ConnectAccount,
@@ -468,6 +469,45 @@ export interface PosDriver {
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
+
+  /**
+   * Replace a location's marketplace inbox settings (off by default; absent =
+   * off). Creates the store settings row from defaults if it does not exist.
+   */
+  setMarketplaceSettings(
+    tenantId: string,
+    locationId: string,
+    marketplace: MarketplaceSettings,
+  ): Promise<StoreSettings>;
+
+  /**
+   * Locations whose marketplace settings register `storeId` for `provider`
+   * (webhook routing: the provider's store id is the only thing a signed payload
+   * can be trusted to name). More than one hit is a misconfiguration.
+   */
+  findMarketplaceLocations(
+    provider: string,
+    storeId: string,
+  ): Promise<{ tenant_id: string; location_id: string }[]>;
+
+  /**
+   * Platform-admin assignment of a provider store id to a location (null
+   * clears it). One (provider, store id) belongs to one location, enforced by a
+   * unique key: throws `MarketplaceStoreTakenError` when another location holds it.
+   */
+  assignMarketplaceStore(input: {
+    provider: string;
+    tenantId: string;
+    locationId: string;
+    storeId: string | null;
+    assignedBy?: string | null;
+  }): Promise<void>;
+
+  /** Existing marketplace orders for (provider, provider order id), any location. */
+  findMarketplaceOrdersByRef(
+    provider: string,
+    externalId: string,
+  ): Promise<Order[]>;
 
   /**
    * [SHARED: online checkout + terminal card reader] Compare-and-set status

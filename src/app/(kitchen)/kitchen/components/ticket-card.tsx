@@ -19,6 +19,7 @@ import { ageLevelFor } from "@/lib/kds/board";
 import { statusLabel } from "@/lib/kds/status";
 import { channelLabel, formatElapsed } from "@/lib/kds/format";
 import type { AgeLevel, KitchenTicket, StationFilter } from "@/lib/kds/types";
+import { MarketplaceBadge } from "@/components/marketplace-badge";
 import { TicketItems } from "./ticket-items";
 
 const AGE_STYLES: Record<AgeLevel, { card: string; header: string }> = {
@@ -100,7 +101,14 @@ function TicketCardImpl({
           </span>
         </div>
         <div className="flex items-center justify-between text-xs font-medium">
-          <span>{channelLabel(order.channel)}</span>
+          {order.fulfillment?.marketplace ? (
+            <MarketplaceBadge
+              provider={order.fulfillment.marketplace.provider}
+              displayId={order.fulfillment.marketplace.display_id}
+            />
+          ) : (
+            <span>{channelLabel(order.channel)}</span>
+          )}
           <span
             className={cn(
               "rounded-full px-2 py-0.5",
@@ -115,6 +123,15 @@ function TicketCardImpl({
           </span>
         </div>
       </header>
+
+      {order.fulfillment?.marketplace?.cancel_requested && (
+        <div
+          role="alert"
+          className="bg-red-600 px-3 py-1 text-sm font-bold text-white"
+        >
+          CANCELLED BY PROVIDER: check with the front
+        </div>
+      )}
 
       <div className="flex-1 px-3 py-2">
         <TicketItems items={order.items} stationFilter={stationFilter} />

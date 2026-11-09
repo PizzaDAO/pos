@@ -32,7 +32,7 @@ export async function POST(
   }
   const driver = getPosDriver();
   let order = await driver.getOrder(id);
-  if (!order || order.channel === "in_store") {
+  if (!order || order.channel === "in_store" || order.channel === "marketplace") {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
 
