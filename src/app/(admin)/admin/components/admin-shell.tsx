@@ -23,6 +23,7 @@ import {
   Eye,
   LayoutGrid,
   MapPin,
+  Printer,
   Receipt,
   Truck,
   Users,
@@ -87,6 +88,9 @@ const CardReaders = dynamic(
   () => import("./card-readers").then((m) => m.CardReaders),
   { loading: PanelFallback },
 );
+const Printers = dynamic(() => import("./printers").then((m) => m.Printers), {
+  loading: PanelFallback,
+});
 const DeliveryDispatch = dynamic(
   () => import("../delivery-dispatch").then((m) => m.DeliveryDispatch),
   { loading: PanelFallback },
@@ -102,6 +106,7 @@ type Tab =
   | "plan"
   | "payments"
   | "late"
+  | "printers"
   | "delivery";
 
 function readTenantParam(fallbackTenantId: string): {
@@ -181,6 +186,7 @@ export function AdminShell({
       { id: "plan", label: "Plan", icon: Wallet },
       { id: "payments", label: "Payments", icon: CreditCard },
       { id: "late", label: "Late payments", icon: AlertTriangle },
+      { id: "printers", label: "Printers", icon: Printer },
       { id: "delivery", label: "Delivery", icon: Truck },
     ];
     return base;
@@ -315,6 +321,9 @@ export function AdminShell({
               <CardReaders tenantId={tenantId} locationId={locationId} />
             )}
           </>
+        )}
+        {tab === "printers" && locationId && (
+          <Printers tenantId={tenantId} locationId={locationId} />
         )}
         {tab === "delivery" &&
           (deliveryAllowed ? (

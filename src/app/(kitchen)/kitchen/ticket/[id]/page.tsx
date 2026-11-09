@@ -4,9 +4,9 @@
  * Server component: resolves the order via the DB abstraction, then hands it to
  * the client `PrintView` which renders a receipt-width ticket and auto-opens the
  * browser print dialog. This is the browser-printer path of the printer seam
- * (`@/lib/printing/provider`); a network-printer implementation would dispatch
- * ESC/POS to a device behind the same interface (documented, not wired — no
- * device + no env in the preview).
+ * (`@/lib/printing/provider`). When the location has a network printer the view
+ * instead sends the ticket to the location's network printers (queued; see
+ * (queued, see `@/lib/printing/queue`) and the browser dialog is the fallback.
  */
 import Link from "next/link";
 import { redirect } from "next/navigation";
@@ -48,5 +48,9 @@ export default async function TicketPrintPage({
     );
   }
 
-  return <PrintView order={order} />;
+  // A network printer at this location takes the ticket; otherwise the browser.
+  const networkPrinters = (
+    await driver.listPrinters(order.tenant_id, order.location_id).catch(() => [])
+  ).length;
+  return <PrintView order={order} networkPrinters={networkPrinters} />;
 }
