@@ -16,9 +16,10 @@
  * Adjustments (refunds) are separate signed facts and never rewrite an earlier
  * fact. They are dated by WHEN THE REFUND HAPPENED, in the location's zone: a
  * refund after a period closed lands in the open period, not in the order's.
- *   - tender tip: refunds come off the tip FIRST (as `netSettledBaseCents` and
- *     the payments service count them), so a refund's tip part is
- *     min(running, tip) - min(prev running, tip); id carries the cumulative part.
+ *   - tender tip: each refund records its own tip part (`refunds[].tip_cents`,
+ *     tip refunds are separate from food refunds); a refund recorded before
+ *     that is tip only beyond the base (tip last).
+ *     The id carries the cumulative tip refunded (`tipRefundSteps`).
  *   - online tip: POS caps a tender's refunds at amount + tip and the tender
  *     tip is 0 here, so a partial refund can never reach the tip (the tip was not
  *     collected on a tender). Only when EVERY settled tender is fully refunded is
@@ -31,7 +32,7 @@
  */
 import { businessDate, type TipFact } from "@openpizza/core";
 import type { Payment } from "@/lib/db";
-import { tenderMethod, toContractRefunds } from "./mappers";
+import { confirmedRefundEntries, tenderMethod, toContractRefunds } from "./mappers";
 
 /** What the builder needs about an order (POS status, not the contract axes). */
 export interface TipOrderInput {
@@ -73,6 +74,37 @@ export const tenderTipAdjustmentId = (paymentId: string, cumTipRefunded: number)
   `tipadj_${paymentId}_c${cumTipRefunded}`;
 export const onlineTipReversalId = (orderId: string) => `tipadj_online_${orderId}_full`;
 
+/**
+ * Each refund of a tender with the cumulative TIP refunded after it (oldest
+ * first; the unrecorded legacy remainder, if any, is the first step; pending
+ * reservations are not refunds). A refund with an explicit `tip_cents` moves
+ * the tip by exactly that; an older one is tip only beyond the base (tip last).
+ * Same rule as public.core_tip_backfill_for_order.
+ */
+export function tipRefundSteps(
+  p: Payment,
+): { refund: ReturnType<typeof toContractRefunds>[number]; cumTip: number }[] {
+  const contract = toContractRefunds(p);
+  const raw = confirmedRefundEntries(p);
+  const legacyOffset = contract.length - raw.length; // 1 when a remainder was prepended
+  const out: { refund: (typeof contract)[number]; cumTip: number }[] = [];
+  let cum = 0;
+  let run = 0;
+  contract.forEach((r, i) => {
+    const entry = i >= legacyOffset ? raw[i - legacyOffset] : undefined;
+    run += r.amount_cents;
+    const left = Math.max(0, p.tip_cents - cum);
+    // Explicit tip part, else the legacy rule: base first, the rest is tip.
+    const part =
+      typeof entry?.tip_cents === "number"
+        ? Math.max(0, Math.min(entry.tip_cents, left))
+        : Math.min(left, Math.max(0, run - p.amount_cents - cum));
+    cum += part;
+    out.push({ refund: r, cumTip: cum });
+  });
+  return out;
+}
+
 export function tipFactsForOrder(order: TipOrderInput, payments: Payment[]): TipFact[] {
   const live = payments.filter(isLive).sort(byCreated);
   if (live.length === 0) return [];
@@ -107,10 +139,7 @@ export function tipFactsForOrder(order: TipOrderInput, payments: Payment[]): Tip
         occurred_at: new Date(p.created_at).toISOString(),
       });
       let prev = 0;
-      let run = 0;
-      for (const r of toContractRefunds(p)) {
-        run += r.amount_cents;
-        const cum = Math.min(run, p.tip_cents);
+      for (const { refund: r, cumTip: cum } of tipRefundSteps(p)) {
         if (cum > prev) {
           facts.push({
             ...base,

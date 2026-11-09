@@ -345,14 +345,15 @@ describe("tip facts (the core rule)", () => {
     expect(tipFactsForOrder(order({ tip: 0 }), [cash(A)])).toEqual([]);
   });
 
-  it("refunds come off the tip first, as signed adjustments that never rewrite the fact", () => {
+  it("legacy refunds are base first, tip last, as signed adjustments that never rewrite the fact", () => {
     const refund = (id: string, n: number, at: string) => ({ id, amount_cents: n, at, processor_ref: null, reason: null });
     const p = cash(A, {
       amount_cents: 1000,
       tip_cents: 300,
-      refunded_cents: 800,
+      refunded_cents: 1300,
       status: "refunded",
-      refunds: [refund("r1", 100, "2026-06-04T23:00:00.000Z"), refund("r2", 700, "2026-06-04T23:30:00.000Z")],
+      // r1: the whole base (1000) + 100 of the tip; r2: the other 200 of the tip.
+      refunds: [refund("r1", 1100, "2026-06-04T23:00:00.000Z"), refund("r2", 200, "2026-06-04T23:30:00.000Z")],
     });
     const facts = tipFactsForOrder(order(), [p]);
     expect(facts.map((f) => [f.id, f.kind, f.amount_cents, f.adjusts ?? null])).toEqual([
@@ -360,7 +361,7 @@ describe("tip facts (the core rule)", () => {
       [`tipadj_${A}_c100`, "adjustment", -100, `tip_${A}`],
       [`tipadj_${A}_c300`, "adjustment", -200, `tip_${A}`],
     ]);
-    // Σ facts = the tip that survives (0); the base refund (500) never touches it
+    // Σ facts = the tip that survives (0); the base refund never touches it
     expect(facts.reduce((n, f) => n + f.amount_cents, 0)).toBe(0);
     // the same state yields the same facts (replay)
     expect(tipFactsForOrder(order(), [p])).toEqual(facts);
@@ -394,7 +395,7 @@ describe("tip facts (the core rule)", () => {
     const refund = (id: string, n: number, at: string) => ({ id, amount_cents: n, at, processor_ref: null, reason: null });
     const facts = tipFactsForOrder(order(), [
       // 2026-06-09T02:30Z is 22:30 on Jun 8 in New York
-      cash(A, { tip_cents: 300, refunded_cents: 300, status: "refunded", refunds: [refund("r1", 300, "2026-06-09T02:30:00.000Z")] }),
+      cash(A, { tip_cents: 300, refunded_cents: 2300, status: "refunded", refunds: [refund("r1", 2300, "2026-06-09T02:30:00.000Z")] }),
     ]);
     expect(facts[0]!.business_date).toBe("2026-06-04");
     expect(facts[1]).toMatchObject({ kind: "adjustment", business_date: "2026-06-08", occurred_at: "2026-06-09T02:30:00.000Z" });
@@ -462,7 +463,7 @@ describe("GET /tips", () => {
   it("a refund adds a signed adjustment fact; the list equals the facts the events carry", async () => {
     await seed();
     const d = getPosDriver();
-    await d.reservePaymentRefund(ID(101), 2100, "ref-1", { at: "2026-06-04T20:00:00.000Z" } as never);
+    await d.reservePaymentRefund(ID(101), 2300, "ref-1", { at: "2026-06-04T20:00:00.000Z" } as never);
     const facts = (await call("GET", "/tips?from=2026-06-04&to=2026-06-04")).json.data as {
       id: string; kind: string; amount_cents: number; adjusts?: string;
     }[];
@@ -549,9 +550,10 @@ describe("tip events (mock outbox twin of core_trg_payments)", () => {
     const d = getPosDriver();
     await mk(ID(1), { at: "2026-06-04T15:00:00Z" });
     await d.upsertPayment(pay(ID(1), ID(101), { rail: "cash", tip_cents: 300 }));
-    await d.reservePaymentRefund(ID(101), 100, "r1", {} as never);
-    await d.reservePaymentRefund(ID(101), 100, "r1", {} as never); // replay of the same request
-    await d.reservePaymentRefund(ID(101), 1500, "r2", {} as never); // lands mostly on the base
+    await d.reservePaymentRefund(ID(101), 1000, "r0", {} as never); // base only: no tip part
+    await d.reservePaymentRefund(ID(101), 1100, "r1", {} as never); // rest of the base + 100 of the tip
+    await d.reservePaymentRefund(ID(101), 1100, "r1", {} as never); // replay of the same request
+    await d.reservePaymentRefund(ID(101), 200, "r2", {} as never); // the rest of the tip
     const adj = tipRows().filter((r) => r.event_type === "tip.adjusted").map((r) => r.row_snapshot?.fact_id);
     expect(adj).toEqual([`tipadj_${ID(101)}_c100`, `tipadj_${ID(101)}_c300`]);
   });
@@ -560,7 +562,7 @@ describe("tip events (mock outbox twin of core_trg_payments)", () => {
     const d = getPosDriver();
     await mk(ID(1), { at: "2026-06-04T15:00:00Z" });
     await d.upsertPayment(pay(ID(1), ID(101), { rail: "cash", tip_cents: 300, created_at: "2026-06-04T15:01:00.000Z" }));
-    await d.reservePaymentRefund(ID(101), 200, "r1", { at: "2026-06-04T20:00:00.000Z" } as never);
+    await d.reservePaymentRefund(ID(101), 2200, "r1", { at: "2026-06-04T20:00:00.000Z" } as never);
     const rows = tipRows();
     expect(rows.map((r) => r.event_type)).toEqual(["tip.recorded", "tip.adjusted"]);
     const listed = (await call("GET", "/tips?from=2026-06-04&to=2026-06-04")).json.data as { id: string }[];
@@ -637,7 +639,7 @@ describe("review fixes", () => {
     await mk(ID(1), { at: "2026-06-04T15:00:00Z" });
     await d.upsertPayment(pay(ID(1), ID(101), { rail: "cash", tip_cents: 300, created_at: "2026-06-04T15:01:00.000Z" }));
     vi.setSystemTime(new Date("2026-06-20T16:00:00Z"));
-    await d.reservePaymentRefund(ID(101), 300, "r1", {} as never);
+    await d.reservePaymentRefund(ID(101), 2300, "r1", {} as never);
     const early = (await call("GET", "/tips?from=2026-06-04&to=2026-06-04")).json.data as { kind: string }[];
     expect(early.map((f) => f.kind)).toEqual(["cash_on_tender"]);
     const late = (await call("GET", "/tips?from=2026-06-18&to=2026-06-21")).json.data as {
@@ -709,8 +711,8 @@ describe("second review fixes", () => {
 
   it("a voided order that had a refunded tip keeps its facts and nets to zero; one with no refund has none", () => {
     const refunded = pay(ID(50), ID(201), {
-      rail: "cash", tip_cents: 300, amount_cents: 1000, refunded_cents: 300, status: "captured",
-      refunds: [refund("r1", 300, "2026-06-09T16:00:00.000Z")],
+      rail: "cash", tip_cents: 300, amount_cents: 1000, refunded_cents: 1300, status: "refunded",
+      refunds: [refund("r1", 1300, "2026-06-09T16:00:00.000Z")],
     });
     const facts = tipFactsForOrder(base({ status: "voided" }), [refunded]);
     expect(facts.map((f) => [f.kind, f.amount_cents, f.business_date])).toEqual([
@@ -726,7 +728,7 @@ describe("second review fixes", () => {
   });
 
   it("the legacy remainder is the first refund step (matches the SQL backfill)", () => {
-    const p = pay(ID(50), ID(201), { rail: "cash", tip_cents: 150, refunded_cents: 200, refunds: [refund("r1", 120, "2026-06-04T20:00:00.000Z")] });
+    const p = pay(ID(50), ID(201), { rail: "cash", tip_cents: 150, refunded_cents: 2200, refunds: [refund("r1", 120, "2026-06-04T20:00:00.000Z")] });
     expect(tipFactsForOrder(base(), [p]).map((f) => f.id)).toEqual([`tip_${ID(201)}`, `tipadj_${ID(201)}_c80`, `tipadj_${ID(201)}_c150`]);
   });
 
@@ -756,7 +758,7 @@ describe("second review fixes", () => {
   it("a refund before the order was announced is backfilled with its steps", async () => {
     const d = getPosDriver();
     await mk(ID(1), { at: "2026-06-04T15:00:00Z", status: "awaiting_payment" });
-    await d.upsertPayment(pay(ID(1), ID(101), { tip_cents: 150, refunded_cents: 200, refunds: [refund("r1", 120, "2026-06-04T20:00:00.000Z")] }));
+    await d.upsertPayment(pay(ID(1), ID(101), { tip_cents: 150, refunded_cents: 2200, refunds: [refund("r1", 120, "2026-06-04T20:00:00.000Z")] }));
     expect(tipRows()).toHaveLength(0);
     await d.updateOrderStatus(ID(1), "paid");
     expect(tipRows().map((r) => r.row_snapshot?.fact_id)).toEqual([`tip_${ID(101)}`, `tipadj_${ID(101)}_c80`, `tipadj_${ID(101)}_c150`]);

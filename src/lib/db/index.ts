@@ -7,6 +7,7 @@ export * from "./client";
 export * from "./types";
 export * from "./menu-types";
 export * from "./payment-types";
+export * from "./adjustment-types";
 export * from "./customer-types";
 export * from "./backoffice-types";
 export * from "./saas-types";

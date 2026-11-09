@@ -29,16 +29,29 @@ export const REFUND_APPLICATION_FEE = true;
  * connected account, so the refund is made with `Stripe-Account`). Note: no
  * `reverse_transfer` -- that is only valid for destination charges.
  */
+/** The only values Stripe accepts for a refund's `reason` (anything else is a 400). */
+const STRIPE_REFUND_REASONS = ["duplicate", "fraudulent", "requested_by_customer"];
+
 export function stripeRefundParams(req: {
   chargeId: string;
   amountCents?: number;
   reason?: string;
+  /** Extra refund metadata (our order / request ids, the tip part). */
+  metadata?: Record<string, string>;
 }): Record<string, unknown> {
+  // Staff reasons are free text: Stripe's `reason` is an enum, so a staff reason
+  // rides in metadata (truncated to Stripe's 500-char value limit) and only an
+  // exact enum value is sent as `reason`.
+  const enumReason =
+    req.reason && STRIPE_REFUND_REASONS.includes(req.reason) ? req.reason : undefined;
+  const metadata: Record<string, string> = { ...(req.metadata ?? {}) };
+  if (req.reason && !enumReason) metadata.staff_reason = req.reason.slice(0, 500);
   return {
     payment_intent: req.chargeId,
     amount: req.amountCents,
-    reason: req.reason,
+    reason: enumReason,
     refund_application_fee: REFUND_APPLICATION_FEE ? true : undefined,
+    metadata: Object.keys(metadata).length ? metadata : undefined,
   };
 }
 

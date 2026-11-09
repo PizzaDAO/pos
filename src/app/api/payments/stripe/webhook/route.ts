@@ -27,6 +27,12 @@
  * also covers `terminal.reader.action_succeeded|action_failed` (the reader
  * object carries the PaymentIntent id in `action.process_payment_intent`).
  *
+ * Refunds that FAIL after Stripe accepted them (`charge.refund.updated`,
+ * `refund.updated`, `refund.failed` with status failed/canceled): the recorded
+ * refund (matched by its `re_` id on the tender's refunds[]) is released, so the
+ * money shows as held again, the ledger row is marked, and staff are alerted.
+ * Replays are no-ops (the entry is gone after the first).
+ *
  * Also handles the Connect event `account.updated`: the connected account's
  * onboarding/charges status is synced onto our connect_accounts row (matched by
  * Stripe account id) so card payments unlock as soon as KYC completes.
@@ -43,6 +49,8 @@ import { applyRailStatus } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
 import { deriveStatus, fetchConnectStatus } from "@/lib/payments/connect";
 import { captureError } from "@/lib/observability";
+import { recordAudit } from "@/lib/security/audit";
+import { refreshRefundRecord } from "@/lib/adjustments/service";
 import { TerminalFlowError, syncCardTender } from "@/lib/payments/terminal/flow";
 
 export const runtime = "nodejs";
@@ -130,6 +138,15 @@ export async function POST(request: Request) {
       }
     }
     return NextResponse.json({ received: true });
+  }
+
+  // A refund Stripe accepted but could not complete: un-record it.
+  if (
+    event.type === "charge.refund.updated" ||
+    event.type === "refund.updated" ||
+    event.type === "refund.failed"
+  ) {
+    return handleRefundUpdate(event.account, event.data?.object as RefundObject | undefined);
   }
 
   // Terminal reader events: find the PaymentIntent the reader acted on and sync.
@@ -252,4 +269,104 @@ async function syncTerminalFromWebhook(paymentId: string) {
     throw err;
   }
   return NextResponse.json({ received: true });
+}
+
+interface RefundObject {
+  id?: string;
+  object?: string;
+  status?: string;
+  amount?: number;
+  payment_intent?: string | null;
+  failure_reason?: string | null;
+}
+
+/**
+ * A refund went `failed` / `canceled` at Stripe: release our record of it (by its
+ * `re_` id) so the tender shows the money as held again, restore an order that
+ * was marked `refunded` because of it, mark the ledger row and alert staff.
+ */
+async function handleRefundUpdate(account: string | undefined, refund: RefundObject | undefined) {
+  if (!refund?.id || !refund.payment_intent) return NextResponse.json({ received: true });
+  if (refund.status !== "failed" && refund.status !== "canceled") {
+    return NextResponse.json({ received: true });
+  }
+  const driver = getPosDriver();
+  const tender = await driver.getPaymentByChargeId(refund.payment_intent);
+  if (!tender) return NextResponse.json({ received: true, ignored: "unknown_payment" });
+  if (!account || account !== tender.connect_account_id) {
+    captureError(new Error("stripe webhook account mismatch"), {
+      scope: "stripe-webhook",
+      paymentId: tender.id,
+      eventAccount: account,
+    });
+    return NextResponse.json({ received: true, ignored: "account_mismatch" });
+  }
+  const entry = (tender.refunds ?? []).find((r) => r.processor_ref === refund.id);
+  if (!entry) return NextResponse.json({ received: true, ignored: "unknown_refund" });
+  if (!entry.request_id) {
+    // A refund recorded before refund ids existed cannot be released by id:
+    // alert loudly, staff correct it by hand.
+    captureError(new Error(`stripe refund ${refund.status} on an unreleasable legacy refund`), {
+      scope: "refund-failed",
+      paymentId: tender.id,
+      refundId: refund.id,
+    });
+    return NextResponse.json({ received: true, flagged: "legacy_refund" });
+  }
+  // Tombstone: the failed refund's idempotency key is never reused.
+  await driver.releasePaymentRefund(tender.id, entry.amount_cents, entry.request_id, {
+    tombstone: true,
+  });
+  const order = await driver.getOrder(tender.order_id);
+  const requestId = entry.request_id.replace(/_[0-9a-zA-Z]{1,8}_\d+$/, "");
+  const record =
+    requestId !== entry.request_id
+      ? ((await driver.listOrderAdjustments(tender.order_id)).find((r) => r.id === requestId) ??
+        null)
+      : null;
+  // The order was closed out (refunded, or voided by a full refund) on the
+  // strength of this refund: the money is held again, so put it back. A recent
+  // refund (< 1 h) goes back to the status it had (from the ledger row); an older
+  // one to `completed`, so an old ticket never reappears on the kitchen screen.
+  // Either way staff are alerted below: never silently holding money.
+  const restoredFrom = order?.status;
+  if (order && (order.status === "refunded" || order.status === "voided")) {
+    const recent = !!record && Date.now() - Date.parse(record.created_at) < 60 * 60_000;
+    const before =
+      recent && typeof record?.meta?.order_status_before === "string"
+        ? (record.meta.order_status_before as typeof order.status)
+        : "completed";
+    const target = before === "refunded" || before === "voided" ? "completed" : before;
+    await driver.transitionOrderStatus(order.id, [order.status], target);
+  }
+  if (record) {
+    // Allocations and status re-derived from what the tenders now show.
+    await refreshRefundRecord(tender.order_id, record.id, {
+      refund_failed: refund.id,
+      refund_failure: refund.failure_reason ?? refund.status,
+    });
+  }
+  if (restoredFrom === "voided") {
+    captureError(new Error("refund failed on a VOIDED order: money is held again"), {
+      scope: "refund-failed-voided",
+      orderId: tender.order_id,
+      paymentId: tender.id,
+      amountCents: entry.amount_cents,
+    });
+  }
+  captureError(new Error(`stripe refund ${refund.status}: money was NOT returned`), {
+    scope: "refund-failed",
+    paymentId: tender.id,
+    orderId: tender.order_id,
+    refundId: refund.id,
+    amountCents: entry.amount_cents,
+    reason: refund.failure_reason ?? null,
+  });
+  await recordAudit({
+    actor: { id: "00000000-0000-0000-0000-000000000000", label: "stripe webhook" },
+    action: "payment_refund",
+    tenantId: tender.tenant_id,
+    detail: `Stripe refund ${refund.id} ${refund.status} (${refund.failure_reason ?? "no reason"}): ${entry.amount_cents}c on payment ${tender.id} (order ${tender.order_id}) was NOT returned and is held again. Refund it another way.`,
+  });
+  return NextResponse.json({ received: true, released: true });
 }

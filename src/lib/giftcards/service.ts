@@ -595,9 +595,16 @@ export async function storedValueSaleRefundMode(
 }
 
 function heldCents(payments: Payment[]): number {
+  // Pending (card / stored value) refund reservations already hold their room:
+  // they count as gone, so two racing "excess" refunds can never both pass.
   return payments
     .filter((p) => p.status === "captured" || p.status === "authorized" || p.status === "refunded")
-    .reduce((n, p) => n + Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents), 0);
+    .reduce(
+      (n, p) =>
+        n +
+        Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents - (p.refund_reserved_cents ?? 0)),
+      0,
+    );
 }
 
 /** The value a sale/reload order bought is no longer on the card (or never was). */

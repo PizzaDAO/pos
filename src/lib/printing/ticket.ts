@@ -166,3 +166,41 @@ export function buildTestDoc(
   add("1234567890".repeat(5).slice(0, cols));
   return { lines };
 }
+
+/**
+ * A VOID ticket: food that was already sent to the kitchen and has just been
+ * voided (some lines, or the whole order). Big STOP banner, the order number
+ * and what to stop making, so a line working from paper tickets stops too.
+ */
+export function buildVoidTicketDoc(
+  order: Order,
+  items: OrderItem[],
+  opts: BuildTicketOptions & { scope: "order" | "lines"; reason?: string | null; at?: string },
+): PrintTicketDoc {
+  const cols = opts.columns;
+  const lines: PrintLine[] = [];
+  const push = (text: string, extra: Partial<PrintLine> = {}) => {
+    const size = extra.size ?? 1;
+    for (const t of wrapText(cleanText(text), Math.floor(cols / size))) {
+      lines.push({ text: t, ...extra });
+    }
+  };
+  const rule = () => lines.push({ text: "", rule: true });
+  push("*** VOID ***", { size: 2, bold: true, align: "center" });
+  const num = cleanText(order.order_number);
+  push(num, { size: num.length * 3 <= cols ? 3 : 2, bold: true, align: "center" });
+  push(opts.scope === "order" ? "WHOLE ORDER - STOP" : "STOP MAKING:", {
+    size: 2,
+    bold: true,
+    align: "center",
+  });
+  push(formatTime(opts.at ?? new Date().toISOString(), opts.timezone), { align: "center" });
+  rule();
+  for (const item of items) pushItem(item, push);
+  if (items.length === 0) push("(no items)", { align: "center" });
+  if (opts.reason) {
+    rule();
+    push(`REASON: ${opts.reason}`);
+  }
+  return { lines };
+}

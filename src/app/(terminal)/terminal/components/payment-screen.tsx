@@ -12,16 +12,24 @@
  * selected card reader (server-driven Stripe Terminal; a virtual reader when no
  * Stripe key): the card panel shows present card / approved / declined with
  * Try again / Cancel / Reset reader (+ Simulate in sandbox). Card needs internet,
- * so offline the screen says to take cash. Completed tenders can be
- * refunded/voided.
+ * so offline the screen says to take cash. Completed orders can be
+ * refunded (see "Adjust order" below).
  *
  * Every tender uses a client UUID as its idempotency key (stable across retries),
  * so retries never double-charge.
+ *
+ * "Adjust order" opens the refund / void / comp dialog (AdjustOrderDialog):
+ * partial refunds by item or amount (tip refunds kept separate), voids before
+ * payment (a paid order voids by refund), comps and $/% discounts, with a
+ * required reason and manager PIN approval above the location threshold.
  */
 "use client";
 
 import { useMemo, useState } from "react";
-import { CreditCard, Loader2, RotateCcw, X } from "lucide-react";
+import { Ban, CreditCard, Loader2, Percent, RotateCcw, X } from "lucide-react";
+import type { AdjustmentKind, AdjustmentRecord } from "@/lib/db";
+import { reasonLabel } from "@/lib/adjustments/reasons";
+import { AdjustOrderDialog, type AdjustMode } from "./adjust-order-dialog";
 import type { PaymentSettings } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { Button } from "@/components/ui/button";
@@ -30,10 +38,7 @@ import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
 import { isFullyRefunded } from "@/lib/payments/refund-state";
 import { planCashTender } from "@/lib/payments/cash-tender";
-import {
-  PAYMENT_RAIL_KEYS,
-  tenderRailLabel,
-} from "@/lib/payments/registry";
+import { PAYMENT_RAIL_KEYS } from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
 import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
 import { TipSelector } from "./tip-selector";
@@ -59,6 +64,14 @@ function quickCashChoices(dueCents: number): number[] {
   }
   return notes;
 }
+
+const ADJUSTMENT_LABELS: Record<AdjustmentKind, string> = {
+  refund: "Refund",
+  void_line: "Void item",
+  void_order: "Void order",
+  comp: "Comp",
+  discount: "Discount",
+};
 
 export interface PaymentScreenProps {
   /** Location display name for the receipt header. */
@@ -98,15 +111,40 @@ export function PaymentScreen({
   const [tipCents, setTipCents] = useState(0);
   const [cashTendered, setCashTendered] = useState("");
 
-  const [confirmRefundId, setConfirmRefundId] = useState<string | null>(null);
+  const [adjustMode, setAdjustMode] = useState<AdjustMode | null>(null);
   /** The last partial cash tender taken (shown until the order is finished). */
   const [partialCashCents, setPartialCashCents] = useState<number | null>(null);
 
   const balance = checkout.balanceCents;
   // Fully refunded: the order is closed out, so never re-offer "Charge".
   const refunded = isFullyRefunded(checkout.order, checkout.payments);
-  const paid = balance === 0 && checkout.payments.length > 0 && !refunded;
-  const finished = paid || refunded;
+  const voided = checkout.order?.status === "voided";
+  const paid = balance === 0 && checkout.payments.length > 0 && !refunded && !voided;
+  const finished = paid || refunded || voided;
+  const closedOut = refunded || voided;
+  // Money still held on a tender (refundable); a paid order is adjusted by refund.
+  const holdsMoney = checkout.payments.some(
+    (p) =>
+      (p.status === "captured" || p.status === "authorized") &&
+      p.amount_cents + p.tip_cents > p.refunded_cents,
+  );
+  const canRefund = holdsMoney && checkout.payments.some((p) => p.rail !== "external");
+  const [adjustError, setAdjustError] = useState<string | null>(null);
+
+  /**
+   * Resume (same request id: finishes what is left, never twice) or cancel (so
+   * its item units are released) a refund that did not finish.
+   */
+  async function unfinishedRefund(a: AdjustmentRecord, action: "resume" | "cancel") {
+    setAdjustError(null);
+    const res = await checkout.adjust("refund", {
+      requestId: a.id,
+      reasonCode: a.reason_code,
+      reasonText: a.reason_text ?? undefined,
+      ...(action === "cancel" ? { cancel: true } : {}),
+    });
+    if (!res.ok) setAdjustError(res.error ?? "That didn't go through.");
+  }
   const changeGivenCents = checkout.payments
     .filter((p) => p.status === "captured")
     .reduce((sum, p) => sum + (p.cash_change_cents ?? 0), 0);
@@ -205,14 +243,18 @@ export function PaymentScreen({
         <div className="flex items-center justify-between border-b p-4">
           <div>
             <h2 id="payment-screen-title" className="text-lg font-bold">
-              {refunded
+              {voided
+                ? "Order voided"
+                : refunded
                 ? "Order refunded"
                 : paid
                   ? "Payment complete"
                   : "Take payment"}
             </h2>
             <p className="text-sm text-muted-foreground">
-              {refunded
+              {voided
+                ? "This order was voided."
+                : refunded
                 ? "All tenders on this order were refunded."
                 : paid
                   ? "Order paid in full."
@@ -589,7 +631,7 @@ export function PaymentScreen({
                 <Button className="h-14 w-full text-base" onClick={onPaid}>
                   Done — new order
                 </Button>
-                {!refunded && (
+                {!closedOut && (
                   <Button
                     variant="outline"
                     className="h-12 w-full"
@@ -612,70 +654,104 @@ export function PaymentScreen({
               />
             )}
 
-            {/* Refund / void completed tenders */}
-            {checkout.payments.some(
-              (p) => p.status === "captured" && p.refunded_cents === 0,
-            ) && (
-              <div className="rounded-md border p-3">
-                <div className="mb-2 text-sm font-medium">Refund / void</div>
-                <ul className="space-y-2">
-                  {checkout.payments
-                    .filter(
-                      (p) => p.status === "captured" && p.refunded_cents === 0,
-                    )
-                    .map((p) => (
-                      <li
-                        key={p.id}
-                        className="flex flex-wrap items-center justify-between gap-2 text-sm"
-                      >
+            {/* Refund / void / comp (each opens the adjust dialog) */}
+            {checkout.order && (
+              <div className="rounded-md border p-3" data-testid="adjust-panel">
+                <div className="mb-2 text-sm font-medium">Adjust order</div>
+                <div className="grid grid-cols-3 gap-2">
+                  <Button
+                    variant="outline"
+                    className="h-11 border-destructive px-2 text-destructive"
+                    disabled={checkout.loading || !canRefund}
+                    onClick={() => setAdjustMode("refund")}
+                  >
+                    <RotateCcw className="mr-1 h-3.5 w-3.5" /> Refund
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-11 px-2"
+                    disabled={checkout.loading || closedOut}
+                    onClick={() => setAdjustMode("void")}
+                  >
+                    <Ban className="mr-1 h-3.5 w-3.5" /> Void
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-11 px-2"
+                    disabled={checkout.loading || closedOut || holdsMoney}
+                    onClick={() => setAdjustMode("comp")}
+                  >
+                    <Percent className="mr-1 h-3.5 w-3.5" /> Comp
+                  </Button>
+                </div>
+                {adjustError && (
+                  <p role="alert" className="mt-2 text-xs text-destructive">
+                    {adjustError}
+                  </p>
+                )}
+                {checkout.adjustments.length > 0 && (
+                  <ul className="mt-3 space-y-1 text-xs text-muted-foreground" aria-label="Adjustment history">
+                    {checkout.adjustments.map((a) => (
+                      <li key={a.id} className="flex justify-between gap-2">
                         <span>
-                          {confirmRefundId === p.id
-                            ? `Refund ${formatMoney(p.amount_cents + p.tip_cents, currency)} ${STAFF_RAIL_LABELS[p.rail as PaymentRailKey]?.toLowerCase() ?? ""}?`
-                            : `${STAFF_RAIL_LABELS[p.rail as PaymentRailKey] ?? tenderRailLabel(p.rail)} · ${formatMoney(p.amount_cents + p.tip_cents, currency)}`}
+                          {ADJUSTMENT_LABELS[a.kind]} · {reasonLabel(a.kind, a.reason_code)}
+                          {a.tip_cents > 0 && (
+                            <span className="ml-1 font-semibold text-amber-700">tip refund</span>
+                          )}
+                          {a.approved_by && <span className="ml-1">· approved</span>}
+                          {a.status !== "completed" && (
+                            <span className="ml-1 font-semibold text-destructive">{a.status}</span>
+                          )}
                         </span>
-                        {confirmRefundId === p.id ? (
-                          <span
-                            role="group"
-                            aria-label="Confirm refund"
-                            className="flex items-center gap-2"
-                          >
-                            <Button
-                              variant="destructive"
-                              className="h-11 px-4"
-                              disabled={checkout.loading}
-                              onClick={() => {
-                                setConfirmRefundId(null);
-                                void checkout.refund(p.id);
-                              }}
-                            >
-                              Confirm refund
-                            </Button>
-                            <Button
-                              variant="outline"
-                              className="h-11 px-4"
-                              onClick={() => setConfirmRefundId(null)}
-                            >
-                              Cancel
-                            </Button>
-                          </span>
-                        ) : (
-                          <Button
-                            variant="outline"
-                            className="h-11 border-destructive px-4 text-destructive"
-                            disabled={checkout.loading}
-                            onClick={() => setConfirmRefundId(p.id)}
-                          >
-                            <RotateCcw className="mr-1 h-3.5 w-3.5" /> Refund
-                          </Button>
-                        )}
+                        <span className="flex items-center gap-2 tabular-nums">
+                          {formatMoney(a.amount_cents + a.tip_cents, currency)}
+                          {a.kind === "refund" && a.status !== "completed" && (
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-8 px-2"
+                                  disabled={checkout.loading}
+                                  onClick={() => void unfinishedRefund(a, "resume")}
+                                >
+                                  Resume
+                                </Button>
+                                {a.status !== "failed" && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-8 px-2"
+                                    disabled={checkout.loading}
+                                    onClick={() => void unfinishedRefund(a, "cancel")}
+                                  >
+                                    Cancel
+                                  </Button>
+                                )}
+                              </>
+                            )}
+                        </span>
                       </li>
                     ))}
-                </ul>
+                  </ul>
+                )}
               </div>
             )}
           </div>
         </div>
       </div>
+      {adjustMode && checkout.order && (
+        <AdjustOrderDialog
+          mode={adjustMode}
+          order={checkout.order}
+          payments={checkout.payments}
+          records={checkout.adjustments}
+          policy={checkout.policy}
+          currency={currency}
+          busy={checkout.loading}
+          onSubmit={checkout.adjust}
+          onClose={() => setAdjustMode(null)}
+        />
+      )}
     </Dialog>
   );
 }

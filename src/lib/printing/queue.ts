@@ -14,9 +14,9 @@
 import { after } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isLiveOrderStatus } from "@/lib/db/menu-types";
-import type { Order } from "@/lib/db";
+import type { Order, OrderItem } from "@/lib/db";
 import { captureError } from "@/lib/observability";
-import { buildTestDoc, buildTicketDoc } from "./ticket";
+import { buildTestDoc, buildTicketDoc, buildVoidTicketDoc } from "./ticket";
 import {
   formatToken,
   generatePrinterSecret,
@@ -289,6 +289,64 @@ export function scheduleAutoPrint(order: Order): void {
   // A gift card sale / reload has nothing to cook: never print a kitchen ticket.
   if (order.core_ext?.stored_value) return;
   const run = () => autoPrintOnFire(order).then(() => undefined);
+  try {
+    after(run);
+  } catch {
+    void run();
+  }
+}
+
+/**
+ * A VOID ticket for fired food that was just voided, on every printer at the
+ * order's location (none = nothing to do: the kitchen screen's STOP banner is
+ * the only notice). Idempotent per printer on `dedupeKey` (the void request id),
+ * and NEVER throws: printing must not fail a void.
+ */
+export async function printVoidTicket(input: {
+  order: Order;
+  items: OrderItem[];
+  scope: "order" | "lines";
+  reason?: string | null;
+  dedupeKey: string;
+  now?: Date;
+}): Promise<number> {
+  try {
+    if (input.items.length === 0) return 0;
+    const driver = getPosDriver();
+    const printers = await driver.listPrinters(input.order.tenant_id, input.order.location_id);
+    if (printers.length === 0) return 0;
+    const now = input.now ?? new Date();
+    const timezone = await locationTimezone(input.order.tenant_id, input.order.location_id);
+    let n = 0;
+    for (const p of printers) {
+      await driver.enqueuePrintJob({
+        tenant_id: input.order.tenant_id,
+        location_id: input.order.location_id,
+        printer_id: p.id,
+        order_id: input.order.id,
+        kind: "ticket",
+        document: buildVoidTicketDoc(input.order, input.items, {
+          columns: p.columns,
+          timezone,
+          scope: input.scope,
+          reason: input.reason ?? null,
+          at: now.toISOString(),
+        }),
+        dedupe_key: `void:${input.dedupeKey}`,
+        expires_at: new Date(now.getTime() + JOB_TTL_MS).toISOString(),
+      });
+      n += 1;
+    }
+    return n;
+  } catch (err) {
+    captureError(err, { scope: "print.voidTicket", orderId: input.order.id });
+    return 0;
+  }
+}
+
+/** `printVoidTicket` after the response is sent (like scheduleAutoPrint). Never throws. */
+export function scheduleVoidTicket(input: Parameters<typeof printVoidTicket>[0]): void {
+  const run = () => printVoidTicket(input).then(() => undefined);
   try {
     after(run);
   } catch {

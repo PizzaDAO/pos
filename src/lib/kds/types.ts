@@ -26,9 +26,27 @@ export interface KitchenTicket {
   deliveryProvider?: string | null;
 }
 
+/**
+ * Food that was already sent to the kitchen and then voided (a whole order
+ * voided / refunded, or lines voided off a live ticket). Shown as a STOP banner
+ * for a while so the line stops making it.
+ */
+export interface VoidNotice {
+  orderId: string;
+  orderNumber: string;
+  /** When it was voided (ISO). */
+  at: string;
+  /** "order" = the whole ticket is off; "lines" = some items came off it. */
+  scope: "order" | "lines";
+  /** What to stop making, e.g. "2x Margherita · Large". */
+  items: string[];
+}
+
 /** Response shape for the KDS orders API (what the polling fetcher returns). */
 export interface KitchenBoardResponse {
   tickets: KitchenTicket[];
+  /** Recently voided food that was already fired (newest first). Optional for older clients. */
+  voided?: VoidNotice[];
   /** Active driver name (diagnostics — mock vs supabase). */
   driver: string;
   /** When the server assembled this snapshot (ISO) — anchors elapsed time. */

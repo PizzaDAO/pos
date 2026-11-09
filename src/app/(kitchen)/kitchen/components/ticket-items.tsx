@@ -97,8 +97,12 @@ export function TicketItems({
   const visible = items.filter(
     (i) => !i.voided && lineMatchesStation(i, stationFilter),
   );
+  // Lines voided AFTER they were sent: shown struck through so the cook stops.
+  const stopped = items.filter(
+    (i) => i.voided && !!i.fired_at && lineMatchesStation(i, stationFilter),
+  );
 
-  if (visible.length === 0) {
+  if (visible.length === 0 && stopped.length === 0) {
     return (
       <p className="py-2 text-sm text-muted-foreground">
         No items for this station.
@@ -110,6 +114,22 @@ export function TicketItems({
     <ul className="divide-y-0">
       {visible.map((line) => (
         <LineRow key={line.id} line={line} />
+      ))}
+      {stopped.map((line) => (
+        <li
+          key={line.id}
+          data-testid="voided-line"
+          className="flex items-baseline justify-between gap-2 border-b border-dashed py-2 last:border-b-0"
+        >
+          <span className="text-lg text-muted-foreground line-through">
+            {line.quantity > 1 && `${line.quantity}× `}
+            {line.item_name}
+            {line.size_name && ` · ${line.size_name}`}
+          </span>
+          <span className="rounded bg-destructive px-1.5 text-xs font-bold uppercase text-destructive-foreground">
+            Void
+          </span>
+        </li>
       ))}
     </ul>
   );

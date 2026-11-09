@@ -8,7 +8,7 @@
  */
 import type { KdsThresholds, Order, OrderItem, Station } from "@/lib/db";
 import { KDS_ACTIVE_STATUSES } from "@/lib/db";
-import type { AgeLevel, KitchenTicket, StationFilter } from "./types";
+import type { AgeLevel, KitchenTicket, StationFilter, VoidNotice } from "./types";
 import { lineStation } from "./types";
 
 /** Default coloring cadence when a location omits `kds_thresholds`. */
@@ -93,4 +93,58 @@ export function ticketsForStation(
   return tickets.filter((t) =>
     t.order.items.some((i) => !i.voided && lineMatchesStation(i, filter)),
   );
+}
+
+/** How long a void stays on the board as a STOP banner. */
+export const VOID_NOTICE_MS = 15 * 60 * 1000;
+
+function lineLabel(i: OrderItem): string {
+  return `${i.quantity > 1 ? `${i.quantity}x ` : ""}${i.item_name}${i.size_name ? ` · ${i.size_name}` : ""}`;
+}
+
+/**
+ * Fired food that was voided in the last `windowMs`: whole orders voided while
+ * they had fired lines, and lines voided off a ticket after they were sent.
+ * Newest first.
+ */
+export function buildVoidNotices(
+  orders: Order[],
+  now: Date,
+  windowMs = VOID_NOTICE_MS,
+): VoidNotice[] {
+  const since = now.getTime() - windowMs;
+  const out: VoidNotice[] = [];
+  for (const order of orders) {
+    // A whole order voided while it was in the kitchen (a refund AFTER hand-off
+    // ends `refunded` and is not the kitchen's business).
+    if (order.status === "voided") {
+      if (new Date(order.updated_at).getTime() < since) continue;
+      const fired = order.items.filter((i) => !!i.fired_at && !i.voided);
+      if (fired.length === 0) continue;
+      out.push({
+        orderId: order.id,
+        orderNumber: order.order_number,
+        at: order.updated_at,
+        scope: "order",
+        items: fired.map(lineLabel),
+      });
+      continue;
+    }
+    const lines = order.items.filter(
+      (i) =>
+        i.voided &&
+        !!i.fired_at &&
+        !!i.voided_at &&
+        new Date(i.voided_at).getTime() >= since,
+    );
+    if (lines.length === 0) continue;
+    out.push({
+      orderId: order.id,
+      orderNumber: order.order_number,
+      at: lines.map((i) => i.voided_at!).sort().pop()!,
+      scope: "lines",
+      items: lines.map(lineLabel),
+    });
+  }
+  return out.sort((a, b) => b.at.localeCompare(a.at));
 }

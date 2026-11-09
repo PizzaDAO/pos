@@ -19,6 +19,7 @@ import type {
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
+import { ApprovalLimits } from "./approval-limits";
 
 interface Props {
   tenantId: string;
@@ -130,6 +131,8 @@ export function StaffShifts({ tenantId, locationId }: Props) {
           {roleError}
         </p>
       )}
+
+      <ApprovalLimits tenantId={tenantId} locationId={locationId} />
 
       <div className="grid gap-3 sm:grid-cols-2">
         {data.staff.filter((s) => s.active).map((s) => {
@@ -352,7 +355,7 @@ function OpenDrawer({
         <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm sm:grid-cols-4">
           <Stat label="Cash sales" value={formatMoney(recon.cash_sales_cents)} />
           <Stat label="Paid in" value={formatMoney(recon.paid_in_cents)} />
-          <Stat label="Payouts" value={formatMoney(recon.payouts_cents)} />
+          <Stat label="Payouts (incl. cash refunds)" value={formatMoney(recon.payouts_cents)} />
           <Stat label="Expected" value={formatMoney(recon.expected_cents)} strong />
         </dl>
       )}

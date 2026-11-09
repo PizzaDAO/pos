@@ -35,6 +35,28 @@ export interface PaymentRefund {
   reason: string | null;
   /** Internal: the client refund-request id this entry was reserved under. */
   request_id?: string | null;
+  /**
+   * The GRATUITY part of `amount_cents` (the rest is base). Recorded on every
+   * refund since tip refunds are tracked separately; absent on older entries,
+   * which came off the tip first (see `tipRefundedCents`).
+   */
+  tip_cents?: number | null;
+  /**
+   * Card / stored-value refunds are reserved BEFORE the provider is called:
+   * `pending` until the provider accepted it (`confirmPaymentRefund`), then
+   * `succeeded`. Absent = succeeded (cash / crypto, older entries). A pending
+   * entry holds its room (`refund_reserved_cents`) but is not yet refunded.
+   */
+  state?: "pending" | "succeeded";
+  /** The tender status before this refund (restored if it is released). */
+  status_before?: string | null;
+  /**
+   * The order was paid in full when this refund was made. Only then does a
+   * refunded tender keep covering the order's balance (a refund after the sale
+   * never re-opens it); a refund on an unpaid order gave the money back.
+   * Absent on older entries (refund-state.ts falls back to the money held).
+   */
+  covering?: boolean | null;
 }
 
 /**
@@ -67,8 +89,21 @@ export interface Payment {
   /** Cash-only: amount tendered + change due, in cents. */
   cash_tendered_cents: number | null;
   cash_change_cents: number | null;
-  /** Amount refunded so far against this tender, in cents. */
+  /** Amount refunded so far against this tender, in cents (base + tip). */
   refunded_cents: number;
+  /**
+   * The gratuity part of `refunded_cents`. Written ONLY by the refund
+   * reservation (never `upsertPayment`). Absent on rows read from a database
+   * that predates it: then refunds came off the tip first (`tipRefundedCents`).
+   */
+  tip_refunded_cents?: number;
+  /**
+   * Money HELD by `pending` refunds (card / stored value, reserved before the
+   * provider is called): counts against the caps, but not in `refunded_cents`,
+   * the status or any report until confirmed. Written only by the refund
+   * reservation functions.
+   */
+  refund_reserved_cents?: number;
   /** Whether this payment was taken on a simulated rail (no live keys). */
   simulated: boolean;
   /**

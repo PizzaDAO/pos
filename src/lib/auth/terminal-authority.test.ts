@@ -307,7 +307,11 @@ describe("refunds: PIN tenant", () => {
       new Request("http://localhost/api/payments/refund", {
         method: "POST",
         headers: cookie ? { cookie } : {},
-        body: JSON.stringify({ paymentId: PAYMENT, amountCents: 100 }),
+        body: JSON.stringify({
+          paymentId: PAYMENT,
+          amountCents: 100,
+          refundId: `authority-${Math.random().toString(36).slice(2, 12)}`,
+        }),
       }),
     );
 

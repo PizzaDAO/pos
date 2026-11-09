@@ -480,7 +480,7 @@ describe("S9: refunds are owner|manager only", () => {
       new Request("http://localhost/api/payments/refund", {
         method: "POST",
         headers: { "x-forwarded-for": "6.6.6.6" },
-        body: JSON.stringify({ paymentId: t.id }),
+        body: JSON.stringify({ paymentId: t.id, refundId: "refund-s9-0001" }),
       }),
     );
     expect(res.status).toBe(403);

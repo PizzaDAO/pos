@@ -11,6 +11,7 @@
  * `drawer_sessions`; ids are POS ids verbatim (the contract accepts them).
  */
 import { parseExternalMixKey } from "@/lib/reports";
+import { compsByLine, currentAdjustments } from "@/lib/adjustments/math";
 import {
   allocate,
   businessDate,
@@ -445,7 +446,8 @@ function tenderStatus(p: Payment): string {
  * sum invariant holds and the id is stable across reads.
  */
 export function toContractRefunds(p: Payment): CorePaymentRefund[] {
-  const out: CorePaymentRefund[] = (p.refunds ?? []).map((r) => ({
+  // Pending (card / stored value) reservations are not refunds yet.
+  const out: CorePaymentRefund[] = confirmedRefundEntries(p).map((r) => ({
     id: r.id,
     amount_cents: r.amount_cents,
     at: ts(r.at),
@@ -463,6 +465,11 @@ export function toContractRefunds(p: Payment): CorePaymentRefund[] {
     });
   }
   return out;
+}
+
+/** A tender's refund entries that actually happened (pending reservations excluded). */
+export function confirmedRefundEntries(p: Payment) {
+  return (p.refunds ?? []).filter((r) => r.state !== "pending");
 }
 
 /**
@@ -591,6 +598,30 @@ function sourceOf(order: Order): CoreOrder["source"] {
   };
 }
 
+/**
+ * Per-line discount: a comp lands on the line(s) it comps, the rest of the
+ * order discount is spread over the lines by what is left of them (largest
+ * remainder), so Σ line discounts == the order discount and no line goes
+ * negative. Orders without recorded adjustments keep the plain proportional
+ * spread.
+ */
+function lineDiscounts(order: Order, live: OrderItem[]): number[] {
+  const total = Math.min(order.totals.discount_cents, order.totals.subtotal_cents);
+  const adjustments = currentAdjustments(order);
+  const recorded = adjustments.reduce((n, a) => n + a.amount_cents, 0);
+  if (!order.adjustments?.length || recorded !== total) {
+    return allocate(total, live.map((i) => i.line_total_cents));
+  }
+  const comps = compsByLine(adjustments);
+  const compParts = live.map((i) => Math.min(comps.get(i.id) ?? 0, i.line_total_cents));
+  const rest = total - compParts.reduce((a, b) => a + b, 0);
+  const restParts =
+    rest > 0
+      ? allocate(rest, live.map((i, k) => Math.max(0, i.line_total_cents - compParts[k]!)))
+      : live.map(() => 0);
+  return live.map((_, k) => compParts[k]! + (restParts[k] ?? 0));
+}
+
 function toContractLines(order: Order): CoreOrderLine[] {
   // A gift card sale / reload has no menu lines: one synthetic `gift_card_load`
   // line (kind gift_card, tax exempt) so hub consumers see what was sold.
@@ -623,10 +654,7 @@ function toContractLines(order: Order): CoreOrderLine[] {
     ];
   }
   const live = order.items.filter((i) => !i.voided);
-  const discounts = allocate(
-    Math.min(order.totals.discount_cents, order.totals.subtotal_cents),
-    live.map((i) => i.line_total_cents),
-  );
+  const discounts = lineDiscounts(order, live);
   let li = 0;
   return order.items.map((i: OrderItem) => {
     const discount = i.voided ? 0 : (discounts[li++] ?? 0);
@@ -734,18 +762,16 @@ export function toContractOrder(input: {
     fire_at: order.core_ext?.fire_at ?? null,
     currency: order.currency,
     lines: toContractLines(order),
-    adjustments:
-      t.discount_cents > 0
-        ? [
-            {
-              id: "adj_discount",
-              type: "discount",
-              source: "pos.manual",
-              label: "Discount",
-              amount_cents: t.discount_cents,
-            },
-          ]
-        : [],
+    // Comps + discounts as applied (a legacy discount_cents is one discount).
+    adjustments: currentAdjustments(order).map((a) => ({
+      id: a.id,
+      type: a.type,
+      source: a.source,
+      label: a.label,
+      amount_cents: a.amount_cents,
+      ...(a.percent_bps ? { percent_bps: a.percent_bps } : {}),
+      ...(a.line_ids?.length ? { line_ids: a.line_ids } : {}),
+    })),
     totals: {
       subtotal_cents: t.subtotal_cents,
       discount_cents: t.discount_cents,

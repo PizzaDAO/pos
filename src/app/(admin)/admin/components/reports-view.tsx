@@ -135,6 +135,21 @@ export function ReportsView({ tenantId, locations }: Props) {
               label="Refunds"
               value={`${report.refund_count} · ${formatMoney(report.refund_cents)}`}
             />
+            {(report.tip_refund_cents ?? 0) > 0 && (
+              <Kpi label="Tip refunds (flagged)" value={formatMoney(report.tip_refund_cents ?? 0)} />
+            )}
+            {(report.comp_count ?? 0) > 0 && (
+              <Kpi
+                label="Comps (in discounts)"
+                value={`${report.comp_count} · ${formatMoney(report.comp_cents ?? 0)}`}
+              />
+            )}
+            {(report.line_void_count ?? 0) > 0 && (
+              <Kpi
+                label="Items voided"
+                value={`${report.line_void_count} · ${formatMoney(report.line_void_cents ?? 0)}`}
+              />
+            )}
           </div>
 
           {/* Payment mix */}

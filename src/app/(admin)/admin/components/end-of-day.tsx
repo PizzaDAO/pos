@@ -338,9 +338,27 @@ export function EndOfDay({
               value={`${report.void_count} · ${formatMoney(report.void_cents)}`}
             />
             <Row
-              label="Refunds"
+              label="Refunds (incl. partial)"
               value={`${report.refund_count} · ${formatMoney(report.refund_cents)}`}
             />
+            {(report.tip_refund_cents ?? 0) > 0 && (
+              <Row
+                label="  of which tip refunds (flagged)"
+                value={formatMoney(report.tip_refund_cents ?? 0)}
+              />
+            )}
+            {(report.comp_count ?? 0) > 0 && (
+              <Row
+                label="Comps (in discounts)"
+                value={`${report.comp_count} · ${formatMoney(report.comp_cents ?? 0)}`}
+              />
+            )}
+            {(report.line_void_count ?? 0) > 0 && (
+              <Row
+                label="Items voided"
+                value={`${report.line_void_count} · ${formatMoney(report.line_void_cents ?? 0)}`}
+              />
+            )}
           </Section>
 
           {drawer && (

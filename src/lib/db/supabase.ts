@@ -36,6 +36,7 @@ import type {
   PrintLocationSettings,
 } from "@/lib/printing/types";
 import type { PosDriver } from "./driver";
+import type { AdjustmentRecord } from "./adjustment-types";
 import type {
   ItemSize,
   Menu,
@@ -226,6 +227,32 @@ function mapStoreSettings(r: Row): StoreSettings {
       (r.kds_thresholds as StoreSettings["kds_thresholds"]) ?? undefined,
     fulfillment: (r.fulfillment as StoreSettings["fulfillment"]) ?? undefined,
     marketplace: (r.marketplace as StoreSettings["marketplace"]) ?? undefined,
+    adjustment_policy:
+      (r.adjustment_policy as StoreSettings["adjustment_policy"] | null) ?? undefined,
+  };
+}
+
+function mapAdjustmentRecord(r: Row): AdjustmentRecord {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    location_id: r.location_id as string,
+    order_id: r.order_id as string,
+    kind: r.kind as AdjustmentRecord["kind"],
+    status: r.status as AdjustmentRecord["status"],
+    amount_cents: r.amount_cents as number,
+    tip_cents: (r.tip_cents as number | null) ?? 0,
+    lines: (r.lines as AdjustmentRecord["lines"] | null) ?? [],
+    allocations: (r.allocations as AdjustmentRecord["allocations"] | null) ?? [],
+    reason_code: r.reason_code as string,
+    reason_text: (r.reason_text as string | null) ?? null,
+    staff_id: (r.staff_id as string | null) ?? null,
+    actor_user_id: r.actor_user_id as string,
+    approved_by: (r.approved_by as string | null) ?? null,
+    meta: (r.meta as Record<string, unknown> | null) ?? null,
+    claimed_until: (r.claimed_until as string | null) ?? null,
+    created_at: r.created_at as string,
+    updated_at: r.updated_at as string,
   };
 }
 
@@ -259,6 +286,7 @@ function mapOrder(r: Row, items: OrderItem[]): Order {
     source: (r.source as Order["source"] | null) ?? undefined,
     hold: (r.hold as Order["hold"] | null) ?? null,
     core_ext: (r.core_ext as Order["core_ext"] | null) ?? null,
+    adjustments: (r.adjustments as Order["adjustments"] | null) ?? null,
     version: (r.version as number | null) ?? 1,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
@@ -284,6 +312,14 @@ function mapPayment(r: Row): Payment {
     cash_tendered_cents: (r.cash_tendered_cents as number | null) ?? null,
     cash_change_cents: (r.cash_change_cents as number | null) ?? null,
     refunded_cents: r.refunded_cents as number,
+    // Absent on a database that predates the column: tipRefundedCents() then
+    // applies the legacy tip-first rule.
+    ...(typeof r.tip_refunded_cents === "number"
+      ? { tip_refunded_cents: r.tip_refunded_cents as number }
+      : {}),
+    ...(typeof r.refund_reserved_cents === "number"
+      ? { refund_reserved_cents: r.refund_reserved_cents as number }
+      : {}),
     refund_ids: (r.refund_ids as string[] | null) ?? [],
     refunds: (r.refunds as Payment["refunds"] | null) ?? [],
     method: (r.method as string | null) ?? null,
@@ -1710,6 +1746,144 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       };
     },
 
+    async setAdjustmentPolicy(tenantId, locationId, policy) {
+      const updated = unwrap(
+        await sb
+          .from("store_settings")
+          .update({ adjustment_policy: policy })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      if (updated) return mapStoreSettings(updated);
+      // No row yet: create one carrying the same defaults getStoreSettings serves.
+      const d = await this.getStoreSettings(tenantId, locationId);
+      const inserted = unwrap(
+        await sb
+          .from("store_settings")
+          .upsert({
+            tenant_id: tenantId,
+            location_id: locationId,
+            currency: d.currency,
+            tax_rate_bps: d.tax_rate_bps,
+            tip_presets_bps: d.tip_presets_bps,
+            kds_thresholds: d.kds_thresholds ?? null,
+            adjustment_policy: policy,
+          })
+          .select()
+          .single(),
+      ) as Row;
+      return mapStoreSettings(inserted);
+    },
+
+    async listOrderAdjustments(orderId) {
+      return (
+        unwrap(
+          await sb
+            .from("order_adjustments")
+            .select("*")
+            .eq("order_id", orderId)
+            .order("created_at")
+            .order("id"),
+        ) as Row[]
+      ).map(mapAdjustmentRecord);
+    },
+
+    async listOrderAdjustmentsForOrders(orderIds) {
+      if (orderIds.length === 0) return [];
+      return (await selectIn("order_adjustments", "order_id", orderIds)).map(mapAdjustmentRecord);
+    },
+
+    async beginOrderRefund(record) {
+      const out = unwrap(
+        await sb.rpc("begin_order_refund", { p_record: record }),
+      ) as { outcome: string; record?: Row; line_id?: string; available?: number };
+      if (out.outcome === "ok" || out.outcome === "duplicate") {
+        return { outcome: out.outcome, record: mapAdjustmentRecord(out.record as Row) };
+      }
+      if (out.outcome === "exceeds") {
+        return {
+          outcome: "exceeds",
+          line_id: out.line_id ?? "",
+          available: out.available ?? 0,
+        };
+      }
+      return { outcome: "not_found" };
+    },
+
+    async reopenOrderRefund(orderId, id) {
+      const out = unwrap(
+        await sb.rpc("reopen_order_refund", { p_order_id: orderId, p_id: id }),
+      ) as { outcome: string; record?: Row; line_id?: string; available?: number };
+      if (out.outcome === "ok" || out.outcome === "duplicate") {
+        return { outcome: out.outcome, record: mapAdjustmentRecord(out.record as Row) };
+      }
+      if (out.outcome === "exceeds") {
+        return { outcome: "exceeds", line_id: out.line_id ?? "", available: out.available ?? 0 };
+      }
+      return { outcome: "not_found" };
+    },
+
+    async claimOrderAdjustment(orderId, id, untilIso) {
+      return (
+        unwrap(
+          await sb.rpc("claim_order_adjustment", {
+            p_order_id: orderId,
+            p_id: id,
+            p_until: untilIso,
+          }),
+        ) === true
+      );
+    },
+
+    async listStalePendingRefunds(beforeIso, limit) {
+      return (
+        unwrap(
+          await sb
+            .from("order_adjustments")
+            .select("*")
+            .eq("status", "pending")
+            .eq("kind", "refund")
+            .lt("updated_at", beforeIso)
+            .order("updated_at")
+            .limit(Math.min(Math.max(limit, 1), 200)),
+        ) as Row[]
+      ).map(mapAdjustmentRecord);
+    },
+
+    async finishOrderAdjustment(orderId, id, patch) {
+      const out = unwrap(
+        await sb.rpc("finish_order_adjustment", {
+          p_order_id: orderId,
+          p_id: id,
+          p_status: patch.status,
+          p_allocations: patch.allocations,
+          p_meta: patch.meta ?? null,
+        }),
+      ) as Row | null;
+      return out ? mapAdjustmentRecord(out) : null;
+    },
+
+    async applyOrderEdit(write) {
+      const out = unwrap(
+        await sb.rpc("apply_order_edit", { p_write: write }),
+      ) as { outcome: string; record?: Row; reason?: string };
+      if (out.outcome === "ok") {
+        const order = await this.getOrder(write.orderId);
+        if (!order) return { outcome: "not_found" };
+        return { outcome: "ok", order, record: mapAdjustmentRecord(out.record as Row) };
+      }
+      if (out.outcome === "duplicate") {
+        return { outcome: "duplicate", record: mapAdjustmentRecord(out.record as Row) };
+      }
+      if (out.outcome === "stale") return { outcome: "stale" };
+      if (out.outcome === "invalid_state") {
+        return { outcome: "invalid_state", reason: out.reason ?? "invalid" };
+      }
+      return { outcome: "not_found" };
+    },
+
     async setMarketplaceSettings(tenantId, locationId, marketplace) {
       // Touch ONLY the marketplace column: never rewrite tax/tips/currency from a
       // possibly stale read.
@@ -1837,6 +2011,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             // Only sent when set, so shop and terminal inserts keep working on a
             // database that predates the column.
             ...(input.core_ext ? { core_ext: input.core_ext } : {}),
+            // Same: only with comps/discounts (migration 20261113001000).
+            ...(input.adjustments?.length ? { adjustments: input.adjustments } : {}),
             created_at: now,
             updated_at: now,
           })
@@ -2345,19 +2521,28 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       // Refund bookkeeping (refunded_cents, refund_ids, a `refunded` status) is
       // owned by the atomic reserve/release RPCs. A whole-row upsert from a stale
       // snapshot must never overwrite it on an existing tender.
+      // tip_refunded_cents is never written here (the column defaults to 0 on
+      // insert; only the reserve/release RPCs move it).
+      const {
+        tip_refunded_cents: _tr,
+        refund_reserved_cents: _rr,
+        ...insertable
+      } = payment;
+      void _tr;
+      void _rr;
       const {
         refunded_cents: _rc,
         refund_ids: _ri,
         refunds: _rf,
         ...writable
-      } = payment;
+      } = insertable;
       void _rc;
       void _ri;
       void _rf;
       const res = await sb
         .from("payments")
         .upsert({
-          ...(existing ? writable : payment),
+          ...(existing ? writable : insertable),
           created_at:
             (existing?.created_at as string) ?? payment.created_at ?? now,
           updated_at: now,
@@ -2447,6 +2632,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_refund_id: refundId,
           p_processor_ref: meta?.processorRef ?? null,
           p_reason: meta?.reason ?? null,
+          // Only sent when set (an explicit tip split needs migration
+          // 20261113001000; without it the legacy tip-first rule applies).
+          ...(typeof meta?.tipCents === "number" ? { p_tip_amount: meta.tipCents } : {}),
+          ...(meta?.pending ? { p_pending: true } : {}),
+          ...(typeof meta?.covering === "boolean" ? { p_covering: meta.covering } : {}),
         }),
       ) as { outcome: string; payment?: Row; refund_entry_id?: string };
       const payment = out.payment ? mapPayment(out.payment) : null;
@@ -2458,6 +2648,17 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           ? out.outcome
           : "exceeds";
       return { ok: false, reason, payment };
+    },
+
+    async confirmPaymentRefund(paymentId, refundId, processorRef) {
+      const out = unwrap(
+        await sb.rpc("confirm_payment_refund", {
+          p_payment_id: paymentId,
+          p_refund_id: refundId,
+          p_processor_ref: processorRef,
+        }),
+      ) as Row | null;
+      return out ? mapPayment(out) : null;
     },
 
     async setRefundProcessorRef(paymentId, requestId, processorRef) {
@@ -2472,12 +2673,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       );
     },
 
-    async releasePaymentRefund(paymentId, amountCents, refundId) {
+    async releasePaymentRefund(paymentId, amountCents, refundId, opts) {
       unwrap(
         await sb.rpc("release_payment_refund", {
           p_payment_id: paymentId,
           p_amount: amountCents,
           p_refund_id: refundId,
+          p_tombstone: opts?.tombstone ?? false,
         }),
       );
     },
@@ -4725,6 +4927,25 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async addShiftCashEvent(event) {
+      // An explicit id is an idempotency key (refund cash-outs): never twice.
+      if (event.id) {
+        const prior = unwrap(
+          await sb.from("shift_cash_events").select("*").eq("id", event.id).maybeSingle(),
+        ) as Row | null;
+        if (prior) {
+          return {
+            id: prior.id as string,
+            shift_id: prior.shift_id as string,
+            tenant_id: prior.tenant_id as string,
+            location_id: prior.location_id as string,
+            type: prior.type as ShiftCashEvent["type"],
+            amount_cents: prior.amount_cents as number,
+            order_id: (prior.order_id as string | null) ?? null,
+            note: (prior.note as string | null) ?? null,
+            created_at: prior.created_at as string,
+          };
+        }
+      }
       const r = unwrap(
         await sb
           .from("shift_cash_events")

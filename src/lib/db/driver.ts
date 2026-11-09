@@ -8,6 +8,13 @@
  */
 import type { OwnerReportBundle } from "@/lib/owner-reports";
 import type {
+  AdjustmentPolicy,
+  AdjustmentRecord,
+  BeginRefundResult,
+  OrderEditResult,
+  OrderEditWrite,
+} from "./adjustment-types";
+import type {
   Printer,
   PrintJob,
   PrintLocationSettings,
@@ -355,6 +362,70 @@ export interface PosDriver {
     locationId: string,
   ): Promise<StoreSettings>;
 
+  /** Set a location's refund / comp / void approval thresholds. */
+  setAdjustmentPolicy(
+    tenantId: string,
+    locationId: string,
+    policy: AdjustmentPolicy,
+  ): Promise<StoreSettings>;
+
+  // -- Refunds / voids / comps (order_adjustments ledger) --------------------
+
+  /** Every adjustment record of an order, oldest first. */
+  listOrderAdjustments(orderId: string): Promise<AdjustmentRecord[]>;
+
+  /** Batch read: adjustment records of several orders (one query). */
+  listOrderAdjustmentsForOrders(orderIds: string[]): Promise<AdjustmentRecord[]>;
+
+  /**
+   * ATOMICALLY open a refund record (status `pending`): under the order row
+   * lock, refuse when any selected line is voided/unknown or would be refunded
+   * past its quantity (Σ units of the line's non-failed refund records + the new
+   * ones), else insert. Idempotent on (order, record id): a retry returns the
+   * stored record as `duplicate`. Two tills refunding the same pizza at once:
+   * exactly one gets it.
+   */
+  beginOrderRefund(record: AdjustmentRecord): Promise<BeginRefundResult>;
+
+  /**
+   * Resume a FAILED item refund under its own id: under the order row lock,
+   * take its units again (refused with `exceeds` when another refund took them
+   * meanwhile) and set it back to `pending`. A row that is not `failed` is
+   * returned as `duplicate`.
+   */
+  reopenOrderRefund(orderId: string, id: string): Promise<BeginRefundResult>;
+
+  /**
+   * Claim a request for one execution until `untilIso` (a doubled request must
+   * not run its refunds twice in parallel). False while another unexpired claim
+   * holds it. `finishOrderAdjustment` releases the claim.
+   */
+  claimOrderAdjustment(orderId: string, id: string, untilIso: string): Promise<boolean>;
+
+  /** Refund records still `pending` since before `beforeIso` (oldest first), any tenant. */
+  listStalePendingRefunds(beforeIso: string, limit: number): Promise<AdjustmentRecord[]>;
+
+  /** Record what a refund actually moved (status, allocations, meta). */
+  finishOrderAdjustment(
+    orderId: string,
+    id: string,
+    patch: Pick<AdjustmentRecord, "status" | "allocations"> & {
+      meta?: Record<string, unknown> | null;
+    },
+  ): Promise<AdjustmentRecord | null>;
+
+  /**
+   * ATOMICALLY apply a void / comp / discount computed from the order at
+   * `expectVersion` (compare-and-set: a concurrent change makes it `stale`, the
+   * caller re-reads and recomputes). Under the order row lock it also re-checks
+   * the money: the tenders must still fit the new amount due (else
+   * `invalid_state`, the caller refunds instead), and a whole-order void is
+   * refused while a tender is in flight or money is still captured. The ledger
+   * row is inserted in the same transaction.
+   */
+  applyOrderEdit(write: OrderEditWrite): Promise<OrderEditResult>;
+
+  /**
   /**
    * Idempotent upsert-by-UUID. Creating with an id that already exists returns
    * the existing order unchanged (so offline retries never duplicate). Assigns
@@ -642,12 +713,15 @@ export interface PosDriver {
   recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult>;
 
   /**
-   * ATOMICALLY reserve a refund on a tender: increment `refunded_cents`, append
-   * `refundId` to `refund_ids`, and flip status to `refunded` when fully refunded
-   * -- all in one step, refused when it would exceed amount + tip, the tender
-   * isn't refundable (captured/authorized only), or `refundId` was already
-   * applied (`duplicate`). `upsertPayment` never touches these fields on an
-   * existing tender, so concurrent refunds can't lose each other's updates.
+   * ATOMICALLY reserve a refund on a tender, all in one step, refused when it
+   * would exceed what is left (base and tip capped separately, pending
+   * reservations included), the tender isn't refundable (captured/authorized
+   * only), or `refundId` was already used (`duplicate`). A plain reservation
+   * increments `refunded_cents` (+ `tip_refunded_cents`) and flips the status to
+   * `refunded` when fully refunded. A `pending` one (card / stored value: the
+   * provider is called after) only HOLDS the room in `refund_reserved_cents`:
+   * status, `refunded_cents` and every report move at `confirmPaymentRefund`.
+   * `upsertPayment` never touches these fields on an existing tender.
    */
   reservePaymentRefund(
     paymentId: string,
@@ -656,12 +730,48 @@ export interface PosDriver {
     /**
      * Recorded on the new `payment.refunds[]` entry (which gets a server-minted
      * stable id, returned as `refundEntryId`): the rail's refund id and the
-     * staff-given reason.
+     * staff-given reason. `tipCents` is the GRATUITY part of `amountCents`
+     * (capped separately: base part <= base left, tip part <= tip left); when
+     * omitted the refund comes off the tip first (legacy rule).
      */
-    meta?: { processorRef?: string | null; reason?: string | null },
+    meta?: {
+      processorRef?: string | null;
+      reason?: string | null;
+      tipCents?: number | null;
+      /** Card refunds: reserve as `pending` before the provider is called. */
+      pending?: boolean;
+      /** The order was paid in full when the refund was made (refunds[].covering). */
+      covering?: boolean | null;
+    },
   ): Promise<RefundReservation>;
 
-  /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */
+  /**
+   * The provider accepted a `pending` refund (reserved under `refundId`): move
+   * it from `refund_reserved_cents` into `refunded_cents` / `tip_refunded_cents`,
+   * flip the status to `refunded` once fully refunded, and record the provider
+   * id. Idempotent; null when no such entry.
+   */
+  confirmPaymentRefund(
+    paymentId: string,
+    refundId: string,
+    processorRef: string | null,
+  ): Promise<Payment | null>;
+
+  /**
+   * Undo a reservation (the rail call failed, or the provider later failed the
+   * refund): drops its `refunds[]` entry and gives its room back (a pending one
+   * from `refund_reserved_cents`, a confirmed one from `refunded_cents` + the
+   * tip part, restoring the status the tender had before). `tombstone` keeps `refundId` in
+   * `refund_ids`, so a provider refund that FAILED can never be "replayed" under
+   * the same idempotency key (a retry must mint the next id).
+   */
+  releasePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string,
+    opts?: { tombstone?: boolean },
+  ): Promise<void>;
+
   /**
    * Fill in the provider refund id on the refunds[] entry recorded under
    * `requestId` that has none yet (a replayed card refund). Atomic; returns
@@ -672,12 +782,6 @@ export interface PosDriver {
     requestId: string,
     processorRef: string,
   ): Promise<boolean>;
-
-  releasePaymentRefund(
-    paymentId: string,
-    amountCents: number,
-    refundId: string | null,
-  ): Promise<void>;
 
   /**
    * TRUE compare-and-set: record a Checkout session id on a tender
@@ -932,33 +1036,6 @@ export interface PosDriver {
    * upsert, so a stale snapshot cannot overwrite a tender that changed meanwhile.
    */
   recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult>;
-
-  /**
-   * ATOMICALLY reserve a refund on a tender: increment `refunded_cents`, append
-   * `refundId` to `refund_ids`, and flip status to `refunded` when fully refunded
-   * -- all in one step, refused when it would exceed amount + tip, the tender
-   * isn't refundable (captured/authorized only), or `refundId` was already
-   * applied (`duplicate`). `upsertPayment` never touches these fields on an
-   * existing tender, so concurrent refunds can't lose each other's updates.
-   */
-  reservePaymentRefund(
-    paymentId: string,
-    amountCents: number,
-    refundId: string | null,
-    /**
-     * Recorded on the new `payment.refunds[]` entry (which gets a server-minted
-     * stable id, returned as `refundEntryId`): the rail's refund id and the
-     * staff-given reason.
-     */
-    meta?: { processorRef?: string | null; reason?: string | null },
-  ): Promise<RefundReservation>;
-
-  /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */
-  releasePaymentRefund(
-    paymentId: string,
-    amountCents: number,
-    refundId: string | null,
-  ): Promise<void>;
 
   /**
    * TRUE compare-and-set: record a Checkout session id on a tender

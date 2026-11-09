@@ -4,11 +4,14 @@
  * cycle).
  */
 import type { Payment } from "@/lib/db";
+import { baseRefundedCents } from "@/lib/payments/refund-state";
 
 /**
  * Base money (tips excluded) still held on SETTLED tenders — captured or
- * authorized, as main's settledCents — in the order's currency, net of refunds
- * beyond the tip: sum(max(0, amount - max(0, refunded - tip))).
+ * authorized, as main's settledCents — in the order's currency, net of the BASE
+ * part of refunds: sum(max(0, amount - baseRefunded)). The tip part of a refund
+ * is recorded separately (`tip_refunded_cents`); older refunds came off the tip
+ * first (`baseRefundedCents`).
  */
 export function netSettledBaseCents(
   payments: Payment[],
@@ -23,8 +26,7 @@ export function netSettledBaseCents(
     )
     .reduce(
       (n, p) =>
-        n +
-        Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
+        n + Math.max(0, p.amount_cents - baseRefundedCents(p)),
       0,
     );
 }

@@ -19,6 +19,7 @@ import type {
   RefundRequest,
   RefundResult,
 } from "../PaymentRail";
+import { RefundRefusedError } from "../PaymentRail";
 
 function storedValueRail(key: "gift_card" | "store_credit"): PaymentRail {
   return {
@@ -46,7 +47,7 @@ function storedValueRail(key: "gift_card" | "store_credit"): PaymentRail {
       const store = await getStoredValueStore();
       const redeemed = await store.getLedgerEntry(req.chargeId);
       if (!redeemed || redeemed.kind !== "redeem" || redeemed.tenant_id !== req.context.tenantId) {
-        throw new Error("Gift card redemption not found for this payment.");
+        throw new RefundRefusedError("Gift card redemption not found for this payment.");
       }
       const amount = req.amount?.amount ?? -redeemed.amount_cents;
       const credited = await store.credit({
@@ -60,7 +61,9 @@ function storedValueRail(key: "gift_card" | "store_credit"): PaymentRail {
         paymentId: redeemed.payment_id,
         reason: req.reason ?? null,
       });
-      if (!credited.ok) throw new Error(`Could not return the value to the card (${credited.reason}).`);
+      if (!credited.ok) {
+        throw new RefundRefusedError(`Could not return the value to the card (${credited.reason}).`);
+      }
       return {
         refundId: credited.entry?.id ?? req.context.idempotencyKey,
         status: "refunded",

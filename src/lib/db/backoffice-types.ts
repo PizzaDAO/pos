@@ -382,6 +382,8 @@ export interface PaymentMixSlice {
   amount_cents: number;
   tip_cents: number;
   application_fee_cents: number;
+  /** Refunded back on these tenders (base + tip). Absent on older snapshots. */
+  refunded_cents?: number;
 }
 
 /**
@@ -405,10 +407,20 @@ export interface SalesReport {
   fees_cents: number;
   /** Custom order fee lines (catering service fee, ...). Absent on reports closed before they existed. */
   order_fees_cents?: number;
+  /** Voided ORDERS (count, their totals). */
   void_count: number;
   void_cents: number;
+  /** Orders with any refund, and Σ refunded on their tenders (base + tip, partial included). */
   refund_count: number;
   refund_cents: number;
+  /** The gratuity part of `refund_cents` (tip refunds are tracked separately). Absent on older snapshots. */
+  tip_refund_cents?: number;
+  /** Comps (part of `discount_cents`): count + amount. Absent on older snapshots. */
+  comp_count?: number;
+  comp_cents?: number;
+  /** Items voided on orders that were NOT voided (list price). Absent on older snapshots. */
+  line_void_count?: number;
+  line_void_cents?: number;
   byDay: SalesBucket[];
   byItem: SalesBucket[];
   byCategory: SalesBucket[];

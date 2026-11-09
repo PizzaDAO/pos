@@ -440,7 +440,7 @@ describe("simulated reader", () => {
     const orderId = await seedOrder();
     const { payment } = await start(orderId);
     await simulateCardTender(payment.id, { outcome: "approve", tipCents: 300 });
-    await refundPayment({ paymentId: payment.id, amountCents: 300, refundId: "tip-back" });
+    await refundPayment({ paymentId: payment.id, amountCents: 300, tipCents: 300, refundId: "tip-back" });
     await takePayment({
       paymentId: uuid(),
       orderId,

@@ -455,7 +455,8 @@ describe("9. /v1 release counts base money, not tips", () => {
     const tipOnly = "c9000000-0000-4000-8000-000000000002";
     await d.createOrder(held(tipOnly));
     await d.upsertPayment(
-      payment(tipOnly, "captured", { amount_cents: 1000, tip_cents: 200, refunded_cents: 200 }),
+      // The refund's recorded split says it was the tip (tip_refunded_cents).
+      payment(tipOnly, "captured", { amount_cents: 1000, tip_cents: 200, refunded_cents: 200, tip_refunded_cents: 200 }),
     );
     const ok = await callV1("POST", `/orders/${tipOnly}/release`, { body: {}, p: agent });
     expect(ok.status).toBe(200);
@@ -464,7 +465,7 @@ describe("9. /v1 release counts base money, not tips", () => {
     const intoBase = "c9000000-0000-4000-8000-000000000003";
     await d.createOrder(held(intoBase));
     await d.upsertPayment(
-      payment(intoBase, "captured", { amount_cents: 1000, tip_cents: 200, refunded_cents: 300 }),
+      payment(intoBase, "captured", { amount_cents: 1000, tip_cents: 200, refunded_cents: 300, tip_refunded_cents: 200 }),
     );
     const refused = await callV1("POST", `/orders/${intoBase}/release`, { body: {}, p: agent });
     expect(refused.status).toBe(402);

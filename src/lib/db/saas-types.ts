@@ -212,7 +212,15 @@ export type AuditAction =
 
   // Stored value: a gift card voided (its sale refunded) / store credit issued.
   | "gift_card_void"
-  | "store_credit_issue";
+  | "store_credit_issue"
+  // Before-payment order edits at the till (refunds keep payment_refund/void).
+  | "order_line_void"
+  | "order_void"
+  | "order_comp"
+  | "order_discount"
+  // A location's refund / comp / void approval thresholds changed.
+  | "adjustment_policy_change";
+
 
 /**
  * An append-only audit entry written when a platform operator takes a

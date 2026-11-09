@@ -24,7 +24,7 @@
 import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
-import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
+import { buildTickets, buildVoidNotices, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import {
   isHandoffStatus,
   kitchenHandsOffDelivery,
@@ -81,6 +81,7 @@ export async function GET(request: Request) {
 
   const body: KitchenBoardResponse = {
     tickets,
+    voided: buildVoidNotices(orders, now),
     driver: driver.name,
     serverTime: now.toISOString(),
     thresholds,

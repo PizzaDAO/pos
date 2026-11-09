@@ -585,18 +585,21 @@ describe("review fixes", () => {
     expect(await findAccountByCode(TENANT, code, { anonymous: true })).toBeNull();
   });
 
-  it("a refund of a gift card tender credits the card BEFORE it is recorded; a crash then a retry credits once", async () => {
+  it("a refund of a gift card tender is reserved, credited, then confirmed; a crash after the credit and a retry credit once", async () => {
     const { code, accountId } = await soldCard(5000);
     const food = await foodOrder(2000); // 2165
     const { payment } = await redeem(food, code);
     const driver = getPosDriver();
-    const reserve = vi.spyOn(driver, "reservePaymentRefund").mockRejectedValueOnce(new Error("crash"));
+    // The process dies after the card got the value, before the refund is confirmed.
+    const confirm = vi.spyOn(driver, "confirmPaymentRefund").mockRejectedValueOnce(new Error("crash"));
     await expect(refundPayment({ paymentId: payment.id, amountCents: 1000, refundId: "r-crash" })).rejects.toThrow("crash");
-    // The card already has the value (never "recorded but not credited")...
     expect((await account(accountId)).balance_cents).toBe(2835 + 1000);
-    expect((await driver.getPayment(payment.id))!.refunded_cents).toBe(0);
-    reserve.mockRestore();
-    // ...and the retry records it without crediting again.
+    // Held as pending (it blocks a second refund of the same room), not yet refunded.
+    const held = (await driver.getPayment(payment.id))!;
+    expect(held.refunded_cents).toBe(0);
+    expect(held.refund_reserved_cents).toBe(1000);
+    confirm.mockRestore();
+    // The retry replays the same credit (same key: no second credit) and confirms it.
     await refundPayment({ paymentId: payment.id, amountCents: 1000, refundId: "r-crash" });
     expect((await account(accountId)).balance_cents).toBe(3835);
     expect((await driver.getPayment(payment.id))!.refunded_cents).toBe(1000);
@@ -683,7 +686,7 @@ describe("card refunds on gift card sales (no crash window)", () => {
     return { sale, p };
   }
 
-  it("a voided card's card-paid sale refunds Stripe-first (rail before the record)", async () => {
+  it("a voided card's card-paid sale refund is reserved pending, then Stripe, then confirmed with the re_ id", async () => {
     const { sale, p } = await cardPaidSale(3000);
     expect((await account(sale.account.id)).status).toBe("active");
     const driver = getPosDriver();
@@ -701,8 +704,11 @@ describe("card refunds on gift card sales (no crash window)", () => {
     });
     await voidStoredValue({ tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "x", actor: ACTOR });
     railSpy.mockRestore();
-    expect(order).toEqual(["rail", "reserve"]);
-    expect((await driver.getPayment(p.id))!.refunds?.[0]?.processor_ref).toBe("re_sim_1");
+    expect(order).toEqual(["reserve", "rail"]);
+    expect((await driver.getPayment(p.id))!.refunds?.[0]).toMatchObject({
+      processor_ref: "re_sim_1",
+      state: "succeeded",
+    });
   });
 
   it("a replayed card refund with no provider id calls the rail again with the same key and records the id", async () => {

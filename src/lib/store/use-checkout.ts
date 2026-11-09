@@ -2,7 +2,8 @@
  * Checkout hook (client) — drives the payment screen.
  *
  * Loads an order + its tenders, takes new tenders (split payment across rails),
- * polls pending crypto tenders until confirmed, and issues refunds. Every tender
+ * polls pending crypto tenders until confirmed, and posts refunds / voids / comps
+ * (`adjust`, /api/orders/[id]/*). Every tender
  * carries a client UUID that is the idempotency key end-to-end (`/api/payments`
  * upserts by it). The UUID is minted ONCE per pending tender and reused on retry
  * (lost response, double-tap) until the tender is recorded or its amount/rail
@@ -16,7 +17,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Order, Payment } from "@/lib/db";
+import type { AdjustmentPolicy, AdjustmentRecord, Order, Payment } from "@/lib/db";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import { createPendingTenderIds, tenderSignature } from "./pending-tender";
 import { useCardReader, type UseCardReader } from "./use-card-reader";
@@ -40,9 +41,32 @@ export interface CheckoutState {
   card: UseCardReader;
   /** Take one tender. Resolves when the tender is recorded (may be pending). */
   takeTender: (input: TakeTenderInput) => Promise<Payment | null>;
-  /** Refund/void a tender (full unless amountCents given). */
-  refund: (paymentId: string, amountCents?: number) => Promise<void>;
+  /** Refund / void / comp history of the order (oldest first). */
+  adjustments: AdjustmentRecord[];
+  /** The location's approval thresholds (null until loaded). */
+  policy: AdjustmentPolicy | null;
+  /**
+   * POST a refund / void / comp to `/api/orders/[id]/<action>` and apply the
+   * fresh order + tenders it returns. Never throws: the caller reads `code`
+   * (`approval_required`, `use_refund`, ...) to decide what to show.
+   */
+  adjust: (action: AdjustAction, body: Record<string, unknown>) => Promise<AdjustResponse>;
   refresh: () => Promise<void>;
+}
+
+export type AdjustAction = "refund" | "void" | "discount";
+
+export interface AdjustResponse {
+  ok: boolean;
+  status: number;
+  error?: string;
+  code?: string;
+  /** Non-error information (manual crypto refund, no open drawer, ...). */
+  note?: string;
+  /** Partial refunds: what landed. */
+  partial?: boolean;
+  /** A card refund whose outcome at Stripe is not known yet (retry the same request). */
+  pending?: boolean;
 }
 
 export interface TakeTenderInput {
@@ -57,6 +81,8 @@ interface PaymentsResponse {
   order: Order;
   payments: Payment[];
   balanceCents: number;
+  adjustments?: AdjustmentRecord[];
+  policy?: AdjustmentPolicy;
 }
 
 export function useCheckout(
@@ -68,13 +94,14 @@ export function useCheckout(
   const [order, setOrder] = useState<Order | null>(null);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [balanceCents, setBalanceCents] = useState(0);
+  const [adjustments, setAdjustments] = useState<AdjustmentRecord[]>([]);
+  const [policy, setPolicy] = useState<AdjustmentPolicy | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /** Non-error information the cashier must read (e.g. a manual crypto refund). */
   const [notice, setNotice] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const pendingIds = useRef(createPendingTenderIds(newUuid));
-  const pendingRefundIds = useRef(createPendingTenderIds(newUuid));
 
   const refresh = useCallback(async () => {
     if (!orderId) return;
@@ -98,6 +125,8 @@ export function useCheckout(
         setOrder(data.order);
         setPayments(data.payments);
         setBalanceCents(data.balanceCents);
+        setAdjustments(data.adjustments ?? []);
+        if (data.policy) setPolicy(data.policy);
         setError(null);
         return;
       } catch (e) {
@@ -220,39 +249,49 @@ export function useCheckout(
     [orderId, tenantId, locationId, currency, refresh, startCard],
   );
 
-  const refund = useCallback(
-    async (paymentId: string, amountCents?: number) => {
+  const adjust = useCallback(
+    async (action: AdjustAction, body: Record<string, unknown>): Promise<AdjustResponse> => {
+      if (!orderId) return { ok: false, status: 0, error: "No order." };
       setLoading(true);
-      setError(null);
       try {
-        const res = await fetch("/api/payments/refund", {
+        const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/${action}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            paymentId,
-            amountCents,
-            // Same id on retry of the same refund; a new refund gets a new id.
-            refundId: pendingRefundIds.current.get(
-              `${paymentId}|${amountCents ?? "all"}`,
-            ),
-          }),
+          body: JSON.stringify(body),
         });
-        const data = (await res.json()) as {
+        const data = (await res.json().catch(() => ({}))) as Partial<PaymentsResponse> & {
           error?: string;
-          manualRefund?: boolean;
+          code?: string;
           note?: string;
+          partial?: boolean;
+          pending?: boolean;
+          manualRefund?: boolean;
         };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-        setNotice(data.manualRefund ? (data.note ?? "Manual refund required.") : null);
-        pendingRefundIds.current.clear();
-        await refresh();
+        if (data.order) setOrder(data.order);
+        if (data.payments) setPayments(data.payments);
+        if (typeof data.balanceCents === "number") setBalanceCents(data.balanceCents);
+        if (data.adjustments) setAdjustments(data.adjustments);
+        if (res.ok && data.note) setNotice(data.note);
+        return {
+          ok: res.ok && !data.error,
+          status: res.status,
+          error: data.error,
+          code: data.code,
+          note: data.note,
+          partial: data.partial,
+          pending: data.pending,
+        };
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Refund failed.");
+        return {
+          ok: false,
+          status: 0,
+          error: e instanceof Error ? e.message : "Request failed (offline?).",
+        };
       } finally {
         setLoading(false);
       }
     },
-    [refresh],
+    [orderId],
   );
 
   return {
@@ -264,7 +303,9 @@ export function useCheckout(
     notice,
     card,
     takeTender,
-    refund,
+    adjustments,
+    policy,
+    adjust,
     refresh,
   };
 }

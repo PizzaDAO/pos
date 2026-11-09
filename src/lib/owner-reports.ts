@@ -2,7 +2,7 @@
  * Owner reports: pure aggregation, comparison and CSV helpers.
  *
  * The Supabase driver gets the same {@link OwnerReportBundle} straight from the
- * SQL function `report_sales_bundle` (supabase/migrations/20261113000600): this
+ * SQL function `report_sales_bundle` (latest: supabase/migrations/20261113001010): this
  * module's {@link buildOwnerBundle} is its twin over in-memory orders for the
  * mock driver and the unit tests, so the two must keep the same definitions:
  *
@@ -11,17 +11,23 @@
  *   discount = order totals.discount_cents
  *   fees     = order total − tip − tax − (gross − discount), floored at 0
  *              (delivery / custom fee lines; they are part of the tender amount)
- *   refunds  = Σ tender refunded_cents (cash back), split per order, TIP LAST
- *              per tender: tip = Σ max(refunded − amount, 0) capped at the order's
- *              tip (plus any overflow of sales beyond gross − discount); the rest
- *              is split pro-rata across sales, tax and fees (tax and fees capped
- *              at their own amount, sales takes the remainder). Each part comes
- *              off its own column, so a fully refunded order contributes 0 net,
- *              0 tax, 0 fees, 0 tip, and refund_cents = sales + tax + fees + tip
- *              always. See {@link splitRefund}.
- *              TODO(refunds-voids-comps): refunds are dated to the ORIGINAL
- *              order's business day (no refund timestamp exists yet); switch to
- *              the refund row's timestamp when that branch adds it.
+ *   refunds  = confirmed tender refunds (cash back; a card refund still
+ *              pending at the provider is not one yet), DATED BY WHEN THE
+ *              REFUND HAPPENED (each refunds[] entry's `at`, in the location's
+ *              business day; an unrecorded older remainder keeps the order's
+ *              day). Each refund's tip part is the one it recorded
+ *              (`refunds[].tip_cents`, = payments.tip_refunded_cents), else tip
+ *              last per tender (only what is beyond the tender's base). The
+ *              order's refunds are split cumulatively, in time order: tip =
+ *              the tip parts capped at the order's tip (plus any overflow of
+ *              sales beyond gross − discount); the rest pro-rata across sales,
+ *              tax and fees (tax and fees capped at their own amount, sales
+ *              takes the remainder); each refund gets the difference, so the
+ *              parts of all refunds equal the split of the order's total and
+ *              refund_cents = sales + tax + fees + tip always. A refund
+ *              comes off the columns of the day it happened. See
+ *              {@link splitRefund} and {@link refundEvents}.
+ *   comps    = Σ orders.adjustments of type comp (part of the discount).
  *   net      = gross − discount − refund sales part
  *   tips     = order-level tip, else the tenders' tips (never both), less tip refunds
  *   tenders  = payments in status captured | refunded
@@ -72,6 +78,9 @@ export interface OwnerDailyRow {
   tip_cents: number;
   void_count: number;
   void_cents: number;
+  /** Comps (orders.adjustments type comp; part of discount_cents). Absent on older bundles. */
+  comp_cents?: number;
+  comp_count?: number;
   cash_cents: number;
   card_cents: number;
   crypto_cents: number;
@@ -175,7 +184,7 @@ export interface OwnerSummary {
   orders: number;
   gross_cents: number;
   discount_cents: number;
-  /** Comps are folded into discounts until the comps ledger lands. */
+  /** Comps (orders.adjustments type comp); also part of discount_cents. */
   comp_cents: number;
   /** Total cash refunded. */
   refund_cents: number;
@@ -385,13 +394,31 @@ export function tenderKey(p: Pick<Payment, "rail" | "method" | "processor">): st
  * and `tip` the tip counted for it. Invariant: total = tip + tax + fees + sales.
  */
 export function splitRefund(
-  tenders: Pick<Payment, "amount_cents" | "tip_cents" | "refunded_cents">[],
+  tenders: Pick<Payment, "amount_cents" | "tip_cents" | "refunded_cents" | "tip_refunded_cents">[],
   amounts: { sales: number; tax: number; fees: number },
   tip: number,
 ): { total: number; tip: number; tax: number; fees: number; sales: number } {
   const total = tenders.reduce((s, p) => s + p.refunded_cents, 0);
-  // Tip last, PER TENDER: only the part beyond a tender's own non-tip amount is tip.
-  const tipRaw = tenders.reduce((s, p) => s + Math.max(p.refunded_cents - p.amount_cents, 0), 0);
+  // The tip part each tender recorded; else tip last, PER TENDER: only the part
+  // beyond a tender's own non-tip amount is tip.
+  const tipRaw = tenders.reduce(
+    (s, p) =>
+      s +
+      (typeof p.tip_refunded_cents === "number"
+        ? p.tip_refunded_cents
+        : Math.max(p.refunded_cents - p.amount_cents, 0)),
+    0,
+  );
+  return splitParts(total, tipRaw, amounts, tip);
+}
+
+/** The split rule itself (mirrors public.report_refund_split). */
+export function splitParts(
+  total: number,
+  tipRaw: number,
+  amounts: { sales: number; tax: number; fees: number },
+  tip: number,
+): { total: number; tip: number; tax: number; fees: number; sales: number } {
   const refTip = Math.min(tipRaw, tip);
   const rest = total - refTip;
   const base = Math.max(amounts.sales, 0) + amounts.tax + amounts.fees;
@@ -402,6 +429,79 @@ export function splitRefund(
   const sales = Math.min(rest - refTax - refFees, Math.max(amounts.sales, 0));
   const overflow = rest - refTax - refFees - sales;
   return { total, tip: refTip + overflow, tax: refTax, fees: refFees, sales };
+}
+
+/** One refund of an order, dated and split (see the module header). */
+export interface RefundEvent {
+  /** The refund's instant; null = an unrecorded older remainder (the order's day). */
+  at: string | null;
+  payment: Payment;
+  total: number;
+  tip: number;
+  tax: number;
+  fees: number;
+  sales: number;
+}
+
+/**
+ * Every confirmed refund of an order (pending reservations are not refunds),
+ * in time order, each split so that the parts of all of them equal the split of
+ * the order's total refunds (cumulative split, differenced).
+ */
+export function refundEvents(
+  counted: Payment[],
+  amounts: { sales: number; tax: number; fees: number },
+  tip: number,
+): RefundEvent[] {
+  type Step = { at: string | null; payment: Payment; amount: number; tipRaw: number; ord: number };
+  const steps: Step[] = [];
+  counted.forEach((p, pi) => {
+    if (p.refunded_cents <= 0) return;
+    const entries = (p.refunds ?? []).filter((r) => r.state !== "pending");
+    const known = entries.reduce((n, r) => n + r.amount_cents, 0);
+    let run = 0;
+    let cumTip = 0;
+    const legacyTip = (r: number) => Math.min(p.tip_cents, Math.max(0, r - p.amount_cents));
+    const push = (at: string | null, amount: number, explicitTip: number | null, n: number) => {
+      run += amount;
+      const part =
+        explicitTip !== null
+          ? Math.max(0, Math.min(explicitTip, p.tip_cents - cumTip))
+          : Math.max(0, legacyTip(run) - cumTip);
+      cumTip += part;
+      steps.push({ at, payment: p, amount, tipRaw: part, ord: pi * 10_000 + n });
+    };
+    if (p.refunded_cents > known) push(null, p.refunded_cents - known, null, 0);
+    entries.forEach((r, i) =>
+      push(r.at, r.amount_cents, typeof r.tip_cents === "number" ? r.tip_cents : null, i + 1),
+    );
+  });
+  steps.sort(
+    (a, b) =>
+      (a.at === null ? 0 : 1) - (b.at === null ? 0 : 1) ||
+      (a.at ?? "").localeCompare(b.at ?? "") ||
+      a.ord - b.ord,
+  );
+  const out: RefundEvent[] = [];
+  let cTotal = 0;
+  let cTip = 0;
+  let prev = { tip: 0, tax: 0, fees: 0, sales: 0 };
+  for (const s of steps) {
+    cTotal += s.amount;
+    cTip += s.tipRaw;
+    const cur = splitParts(cTotal, cTip, amounts, tip);
+    out.push({
+      at: s.at,
+      payment: s.payment,
+      total: s.amount,
+      tip: cur.tip - prev.tip,
+      tax: cur.tax - prev.tax,
+      fees: cur.fees - prev.fees,
+      sales: cur.sales - prev.sales,
+    });
+    prev = cur;
+  }
+  return out;
 }
 
 export interface BuildBundleInput {
@@ -447,35 +547,15 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     outstanding_cents: input.storedValueOutstandingCents ?? 0,
   };
 
-  for (const o of input.orders) {
-    if (o.tenant_id !== input.tenantId) continue;
-    if (input.locationId && o.location_id !== input.locationId) continue;
-    const loc = locById.get(o.location_id);
-    if (!loc) continue;
-    const isVoid = o.status === "voided";
-    const isSale = !NON_SALE.has(o.status);
-    if (!isSale && !isVoid) continue;
-    const when = businessDay(o.created_at, loc.timezone, loc.business_day_cutoff_minutes ?? 0);
-    if (when.date < input.from || when.date > input.to) continue;
-    if (o.core_ext?.stored_value) {
-      // A liability, never a sale (no day row, staff row, channel or tender line).
-      if (!isSale) continue;
-      const counted = (paysByOrder.get(o.id) ?? []).filter((p) => COUNTED_TENDER.has(p.status));
-      if (counted.length > 0) sv.sold_count += 1;
-      for (const p of counted) {
-        sv.sold_cents += p.amount_cents;
-        sv.sold_refunded_cents += Math.min(p.refunded_cents, p.amount_cents + p.tip_cents);
-      }
-      continue;
-    }
-
-    const key = `${o.location_id}|${when.date}`;
+  const inRange = (date: string) => date >= input.from && date <= input.to;
+  const dayRow = (locationId: string, locationName: string, date: string): OwnerDailyRow => {
+    const key = `${locationId}|${date}`;
     const d =
       daily.get(key) ??
       ({
-        location_id: o.location_id,
-        location_name: loc.name,
-        business_date: when.date,
+        location_id: locationId,
+        location_name: locationName,
+        business_date: date,
         orders: 0,
         gross_cents: 0,
         discount_cents: 0,
@@ -489,6 +569,8 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
         tip_cents: 0,
         void_count: 0,
         void_cents: 0,
+        comp_cents: 0,
+        comp_count: 0,
         cash_cents: 0,
         card_cents: 0,
         crypto_cents: 0,
@@ -497,13 +579,15 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
         other_cents: 0,
       } satisfies OwnerDailyRow);
     daily.set(key, d);
-
-    const sKey = o.staff_id ?? "";
+    return d;
+  };
+  const staffRow = (staffId: string | null | undefined): OwnerStaffRow => {
+    const sKey = staffId ?? "";
     const st =
       staff.get(sKey) ??
       ({
-        staff_id: o.staff_id ?? null,
-        name: o.staff_id ? (staffName.get(o.staff_id) ?? "Unattributed") : "Unattributed",
+        staff_id: staffId ?? null,
+        name: staffId ? (staffName.get(staffId) ?? "Unattributed") : "Unattributed",
         orders: 0,
         sales_cents: 0,
         tip_cents: 0,
@@ -511,11 +595,50 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
         void_count: 0,
       } satisfies OwnerStaffRow);
     staff.set(sKey, st);
+    return st;
+  };
+  const channelRow = (ch: string): OwnerChannelRow => {
+    const c =
+      channels.get(ch) ??
+      { channel: ch, orders: 0, gross_cents: 0, discount_cents: 0, refund_cents: 0, refund_sales_cents: 0, refund_fees_cents: 0, fees_cents: 0 };
+    channels.set(ch, c);
+    return c;
+  };
+  const tenderRow = (tk: string): OwnerTenderRow => {
+    const t = tenders.get(tk) ?? { key: tk, count: 0, amount_cents: 0, tip_cents: 0, refunded_cents: 0 };
+    tenders.set(tk, t);
+    return t;
+  };
+
+  for (const o of input.orders) {
+    if (o.tenant_id !== input.tenantId) continue;
+    if (input.locationId && o.location_id !== input.locationId) continue;
+    const loc = locById.get(o.location_id);
+    if (!loc) continue;
+    const isVoid = o.status === "voided";
+    const isSale = !NON_SALE.has(o.status);
+    if (!isSale && !isVoid) continue;
+    const cutoff = loc.business_day_cutoff_minutes ?? 0;
+    const when = businessDay(o.created_at, loc.timezone, cutoff);
+    const orderInRange = inRange(when.date);
+    if (o.core_ext?.stored_value) {
+      // A liability, never a sale (no day row, staff row, channel or tender line).
+      if (!isSale || !orderInRange) continue;
+      const counted = (paysByOrder.get(o.id) ?? []).filter((p) => COUNTED_TENDER.has(p.status));
+      if (counted.length > 0) sv.sold_count += 1;
+      for (const p of counted) {
+        sv.sold_cents += p.amount_cents;
+        sv.sold_refunded_cents += Math.min(p.refunded_cents, p.amount_cents + p.tip_cents);
+      }
+      continue;
+    }
 
     if (isVoid) {
+      if (!orderInRange) continue;
+      const d = dayRow(o.location_id, loc.name, when.date);
       d.void_count += 1;
       d.void_cents += cents(o.totals?.total_cents);
-      st.void_count += 1;
+      staffRow(o.staff_id).void_count += 1;
       continue;
     }
 
@@ -527,75 +650,93 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     const tip = orderTip > 0 ? orderTip : counted.reduce((s, p) => s + p.tip_cents, 0);
     const tax = cents(o.totals?.tax_cents);
     const fees = Math.max(0, cents(o.totals?.total_cents) - cents(o.totals?.tip_cents) - tax - (gross - discount));
-    const ref = splitRefund(counted, { sales: gross - discount, tax, fees }, tip);
-    const refunded = ref.total;
+    const ch = reportChannel(o);
 
-    d.orders += 1;
-    d.gross_cents += gross;
-    d.discount_cents += discount;
-    d.refund_cents += refunded;
-    d.refund_sales_cents += ref.sales;
-    d.refund_tax_cents += ref.tax;
-    d.refund_fees_cents += ref.fees;
-    d.fees_cents += fees - ref.fees;
-    d.refund_tip_cents += ref.tip;
-    d.tax_cents += tax - ref.tax;
-    d.tip_cents += tip - ref.tip;
-    for (const p of counted) {
-      d[`${tenderFamily(p)}_cents`] += p.amount_cents;
-      // Net of value returned to the card (a refund of that tender).
-      const kept = p.amount_cents - Math.min(p.refunded_cents, p.amount_cents);
-      if (p.rail === "gift_card") sv.redeemed_gift_card_cents += kept;
-      if (p.rail === "store_credit") sv.redeemed_store_credit_cents += kept;
-      const tk = tenderKey(p);
-      const t = tenders.get(tk) ?? { key: tk, count: 0, amount_cents: 0, tip_cents: 0, refunded_cents: 0 };
-      t.count += 1;
-      t.amount_cents += p.amount_cents;
-      t.tip_cents += p.tip_cents;
-      t.refunded_cents += p.refunded_cents;
-      tenders.set(tk, t);
+    if (orderInRange) {
+      const d = dayRow(o.location_id, loc.name, when.date);
+      d.orders += 1;
+      d.gross_cents += gross;
+      d.discount_cents += discount;
+      d.fees_cents += fees;
+      d.tax_cents += tax;
+      d.tip_cents += tip;
+      for (const a of o.adjustments ?? []) {
+        if (a.type !== "comp") continue;
+        d.comp_cents = (d.comp_cents ?? 0) + cents(a.amount_cents);
+        d.comp_count = (d.comp_count ?? 0) + 1;
+      }
+      for (const p of counted) {
+        d[`${tenderFamily(p)}_cents`] += p.amount_cents;
+        // Net of value returned to the card (a refund of that tender).
+        const kept = p.amount_cents - Math.min(p.refunded_cents, p.amount_cents);
+        if (p.rail === "gift_card") sv.redeemed_gift_card_cents += kept;
+        if (p.rail === "store_credit") sv.redeemed_store_credit_cents += kept;
+        const t = tenderRow(tenderKey(p));
+        t.count += 1;
+        t.amount_cents += p.amount_cents;
+        t.tip_cents += p.tip_cents;
+      }
+
+      const c = channelRow(ch);
+      c.orders += 1;
+      c.gross_cents += gross;
+      c.discount_cents += discount;
+      c.fees_cents += fees;
+
+      const hk = `${when.dow}|${when.hour}`;
+      const h = hourly.get(hk) ?? { dow: when.dow, hour: when.hour, orders: 0, sales_cents: 0 };
+      h.orders += 1;
+      h.sales_cents += gross - discount;
+      hourly.set(hk, h);
+
+      const st = staffRow(o.staff_id);
+      st.orders += 1;
+      st.sales_cents += gross - discount;
+      st.tip_cents += tip;
+      st.void_count += o.items.length - live.length;
+
+      for (const line of live) {
+        const rev = line.unit_price_cents * line.quantity;
+        itemTotal += rev;
+        const cat = input.categoryOf(line.item_id);
+        const it =
+          items.get(line.item_id) ??
+          ({ item_id: line.item_id, name: line.item_name, category: cat?.name ?? null, qty: 0, revenue_cents: 0 } satisfies OwnerItemRow);
+        it.qty += line.quantity;
+        it.revenue_cents += rev;
+        items.set(line.item_id, it);
+        const ck = cat?.id ?? "uncategorized";
+        const ct = cats.get(ck) ?? { key: ck, name: cat?.name ?? "Uncategorized", qty: 0, revenue_cents: 0 };
+        ct.qty += line.quantity;
+        ct.revenue_cents += rev;
+        cats.set(ck, ct);
+      }
     }
 
-    const ch = reportChannel(o);
-    const c =
-      channels.get(ch) ??
-      { channel: ch, orders: 0, gross_cents: 0, discount_cents: 0, refund_cents: 0, refund_sales_cents: 0, refund_fees_cents: 0, fees_cents: 0 };
-    c.orders += 1;
-    c.gross_cents += gross;
-    c.discount_cents += discount;
-    c.refund_cents += refunded;
-    c.refund_sales_cents += ref.sales;
-    c.refund_fees_cents += ref.fees;
-    c.fees_cents += fees - ref.fees;
-    channels.set(ch, c);
-
-    const hk = `${when.dow}|${when.hour}`;
-    const h = hourly.get(hk) ?? { dow: when.dow, hour: when.hour, orders: 0, sales_cents: 0 };
-    h.orders += 1;
-    h.sales_cents += gross - discount;
-    hourly.set(hk, h);
-
-    st.orders += 1;
-    st.sales_cents += gross - discount - ref.sales;
-    st.tip_cents += tip - ref.tip;
-    st.refund_cents += refunded;
-    st.void_count += o.items.length - live.length;
-
-    for (const line of live) {
-      const rev = line.unit_price_cents * line.quantity;
-      itemTotal += rev;
-      const cat = input.categoryOf(line.item_id);
-      const it =
-        items.get(line.item_id) ??
-        ({ item_id: line.item_id, name: line.item_name, category: cat?.name ?? null, qty: 0, revenue_cents: 0 } satisfies OwnerItemRow);
-      it.qty += line.quantity;
-      it.revenue_cents += rev;
-      items.set(line.item_id, it);
-      const ck = cat?.id ?? "uncategorized";
-      const ct = cats.get(ck) ?? { key: ck, name: cat?.name ?? "Uncategorized", qty: 0, revenue_cents: 0 };
-      ct.qty += line.quantity;
-      ct.revenue_cents += rev;
-      cats.set(ck, ct);
+    // Refunds come off the columns of the day they HAPPENED (whatever day the
+    // order was), each part off its own column.
+    for (const ev of refundEvents(counted, { sales: gross - discount, tax, fees }, tip)) {
+      const day = ev.at ? businessDay(ev.at, loc.timezone, cutoff).date : when.date;
+      if (!inRange(day)) continue;
+      const d = dayRow(o.location_id, loc.name, day);
+      d.refund_cents += ev.total;
+      d.refund_sales_cents += ev.sales;
+      d.refund_tax_cents += ev.tax;
+      d.refund_fees_cents += ev.fees;
+      d.refund_tip_cents += ev.tip;
+      d.fees_cents -= ev.fees;
+      d.tax_cents -= ev.tax;
+      d.tip_cents -= ev.tip;
+      const c = channelRow(ch);
+      c.refund_cents += ev.total;
+      c.refund_sales_cents += ev.sales;
+      c.refund_fees_cents += ev.fees;
+      c.fees_cents -= ev.fees;
+      const st = staffRow(o.staff_id);
+      st.sales_cents -= ev.sales;
+      st.tip_cents -= ev.tip;
+      st.refund_cents += ev.total;
+      tenderRow(tenderKey(ev.payment)).refunded_cents += ev.total;
     }
   }
 
@@ -649,6 +790,7 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     s.orders += d.orders;
     s.gross_cents += d.gross_cents;
     s.discount_cents += d.discount_cents;
+    s.comp_cents += d.comp_cents ?? 0;
     s.refund_cents += d.refund_cents;
     s.refund_sales_cents += d.refund_sales_cents;
     s.refund_tax_cents += d.refund_tax_cents;

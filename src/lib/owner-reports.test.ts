@@ -419,3 +419,74 @@ describe("stored value (gift cards) in owner reports", () => {
     expect(b.stored_value).toMatchObject({ sold_count: 1, sold_cents: 2000, sold_refunded_cents: 2000 });
   });
 });
+
+describe("refunds dated by when they happened (twin of supabase/tests/owner_reports_refunds.sql)", () => {
+  const o = order({
+    price: 2200,
+    totals: { subtotal_cents: 2200, discount_cents: 200, taxable_cents: 2000, tax_cents: 165, tip_cents: 0, total_cents: 2165 },
+  });
+  const sale = {
+    ...o,
+    created_at: "2026-05-01T16:00:00Z",
+    adjustments: [
+      {
+        id: "c1",
+        type: "comp" as const,
+        source: "pos.manual",
+        label: "Comp",
+        percent_bps: null,
+        amount_cents: 200,
+        line_ids: null,
+        reason_code: "quality",
+        reason_text: null,
+        staff_id: null,
+        approved_by: null,
+        created_at: "",
+      },
+    ],
+  };
+  const p = pay(sale, {
+    rail: "stripe_terminal",
+    amount_cents: 2165,
+    tip_cents: 300,
+    refunded_cents: 600,
+    tip_refunded_cents: 100,
+    refund_reserved_cents: 300,
+    refunds: [
+      { id: "e1", amount_cents: 500, tip_cents: 0, at: "2026-05-03T15:00:00Z", request_id: "x1", processor_ref: null, reason: null, state: "succeeded" },
+      { id: "e2", amount_cents: 100, tip_cents: 100, at: "2026-05-03T16:00:00Z", request_id: "x2", processor_ref: null, reason: null, state: "succeeded" },
+      { id: "e3", amount_cents: 300, tip_cents: 0, at: "2026-05-03T17:00:00Z", request_id: "x3", processor_ref: null, reason: null, state: "pending" },
+    ],
+  });
+  const loc = { ...NY, business_day_cutoff_minutes: 0 };
+  const run = (from: string, to: string, payments = [p]) =>
+    buildOwnerBundle({ ...base, locations: [loc], from, to, orders: [sale], payments });
+
+  it("the sale day has the sale and the comp, no refund", () => {
+    const d = run("2026-05-01", "2026-05-01").daily[0]!;
+    expect(d).toMatchObject({ orders: 1, refund_cents: 0, comp_cents: 200, comp_count: 1, tip_cents: 300, discount_cents: 200 });
+  });
+
+  it("the refund day has the confirmed refunds (pending excluded) and the recorded tip part", () => {
+    const b = run("2026-05-03", "2026-05-03");
+    const d = b.daily[0]!;
+    expect(d).toMatchObject({ orders: 0, refund_cents: 600, refund_tip_cents: 100, tip_cents: -100 });
+    expect(d.refund_sales_cents + d.refund_tax_cents + d.refund_fees_cents).toBe(500);
+    expect(b.tenders[0]).toMatchObject({ refunded_cents: 600, amount_cents: 0 });
+    expect(b.channels[0]!.refund_cents).toBe(600);
+    expect(b.staff[0]!.refund_cents).toBe(600);
+  });
+
+  it("over the whole range the refunds equal the order-level split", () => {
+    const s = summarize(run("2026-05-01", "2026-05-03").daily);
+    expect(s.refund_cents).toBe(600);
+    expect(s.orders).toBe(1);
+    const whole = splitRefund([p], { sales: 2000, tax: 165, fees: 0 }, 300);
+    expect([s.refund_sales_cents, s.refund_tax_cents, s.refund_tip_cents]).toEqual([whole.sales, whole.tax, whole.tip]);
+  });
+
+  it("an unrecorded older remainder keeps the order's day", () => {
+    const older = { ...p, refunded_cents: 700 };
+    expect(run("2026-05-01", "2026-05-01", [older]).daily[0]!.refund_cents).toBe(100);
+  });
+});

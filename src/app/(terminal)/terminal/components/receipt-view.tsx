@@ -65,9 +65,17 @@ export function ReceiptView({
 
         <dl className="space-y-1">
           <Row label="Subtotal" value={formatMoney(r.subtotalCents, c)} />
-          {r.discountCents > 0 && (
-            <Row label="Discount" value={`−${formatMoney(r.discountCents, c)}`} />
-          )}
+          {r.adjustments.length > 0
+            ? r.adjustments.map((a, i) => (
+                <Row
+                  key={`adj-${i}`}
+                  label={a.label}
+                  value={`−${formatMoney(a.amountCents, c)}`}
+                />
+              ))
+            : r.discountCents > 0 && (
+                <Row label="Discount" value={`−${formatMoney(r.discountCents, c)}`} />
+              )}
           {r.fees.map((f, i) => (
             <Row key={`fee-${i}`} label={f.label} value={formatMoney(f.amountCents, c)} />
           ))}
@@ -140,11 +148,45 @@ export function ReceiptView({
           </div>
         )}
 
+        {r.refunds.length > 0 && (
+          <>
+            <hr className="my-3 border-dashed" />
+            <div className="text-xs font-semibold uppercase text-muted-foreground">
+              Refunds
+            </div>
+            <dl className="mt-1 space-y-1" data-testid="receipt-refunds">
+              {r.refunds.map((f, i) => (
+                <div key={i}>
+                  <div className="flex justify-between text-red-700">
+                    <dt>Refund · {f.tenderLabel}</dt>
+                    <dd>−{formatMoney(f.amountCents, c)}</dd>
+                  </div>
+                  {f.tipCents > 0 && (
+                    <div className="flex justify-between pl-4 text-xs text-amber-700">
+                      <dt>incl. tip refund</dt>
+                      <dd>{formatMoney(f.tipCents, c)}</dd>
+                    </div>
+                  )}
+                  {f.reason && (
+                    <div className="pl-4 text-xs text-muted-foreground">{f.reason}</div>
+                  )}
+                </div>
+              ))}
+            </dl>
+          </>
+        )}
+
         {r.refundedCents > 0 && !r.fullyRefunded && (
-          <div className="mt-3 flex justify-between font-bold text-red-700">
-            <span>Refunded</span>
-            <span>{formatMoney(r.refundedCents, c)}</span>
-          </div>
+          <>
+            <div className="mt-3 flex justify-between font-bold text-red-700">
+              <span>Refunded</span>
+              <span>{formatMoney(r.refundedCents, c)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span>Net paid</span>
+              <span>{formatMoney(r.netPaidCents, c)}</span>
+            </div>
+          </>
         )}
         {r.fullyRefunded ? (
           <div className="mt-3 text-center text-sm font-bold uppercase text-red-700">

@@ -118,12 +118,16 @@ export interface RefundRequest {
   /** Optional partial refund amount; defaults to a full refund. */
   amount?: Money;
   reason?: string;
+  /** Correlation ids carried to the provider (Stripe refund metadata). */
+  metadata?: Record<string, string>;
 }
 
 export interface RefundResult {
   refundId: string;
   status: ChargeStatus;
   amount: Money;
+  /** The provider's own refund status (Stripe: succeeded / pending / failed / canceled ...). */
+  providerStatus?: string;
 }
 
 /**
@@ -147,4 +151,15 @@ export interface PaymentRail {
 
   /** Fetch the current status of a charge (used by watchers/reconciliation). */
   status(context: PaymentContext, chargeId: string): Promise<ChargeStatus>;
+}
+
+/**
+ * A rail refused a refund for sure (nothing was applied): e.g. the gift card
+ * could not take the value back. The caller releases its reservation.
+ */
+export class RefundRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RefundRefusedError";
+  }
 }
