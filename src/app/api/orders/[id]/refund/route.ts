@@ -31,6 +31,9 @@ import { optCents, parseLineSelections, prepareAction, respond } from "@/lib/adj
 import { cancelRefundRequest, refundOrder } from "@/lib/adjustments/service";
 
 export const runtime = "nodejs";
+// Must stay under the 2-minute order_adjustments claim so a hung provider call
+// can't outlive its claim and let a retry run alongside it.
+export const maxDuration = 60;
 
 export async function POST(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
