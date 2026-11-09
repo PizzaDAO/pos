@@ -672,9 +672,9 @@ export function withOutbox(
       return shift;
     },
 
-    async closeBusinessDay(tenantId, locationId, businessDate) {
+    async closeBusinessDay(tenantId, locationId, businessDate, opts) {
       const existing = await inner.getBusinessDayClose(tenantId, locationId, businessDate);
-      const close = await inner.closeBusinessDay(tenantId, locationId, businessDate);
+      const close = await inner.closeBusinessDay(tenantId, locationId, businessDate, opts);
       if (!existing) {
         box.append({
           tenant_id: tenantId,

@@ -141,7 +141,7 @@ import { buildStarterMenu } from "@/lib/saas/menu-template";
 import type { ImportChanges } from "@/lib/menu-import/apply";
 import type { MenuSnapshot } from "@/lib/menu-import/types";
 import { seedKitchenOrders } from "./kds-seed";
-import { buildSalesReport, isoDate } from "@/lib/reports";
+import { buildSalesReport, locationBusinessDate } from "@/lib/reports";
 import { buildOwnerBundle, type OwnerReportBundle } from "@/lib/owner-reports";
 
 /**
@@ -3079,6 +3079,7 @@ export const mockDriver: PosDriver = {
       payments: scopedPayments,
       categoryOf: categoryOfItem,
       locationName,
+      locationClock: (id) => locations.find((l) => l.id === id),
     });
   },
 
@@ -3116,6 +3117,7 @@ export const mockDriver: PosDriver = {
     tenantId: string,
     locationId: string,
     businessDate: string,
+    opts?: { drawer?: BusinessDayClose["drawer"] },
   ): Promise<BusinessDayClose> {
     const key = `${locationId}:${businessDate}`;
     const existing = businessDayCloses.get(key);
@@ -3132,7 +3134,10 @@ export const mockDriver: PosDriver = {
         s.location_id === locationId &&
         s.status === "closed" &&
         s.closed_at != null &&
-        isoDate(s.closed_at) === businessDate,
+        locationBusinessDate(
+          s.closed_at,
+          locations.find((l) => l.id === locationId),
+        ) === businessDate,
     );
     let openingFloat = 0;
     let cashSales = 0;
@@ -3153,7 +3158,7 @@ export const mockDriver: PosDriver = {
       business_date: businessDate,
       closed_at: nowIso(),
       report,
-      drawer: {
+      drawer: opts?.drawer ?? {
         opening_float_cents: openingFloat,
         cash_sales_cents: cashSales,
         expected_cents: expected,
