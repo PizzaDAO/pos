@@ -131,7 +131,8 @@ import {
   tenants as seedTenants,
   users as seedUsers,
 } from "./seed-data";
-import { buildStarterMenu } from "@/lib/saas/menu-template";
+import { buildStarterMenu, type MenuTemplate } from "@/lib/saas/menu-template";
+import type { MenuSnapshot } from "@/lib/menu-import/types";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
 
@@ -2270,6 +2271,119 @@ export const mockDriver: PosDriver = {
       }
       default:
         return null;
+    }
+  },
+
+  async getMenuSnapshot(tenantId: string): Promise<MenuSnapshot> {
+    const cats = menuCategories.filter((c) => c.tenant_id === tenantId);
+    const groups = modifierGroups.filter((g) => g.tenant_id === tenantId);
+    const groupIds = new Set(groups.map((g) => g.id));
+    return {
+      categories: cats.map((c) => ({
+        id: c.id,
+        name: c.name,
+        sort_order: c.sort_order,
+      })),
+      items: menuItems
+        .filter((i) => i.tenant_id === tenantId)
+        .map((i) => ({ id: i.id, category_id: i.category_id, name: i.name })),
+      modifierGroups: groups.map((g) => ({ id: g.id, name: g.name })),
+      modifiers: modifiers
+        .filter((m) => groupIds.has(m.group_id))
+        .map((m) => ({
+          id: m.id,
+          group_id: m.group_id,
+          name: m.name,
+          sort_order: m.sort_order,
+        })),
+    };
+  },
+
+  // Mirrors public.import_menu(): all-or-nothing. State is snapshotted up front
+  // and restored if any step throws (the SQL function gets this from its
+  // transaction). One synchronous block, so no await can interleave.
+  async applyMenuImport(
+    tenantId: string,
+    rows: MenuTemplate,
+    replace: boolean,
+  ): Promise<void> {
+    const saved = {
+      categories: [...menuCategories],
+      items: [...menuItems],
+      sizes: [...itemSizes],
+      groups: [...modifierGroups],
+      mods: [...modifiers],
+      links: [...itemModifierGroups],
+      overrides: new Map(overrides),
+    };
+    try {
+      if (replace) {
+        const groupIds = new Set(
+          modifierGroups.filter((g) => g.tenant_id === tenantId).map((g) => g.id),
+        );
+        const itemIds = new Set(
+          menuItems.filter((i) => i.tenant_id === tenantId).map((i) => i.id),
+        );
+        removeWhere(itemSizes, (s) => itemIds.has(s.item_id));
+        removeWhere(itemModifierGroups, (l) => itemIds.has(l.item_id));
+        removeWhere(modifiers, (m) => groupIds.has(m.group_id));
+        removeWhere(menuItems, (i) => i.tenant_id === tenantId);
+        removeWhere(menuCategories, (c) => c.tenant_id === tenantId);
+        removeWhere(modifierGroups, (g) => g.tenant_id === tenantId);
+        for (const [key, ov] of overrides) {
+          if (ov.tenant_id === tenantId) overrides.delete(key);
+        }
+      }
+      const mine = <T extends { tenant_id: string }>(r: T) => {
+        if (r.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        return r;
+      };
+      const catIds = new Set(
+        menuCategories.filter((c) => c.tenant_id === tenantId).map((c) => c.id),
+      );
+      for (const c of rows.categories) {
+        menuCategories.push({ ...mine(c) });
+        catIds.add(c.id);
+      }
+      const itemIds = new Set(
+        menuItems.filter((i) => i.tenant_id === tenantId).map((i) => i.id),
+      );
+      for (const i of rows.items) {
+        if (!catIds.has(i.category_id)) throw new Error("Unknown category_id.");
+        menuItems.push({ ...mine(i) });
+        itemIds.add(i.id);
+      }
+      const groupIds = new Set(
+        modifierGroups.filter((g) => g.tenant_id === tenantId).map((g) => g.id),
+      );
+      for (const g of rows.modifierGroups) {
+        modifierGroups.push({ ...mine(g) });
+        groupIds.add(g.id);
+      }
+      for (const sz of rows.sizes) {
+        if (!itemIds.has(sz.item_id)) throw new Error("Unknown item_id.");
+        itemSizes.push({ ...sz });
+      }
+      for (const m of rows.modifiers) {
+        if (!groupIds.has(m.group_id)) throw new Error("Unknown group_id.");
+        modifiers.push({ ...m });
+      }
+      for (const l of rows.itemModifierGroups) {
+        if (!itemIds.has(l.item_id) || !groupIds.has(l.group_id)) {
+          throw new Error("Unknown item or group in link.");
+        }
+        itemModifierGroups.push({ ...l });
+      }
+    } catch (err) {
+      menuCategories.splice(0, menuCategories.length, ...saved.categories);
+      menuItems.splice(0, menuItems.length, ...saved.items);
+      itemSizes.splice(0, itemSizes.length, ...saved.sizes);
+      modifierGroups.splice(0, modifierGroups.length, ...saved.groups);
+      modifiers.splice(0, modifiers.length, ...saved.mods);
+      itemModifierGroups.splice(0, itemModifierGroups.length, ...saved.links);
+      overrides.clear();
+      for (const [k, v] of saved.overrides) overrides.set(k, v);
+      throw err;
     }
   },
 

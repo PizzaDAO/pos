@@ -3084,6 +3084,59 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       }
     },
 
+    async getMenuSnapshot(tenantId) {
+      const [cats, items, groups] = await Promise.all([
+        sb.from("menu_categories").select("id,name,sort_order").eq("tenant_id", tenantId),
+        sb.from("menu_items").select("id,category_id,name").eq("tenant_id", tenantId),
+        sb.from("modifier_groups").select("id,name").eq("tenant_id", tenantId),
+      ]);
+      const groupRows = unwrap(groups) as Row[];
+      const groupIds = groupRows.map((g) => g.id as string);
+      const mods = groupIds.length
+        ? (unwrap(
+            await sb
+              .from("modifiers")
+              .select("id,group_id,name,sort_order")
+              .in("group_id", groupIds),
+          ) as Row[])
+        : [];
+      return {
+        categories: (unwrap(cats) as Row[]).map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          sort_order: r.sort_order as number,
+        })),
+        items: (unwrap(items) as Row[]).map((r) => ({
+          id: r.id as string,
+          category_id: r.category_id as string,
+          name: r.name as string,
+        })),
+        modifierGroups: groupRows.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+        })),
+        modifiers: mods.map((r) => ({
+          id: r.id as string,
+          group_id: r.group_id as string,
+          name: r.name as string,
+          sort_order: r.sort_order as number,
+        })),
+      };
+    },
+
+    // ONE transaction inside public.import_menu() (migration
+    // 20261113000100): a PostgREST client can't span statements, so the whole
+    // replace/insert runs server-side and rolls back as a unit.
+    async applyMenuImport(tenantId, rows, replace) {
+      unwrap(
+        await sb.rpc("import_menu", {
+          p_tenant_id: tenantId,
+          p_replace: replace,
+          p_rows: rows,
+        }),
+      );
+    },
+
     async listCategories(tenantId) {
       return (
         unwrap(
