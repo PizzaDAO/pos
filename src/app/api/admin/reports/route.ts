@@ -16,7 +16,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { giftCardsEnabled } from "@/lib/giftcards/limits";
 import { getStoredValueStore } from "@/lib/giftcards/store";
 import { captureError } from "@/lib/observability";
@@ -26,7 +26,7 @@ export const runtime = "nodejs";
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const locationParam = searchParams.get("locationId");
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId:
       !locationParam || locationParam === "all" ? null : locationParam,
   });

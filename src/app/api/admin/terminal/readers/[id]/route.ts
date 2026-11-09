@@ -7,8 +7,7 @@
 import { NextResponse } from "next/server";
 import { removeTerminalReader } from "@/lib/payments/terminal/readers";
 import {
-  ADMIN_ROLES,
-  authorizeLocation,
+  authorizeAdminLocation,
   errorResponse,
 } from "@/lib/payments/terminal/http";
 import { enforceRateLimit } from "@/lib/security";
@@ -22,10 +21,10 @@ export async function DELETE(
   const limited = enforceRateLimit(request, "payments");
   if (limited) return limited;
   const { searchParams } = new URL(request.url);
-  const auth = await authorizeLocation(
+  const auth = await authorizeAdminLocation(
+    request,
     searchParams.get("tenantId"),
     searchParams.get("locationId"),
-    ADMIN_ROLES,
   );
   if (!auth.ok) return auth.res;
   const { id } = await ctx.params;

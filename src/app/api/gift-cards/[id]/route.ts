@@ -1,9 +1,9 @@
 /**
  * GET /api/gift-cards/[id]?tenantId= — one account and its full ledger (oldest
- * first), with an integrity check of the cached balance. Owner | manager.
+ * first), with an integrity check of the cached balance. Back office: owner | manager behind the PIN gate (requireAdminAccess).
  */
 import { NextResponse } from "next/server";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { featureOff } from "@/lib/giftcards/http";
 import { verifyLedger } from "@/lib/giftcards/ledger";
 import { getStoredValueStore } from "@/lib/giftcards/store";
@@ -15,7 +15,7 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
   if (off) return off;
   const { id } = await ctx.params;
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), ["owner", "manager"]);
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"));
   if (!auth.ok) return auth.res;
   const store = await getStoredValueStore();
   const account = await store.getAccount(auth.tenantId, id);

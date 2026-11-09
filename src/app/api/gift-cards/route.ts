@@ -1,10 +1,10 @@
 /**
  * GET /api/gift-cards?tenantId=&kind=gift_card|store_credit — list a tenant's
  * gift cards / store credit (last 4 only, never codes) plus the outstanding
- * liability (aggregated in SQL; the list shows the newest 500). Owner | manager.
+ * liability (aggregated in SQL; the list shows the newest 500). Back office: owner | manager behind the PIN gate (requireAdminAccess).
  */
 import { NextResponse } from "next/server";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { featureOff } from "@/lib/giftcards/http";
 import { getStoredValueStore } from "@/lib/giftcards/store";
 
@@ -14,7 +14,7 @@ export async function GET(request: Request) {
   const off = featureOff();
   if (off) return off;
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), ["owner", "manager"]);
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"));
   if (!auth.ok) return auth.res;
   const kindParam = searchParams.get("kind");
   const kind = kindParam === "gift_card" || kindParam === "store_credit" ? kindParam : undefined;

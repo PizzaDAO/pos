@@ -15,7 +15,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { railLabel } from "@/lib/reports";
 import {
   REPORT_KINDS,
@@ -32,8 +32,9 @@ export const runtime = "nodejs";
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const locationParam = searchParams.get("locationId");
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
-    locationId: !locationParam || locationParam === "all" ? null : locationParam,
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
+    locationId:
+      !locationParam || locationParam === "all" ? null : locationParam,
   });
   if (!auth.ok) return auth.res;
   const { tenantId, locationId } = auth;
@@ -41,13 +42,22 @@ export async function GET(request: Request) {
   const from = searchParams.get("from");
   const to = searchParams.get("to");
   const bad = rangeError(from, to);
-  if (bad || !from || !to) return NextResponse.json({ error: bad }, { status: 422 });
+  if (bad || !from || !to)
+    return NextResponse.json({ error: bad }, { status: 422 });
 
   const topNRaw = Number(searchParams.get("topN") ?? 50);
-  const topN = Number.isFinite(topNRaw) ? Math.min(Math.max(Math.trunc(topNRaw), 1), 200) : 50;
+  const topN = Number.isFinite(topNRaw)
+    ? Math.min(Math.max(Math.trunc(topNRaw), 1), 200)
+    : 50;
 
   const driver = getPosDriver();
-  const bundle = await driver.getOwnerReportBundle(tenantId, locationId, from, to, topN);
+  const bundle = await driver.getOwnerReportBundle(
+    tenantId,
+    locationId,
+    from,
+    to,
+    topN,
+  );
 
   if (searchParams.get("format") === "csv") {
     const kind = searchParams.get("report") as OwnerReportKind | null;
@@ -74,7 +84,13 @@ export async function GET(request: Request) {
   let deltas = null;
   if (searchParams.get("compare") === "1") {
     previous = previousRange(from, to);
-    previousBundle = await driver.getOwnerReportBundle(tenantId, locationId, previous.from, previous.to, topN);
+    previousBundle = await driver.getOwnerReportBundle(
+      tenantId,
+      locationId,
+      previous.from,
+      previous.to,
+      topN,
+    );
     previousSummary = summarize(previousBundle.daily);
     deltas = compareSummaries(summary, previousSummary);
   }

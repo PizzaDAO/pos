@@ -29,13 +29,13 @@ import {
   assignDriver,
   dispatchManuallyInstead,
 } from "@/lib/delivery/service";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 
 export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId: searchParams.get("locationId"),
     requireLocation: true,
   });
@@ -113,7 +113,7 @@ export async function POST(request: Request) {
   if (!existing) {
     return NextResponse.json({ error: "Delivery not found." }, { status: 404 });
   }
-  const auth = await requireTenantAccess(existing.tenant_id, "admin");
+  const auth = await requireAdminAccess(request, existing.tenant_id);
   if (!auth.ok) return auth.res;
 
   if (isManualSwitch(body)) {

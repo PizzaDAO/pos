@@ -66,6 +66,10 @@ const StaffShifts = dynamic(
   () => import("./staff-shifts").then((m) => m.StaffShifts),
   { loading: PanelFallback },
 );
+const StaffManager = dynamic(
+  () => import("./staff-manager").then((m) => m.StaffManager),
+  { loading: PanelFallback },
+);
 const EndOfDay = dynamic(() => import("./end-of-day").then((m) => m.EndOfDay), {
   loading: PanelFallback,
 });
@@ -146,6 +150,8 @@ export function AdminShell({
   const [tenantName, setTenantName] = useState("Back office");
   const [locations, setLocations] = useState<Location[]>([]);
   const [locationId, setLocationId] = useState<string>("");
+  // Bumped after a roster change so the drawer list below reloads.
+  const [rosterVersion, setRosterVersion] = useState(0);
   // Returning from Stripe onboarding (?connect=return|refresh) lands on the
   // Payments tab, whose mount triggers the GET refresh of the account status.
   const [tab, setTab] = useState<Tab>("menu");
@@ -292,7 +298,19 @@ export function AdminShell({
             />
           ))}
         {tab === "staff" && locationId && (
-          <StaffShifts tenantId={tenantId} locationId={locationId} />
+          <div className="space-y-10">
+            <StaffManager
+              tenantId={tenantId}
+              locationId={locationId}
+              locations={locations}
+              onChanged={() => setRosterVersion((v) => v + 1)}
+            />
+            <StaffShifts
+              key={rosterVersion}
+              tenantId={tenantId}
+              locationId={locationId}
+            />
+          </div>
         )}
         {tab === "eod" && locationId && (
           <EndOfDay

@@ -19,7 +19,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type Location, type SalesReport } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { eodDrawerSummary, reportCashCents } from "@/lib/eod-drawer";
 import { isMoneyCents } from "@/lib/security";
 import { locationBusinessDate } from "@/lib/reports";
@@ -82,7 +82,7 @@ async function drawerFor(
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId: searchParams.get("locationId"),
     requireLocation: true,
   });
@@ -122,7 +122,7 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
-  const auth = await requireTenantAccess(body.tenantId, "admin", {
+  const auth = await requireAdminAccess(request, body.tenantId, {
     locationId: body.locationId,
     requireLocation: true,
   });

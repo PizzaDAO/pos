@@ -202,6 +202,13 @@ export type AuditAction =
   | "delivery_manual_override"
   // A menu was bulk-imported (add or replace) from a Square/Toast/Clover/CSV file.
   | "menu_import"
+  // Admin > Staff: roster changes and PIN resets; the back-office PIN unlock.
+  | "staff_create"
+  | "staff_update"
+  | "staff_deactivate"
+  | "staff_reactivate"
+  | "staff_pin_reset"
+  | "admin_unlock"
 
   // Stored value: a gift card voided (its sale refunded) / store credit issued.
   | "gift_card_void"

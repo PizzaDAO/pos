@@ -127,7 +127,7 @@ import type {
   OrderCoreExt,
   OrderFeeLine,
 } from "@/lib/db";
-import { hashPin, verifyPin } from "@/lib/auth/pin";
+import { hashPin, matchStaffPin, verifyPin } from "@/lib/auth/pin";
 import { tenderFingerprint } from "@/lib/db/payment-types";
 import { netSettledBaseCents } from "./money";
 import {
@@ -1282,16 +1282,28 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     }
     // A member with no PIN set costs the same scrypt as a wrong PIN (and can
     // never match: the dummy is a random secret, and the result is ANDed).
-    const ok =
+    const current =
       verifyPin(pin, staff.pin_hash ?? dummyPinHash()) && Boolean(staff.pin_hash);
-    if (!ok) throw mismatch();
+    // A replaced short PIN stays valid for a short grace (see rotateStaffPin).
+    const previous =
+      !current && matchStaffPin(pin, { ...staff, pin_hash: null }) === "previous";
+    if (!current && !previous) throw mismatch();
     await ctx.driver.clearPinAttempts(tenantId, staff.id);
+    if (current && staff.pin_previous_hash) {
+      await ctx.driver.clearPreviousPin(tenantId, staff.id);
+    }
 
     const email = staff.user_id
       ? ((await ctx.driver.getUserEmails([staff.user_id])).get(staff.user_id) ?? null)
       : null;
     return {
-      body: { staff: toContractStaff({ ...staff, pin_hash: undefined }, true, email) },
+      body: {
+        staff: toContractStaff(
+          { ...staff, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined },
+          true,
+          email,
+        ),
+      },
     };
   },
 
@@ -1300,6 +1312,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
    * checked role rank and location). POS re-checks the TENANT (and a
    * location-limited token's reach) and hashes with the till's scrypt. `null`
    * clears the PIN. One targeted update of `pin_hash`; the PIN is never logged.
+   * Every live till / back-office session of the member is revoked.
    */
   "staff.setPin": async (ctx) => {
     requireHubSigned(ctx);
@@ -1323,6 +1336,9 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!(await ctx.driver.setStaffPinHash(tenantId, staff.id, hash))) {
       throw notFound("Staff member");
     }
+    // Whoever is signed in on the old PIN (till switch-in or back-office
+    // unlock) is signed out with it.
+    await ctx.driver.revokeStaffSessionsForStaff(tenantId, staff.id);
     const member = (await loadStaffList(tenantId, ctx.driver)).find((s) => s.id === staff.id);
     if (!member) throw notFound("Staff member");
     return { body: member };

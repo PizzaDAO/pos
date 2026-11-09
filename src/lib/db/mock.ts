@@ -98,6 +98,8 @@ import type {
   Staff,
   PinAttempt,
   StaffSession,
+  StaffPinRecord,
+  StaffProfilePatch,
 } from "./backoffice-types";
 import type {
   Location,
@@ -278,6 +280,11 @@ const staffSessions = new Map<string, StaffSession>();
 const pinLocks = new Map<string, { attempts: number; lockedUntil: number | null }>();
 const PIN_MAX_FAILURES = 5;
 const PIN_LOCK_MS = 15 * 60_000;
+/** Per-device / per-location PIN attempt budgets (mirrors pin_attempt_limits). */
+const pinLimits = new Map<
+  string,
+  { attempts: number; windowStart: number; lockedUntil: number | null }
+>();
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 /** Stripe Terminal locations keyed by POS location id; readers keyed by tmr_ id. */
@@ -3196,7 +3203,12 @@ export const mockDriver: PosDriver = {
     return [...staffById.values()]
       .filter((s) => s.tenant_id === tenantId)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((s) => ({ ...s, pin_hash: undefined }));
+      .map((s) => ({
+        ...s,
+        pin_hash: undefined,
+        pin_previous_hash: undefined,
+        pin_previous_until: undefined,
+      }));
   },
 
   async getStaffById(tenantId: string, staffId: string): Promise<Staff | null> {
@@ -3248,9 +3260,37 @@ export const mockDriver: PosDriver = {
   async setStaffPinHash(tenantId, staffId, pinHash): Promise<boolean> {
     const s = staffById.get(staffId);
     if (!s || s.tenant_id !== tenantId) return false;
-    staffById.set(staffId, { ...s, pin_hash: pinHash });
+    staffById.set(staffId, {
+      ...s,
+      pin_hash: pinHash,
+      pin_previous_hash: null,
+      pin_previous_until: null,
+    });
     pinLocks.delete(staffId); // a reset PIN starts with a fresh lockout budget
     return true;
+  },
+
+  async rotateStaffPin(tenantId, staffId, pinHash, graceUntil): Promise<boolean> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return false;
+    const keep =
+      !!s.pin_previous_hash &&
+      !!s.pin_previous_until &&
+      new Date(s.pin_previous_until).getTime() > Date.now();
+    staffById.set(staffId, {
+      ...s,
+      pin_hash: pinHash,
+      pin_previous_hash: keep ? s.pin_previous_hash : (s.pin_hash ?? null),
+      pin_previous_until: keep ? s.pin_previous_until : graceUntil,
+    });
+    pinLocks.delete(staffId);
+    return true;
+  },
+
+  async clearPreviousPin(tenantId, staffId): Promise<void> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return;
+    staffById.set(staffId, { ...s, pin_previous_hash: null, pin_previous_until: null });
   },
 
   async tenantHasStaffPins(tenantId): Promise<boolean> {
@@ -3259,9 +3299,90 @@ export const mockDriver: PosDriver = {
     );
   },
 
+  async listStaffPinRecords(tenantId): Promise<StaffPinRecord[]> {
+    return [...staffById.values()]
+      .filter((s) => s.tenant_id === tenantId)
+      .map((s) => ({
+        id: s.id,
+        active: s.active,
+        location_ids: [...(s.location_ids ?? [])],
+        pin_hash: s.pin_hash ?? null,
+        pin_previous_hash: s.pin_previous_hash ?? null,
+        pin_previous_until: s.pin_previous_until ?? null,
+      }));
+  },
+
+  async updateStaffProfile(
+    tenantId: string,
+    staffId: string,
+    patch: StaffProfilePatch,
+  ): Promise<Staff | null> {
+    const cur = staffById.get(staffId);
+    if (!cur || cur.tenant_id !== tenantId) return null;
+    const next: Staff = { ...cur };
+    if (patch.name !== undefined) next.name = patch.name;
+    if (patch.role !== undefined) next.role = patch.role;
+    if (patch.active !== undefined) next.active = patch.active;
+    if (patch.contact_email !== undefined) next.contact_email = patch.contact_email;
+    if (patch.contact_phone !== undefined) next.contact_phone = patch.contact_phone;
+    if (patch.location_ids !== undefined) next.location_ids = [...patch.location_ids];
+    if (patch.module_roles !== undefined) next.module_roles = [...patch.module_roles];
+    staffById.set(staffId, next);
+    return { ...next, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
+  },
+
+  async lastStaffSignIns(tenantId): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const s of staffSessions.values()) {
+      if (s.tenant_id !== tenantId) continue;
+      const cur = out.get(s.staff_id);
+      if (!cur || s.created_at > cur) out.set(s.staff_id, s.created_at);
+    }
+    return out;
+  },
+
+  // Mirrors begin_pin_limit_attempt(): single-threaded JS makes this atomic.
+  async beginPinLimitAttempt(scope, key, limits): Promise<PinAttempt> {
+    const id = `${scope}:${key}`;
+    const now = Date.now();
+    let l = pinLimits.get(id) ?? { attempts: 0, windowStart: now, lockedUntil: null };
+    if (l.lockedUntil !== null && l.lockedUntil > now) {
+      return {
+        allowed: false,
+        justLocked: false,
+        attempts: l.attempts,
+        lockedUntil: new Date(l.lockedUntil).toISOString(),
+      };
+    }
+    if (l.lockedUntil !== null || l.windowStart + limits.windowMinutes * 60_000 <= now) {
+      l = { attempts: 0, windowStart: now, lockedUntil: null };
+    }
+    if (l.attempts >= limits.max) {
+      const lockedUntil = now + limits.lockMinutes * 60_000;
+      pinLimits.set(id, { attempts: 0, windowStart: now, lockedUntil });
+      return {
+        allowed: false,
+        justLocked: true,
+        attempts: 0,
+        lockedUntil: new Date(lockedUntil).toISOString(),
+      };
+    }
+    const attempts = l.attempts + 1;
+    pinLimits.set(id, { ...l, attempts });
+    return { allowed: true, justLocked: false, attempts, lockedUntil: null };
+  },
+
+  async releasePinLimitAttempt(scope, key): Promise<void> {
+    const id = `${scope}:${key}`;
+    const l = pinLimits.get(id);
+    if (l && l.lockedUntil === null) {
+      pinLimits.set(id, { ...l, attempts: Math.max(l.attempts - 1, 0) });
+    }
+  },
+
   async createStaffSession(session: StaffSession): Promise<StaffSession> {
-    staffSessions.set(session.id, { ...session });
-    return { ...session };
+    staffSessions.set(session.id, { kind: "till", ...session });
+    return { kind: "till", ...session };
   },
 
   async getStaffSession(id: string): Promise<StaffSession | null> {
@@ -3283,6 +3404,15 @@ export const mockDriver: PosDriver = {
     }
   },
 
+  async revokeStaffSessionsForStaff(tenantId, staffId): Promise<void> {
+    const now = nowIso();
+    for (const [id, s] of staffSessions) {
+      if (s.tenant_id === tenantId && s.staff_id === staffId && !s.revoked_at) {
+        staffSessions.set(id, { ...s, revoked_at: now });
+      }
+    }
+  },
+
   async upsertStaff(staff: Staff): Promise<Staff> {
     const existing = staffById.get(staff.id);
     const merged: Staff = {
@@ -3296,7 +3426,7 @@ export const mockDriver: PosDriver = {
       created_at: existing?.created_at ?? staff.created_at ?? nowIso(),
     };
     staffById.set(merged.id, merged);
-    return { ...merged, pin_hash: undefined };
+    return { ...merged, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async setStaffModuleRoles(tenantId, staffId, roles) {
@@ -3304,7 +3434,7 @@ export const mockDriver: PosDriver = {
     if (!cur || cur.tenant_id !== tenantId) return null;
     const next: Staff = { ...cur, module_roles: [...roles] };
     staffById.set(staffId, next);
-    return { ...next, pin_hash: undefined };
+    return { ...next, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async getShift(id: string): Promise<Shift | null> {
@@ -3411,6 +3541,18 @@ export const mockDriver: PosDriver = {
     return { ...updated };
   },
 };
+
+/** Test helper: clear the per-device / per-location PIN budgets only. */
+export function resetMockPinLimits(): void {
+  pinLimits.clear();
+}
+
+/** Test helper: clear PIN budgets/locks and staff sessions. */
+export function resetMockPinState(): void {
+  pinLimits.clear();
+  pinLocks.clear();
+  staffSessions.clear();
+}
 
 /** Test helper: clear placed orders + reset the sequence + KDS seed flag. */
 export function resetMockOrders(): void {

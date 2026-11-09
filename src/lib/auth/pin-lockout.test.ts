@@ -11,6 +11,8 @@ vi.mock("./session", () => ({
 }));
 
 import { DEMO_TENANT_ID, getPosDriver } from "@/lib/db";
+import { resetMockPinLimits } from "@/lib/db/mock";
+import { DEVICE_COOKIE, mintDeviceCookie } from "./pin-attempt";
 import { GET as pinGET, POST as pinPOST } from "@/app/api/terminal/pin/route";
 
 const device: SessionUser = {
@@ -31,12 +33,19 @@ const device: SessionUser = {
 
 beforeEach(() => {
   session.user = device;
+  // These tests are about the per-staff lockout; the per-device/location
+  // budgets (pin-limits.test.ts) start fresh for each.
+  resetMockPinLimits();
 });
 
+// A till that already has its device id (pin-limits.test.ts covers the
+// smaller budget of a browser without one).
+const DEVICE = mintDeviceCookie()!;
 const attempt = (staffId: string, pin: string) =>
   pinPOST(
     new Request("http://localhost/api/terminal/pin", {
       method: "POST",
+      headers: { cookie: `${DEVICE_COOKIE}=${DEVICE}` },
       body: JSON.stringify({ staffId, pin }),
     }),
   );

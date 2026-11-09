@@ -18,7 +18,7 @@ import {
   type OverrideInput,
   type OverrideTargetType,
 } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { isMoneyCents, recordAudit } from "@/lib/security";
 
 const TARGET_TYPES: OverrideTargetType[] = ["item", "size", "modifier"];
@@ -27,7 +27,7 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId: searchParams.get("locationId"),
     requireLocation: true,
   });
@@ -70,7 +70,7 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
-  const auth = await requireTenantAccess(body.tenant_id, "admin", {
+  const auth = await requireAdminAccess(request, body.tenant_id, {
     locationId: body.location_id,
     requireLocation: true,
   });
@@ -120,7 +120,7 @@ export async function DELETE(request: Request) {
       { status: 400 },
     );
   }
-  const auth = await requireTenantAccess(tenantId, "admin", { locationId });
+  const auth = await requireAdminAccess(request, tenantId, { locationId });
   if (!auth.ok) return auth.res;
   await getPosDriver().clearOverride(
     tenantId,

@@ -4,7 +4,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { ADMIN_ROLES, authorizeLocation } from "@/lib/payments/terminal/http";
+import { authorizeAdminLocation } from "@/lib/payments/terminal/http";
 import { enqueueTestTicket } from "@/lib/printing/queue";
 import { publicJob } from "@/lib/printing/public";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
@@ -15,13 +15,19 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(request, "payments");
   if (limited) return limited;
   const parsed = await readJsonBody(request);
-  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
+  if (!parsed.ok)
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   const b = (parsed.body ?? {}) as Record<string, unknown>;
-  const auth = await authorizeLocation(b.tenantId, b.locationId, ADMIN_ROLES);
+  const auth = await authorizeAdminLocation(request, b.tenantId, b.locationId);
   if (!auth.ok) return auth.res;
   const printer =
     typeof b.printerId === "string"
-      ? await getPosDriver().getPrinter(b.printerId).catch(() => null)
+      ? await getPosDriver()
+          .getPrinter(b.printerId)
+          .catch(() => null)
       : null;
   if (
     !printer ||
