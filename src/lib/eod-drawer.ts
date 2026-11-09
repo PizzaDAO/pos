@@ -3,7 +3,8 @@
  * close, so the "expected cash" a manager confirms against is exactly what is
  * frozen into the close.
  *
- * - Shifts that CLOSED on the business date contribute their reconciliation
+ * - Shifts that CLOSED on the business date (the location's local date, less
+ *   its cutoff: `locationBusinessDate`) contribute their reconciliation
  *   (float + cash sales + paid-in − payouts = expected; their own counts).
  * - With no shifts that day (a store not using drawers), expected cash is the
  *   day's cash takings from the sales report.
@@ -13,7 +14,11 @@
  *   expected until they are closed).
  */
 import type { BusinessDayClose, DrawerReconciliation, Shift } from "@/lib/db";
-import { isoDate, railFamily } from "@/lib/reports";
+import {
+  locationBusinessDate,
+  railFamily,
+  type LocationClock,
+} from "@/lib/reports";
 
 export type EodDrawer = BusinessDayClose["drawer"];
 
@@ -27,6 +32,8 @@ export function reportCashCents(
 
 export function eodDrawerSummary(input: {
   businessDate: string;
+  /** The location's time zone + cutoff (business dates are local to it). */
+  location?: LocationClock | null;
   shifts: readonly { shift: Shift; rec: DrawerReconciliation }[];
   /** The day's cash takings (from the sales report), used with no shifts. */
   reportCashCents: number;
@@ -37,7 +44,7 @@ export function eodDrawerSummary(input: {
     ({ shift }) =>
       shift.status === "closed" &&
       shift.closed_at != null &&
-      isoDate(shift.closed_at) === input.businessDate,
+      locationBusinessDate(shift.closed_at, input.location) === input.businessDate,
   );
   const openDrawers = input.shifts.filter(({ shift }) => shift.status !== "closed").length;
   let opening = 0;

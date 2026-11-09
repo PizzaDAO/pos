@@ -13,7 +13,7 @@
  * `paid` is an entry point equivalent to `placed` (paid-at-counter, not yet
  * started), so bumping it begins prep.
  */
-import type { OrderChannel, OrderStatus } from "@/lib/db";
+import type { Order, OrderChannel, OrderStatus } from "@/lib/db";
 
 /** Bump order: where each status advances to. */
 const BUMP_NEXT: Partial<Record<OrderStatus, OrderStatus>> = {
@@ -46,17 +46,43 @@ export function nextBumpStatus(
   return BUMP_NEXT[current] ?? null;
 }
 
+/** Statuses that sit in the KDS hand-off lane (done cooking, not yet gone). */
+export function isHandoffStatus(status: OrderStatus): boolean {
+  return (
+    status === "ready" || status === "completed" || status === "out_for_delivery"
+  );
+}
+
 /**
- * Label for the hand-off bump on a `ready` ticket (null when the ticket isn't
- * waiting for hand-off). Pickup / in-store tickets go to `completed` and leave
- * the board; delivery tickets go out with the driver.
+ * Whether the KITCHEN hands this delivery to the driver itself. Only in-house
+ * manual delivery does; for DoorDash / the driver module the provider sets the
+ * delivery status, so the KDS must not move it. (Same default as dispatch in
+ * lib/shop/finalize: no recorded provider means in-house.)
+ */
+export function kitchenHandsOffDelivery(
+  order: Pick<Order, "channel" | "fulfillment">,
+): boolean {
+  if (order.channel !== "online_delivery") return true;
+  return (order.fulfillment?.delivery_provider ?? "in_house_manual") === "in_house_manual";
+}
+
+/**
+ * Label for the hand-off bump on a ticket in the hand-off lane (null when the
+ * KDS offers none). Pickup / in-store: Ready → "Picked up" (→ `completed`, which
+ * leaves the board). In-house delivery: Ready → "Out with driver"
+ * (→ `out_for_delivery`), then "Delivered" (→ `completed`). Provider-run
+ * delivery (DoorDash, driver module): no hand-off button.
  */
 export function handoffLabel(
-  current: OrderStatus,
-  channel?: OrderChannel,
+  order: Pick<Order, "status" | "channel" | "fulfillment">,
 ): string | null {
-  if (current !== "ready") return null;
-  return channel === "online_delivery" ? "Out with driver" : "Picked up";
+  if (order.channel === "online_delivery") {
+    if (!kitchenHandsOffDelivery(order)) return null;
+    if (order.status === "ready") return "Out with driver";
+    if (order.status === "out_for_delivery") return "Delivered";
+    return null;
+  }
+  return order.status === "ready" ? "Picked up" : null;
 }
 
 /**

@@ -12,7 +12,8 @@
  *   Advances (bump) or re-opens (recall) an order's status through the DB
  *   abstraction. Idempotent: bumping a `completed` order or recalling an
  *   in-progress one is a no-op that returns the unchanged order, so double-taps
- *   / retries never corrupt state.
+ *   / retries never corrupt state. A Ready / out-for-delivery ticket whose
+ *   delivery is provider-run (not in_house_manual) can't be bumped (no-op).
  *
  * Auth: an operational role (kitchen surface) of the tenant; the location must
  * belong to it. Bump/recall resolves the ORDER first and authorizes against the
@@ -24,7 +25,12 @@ import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
-import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
+import {
+  isHandoffStatus,
+  kitchenHandsOffDelivery,
+  nextBumpStatus,
+  recallStatus,
+} from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
 import {
   requireOrderAccess,
@@ -105,8 +111,15 @@ export async function POST(request: Request) {
     );
   }
 
-  const next =
-    action === "bump"
+  // A provider-run delivery (DoorDash, the driver module) leaves the kitchen
+  // through the provider: the KDS never moves it past Ready.
+  const providerOwned =
+    action === "bump" &&
+    isHandoffStatus(current.status) &&
+    !kitchenHandsOffDelivery(current);
+  const next = providerOwned
+    ? null
+    : action === "bump"
       ? nextBumpStatus(current.status, current.channel)
       : recallStatus(current.status);
 

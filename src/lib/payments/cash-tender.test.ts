@@ -65,14 +65,17 @@ describe("planCashTender", () => {
 });
 
 let seq = 0;
-async function seedOrder(total: number): Promise<string> {
+async function seedOrder(
+  total: number,
+  channel: CreateOrderInput["channel"] = "in_store",
+): Promise<string> {
   seq += 1;
   const id = `cash-tender-${seq}`;
   const input: CreateOrderInput = {
     id,
     tenant_id: TENANT,
     location_id: LOCATION,
-    channel: "in_store",
+    channel,
     currency: "USD",
     items: [
       {
@@ -247,5 +250,29 @@ describe("POST /api/payments cash tenders", () => {
       }),
     ).rejects.toBeInstanceOf(CashUnderTenderError);
     expect(await getPosDriver().getPayment("svc-short")).toBeNull();
+  });
+
+  it("a short cash tender is refused BEFORE superseded online tenders are canceled", async () => {
+    const orderId = await seedOrder(2000, "online_pickup");
+    const card = await pay(orderId, {
+      paymentId: "online-card",
+      rail: "stripe_online",
+      amountCents: 2000,
+    });
+    expect(card.status).toBe(201);
+    const cardTender = (await card.json()).payment;
+    const before = await getPosDriver().getPayment(cardTender.id);
+    expect(before?.status).not.toBe("canceled");
+
+    const res = await pay(orderId, {
+      paymentId: "online-cash-short",
+      rail: "cash",
+      amountCents: 2000,
+      cashTenderedCents: 500,
+    });
+    expect(res.status).toBe(422);
+    expect((await res.json()).error).toMatch(/Reload the till/);
+    // The customer's card checkout was left alone.
+    expect((await getPosDriver().getPayment(cardTender.id))?.status).toBe(before?.status);
   });
 });

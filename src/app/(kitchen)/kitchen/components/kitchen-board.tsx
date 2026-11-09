@@ -13,6 +13,7 @@ import { ChefHat } from "lucide-react";
 import { DEFAULT_KDS_THRESHOLDS, lineMatchesStation } from "@/lib/kds/board";
 import { DEMO_LOCATION_DOWNTOWN_ID, DEMO_TENANT_ID } from "@/lib/db";
 import { useKitchenBoard } from "@/lib/kds/use-kitchen-board";
+import { isHandoffStatus as isHandoff } from "@/lib/kds/status";
 import type { StationFilter } from "@/lib/kds/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -20,9 +21,6 @@ import { StationFilterBar } from "./station-filter";
 import { PrinterBanner } from "@/components/printer-banner";
 import { TicketCard } from "./ticket-card";
 
-function isHandoff(status: string): boolean {
-  return status === "ready" || status === "completed";
-}
 
 const STATION_VALUES: StationFilter[] = [
   "all",

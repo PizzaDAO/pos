@@ -84,7 +84,7 @@ export function cashTenderError(input: {
   if (input.cashTenderedCents === undefined) return null;
   const due = input.amountCents + input.tipCents;
   if (input.cashTenderedCents < due) {
-    return "The cash handed over is less than this tender. Take it as a partial payment for the amount handed over.";
+    return "Cash handed over is less than the amount due. Reload the till and take it as a partial payment.";
   }
   return null;
 }

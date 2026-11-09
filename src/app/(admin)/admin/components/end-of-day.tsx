@@ -6,20 +6,19 @@
  * idempotent (re-closing the same day returns the frozen snapshot). Close day
  * asks first: a confirm dialog with the day's orders, expected cash vs the cash
  * counted now (over/short live) and a warning for drawers still open. The
- * default business date is TODAY IN THE LOCATION'S TIME ZONE (core
- * `businessDate`), not UTC. Includes a print-friendly layout (browser print CSS
+ * default business date is TODAY AT THE LOCATION (its time zone and cutoff,
+ * `locationBusinessDate`), not UTC, and the report buckets by the same rule. Includes a print-friendly layout (browser print CSS
  * hides the chrome). Talks to /api/admin/eod. No env vars.
  */
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
 import { Lock, Printer, Receipt } from "lucide-react";
-import { businessDate } from "@openpizza/core";
 import type { BusinessDayClose, SalesReport } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { formatMoney } from "@/lib/pricing";
-import { railFamily } from "@/lib/reports";
+import { locationBusinessDate, railFamily } from "@/lib/reports";
 
 interface Props {
   tenantId: string;
@@ -30,15 +29,23 @@ interface Props {
   tenantName?: string;
   /** IANA time zone of the location (the business date is local to it). */
   timezone?: string;
+  /** Minutes after local midnight the business day starts (default 0). */
+  cutoffMinutes?: number;
 }
 
-/** Today's business date in the location's time zone. */
-export function todayInZone(timezone: string | undefined, now = new Date()): string {
-  try {
-    return businessDate(now, timezone || "UTC");
-  } catch {
-    return now.toISOString().slice(0, 10);
-  }
+/**
+ * Today's business date at the location: local date in its zone, less its
+ * cutoff (the same rule the Z-report and owner reports bucket by).
+ */
+export function todayInZone(
+  timezone: string | undefined,
+  now = new Date(),
+  cutoffMinutes = 0,
+): string {
+  return locationBusinessDate(now.toISOString(), {
+    timezone,
+    business_day_cutoff_minutes: cutoffMinutes,
+  });
 }
 
 /** "Mon, Nov 9" for a yyyy-mm-dd business date. */
@@ -67,13 +74,16 @@ export function EndOfDay({
   locationName: locName,
   tenantName,
   timezone,
+  cutoffMinutes = 0,
 }: Props) {
-  const [date, setDate] = useState(() => todayInZone(timezone));
+  const [date, setDate] = useState(() =>
+    todayInZone(timezone, new Date(), cutoffMinutes),
+  );
   // Until the manager picks a date, follow the location's (late-loading) zone.
   const [dateTouched, setDateTouched] = useState(false);
   useEffect(() => {
-    if (!dateTouched) setDate(todayInZone(timezone));
-  }, [timezone, dateTouched]);
+    if (!dateTouched) setDate(todayInZone(timezone, new Date(), cutoffMinutes));
+  }, [timezone, cutoffMinutes, dateTouched]);
   const [data, setData] = useState<EodData | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);

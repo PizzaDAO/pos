@@ -10,30 +10,39 @@
  *      the drawer summary with its over/short. Re-closing the same (location,
  *      date) returns the frozen snapshot.
  *
- * `date` is "yyyy-mm-dd" (location-tz business date; when omitted, today in the
- * location's time zone). No env vars; mock driver.
+ * `date` is "yyyy-mm-dd": the location's business date (local date in its time
+ * zone, less its cutoff; `locationBusinessDate`). Orders (created_at) and closed
+ * drawers (closed_at) are bucketed by the same rule. When omitted: today at the
+ * location. No env vars; mock driver.
  *
  * Auth: owner|manager of the tenant; the location must belong to it.
  */
 import { NextResponse } from "next/server";
-import { businessDate } from "@openpizza/core";
-import { getPosDriver, type SalesReport } from "@/lib/db";
+import { getPosDriver, type Location, type SalesReport } from "@/lib/db";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { eodDrawerSummary, reportCashCents } from "@/lib/eod-drawer";
 import { isMoneyCents } from "@/lib/security";
+import { locationBusinessDate } from "@/lib/reports";
 
 export const runtime = "nodejs";
 
-/** Today's business date in the location's time zone (UTC if unknown). */
-async function todayAt(tenantId: string, locationId: string): Promise<string> {
-  const loc = (await getPosDriver().listLocations(tenantId)).find(
-    (l) => l.id === locationId,
+async function locationOf(
+  tenantId: string,
+  locationId: string,
+): Promise<Location | null> {
+  return (
+    (await getPosDriver().listLocations(tenantId)).find(
+      (l) => l.id === locationId,
+    ) ?? null
   );
-  try {
-    return businessDate(new Date(), loc?.timezone || "UTC");
-  } catch {
-    return new Date().toISOString().slice(0, 10);
-  }
+}
+
+/** Today's business date at the location (its time zone + cutoff). */
+async function todayAt(tenantId: string, locationId: string): Promise<string> {
+  return locationBusinessDate(
+    new Date().toISOString(),
+    await locationOf(tenantId, locationId),
+  );
 }
 
 /** The day's drawer summary (closed shifts' reconciliations, or cash sales). */
@@ -45,9 +54,16 @@ async function drawerFor(
   countedCents?: number,
 ) {
   const driver = getPosDriver();
-  const shifts = await driver.listShifts(tenantId, locationId);
+  const [shifts, location] = await Promise.all([
+    driver.listShifts(tenantId, locationId),
+    locationOf(tenantId, locationId),
+  ]);
+  // Open drawers (for the warning) + drawers closed on this LOCAL business day.
   const relevant = shifts.filter(
-    (s) => s.status !== "closed" || (s.closed_at ?? "").slice(0, 10) === date,
+    (s) =>
+      s.status !== "closed" ||
+      (s.closed_at != null &&
+        locationBusinessDate(s.closed_at, location) === date),
   );
   const withRecs = await Promise.all(
     relevant.map(async (shift) => ({
@@ -57,6 +73,7 @@ async function drawerFor(
   );
   return eodDrawerSummary({
     businessDate: date,
+    location,
     shifts: withRecs,
     reportCashCents: reportCashCents(report.paymentMix),
     countedCents,

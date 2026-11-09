@@ -225,6 +225,24 @@ export async function POST(request: Request) {
     // Fall through: takePayment repeats the idempotency check.
   }
 
+  // Cash must be covered by the cash handed over. Checked against what the client
+  // asked for BEFORE anything is touched (superseded online tenders canceled, a
+  // live card tender closed). A short cash tender goes in as a partial:
+  // amountCents = cash handed over, no tip.
+  if (body.rail === "cash") {
+    const short = cashTenderError({
+      amountCents: body.amountCents,
+      tipCents: body.tipCents ?? 0,
+      cashTenderedCents: body.cashTenderedCents,
+    });
+    if (short) {
+      return NextResponse.json(
+        { error: short, code: "cash_under_tender" },
+        { status: 422 },
+      );
+    }
+  }
+
   // ONLINE orders: the server decides what is owed. The client's amountCents /
   // tipCents are ignored (the order total already includes the customer's tip,
   // which rides on the tender's tip, so trusting the body double-charges it).
@@ -344,9 +362,9 @@ export async function POST(request: Request) {
     }
   }
 
-  // Cash must be covered by the cash handed over (checked before anything else is
-  // touched, e.g. a live card tender closed below). A short cash tender goes in
-  // as a partial: amountCents = cash handed over, no tip. The service re-checks.
+  // Re-check against the FINAL amount + tip (an online order's are derived by the
+  // server above), still before a live card tender is closed below. The service
+  // checks once more.
   if (body.rail === "cash") {
     const short = cashTenderError({
       amountCents,

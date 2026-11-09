@@ -7,8 +7,9 @@
  * - Shows order number, channel, status badge, live elapsed mm:ss, line items
  *   (with half-and-half), and order notes.
  * - Bump advances status; a Ready ticket's primary action is the hand-off bump
- *   ("Picked up": ready → completed, which drops it off the board; delivery goes
- *   out with the driver), with Recall as the secondary; Print opens the
+ *   ("Picked up": ready → completed, which drops it off the board; in-house
+ *   delivery goes "Out with driver" then "Delivered"; provider-run delivery has
+ *   no hand-off button), with Recall as the secondary; Print opens the
  *   print-friendly ticket route.
  */
 "use client";
@@ -18,7 +19,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { KdsThresholds } from "@/lib/db";
 import { ageLevelFor } from "@/lib/kds/board";
-import { handoffLabel, statusLabel } from "@/lib/kds/status";
+import { handoffLabel, isHandoffStatus, statusLabel } from "@/lib/kds/status";
 import { channelLabel, formatElapsed } from "@/lib/kds/format";
 import type { AgeLevel, KitchenTicket, StationFilter } from "@/lib/kds/types";
 import { MarketplaceBadge } from "@/components/marketplace-badge";
@@ -79,12 +80,12 @@ function TicketCardImpl({
   const { order } = ticket;
   const elapsed = useLiveElapsed(order.created_at);
   const ageLevel = ageLevelFor(elapsed, thresholds);
-  const isBumped = order.status === "ready" || order.status === "completed";
+  const isBumped = isHandoffStatus(order.status);
   // Ready/done tickets are waiting for hand-off, not aging in the kitchen, so
   // they are greyed out instead of turning amber/red.
   const styles = isBumped ? READY_STYLE : AGE_STYLES[ageLevel];
   const isRecalled = order.status === "recall";
-  const handoff = handoffLabel(order.status, order.channel);
+  const handoff = handoffLabel(order);
 
   return (
     <article

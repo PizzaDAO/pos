@@ -296,6 +296,10 @@ export function AdminShell({
             }
             tenantName={tenantName === "Back office" ? undefined : tenantName}
             timezone={locations.find((l) => l.id === locationId)?.timezone}
+            cutoffMinutes={
+              locations.find((l) => l.id === locationId)
+                ?.business_day_cutoff_minutes ?? 0
+            }
           />
         )}
         {tab === "late" && locationId && (

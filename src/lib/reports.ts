@@ -9,6 +9,7 @@
 import type { Order, OrderChannel, Payment } from "@/lib/db";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import { providerLabel } from "@/lib/marketplace/types";
+import { businessDay } from "@/lib/owner-reports";
 import type {
   DateRange,
   PaymentMixSlice,
@@ -102,18 +103,47 @@ export function railFamily(rail: string): "cash" | "card" | "crypto" | "other" {
   return "card";
 }
 
-/** ISO timestamp → "yyyy-mm-dd" (UTC; the mock seed uses UTC timestamps). */
+/** ISO timestamp → "yyyy-mm-dd" (UTC calendar date; no location known). */
 export function isoDate(iso: string): string {
   return iso.slice(0, 10);
 }
 
-/** Whether an order's created date falls within an inclusive date range. */
-export function inRange(order: Order, range: DateRange): boolean {
-  const day = isoDate(order.created_at);
+/** What a location's business day is measured in. */
+export interface LocationClock {
+  timezone?: string | null;
+  business_day_cutoff_minutes?: number | null;
+}
+
+/**
+ * Business date ("yyyy-mm-dd") of an instant at a location: the LOCAL date in
+ * its time zone, less its business-day cutoff. The same rule as the owner
+ * reports (lib/owner-reports `businessDay`, and the SQL bundle) and, at cutoff
+ * 0, core's `businessDate(at, tz)`. UTC only when the location is unknown.
+ */
+export function locationBusinessDate(
+  iso: string,
+  loc?: LocationClock | null,
+): string {
+  if (!loc?.timezone) return isoDate(iso);
+  return businessDay(iso, loc.timezone, loc.business_day_cutoff_minutes ?? 0).date;
+}
+
+/**
+ * Whether an order's business date falls within an inclusive date range.
+ * `dayOf` gives the order's business date (default: UTC calendar date).
+ */
+export function inRange(
+  order: Order,
+  range: DateRange,
+  dayOf: (order: Order) => string = (o) => isoDate(o.created_at),
+): boolean {
+  const day = dayOf(order);
   if (range.from && day < range.from) return false;
   if (range.to && day > range.to) return false;
   return true;
 }
+
+const inRangeBy = inRange;
 
 /** Gross (non-voided line totals) for an order. */
 export function orderGrossCents(order: Order): number {
@@ -156,6 +186,11 @@ export interface BuildReportInput {
   categoryOf: (itemId: string) => { id: string; name: string } | null;
   /** Resolve a location id → display name (for the byLocation slice). */
   locationName: (locationId: string) => string;
+  /**
+   * Resolve a location id → its time zone + cutoff, so orders are bucketed by
+   * the location's business date. Omitted: UTC calendar dates.
+   */
+  locationClock?: (locationId: string) => LocationClock | null | undefined;
 }
 
 /**
@@ -164,7 +199,11 @@ export interface BuildReportInput {
  * payment mix sums tenders that aren't failed/canceled.
  */
 export function buildSalesReport(input: BuildReportInput): SalesReport {
-  const { payments, range } = input;
+  const { payments } = input;
+  const dayOf = (o: Order) =>
+    locationBusinessDate(o.created_at, input.locationClock?.(o.location_id));
+  const inRange = (o: Order, r: DateRange) => inRangeBy(o, r, dayOf);
+  const range = input.range;
   // Unpaid online checkouts (awaiting_payment / abandoned) are not sales.
   const orders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
 
@@ -208,7 +247,7 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     orderFeesCents += order.totals.fees_cents ?? 0;
     tipCents += order.totals.tip_cents;
 
-    pushBucket(byDay, isoDate(order.created_at), isoDate(order.created_at), gross, 1);
+    pushBucket(byDay, dayOf(order), dayOf(order), gross, 1);
     const bucket = channelBucket(order);
     pushBucket(
       byChannel,
