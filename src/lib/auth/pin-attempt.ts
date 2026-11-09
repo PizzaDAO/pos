@@ -3,38 +3,115 @@
  * quick-switch (/api/terminal/pin) and the back-office unlock
  * (/api/admin/unlock) so both enforce the same brute-force budget.
  *
- * Layers, outermost first (the per-IP rate limit runs in the route):
- *   1. per-DEVICE budget: the device login (auth user id) — a copied or cleared
- *      cookie can't reset it, because it is keyed on the signed-in account;
- *   2. per-LOCATION budget: the till's location (validated to belong to the
- *      staff member's tenant), or the tenant as a whole when none is named;
- *   3. the per-staff lockout (begin_pin_attempt: 5 → 15-minute lock).
+ * Layers (the per-IP rate limit runs in the route):
+ *   1. the per-STAFF lockout (begin_pin_attempt: 5 → 15-minute lock) — the main
+ *      limit: a PIN is guessed for one person, and that person locks;
+ *   2. per-DEVICE budget: this browser (a random, signed, httpOnly `pos_device`
+ *      id) under this device login. Every till of a shop is usually signed in
+ *      as the owner, so the login alone can't be the key: one till's bad
+ *      guesses would lock PIN entry on every till. A browser without a valid
+ *      id shares ONE bucket per login ("unidentified"), and an id is only
+ *      handed out on a SUCCESSFUL PIN, so clearing the cookie doesn't buy an
+ *      attacker a fresh budget;
+ *   3. per-LOCATION budget: the till's location (validated to belong to the
+ *      staff member's tenant), or the tenant as a whole when none is named. Set
+ *      high: it is a backstop against spraying guesses over many staff, not a
+ *      way for one till to lock a whole shop.
  * Each layer counts the attempt under a row lock BEFORE the PIN is checked, so
  * concurrent guesses can't race past it. A verified PIN releases its own
  * device/location attempt (only unproven guesses spend those budgets; a cashier
  * can't refill them by also typing their own PIN, since that only un-counts
  * itself) and resets the staff counter.
  *
+ * `ownerBypass` (the back-office unlock): an OWNER is never kept out of admin
+ * by the device or location budget — only by their own per-staff lockout — so
+ * a flood of bad guesses at a till can't lock the owner out of fixing it.
+ *
  * Answers: 401 "Incorrect PIN." for a wrong PIN / unknown or inactive staff
- * (no enumeration), 423 with `lockedUntil` when any layer is locked.
+ * (no enumeration), 423 with `lockedUntil` when a layer is locked.
  */
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { getPosDriver, type MembershipRole, type Staff } from "@/lib/db";
 import { recordAudit } from "@/lib/security";
+import { readCookie } from "./active-staff";
 import { verifyPin } from "./pin";
 import type { SessionUser } from "./session";
+import { signingSecret } from "./signing-secret";
 
-/** Unproven attempts per device login per window before a lock. */
+/** Unproven attempts per browser (per device login) per window before a lock. */
 export const PIN_DEVICE_LIMIT = { max: 10, windowMinutes: 15, lockMinutes: 15 };
 /** Unproven attempts per location (all its tills) per window before a lock. */
 export const PIN_LOCATION_LIMIT = {
-  max: 30,
+  max: 100,
   windowMinutes: 15,
   lockMinutes: 15,
 };
 
+/** The per-browser device id cookie (random id + HMAC). */
+export const DEVICE_COOKIE = "pos_device";
+const DEVICE_PURPOSE = "device:v1";
+
+function deviceMac(id: string): string | null {
+  const key = signingSecret();
+  if (!key) return null;
+  return createHmac("sha256", key)
+    .update(`${DEVICE_PURPOSE}:${id}`)
+    .digest("hex");
+}
+
+/** A new signed device id cookie value, or null with no signing secret. */
+export function mintDeviceCookie(): string | null {
+  const id = randomBytes(16).toString("hex");
+  const sig = deviceMac(id);
+  return sig ? `${id}.${sig}` : null;
+}
+
+/** The verified device id of this browser, or null (absent / forged). */
+export function readDeviceId(request: Request): string | null {
+  const value = readCookie(request, DEVICE_COOKIE);
+  if (!value) return null;
+  const [id, sig] = value.split(".");
+  if (!id || !sig || !/^[0-9a-f]{32}$/.test(id)) return null;
+  const expected = deviceMac(id);
+  if (!expected) return null;
+  const a = Buffer.from(expected, "hex");
+  const b = Buffer.from(sig, "hex");
+  return a.length === b.length && timingSafeEqual(a, b) ? id : null;
+}
+
+/** Long-lived, httpOnly: identifies the browser, carries no authority. */
+export function deviceCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge: 365 * 24 * 60 * 60,
+  };
+}
+
+/** The device budget key: this browser under this login. */
+export function deviceKey(userId: string, deviceId: string | null): string {
+  return `${userId}:${deviceId ?? "unidentified"}`;
+}
+
+/** The location budget key: the till's location, or the whole tenant. */
+export function locationKey(
+  tenantId: string,
+  locationId: string | null,
+): string {
+  return `${tenantId}:${locationId ?? "*"}`;
+}
+
 export type PinAttemptResult =
-  | { ok: true; staff: Staff; locationId: string | null }
+  | {
+      ok: true;
+      staff: Staff;
+      locationId: string | null;
+      /** Set this `pos_device` cookie value (the browser had no valid id). */
+      newDeviceCookie: string | null;
+    }
   | { ok: false; res: NextResponse };
 
 const incorrect = (): PinAttemptResult => ({
@@ -50,14 +127,6 @@ const locked = (lockedUntil: string | null): PinAttemptResult => ({
   ),
 });
 
-/** The location budget key: the till's location, or the whole tenant. */
-export function locationKey(
-  tenantId: string,
-  locationId: string | null,
-): string {
-  return `${tenantId}:${locationId ?? "*"}`;
-}
-
 /**
  * Verify `pin` for staff `staffId` within `tenantIds` (the tenants the device
  * login may operate). `roles` (optional) restricts WHICH staff may use this
@@ -65,25 +134,40 @@ export function locationKey(
  * anyway, so this reveals nothing and spends no budget).
  */
 export async function attemptStaffPin(input: {
+  request: Request;
   user: SessionUser;
   tenantIds: string[];
   staffId: string;
   pin: string;
   locationId?: unknown;
   roles?: readonly MembershipRole[];
+  /** Owners skip the device/location budgets (back-office unlock only). */
+  ownerBypass?: boolean;
   /** Audit label for lock events, e.g. "Back-office unlock". */
   context: string;
 }): Promise<PinAttemptResult> {
   const driver = getPosDriver();
   const { user } = input;
+  const deviceId = readDeviceId(input.request);
+  const devKey = deviceKey(user.id, deviceId);
 
-  // 1. Per device (the device login). Counted even for an unknown staff id.
+  // Device budget first, so guesses at unknown staff ids are counted too.
   const device = await driver.beginPinLimitAttempt(
     "device",
-    user.id,
+    devKey,
     PIN_DEVICE_LIMIT,
   );
-  if (!device.allowed) {
+
+  // getStaffById carries pin_hash; it never goes to the client.
+  let staff: Staff | null = null;
+  for (const tenantId of input.tenantIds) {
+    staff = await driver.getStaffById(tenantId, input.staffId);
+    if (staff) break;
+  }
+  const bypass =
+    !!input.ownerBypass && !!staff?.active && staff.role === "owner";
+
+  if (!device.allowed && !bypass) {
     if (device.justLocked && input.tenantIds[0]) {
       await recordAudit({
         actor: { id: user.id, label: user.email },
@@ -94,16 +178,9 @@ export async function attemptStaffPin(input: {
     }
     return locked(device.lockedUntil);
   }
-
-  // getStaffById carries pin_hash; it never goes to the client.
-  let staff: Staff | null = null;
-  for (const tenantId of input.tenantIds) {
-    staff = await driver.getStaffById(tenantId, input.staffId);
-    if (staff) break;
-  }
   if (!staff || !staff.active) return incorrect();
   if (input.roles && !input.roles.includes(staff.role)) {
-    await driver.releasePinLimitAttempt("device", user.id);
+    if (device.allowed) await driver.releasePinLimitAttempt("device", devKey);
     return {
       ok: false,
       res: NextResponse.json(
@@ -113,7 +190,7 @@ export async function attemptStaffPin(input: {
     };
   }
 
-  // 2. Per location (validated to be one of the staff member's tenant).
+  // Per location (validated to be one of the staff member's tenant).
   let locationId: string | null = null;
   if (typeof input.locationId === "string" && input.locationId) {
     const locations = await driver.listLocations(staff.tenant_id);
@@ -127,7 +204,7 @@ export async function attemptStaffPin(input: {
     locKey,
     PIN_LOCATION_LIMIT,
   );
-  if (!location.allowed) {
+  if (!location.allowed && !bypass) {
     if (location.justLocked) {
       await recordAudit({
         actor: { id: user.id, label: user.email },
@@ -139,7 +216,7 @@ export async function attemptStaffPin(input: {
     return locked(location.lockedUntil);
   }
 
-  // 3. Per staff (persisted, atomic: begin_pin_attempt).
+  // Per staff (persisted, atomic: begin_pin_attempt) — never bypassed.
   const attemptState = await driver.beginPinAttempt(staff.tenant_id, staff.id);
   if (!attemptState.allowed) {
     if (attemptState.justLocked) {
@@ -155,12 +232,19 @@ export async function attemptStaffPin(input: {
 
   if (!verifyPin(input.pin, staff.pin_hash)) return incorrect();
 
-  // Proven: un-count this attempt from the device/location budgets, and reset
-  // the staff counter (unless a concurrent burst set a lock meanwhile).
+  // Proven: un-count this attempt from the device/location budgets (a no-op
+  // on a locked bucket), and reset the staff counter (unless a concurrent
+  // burst set a lock meanwhile).
   await Promise.all([
-    driver.releasePinLimitAttempt("device", user.id),
+    driver.releasePinLimitAttempt("device", devKey),
     driver.releasePinLimitAttempt("location", locKey),
     driver.clearPinAttempts(staff.tenant_id, staff.id),
   ]);
-  return { ok: true, staff, locationId };
+  return {
+    ok: true,
+    staff,
+    locationId,
+    // First proven PIN on this browser: give it its own device budget.
+    newDeviceCookie: deviceId ? null : mintDeviceCookie(),
+  };
 }

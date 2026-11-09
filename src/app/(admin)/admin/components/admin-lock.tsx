@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Lock, ShieldAlert } from "lucide-react";
 import { StaffSwitch } from "@/app/(terminal)/terminal/components/staff-switch";
+import { PinReveal, SignInAgain } from "./staff-manager";
 import { Button } from "@/components/ui/button";
 
 export interface AdminLockState {
@@ -108,6 +109,11 @@ export function AdminLock({
   // The PIN pad calls onClose right after a successful verify, before the
   // unlocked state has rendered: remember the success so "close" isn't "leave".
   const verified = useRef(false);
+  /** A PIN to show once (a replaced short PIN, or an owner's first PIN). */
+  const [revealed, setRevealed] = useState<{
+    name: string;
+    pin: string;
+  } | null>(null);
 
   async function unlock(
     staffId: string,
@@ -122,8 +128,11 @@ export function AdminLock({
       const d = (await res.json()) as {
         staff: NonNullable<AdminLockState["staff"]>;
         expiresAt: string;
+        newPin?: string;
       };
       verified.current = true;
+      // A short PIN was replaced by the server: show the new one once.
+      if (d.newPin) setRevealed({ name: d.staff.name, pin: d.newPin });
       setState((s) => ({ ...s, staff: d.staff, expiresAt: d.expiresAt }));
       setNow(Date.now());
       return true;
@@ -163,7 +172,7 @@ export function AdminLock({
         <div className="flex items-center justify-center gap-2 border-b border-amber-500/50 bg-amber-500/10 px-4 py-1.5 text-center text-xs text-amber-900 dark:text-amber-200">
           <ShieldAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           Anyone at a till signed in as you can open the back office. Give an
-          owner or manager a PIN (Staff &amp; drawer) to require it here.
+          owner a PIN (Staff &amp; drawer) to require it here.
         </div>
       )}
 
@@ -176,9 +185,17 @@ export function AdminLock({
           roles={ADMIN_PIN_ROLES}
           title="Unlock the back office"
           intro={
-            shellMounted
-              ? "The back office locked itself. Enter an owner or manager PIN to carry on."
-              : "Enter an owner or manager PIN. The back office stays unlocked for 10 minutes."
+            <>
+              <p>
+                {shellMounted
+                  ? "The back office locked itself. Enter an owner or manager PIN to carry on."
+                  : "Enter an owner or manager PIN. The back office stays unlocked for 10 minutes."}
+              </p>
+              <OwnerPinSetup
+                tenantId={tenantId}
+                onIssued={(name, pin) => setRevealed({ name, pin })}
+              />
+            </>
           }
           submitLabel="Unlock"
           closeLabel="Leave"
@@ -194,6 +211,99 @@ export function AdminLock({
           }}
         />
       )}
+
+      {revealed && <PinReveal {...revealed} onDone={() => setRevealed(null)} />}
     </>
+  );
+}
+
+/**
+ * An owner with no PIN yet sets one up from the lock screen
+ * (/api/admin/owner-pin: owner login + a recent sign-in). Renders nothing for a
+ * manager login or when every owner already has a PIN.
+ */
+function OwnerPinSetup({
+  tenantId,
+  onIssued,
+}: {
+  tenantId: string;
+  onIssued: (name: string, pin: string) => void;
+}) {
+  const [owners, setOwners] = useState<{ id: string; name: string }[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [reauth, setReauth] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/admin/owner-pin?tenantId=${encodeURIComponent(tenantId)}`, {
+      cache: "no-store",
+    })
+      .then((r) => (r.ok ? r.json() : { owners: [] }))
+      .then((d: { owners?: { id: string; name: string }[] }) => {
+        if (alive) setOwners(d.owners ?? []);
+      })
+      .catch(() => null);
+    return () => {
+      alive = false;
+    };
+  }, [tenantId]);
+
+  if (owners.length === 0) return null;
+
+  async function issue(o: { id: string; name: string }) {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/owner-pin", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tenantId, staffId: o.id }),
+      });
+      const d = (await res.json().catch(() => ({}))) as {
+        pin?: string;
+        error?: string;
+        code?: string;
+      };
+      if (res.ok && d.pin) {
+        setOwners((cur) => cur.filter((x) => x.id !== o.id));
+        onIssued(o.name, d.pin);
+        return;
+      }
+      setReauth(d.code === "reauth_required");
+      setError(d.error ?? "Could not set the PIN.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-md border p-2">
+      <p className="text-xs">Owner without a PIN yet? Set one up:</p>
+      <div className="mt-1 flex flex-wrap gap-2">
+        {owners.map((o) => (
+          <Button
+            key={o.id}
+            type="button"
+            variant="outline"
+            className="h-11"
+            disabled={busy}
+            onClick={() => void issue(o)}
+          >
+            Set PIN for {o.name}
+          </Button>
+        ))}
+      </div>
+      {error && (
+        <p role="alert" className="mt-1 text-xs text-destructive">
+          {error}
+        </p>
+      )}
+      {reauth && (
+        <div className="mt-1">
+          <SignInAgain />
+        </div>
+      )}
+    </div>
   );
 }

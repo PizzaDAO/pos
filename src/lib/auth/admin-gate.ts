@@ -17,15 +17,21 @@
  *
  * A request passes the gate only when ALL hold: the cookie's signature and
  * expiry verify; it names this tenant and THIS device login; the session row
- * exists, is kind 'admin', unexpired and not revoked (Lock, switch-out and
- * sign-out revoke it); and the staff member is still active and still an owner
- * or manager — so demoting or deactivating someone ends their unlock at once.
+ * exists, is kind 'admin', unexpired and not revoked; and the staff member is
+ * still active and still an owner or manager — so demoting or deactivating
+ * someone ends their unlock at once. What revokes it: "Lock now" (DELETE
+ * /api/admin/unlock), a till switch-in or switch-out on this browser (POST /
+ * DELETE /api/terminal/pin), account sign-out (/auth/signout revokes every
+ * session of the login), and a role change, deactivation or PIN reset of the
+ * staff member (incl. a hub PIN change through /v1).
  *
  * When is the gate in force? In real mode, as soon as the tenant has an ACTIVE
  * owner/manager staff member with a PIN. Before that (a new tenant, or the
- * zero-env demo) the device session's owner/manager role is used as before,
- * so an owner can always get in to set up the first PIN; the admin UI nudges
- * them to do it.
+ * zero-env demo) the device session's owner/manager role is used as before.
+ * Bootstrap (src/lib/staff/manage.ts#checkPinIssue): the first gating PIN
+ * must be an OWNER's and needs a recent account sign-in; and an owner device
+ * session may always give an owner staff row with no PIN its first PIN
+ * (/api/admin/owner-pin), so an owner can never be locked out by the gate.
  *
  * The acting role inside admin (e.g. managers can't create owners) is the PIN
  * staff member's role when the gate is in force, else the device login's role.
@@ -64,6 +70,18 @@ export interface AdminActor {
   gated: boolean;
   /** When the current unlock ends (gated), else null. */
   expiresAt: string | null;
+}
+
+/**
+ * Did this login session sign in recently (RECENT_SIGN_IN_MS)? Always true
+ * outside real mode (no real sign-in to check).
+ */
+export function recentlySignedIn(
+  user: Pick<SessionUser, "authAt">,
+  windowMs = 10 * 60 * 1000,
+): boolean {
+  if (!isRealMode()) return true;
+  return typeof user.authAt === "number" && Date.now() - user.authAt <= windowMs;
 }
 
 /** Is the PIN gate in force for this tenant (see the module comment)? */

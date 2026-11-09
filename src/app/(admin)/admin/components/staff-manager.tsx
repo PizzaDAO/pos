@@ -87,6 +87,8 @@ export function StaffManager({
     pin: string;
   } | null>(null);
   const [showInactive, setShowInactive] = useState(false);
+  /** The server wants a fresh account sign-in before issuing this PIN. */
+  const [reauth, setReauth] = useState(false);
 
   const load = useCallback(async () => {
     const res = await fetch(
@@ -119,8 +121,10 @@ export function StaffManager({
       const d = (await res.json().catch(() => ({}))) as Record<string, unknown>;
       if (!res.ok) {
         setError(typeof d.error === "string" ? d.error : "That didn't work.");
+        setReauth(d.code === "reauth_required");
         return null;
       }
+      setReauth(false);
       await load();
       onChanged?.();
       return d;
@@ -184,8 +188,9 @@ export function StaffManager({
 
       {!anyAdminPin && (
         <p className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200">
-          No owner or manager has a PIN yet. Reset a PIN for one to lock the
-          back office behind it.
+          No owner or manager has a PIN yet. Set an owner&apos;s PIN to lock the
+          back office behind it (you&apos;ll be asked to have signed in within
+          the last 10 minutes). Manager PINs come after.
         </p>
       )}
 
@@ -194,6 +199,7 @@ export function StaffManager({
           {error}
         </p>
       )}
+      {reauth && <SignInAgain />}
 
       <ul className="divide-y overflow-hidden rounded-xl border">
         {shown.map((s) => {
@@ -367,7 +373,7 @@ export function StaffManager({
   );
 }
 
-function PinReveal({
+export function PinReveal({
   name,
   pin,
   onDone,
@@ -603,5 +609,22 @@ function StaffForm({
         </div>
       </form>
     </Dialog>
+  );
+}
+
+/**
+ * "Sign in again" for a server `reauth_required` refusal: signs this browser
+ * out and comes back to the back office after a fresh sign-in.
+ */
+export function SignInAgain() {
+  return (
+    <form
+      method="post"
+      action={`/auth/signout?redirect=${encodeURIComponent("/login?redirect=/admin")}`}
+    >
+      <Button type="submit" variant="outline" className="h-11">
+        Sign in again
+      </Button>
+    </form>
   );
 }

@@ -25,6 +25,7 @@
  * mode or a positively identified Stripe TEST key only; live keys answer 501
  * unless the tenant is explicitly allow-listed.
  */
+import { scheduleAutoPrint } from "@/lib/printing/queue";
 import {
   AllergenPublishInputSchema,
   AvailabilityUpdateSchema,
@@ -886,6 +887,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!res.ok && res.reason === "conflict" && res.order.status === "voided") {
       throw ProblemError.of("INVALID_TRANSITION", { detail: "Order was canceled." });
     }
+    if (res.ok) scheduleAutoPrint(res.order);
     // Released by hand after all: a still-open "stranded" flag is moot.
     const flag = order.fulfillment?.late_payment;
     if (res.ok && flag && flag.kind === "scheduled" && !flag.resolved) {
@@ -1292,6 +1294,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
    * checked role rank and location). POS re-checks the TENANT (and a
    * location-limited token's reach) and hashes with the till's scrypt. `null`
    * clears the PIN. One targeted update of `pin_hash`; the PIN is never logged.
+   * Every live till / back-office session of the member is revoked.
    */
   "staff.setPin": async (ctx) => {
     requireHubSigned(ctx);
@@ -1315,6 +1318,9 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!(await ctx.driver.setStaffPinHash(tenantId, staff.id, hash))) {
       throw notFound("Staff member");
     }
+    // Whoever is signed in on the old PIN (till switch-in or back-office
+    // unlock) is signed out with it.
+    await ctx.driver.revokeStaffSessionsForStaff(tenantId, staff.id);
     const member = (await loadStaffList(tenantId, ctx.driver)).find((s) => s.id === staff.id);
     if (!member) throw notFound("Staff member");
     return { body: member };
@@ -2394,6 +2400,8 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     },
   };
   const order = await ctx.driver.createOrder(create);
+  // Held (draft) orders print when released; placed orders fire now.
+  scheduleAutoPrint(order);
   const tz = bundle.location.timezone;
   const body = await mapOrder(order, tz, ctx.driver);
   return { status: 201, body, headers: { location: `/api/v1/orders/${order.id}` } };

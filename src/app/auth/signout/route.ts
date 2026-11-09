@@ -14,6 +14,11 @@ import {
   activeStaffCookieOptions,
 } from "@/lib/auth/active-staff";
 import { safeRedirectPath } from "@/lib/auth/safe-redirect";
+import {
+  ADMIN_UNLOCK_COOKIE,
+  adminUnlockCookieOptions,
+  revokeAdminUnlock,
+} from "@/lib/auth/admin-gate";
 
 export const runtime = "nodejs";
 
@@ -27,6 +32,9 @@ export async function POST(request: Request) {
   // Revoke every terminal staff session this device login opened, so a copied
   // active-staff cookie stops working the moment the device signs out.
   const user = await getCurrentUser().catch(() => null);
+  // The back-office unlock named by this browser's cookie (also covered by the
+  // per-user revoke below; this one works even without a resolvable session).
+  await revokeAdminUnlock(request).catch(() => null);
   if (user) {
     await getPosDriver()
       .revokeStaffSessionsForUser(user.id)
@@ -43,5 +51,6 @@ export async function POST(request: Request) {
     ...activeStaffCookieOptions(),
     maxAge: 0,
   });
+  res.cookies.set(ADMIN_UNLOCK_COOKIE, "", { ...adminUnlockCookieOptions(), maxAge: 0 });
   return res;
 }

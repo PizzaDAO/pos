@@ -47,6 +47,35 @@ export interface SessionUser {
    * simulated/seed fallback (`false`). Surfaces can badge "simulated auth".
    */
   real: boolean;
+  /**
+   * When THIS login session last authenticated (ms since epoch): the newest
+   * `amr` timestamp of the Supabase access token, which survives token
+   * refreshes, so it is the sign-in time of this browser's session. null when
+   * unknown (simulated mode). Used to require a recent sign-in before the
+   * first back-office PIN is issued (src/lib/auth/admin-gate.ts).
+   */
+  authAt?: number | null;
+}
+
+/**
+ * The newest `amr[].timestamp` (seconds) of a JWT payload, in ms; null when
+ * absent. Pure; exported for tests. Only call on a token getUser() verified.
+ */
+export function authTimeFromAccessToken(token: string | null | undefined): number | null {
+  if (!token) return null;
+  const part = token.split(".")[1];
+  if (!part) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as {
+      amr?: { timestamp?: unknown }[];
+    };
+    const ts = (payload.amr ?? [])
+      .map((a) => (typeof a?.timestamp === "number" ? a.timestamp : NaN))
+      .filter((n) => Number.isFinite(n));
+    return ts.length ? Math.max(...ts) * 1000 : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -72,11 +101,21 @@ export async function getCurrentUser(opts?: {
 
     const email = user.email ?? "";
     // auth.uid() == public.users.id (identity bridge). Resolve access by id.
-    const [memberships, isPlatformAdmin] = await Promise.all([
+    const [memberships, isPlatformAdmin, sessionRes] = await Promise.all([
       driver.listMembershipsForUser(user.id),
       driver.isPlatformAdmin(user.id),
+      // The token was just verified by getUser(); read its sign-in time.
+      supabase.auth.getSession().catch(() => null),
     ]);
-    return { id: user.id, email, memberships, isPlatformAdmin, real: true };
+    const token = sessionRes?.data?.session?.access_token ?? null;
+    return {
+      id: user.id,
+      email,
+      memberships,
+      isPlatformAdmin,
+      real: true,
+      authAt: authTimeFromAccessToken(token),
+    };
   }
 
   // ---- SIMULATED MODE: derive a deterministic session from the seed. ----

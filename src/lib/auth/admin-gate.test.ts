@@ -45,6 +45,9 @@ import {
   adminGateRequired,
 } from "./admin-gate";
 import { ACTIVE_STAFF_COOKIE, effectiveTerminalRole } from "./active-staff";
+import { hashPin, verifyPin } from "./pin";
+import { DELETE as tillPinDELETE } from "@/app/api/terminal/pin/route";
+import { POST as signOutPOST } from "@/app/auth/signout/route";
 
 const T = DEMO_TENANT_ID;
 const L = DEMO_LOCATION_DOWNTOWN_ID;
@@ -53,12 +56,17 @@ const L = DEMO_LOCATION_DOWNTOWN_ID;
 const TONY = "80000000-0000-0000-0000-000000000001";
 const CARMELA = "80000000-0000-0000-0000-000000000002";
 const CHRIS = "80000000-0000-0000-0000-000000000003";
+// 6-digit PINs (a shorter owner/manager PIN is replaced at unlock; see below).
+const TONY_PIN = "739204";
+const CARMELA_PIN = "482915";
 
 const ROOT = resolve(__dirname, "../../app/api");
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 
 /** Every /api/admin route is gated except these (path relative to src/app/api). */
 const UNGATED: Record<string, string> = {
+  "admin/owner-pin":
+    "An owner with no PIN must be able to get one, so the gate can never lock an owner out. It requires an OWNER device session, a sign-in within the last 10 minutes, and only gives a FIRST PIN to an active owner row that has none.",
   "admin/unlock":
     "It is the PIN entry that passes the gate. It still requires an owner|manager device session, and its POST runs the device/location/staff PIN budgets.",
 };
@@ -193,6 +201,8 @@ async function reports(cookie?: string | null, name?: string) {
 }
 
 beforeAll(async () => {
+  await getPosDriver().setStaffPinHash(T, TONY, hashPin(TONY_PIN));
+  await getPosDriver().setStaffPinHash(T, CARMELA, hashPin(CARMELA_PIN));
   const order: CreateOrderInput = {
     id: ORDER_ID,
     tenant_id: T,
@@ -286,7 +296,7 @@ describe("every admin route is behind the PIN gate", () => {
     });
 
     it(`${rel}: a manager PIN unlock lets every method through the gate`, async () => {
-      const { cookie } = await unlock(CARMELA, "2222");
+      const { cookie } = await unlock(CARMELA, CARMELA_PIN);
       expect(cookie).toBeTruthy();
       const mod = (await import(resolve(ROOT, rel, "route.ts"))) as Record<
         string,
@@ -334,7 +344,7 @@ describe("unlock", () => {
   });
 
   it("owner and manager PINs unlock; it lasts 10 minutes then re-prompts", async () => {
-    const { res, cookie } = await unlock(TONY, "1111");
+    const { res, cookie } = await unlock(TONY, TONY_PIN);
     expect(res.status).toBe(200);
     expect(res.headers.get("set-cookie")).toMatch(/HttpOnly/i);
     expect((await reports(cookie)).status).toBe(200);
@@ -349,7 +359,7 @@ describe("unlock", () => {
   });
 
   it("GET reports who unlocked; DELETE (Lock now) ends it", async () => {
-    const { cookie } = await unlock(CARMELA, "2222");
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
     const status = (await (
       await unlockGET(
         new Request(`http://localhost/api/admin/unlock?tenantId=${T}`, {
@@ -380,14 +390,14 @@ describe("unlock", () => {
   });
 
   it("the unlock is bound to the device login that opened it", async () => {
-    const { cookie } = await unlock(CARMELA, "2222");
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
     session.user = owner("other-device");
     expect((await reports(cookie)).code).toBe(ADMIN_PIN_REQUIRED);
   });
 
   it("demoting or deactivating the unlocking manager ends the unlock at once", async () => {
     const driver = getPosDriver();
-    const { cookie } = await unlock(CARMELA, "2222");
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
     expect((await reports(cookie)).status).toBe(200);
     await driver.updateStaffProfile(T, CARMELA, { role: "cashier" });
     try {
@@ -409,7 +419,7 @@ describe("unlock", () => {
     const till = await tillPinPOST(
       new Request("http://localhost/api/terminal/pin", {
         method: "POST",
-        body: JSON.stringify({ staffId: CARMELA, pin: "2222" }),
+        body: JSON.stringify({ staffId: CARMELA, pin: CARMELA_PIN }),
       }),
     );
     const tillCookie = /pos_active_staff=([^;]+)/.exec(
@@ -422,7 +432,7 @@ describe("unlock", () => {
 
     // An admin unlock's session id, named as an offline order's session, gives
     // the till no manager authority.
-    const { cookie } = await unlock(CARMELA, "2222");
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
     const sessionId = cookie!.split(".")[3]!;
     const role = await effectiveTerminalRole(
       new Request("http://localhost/api/orders", {
@@ -437,7 +447,7 @@ describe("unlock", () => {
   });
 
   it("a forged or tampered cookie is refused", async () => {
-    const { cookie } = await unlock(CARMELA, "2222");
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
     const parts = cookie!.split(".");
     parts[1] = TONY; // claim to be the owner
     expect((await reports(parts.join("."))).code).toBe(ADMIN_PIN_REQUIRED);
@@ -480,5 +490,88 @@ describe("when the gate is not in force", () => {
       await driver.updateStaffProfile(T, CARMELA, { active: true });
       await driver.setStaffPinHash(T, TONY, tony!.pin_hash ?? null);
     }
+  });
+});
+
+describe("what ends an unlock", () => {
+  const withCookie = (
+    url: string,
+    cookie: string,
+    method = "POST",
+    body?: unknown,
+  ) =>
+    new Request(url, {
+      method,
+      headers: {
+        cookie: `${ADMIN_UNLOCK_COOKIE}=${encodeURIComponent(cookie)}`,
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+
+  it("till switch-out / lock (DELETE /api/terminal/pin) revokes it and clears the cookie", async () => {
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
+    const res = await tillPinDELETE(
+      withCookie("http://localhost/api/terminal/pin", cookie!, "DELETE"),
+    );
+    expect(res.headers.get("set-cookie")).toMatch(
+      new RegExp(`${ADMIN_UNLOCK_COOKIE}=;`),
+    );
+    expect((await reports(cookie)).code).toBe(ADMIN_PIN_REQUIRED);
+  });
+
+  it("a till switch-in on this browser revokes it", async () => {
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
+    const res = await tillPinPOST(
+      withCookie("http://localhost/api/terminal/pin", cookie!, "POST", {
+        staffId: CHRIS,
+        pin: "3333",
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await reports(cookie)).code).toBe(ADMIN_PIN_REQUIRED);
+  });
+
+  it("account sign-out revokes it", async () => {
+    const { cookie } = await unlock(CARMELA, CARMELA_PIN);
+    const res = await signOutPOST(
+      withCookie("http://localhost/auth/signout", cookie!),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("set-cookie")).toMatch(
+      new RegExp(`${ADMIN_UNLOCK_COOKIE}=;`),
+    );
+    expect((await reports(cookie)).code).toBe(ADMIN_PIN_REQUIRED);
+  });
+});
+
+describe("short owner/manager PINs", () => {
+  it("are replaced by a server-issued 6-digit PIN at unlock (shown once)", async () => {
+    const driver = getPosDriver();
+    await driver.setStaffPinHash(T, CARMELA, hashPin("2468"));
+    try {
+      const { res, cookie } = await unlock(CARMELA, "2468");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = (await res.json()) as { newPin?: string };
+      expect(body.newPin).toMatch(/^\d{6}$/);
+      const stored = await driver.getStaffById(T, CARMELA);
+      expect(verifyPin("2468", stored?.pin_hash)).toBe(false);
+      expect(verifyPin(body.newPin!, stored?.pin_hash)).toBe(true);
+      expect((await reports(cookie)).status).toBe(200);
+      const log = await driver.listAuditLog(T);
+      expect(
+        log.some(
+          (e) => e.action === "staff_pin_reset" && e.detail?.includes(CARMELA),
+        ),
+      ).toBe(true);
+      expect(log.some((e) => e.detail?.includes(body.newPin!))).toBe(false);
+    } finally {
+      await driver.setStaffPinHash(T, CARMELA, hashPin(CARMELA_PIN));
+    }
+  });
+
+  it("a 6-digit PIN is left alone", async () => {
+    const { res } = await unlock(CARMELA, CARMELA_PIN);
+    expect(((await res.json()) as { newPin?: string }).newPin).toBeUndefined();
   });
 });

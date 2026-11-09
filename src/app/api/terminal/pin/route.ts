@@ -34,7 +34,16 @@ import { getCurrentUser } from "@/lib/auth/session";
 import { tenantsForSurface } from "@/lib/auth/roles";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { isValidPinFormat } from "@/lib/auth/pin";
-import { attemptStaffPin } from "@/lib/auth/pin-attempt";
+import {
+  DEVICE_COOKIE,
+  attemptStaffPin,
+  deviceCookieOptions,
+} from "@/lib/auth/pin-attempt";
+import {
+  ADMIN_UNLOCK_COOKIE,
+  adminUnlockCookieOptions,
+  revokeAdminUnlock,
+} from "@/lib/auth/admin-gate";
 import { enforceRateLimit, readJsonBody, recordAudit } from "@/lib/security";
 import {
   ACTIVE_STAFF_COOKIE,
@@ -113,6 +122,7 @@ export async function POST(request: Request) {
   // Device, location and per-staff budgets + the scrypt check (shared with
   // the back-office unlock): see src/lib/auth/pin-attempt.ts.
   const attempt = await attemptStaffPin({
+    request,
     user,
     tenantIds: allowedTenants,
     staffId: body.staffId,
@@ -162,16 +172,28 @@ export async function POST(request: Request) {
     },
   });
   res.cookies.set(ACTIVE_STAFF_COOKIE, opened.cookie, activeStaffCookieOptions());
+  if (attempt.newDeviceCookie) {
+    res.cookies.set(DEVICE_COOKIE, attempt.newDeviceCookie, deviceCookieOptions());
+  }
+  // Someone new is at the till: a back-office unlock left open on this
+  // browser ends with the previous person's turn.
+  await revokeAdminUnlock(request);
+  res.cookies.set(ADMIN_UNLOCK_COOKIE, "", { ...adminUnlockCookieOptions(), maxAge: 0 });
   return res;
 }
 
-/** DELETE /api/terminal/pin — switch the active staff out (revoke + clear). */
+/**
+ * DELETE /api/terminal/pin — switch the active staff out / lock the till:
+ * revoke + clear the till session AND any back-office unlock on this browser.
+ */
 export async function DELETE(request: Request) {
   await revokeRequestStaffSession(request);
+  await revokeAdminUnlock(request);
   const res = NextResponse.json({ ok: true });
   res.cookies.set(ACTIVE_STAFF_COOKIE, "", {
     ...activeStaffCookieOptions(),
     maxAge: 0,
   });
+  res.cookies.set(ADMIN_UNLOCK_COOKIE, "", { ...adminUnlockCookieOptions(), maxAge: 0 });
   return res;
 }

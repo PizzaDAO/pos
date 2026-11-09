@@ -13,7 +13,8 @@
 --     only 'admin' ones, so a session id of one kind can't be replayed as the
 --     other (e.g. an admin unlock id passed as an offline order's session).
 --   * pin_attempt_limits + begin_pin_limit_attempt / release_pin_limit_attempt:
---     per-DEVICE (device login) and per-LOCATION PIN attempt budgets, on top of
+--     per-DEVICE (a browser id under the device login) and per-LOCATION PIN
+--     attempt budgets, on top of
 --     the per-staff lockout (begin_pin_attempt) and the per-IP rate limit. An
 --     attempt is counted under a row lock BEFORE the PIN is checked; a verified
 --     PIN releases (un-counts) its own attempt, so only unproven attempts spend
@@ -45,7 +46,7 @@ begin
       check (
         (contact_email is null or char_length(contact_email) <= 254)
         and (contact_phone is null or char_length(contact_phone) <= 32)
-      );
+      ) not valid;
   end if;
 end
 $$;
@@ -103,10 +104,15 @@ begin
   ) then
     alter table public.terminal_staff_sessions
       add constraint terminal_staff_sessions_kind_chk
-      check (kind in ('till', 'admin'));
+      check (kind in ('till', 'admin')) not valid;
   end if;
 end
 $$;
+-- Added NOT VALID (no long scan under the ACCESS EXCLUSIVE lock), then
+-- validated under the weaker SHARE UPDATE EXCLUSIVE lock. Re-validating an
+-- already valid constraint is a no-op, so this stays re-runnable.
+alter table public.staff validate constraint staff_contact_len_chk;
+alter table public.terminal_staff_sessions validate constraint terminal_staff_sessions_kind_chk;
 
 -- "Last sign-in" in Admin > Staff reads the newest session per staff member.
 create index if not exists terminal_staff_sessions_staff_idx

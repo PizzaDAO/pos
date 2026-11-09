@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DEMO_TENANT_ID, getPosDriver } from "@/lib/db";
 import { hashPin, verifyPin } from "@/lib/auth/pin";
 import {
+  checkPinIssue,
   checkStaffChange,
   cleanEmail,
   cleanName,
@@ -191,6 +192,43 @@ describe("issueStaffPin", () => {
         FURIO,
         () => 739204,
       ),
+    ).toBeNull();
+  });
+});
+
+describe("checkPinIssue (bootstrap)", () => {
+  const base = { ownerHasPin: false, gateOn: false, recentSignIn: true };
+  it("no manager PIN before an owner has one", () => {
+    expect(checkPinIssue({ ...base, role: "manager" })?.status).toBe(409);
+    expect(
+      checkPinIssue({
+        ...base,
+        role: "manager",
+        ownerHasPin: true,
+        gateOn: true,
+      }),
+    ).toBeNull();
+  });
+  it("the PIN that turns the gate on needs a recent sign-in", () => {
+    expect(
+      checkPinIssue({ ...base, role: "owner", recentSignIn: false }),
+    ).toMatchObject({
+      status: 401,
+      code: "reauth_required",
+    });
+    expect(checkPinIssue({ ...base, role: "owner" })).toBeNull();
+    // Once on, resets happen inside the PIN-gated back office.
+    expect(
+      checkPinIssue({
+        ...base,
+        role: "owner",
+        gateOn: true,
+        recentSignIn: false,
+      }),
+    ).toBeNull();
+    // Cashier/kitchen PINs never turn it on.
+    expect(
+      checkPinIssue({ ...base, role: "cashier", recentSignIn: false }),
     ).toBeNull();
   });
 });

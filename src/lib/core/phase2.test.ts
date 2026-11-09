@@ -784,6 +784,30 @@ describe("4. staff.setPin", () => {
     expect((await verify(FURIO, "4444")).status).toBe(403);
   });
 
+  it("setting or clearing a PIN signs the member out of the till and the back office", async () => {
+    const driver = getPosDriver();
+    const open = async (id: string, kind: "till" | "admin") =>
+      driver.createStaffSession({
+        id,
+        user_id: "device-user",
+        tenant_id: DEMO_TENANT_ID,
+        staff_id: FURIO,
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        revoked_at: null,
+        kind,
+      });
+    await open("9a7e0000-0000-4000-8000-000000000001", "till");
+    await open("9a7e0000-0000-4000-8000-000000000002", "admin");
+    expect((await set(FURIO, "4321")).status).toBe(200);
+    for (const id of ["9a7e0000-0000-4000-8000-000000000001", "9a7e0000-0000-4000-8000-000000000002"]) {
+      expect((await driver.getStaffSession(id))?.revoked_at).toBeTruthy();
+    }
+    await open("9a7e0000-0000-4000-8000-000000000003", "till");
+    expect((await set(FURIO, null)).status).toBe(200);
+    expect((await driver.getStaffSession("9a7e0000-0000-4000-8000-000000000003"))?.revoked_at).toBeTruthy();
+  });
+
   it("null clears the PIN", async () => {
     await set(FURIO, "4321");
     const r = await set(FURIO, null);

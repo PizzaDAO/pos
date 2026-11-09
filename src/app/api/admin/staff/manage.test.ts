@@ -24,7 +24,8 @@ import {
   getPosDriver,
 } from "@/lib/db";
 import { resetMockPinState } from "@/lib/db/mock";
-import { verifyPin } from "@/lib/auth/pin";
+import { hashPin, verifyPin } from "@/lib/auth/pin";
+import { POST as ownerPinPOST } from "@/app/api/admin/owner-pin/route";
 import { ADMIN_UNLOCK_COOKIE } from "@/lib/auth/admin-gate";
 import { POST as unlockPOST } from "@/app/api/admin/unlock/route";
 import { POST as tillPOST } from "@/app/api/terminal/pin/route";
@@ -131,10 +132,15 @@ const till = (staffId: string, pin: string) =>
     }),
   );
 
+const TONY_PIN = "739204";
+const CARMELA_PIN = "482915";
+
 beforeEach(async () => {
   resetMockPinState();
   session.user = device;
-  await unlockAs(TONY, "1111");
+  await getPosDriver().setStaffPinHash(T, TONY, hashPin(TONY_PIN));
+  await getPosDriver().setStaffPinHash(T, CARMELA, hashPin(CARMELA_PIN));
+  await unlockAs(TONY, TONY_PIN);
 });
 
 describe("owner manages staff", () => {
@@ -349,7 +355,7 @@ describe("owner manages staff", () => {
       (await post({ action: "update", staffId: TONY, role: "manager" })).status,
     ).toBe(200);
     // Now Livia is the last owner (Tony's own unlock ended with his role change).
-    await unlockAs(CARMELA, "2222");
+    await unlockAs(CARMELA, CARMELA_PIN);
     expect(
       (await post({ action: "deactivate", staffId: liviaId })).status,
     ).toBe(403);
@@ -361,7 +367,7 @@ describe("owner manages staff", () => {
 
 describe("manager limits", () => {
   beforeEach(async () => {
-    await unlockAs(CARMELA, "2222");
+    await unlockAs(CARMELA, CARMELA_PIN);
   });
 
   it("the acting role is the PIN staff member's, not the owner device login's", async () => {
@@ -423,5 +429,125 @@ describe("manager limits", () => {
         (e) => e.detail?.includes(id) && e.actor_label.includes("Carmela M."),
       ),
     ).toBe(true);
+  });
+});
+
+describe("bootstrap: the first gating PIN", () => {
+  // No owner/manager PIN yet: the gate is off and the device role (owner) acts.
+  beforeEach(async () => {
+    cookie = "";
+    await getPosDriver().setStaffPinHash(T, TONY, null);
+    await getPosDriver().setStaffPinHash(T, CARMELA, null);
+  });
+
+  it("must be an owner's: no manager PIN while no owner has one", async () => {
+    session.user = { ...device, authAt: Date.now() };
+    const r = await post({ action: "resetPin", staffId: CARMELA });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toMatch(/owner a PIN first/);
+    expect(
+      (
+        await post({
+          action: "create",
+          name: "New Mgr",
+          role: "manager",
+          issuePin: true,
+        })
+      ).status,
+    ).toBe(409);
+    // Cashier/kitchen PINs don't turn the gate on: fine without a recent sign-in.
+    session.user = device;
+    expect((await post({ action: "resetPin", staffId: CHRIS })).status).toBe(
+      200,
+    );
+  });
+
+  it("needs a recent account sign-in, then turns the gate on", async () => {
+    session.user = { ...device, authAt: Date.now() - 11 * 60_000 };
+    const stale = await post({ action: "resetPin", staffId: TONY });
+    expect(stale.status).toBe(401);
+    expect(stale.body.code).toBe("reauth_required");
+    expect((await getPosDriver().getStaffById(T, TONY))?.pin_hash).toBeNull();
+
+    session.user = { ...device, authAt: Date.now() - 60_000 };
+    const ok = await post({ action: "resetPin", staffId: TONY });
+    expect(ok.status).toBe(200);
+    // The gate is on now: without an unlock the staff API refuses.
+    const after = await post({ action: "resetPin", staffId: CHRIS });
+    expect(after.body.code).toBe("admin_pin_required");
+    // …and with the new owner PIN it unlocks; now a manager PIN may be issued.
+    await unlockAs(TONY, ok.body.pin as string);
+    expect((await post({ action: "resetPin", staffId: CARMELA })).status).toBe(
+      200,
+    );
+  });
+
+  describe("/api/admin/owner-pin (never gated)", () => {
+    const ownerPin = (staffId: string) =>
+      ownerPinPOST(
+        new Request("http://localhost/api/admin/owner-pin", {
+          method: "POST",
+          body: JSON.stringify({ tenantId: T, staffId }),
+        }),
+      );
+
+    it("an owner device session with a recent sign-in sets a pin-less owner's first PIN, even with the gate on", async () => {
+      // Gate on through a manager PIN (e.g. set by the hub) but no owner PIN.
+      await getPosDriver().setStaffPinHash(T, CARMELA, hashPin(CARMELA_PIN));
+      session.user = device;
+      const stale = await ownerPin(TONY);
+      expect(stale.status).toBe(401);
+      expect(((await stale.json()) as { code: string }).code).toBe(
+        "reauth_required",
+      );
+
+      session.user = { ...device, authAt: Date.now() };
+      const res = await ownerPin(TONY);
+      expect(res.status).toBe(200);
+      const { pin } = (await res.json()) as { pin: string };
+      expect(pin).toMatch(/^\d{6}$/);
+      expect(
+        verifyPin(pin, (await getPosDriver().getStaffById(T, TONY))?.pin_hash),
+      ).toBe(true);
+      // Never replaces an existing PIN.
+      expect((await ownerPin(TONY)).status).toBe(409);
+      expect(
+        (await audit("staff_pin_reset")).some((e) =>
+          e.detail?.includes("first PIN"),
+        ),
+      ).toBe(true);
+    });
+
+    it("only for an owner login and an owner staff row", async () => {
+      session.user = { ...device, authAt: Date.now() };
+      expect((await ownerPin(CHRIS)).status).toBe(409);
+      session.user = {
+        ...device,
+        authAt: Date.now(),
+        memberships: [{ ...device.memberships[0]!, role: "manager" }],
+      };
+      expect((await ownerPin(TONY)).status).toBe(403);
+    });
+  });
+});
+
+describe("concurrent staff changes", () => {
+  it("a deadlock / serialization failure is a 409 'try again', not a 500", async () => {
+    const driver = getPosDriver();
+    for (const code of ["40P01", "40001"]) {
+      const spy = vi
+        .spyOn(driver, "updateStaffProfile")
+        .mockRejectedValueOnce(
+          Object.assign(new Error("Supabase: deadlock detected"), { code }),
+        );
+      const r = await post({
+        action: "update",
+        staffId: CHRIS,
+        name: "Christopher X",
+      });
+      expect(r.status).toBe(409);
+      expect(r.body.error).toMatch(/Try again/);
+      spy.mockRestore();
+    }
   });
 });

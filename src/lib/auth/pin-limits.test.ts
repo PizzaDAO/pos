@@ -21,10 +21,13 @@ import { resetMockPinState } from "@/lib/db/mock";
 import { POST as pinPOST } from "@/app/api/terminal/pin/route";
 import { POST as unlockPOST } from "@/app/api/admin/unlock/route";
 import {
+  DEVICE_COOKIE,
   PIN_DEVICE_LIMIT,
   PIN_LOCATION_LIMIT,
   locationKey,
+  mintDeviceCookie,
 } from "./pin-attempt";
+import { hashPin } from "./pin";
 
 const T = DEMO_TENANT_ID;
 const TONY = "80000000-0000-0000-0000-000000000001";
@@ -51,13 +54,37 @@ function device(id: string): SessionUser {
   };
 }
 
-const till = (staffId: string, pin: string, locationId?: string) =>
+const till = (
+  staffId: string,
+  pin: string,
+  locationId?: string,
+  deviceCookie?: string,
+) =>
   pinPOST(
     new Request("http://localhost/api/terminal/pin", {
       method: "POST",
+      headers: deviceCookie
+        ? { cookie: `${DEVICE_COOKIE}=${deviceCookie}` }
+        : {},
       body: JSON.stringify({ staffId, pin, locationId }),
     }),
   );
+
+const unlock = (staffId: string, pin: string, deviceCookie?: string) =>
+  unlockPOST(
+    new Request("http://localhost/api/admin/unlock", {
+      method: "POST",
+      headers: deviceCookie
+        ? { cookie: `${DEVICE_COOKIE}=${deviceCookie}` }
+        : {},
+      body: JSON.stringify({ tenantId: T, staffId, pin }),
+    }),
+  );
+
+const deviceCookieOf = (res: Response) =>
+  new RegExp(`${DEVICE_COOKIE}=([^;]+)`).exec(
+    res.headers.get("set-cookie") ?? "",
+  )?.[1];
 
 beforeEach(() => {
   resetMockPinState();
@@ -220,5 +247,86 @@ describe("driver budget (mirrors begin_pin_limit_attempt)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+describe("per-browser device budget (tills share the owner login)", () => {
+  /** Lock the budget of the browser holding `cookie` (or the no-cookie bucket). */
+  async function exhaust(cookie?: string) {
+    for (let i = 0; i < PIN_DEVICE_LIMIT.max; i++) {
+      await till(STAFF[i % STAFF.length]!, "9999", undefined, cookie);
+      for (const st of STAFF) await getPosDriver().clearPinAttempts(T, st);
+    }
+  }
+
+  it("bad guesses on one till don't lock PIN entry on another till signed in as the same owner", async () => {
+    const tillA = mintDeviceCookie()!;
+    const tillB = mintDeviceCookie()!;
+    await exhaust(tillA);
+    expect((await till(CHRIS, "3333", undefined, tillA)).status).toBe(423);
+    expect((await till(CHRIS, "3333", undefined, tillB)).status).toBe(200);
+  });
+
+  it("a device id is handed out only on a successful PIN; browsers without one share a bucket", async () => {
+    const bad = await till(CHRIS, "9999");
+    expect(bad.status).toBe(401);
+    expect(deviceCookieOf(bad)).toBeUndefined();
+    const good = await till(CHRIS, "3333");
+    expect(good.status).toBe(200);
+    const issued = deviceCookieOf(good);
+    expect(issued).toBeTruthy();
+    expect(good.headers.get("set-cookie")).toMatch(
+      /pos_device=[^;]+;.*HttpOnly/i,
+    );
+
+    // Clearing the cookie doesn't buy a fresh budget: no-cookie requests share one.
+    await exhaust(undefined);
+    expect((await till(CHRIS, "3333")).status).toBe(423);
+    // A forged id counts as no id.
+    expect(
+      (await till(CHRIS, "3333", undefined, "a".repeat(32) + ".beef")).status,
+    ).toBe(423);
+    // The browser that earned an id keeps its own budget.
+    expect(
+      (await till(CHRIS, "3333", undefined, decodeURIComponent(issued!)))
+        .status,
+    ).toBe(200);
+  });
+});
+
+describe("admin unlock: an owner is never locked out by the device/location budgets", () => {
+  const TONY_PIN = "739204";
+  const CARMELA_PIN = "482915";
+  beforeEach(async () => {
+    await getPosDriver().setStaffPinHash(T, TONY, hashPin(TONY_PIN));
+    await getPosDriver().setStaffPinHash(T, CARMELA, hashPin(CARMELA_PIN));
+  });
+
+  it("device budget spent: owner unlocks, manager is refused", async () => {
+    for (let i = 0; i < PIN_DEVICE_LIMIT.max; i++) {
+      await till(STAFF[i % STAFF.length]!, "9999");
+      for (const st of STAFF) await getPosDriver().clearPinAttempts(T, st);
+    }
+    expect((await unlock(CARMELA, CARMELA_PIN)).status).toBe(423);
+    expect((await unlock(TONY, TONY_PIN)).status).toBe(200);
+  });
+
+  it("location budget spent: owner still unlocks", async () => {
+    const driver = getPosDriver();
+    for (let i = 0; i <= PIN_LOCATION_LIMIT.max; i++) {
+      await driver.beginPinLimitAttempt(
+        "location",
+        locationKey(T, null),
+        PIN_LOCATION_LIMIT,
+      );
+    }
+    expect((await unlock(CARMELA, CARMELA_PIN)).status).toBe(423);
+    expect((await unlock(TONY, TONY_PIN)).status).toBe(200);
+  });
+
+  it("the owner's own per-staff lockout still applies", async () => {
+    for (let i = 0; i < 5; i++)
+      expect((await unlock(TONY, "000001")).status).toBe(401);
+    expect((await unlock(TONY, TONY_PIN)).status).toBe(423);
   });
 });

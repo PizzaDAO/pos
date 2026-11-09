@@ -10,7 +10,10 @@
  *        PIN (same device / location / per-staff budgets as the till; see
  *        src/lib/auth/pin-attempt.ts) and open a 10-minute unlock: a server-side
  *        session of kind 'admin' + an httpOnly signed cookie. 401 wrong PIN,
- *        403 not an owner/manager, 423 locked.
+ *        403 not an owner/manager, 423 locked. An OWNER is never kept out by
+ *        the device/location budgets, only by their own per-staff lockout.
+ *        An owner/manager PIN shorter than 6 digits is replaced first: the
+ *        server issues a new 6-digit PIN, returned ONCE as `newPin`.
  * DELETE ?tenantId= → Lock: revoke the unlock and clear the cookie.
  *
  * See src/lib/auth/admin-gate.ts. No env vars required (mock driver).
@@ -18,7 +21,13 @@
 import { NextResponse } from "next/server";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { isValidPinFormat } from "@/lib/auth/pin";
-import { attemptStaffPin } from "@/lib/auth/pin-attempt";
+import {
+  DEVICE_COOKIE,
+  attemptStaffPin,
+  deviceCookieOptions,
+} from "@/lib/auth/pin-attempt";
+import { getPosDriver } from "@/lib/db";
+import { ISSUED_PIN_LENGTH, issueStaffPin } from "@/lib/staff/manage";
 import { readCookie } from "@/lib/auth/active-staff";
 import {
   ADMIN_PIN_ROLES,
@@ -86,16 +95,39 @@ export async function POST(request: Request) {
   }
 
   const attempt = await attemptStaffPin({
+    request,
     user: auth.user,
     tenantIds: [auth.tenantId],
     staffId: b.staffId,
     pin: b.pin,
     locationId: b.locationId,
     roles: ADMIN_PIN_ROLES,
+    ownerBypass: true,
     context: "Back-office unlock",
   });
   if (!attempt.ok) return attempt.res;
   const staff = attempt.staff;
+
+  // A short owner/manager PIN guards the whole back office: replace it with a
+  // server-issued 6-digit one before unlocking (shown once, below).
+  let newPin: string | null = null;
+  if (b.pin.length < ISSUED_PIN_LENGTH) {
+    newPin = await issueStaffPin(auth.tenantId, staff.id);
+    if (!newPin) {
+      return NextResponse.json({ error: "Staff not found." }, { status: 404 });
+    }
+    // The old PIN's till sessions end with it.
+    await getPosDriver().revokeStaffSessionsForStaff(auth.tenantId, staff.id);
+    await recordAudit({
+      actor: {
+        id: auth.user.id,
+        label: `${auth.user.email} (PIN: ${staff.name})`,
+      },
+      action: "staff_pin_reset",
+      tenantId: auth.tenantId,
+      detail: `Replaced the short PIN of staff ${staff.id} "${staff.name}" with a 6-digit PIN at back-office unlock.`,
+    });
+  }
 
   // One unlock per device: replace any previous one.
   await revokeAdminUnlock(request);
@@ -117,10 +149,21 @@ export async function POST(request: Request) {
     detail: `Back office unlocked by ${staff.name} (${staff.role}) until ${opened.expiresAt}.`,
   });
 
-  const res = NextResponse.json({
-    staff: { id: staff.id, name: staff.name, role: staff.role },
-    expiresAt: opened.expiresAt,
-  });
+  const res = NextResponse.json(
+    {
+      staff: { id: staff.id, name: staff.name, role: staff.role },
+      expiresAt: opened.expiresAt,
+      ...(newPin ? { newPin } : {}),
+    },
+    { headers: { "Cache-Control": "no-store" } },
+  );
+  if (attempt.newDeviceCookie) {
+    res.cookies.set(
+      DEVICE_COOKIE,
+      attempt.newDeviceCookie,
+      deviceCookieOptions(),
+    );
+  }
   res.cookies.set(
     ADMIN_UNLOCK_COOKIE,
     opened.cookie,

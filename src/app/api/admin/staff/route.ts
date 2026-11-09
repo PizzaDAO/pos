@@ -44,7 +44,11 @@ import {
   type Staff,
   type StaffProfilePatch,
 } from "@/lib/db";
-import { requireAdminAccess, type AdminActor } from "@/lib/auth/admin-gate";
+import {
+  recentlySignedIn,
+  requireAdminAccess,
+  type AdminActor,
+} from "@/lib/auth/admin-gate";
 import { isMoneyCents, recordAudit } from "@/lib/security";
 import { STAFF_MODULE_ROLES, normalizeModuleRoles } from "@/lib/db";
 import {
@@ -54,6 +58,8 @@ import {
   cleanPhone,
   isStaffRole,
   issueStaffPin,
+  checkPinIssue,
+  ownerHasPin,
   type StaffChange,
 } from "@/lib/staff/manage";
 
@@ -163,6 +169,36 @@ async function cleanLocationIds(
   return ids.every((id) => typeof id === "string" && known.has(id))
     ? (ids as string[])
     : false;
+}
+
+/** A deadlock / serialization failure (Postgres 40P01 / 40001): retryable → 409. */
+function isRetryableDbError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code;
+  return (
+    code === "40P01" ||
+    code === "40001" ||
+    /deadlock detected|could not serialize access/i.test(err.message)
+  );
+}
+
+/** The bootstrap rules for issuing a PIN to a member with `role` (manage.ts). */
+async function pinIssueRefusal(
+  auth: ManageAuth,
+  role: MembershipRole,
+): Promise<NextResponse | null> {
+  const why = checkPinIssue({
+    role,
+    ownerHasPin: await ownerHasPin(auth.tenantId),
+    gateOn: auth.actor.gated,
+    recentSignIn: recentlySignedIn(auth.user),
+  });
+  return why
+    ? NextResponse.json(
+        { error: why.error, ...(why.code ? { code: why.code } : {}) },
+        { status: why.status },
+      )
+    : null;
 }
 
 /** Owner-safe failure of the DB "keep an owner" trigger → 409. */
@@ -284,6 +320,9 @@ export async function POST(request: Request) {
     try {
       return await manage(body, { ...auth, tenantId });
     } catch (err) {
+      if (isRetryableDbError(err)) {
+        return deny(409, "Someone else changed staff at the same time. Try again.");
+      }
       if (isLastOwnerError(err)) {
         return deny(409, "This is the last owner. Make someone else an owner first.");
       }
@@ -411,7 +450,7 @@ export async function POST(request: Request) {
 
 type ManageAuth = {
   tenantId: string;
-  user: { id: string; email: string };
+  user: { id: string; email: string; authAt?: number | null };
   actor: AdminActor;
 };
 
@@ -444,6 +483,10 @@ async function manage(body: StaffBody, auth: ManageAuth): Promise<NextResponse> 
     if (locationIds === false) return deny(422, "Unknown location.");
     const refused = await refuse(auth.actor, tenantId, { kind: "create", role });
     if (refused) return refused;
+    if (body.issuePin === true) {
+      const pinRefused = await pinIssueRefusal(auth, role);
+      if (pinRefused) return pinRefused;
+    }
 
     const created = await driver.upsertStaff({
       id: randomUUID(),
@@ -494,6 +537,8 @@ async function manage(body: StaffBody, auth: ManageAuth): Promise<NextResponse> 
   if (body.action === "resetPin") {
     const refused = await refuse(auth.actor, tenantId, { kind: "resetPin", target });
     if (refused) return refused;
+    const pinRefused = await pinIssueRefusal(auth, target.role);
+    if (pinRefused) return pinRefused;
     const pin = await issueStaffPin(tenantId, target.id);
     if (!pin) return deny(404, "Staff not found.");
     // Whoever was signed in on the old PIN is signed out.

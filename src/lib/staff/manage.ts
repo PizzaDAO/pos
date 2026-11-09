@@ -188,3 +188,55 @@ export async function issueStaffPin(
   }
   throw new Error("Could not issue a unique PIN. Try again.");
 }
+
+// ---- PIN bootstrap -----------------------------------------------------------------
+
+/** How recent an account sign-in must be to issue the first gating PIN. */
+export const RECENT_SIGN_IN_MS = 10 * 60 * 1000;
+
+/** Machine-readable code: the UI asks the person to sign in again. */
+export const REAUTH_REQUIRED = "reauth_required";
+
+/**
+ * May a PIN be issued to a member with `role`? null = yes; otherwise the
+ * refusal. Bootstrap rules (the back-office gate turns on with the first
+ * owner/manager PIN, see src/lib/auth/admin-gate.ts):
+ *   - the first gating PIN must be an OWNER's: no manager PIN while no active
+ *     owner has one (else a manager's PIN would lock the owner out);
+ *   - issuing the PIN that turns the gate on needs a recent account sign-in
+ *     (`recentSignIn`), so a cashier at a till left signed in as the owner
+ *     can't mint the owner a PIN they then know.
+ */
+export function checkPinIssue(input: {
+  role: MembershipRole;
+  ownerHasPin: boolean;
+  gateOn: boolean;
+  recentSignIn: boolean;
+}): { status: 401 | 409; error: string; code?: string } | null {
+  if (input.role === "manager" && !input.ownerHasPin) {
+    return {
+      status: 409,
+      error: "Give an owner a PIN first. Manager PINs come after the owner's.",
+    };
+  }
+  const turnsGateOn =
+    !input.gateOn && (input.role === "owner" || input.role === "manager");
+  if (turnsGateOn && !input.recentSignIn) {
+    return {
+      status: 401,
+      error: "Sign in again to set the first owner PIN (for your security).",
+      code: REAUTH_REQUIRED,
+    };
+  }
+  return null;
+}
+
+/** Does the tenant have an ACTIVE owner with a PIN? */
+export async function ownerHasPin(tenantId: string): Promise<boolean> {
+  const driver = getPosDriver();
+  const [staff, withPin] = await Promise.all([
+    driver.listStaff(tenantId),
+    driver.listStaffWithPin(tenantId),
+  ]);
+  return staff.some((s) => s.active && s.role === "owner" && withPin.has(s.id));
+}

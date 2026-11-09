@@ -44,17 +44,24 @@ export async function GET(request: Request) {
   const locationId = auth.locationId as string;
   const driver = getPosDriver();
   const deliveries = await driver.listDeliveries(tenantId, locationId);
-  // Enrich each with its order number for the dispatch board.
-  const rows = await Promise.all(
-    deliveries.map(async (d) => {
-      const order = await driver.getOrder(d.order_id);
-      return {
-        delivery: d,
-        orderNumber: order?.order_number ?? null,
-        orderStatus: order?.status ?? null,
-      };
-    }),
+  // Enrich each with its order number for the dispatch board. One batched read
+  // (getOrdersByIds chunks 100 ids per query) instead of a getOrder per row.
+  const ordersById = new Map(
+    (
+      await driver.getOrdersByIds(
+        tenantId,
+        deliveries.map((d) => d.order_id),
+      )
+    ).map((o) => [o.id, o]),
   );
+  const rows = deliveries.map((d) => {
+    const order = ordersById.get(d.order_id);
+    return {
+      delivery: d,
+      orderNumber: order?.order_number ?? null,
+      orderStatus: order?.status ?? null,
+    };
+  });
   return NextResponse.json(
     { deliveries: rows, serverTime: new Date().toISOString() },
     { headers: { "Cache-Control": "no-store" } },
