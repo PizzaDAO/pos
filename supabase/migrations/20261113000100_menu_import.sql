@@ -225,44 +225,32 @@ begin
     raise exception 'import_menu: row not found';
   end if;
 
-  -- Everything that goes with a deleted parent.
-  select coalesce(array_agg(distinct id), '{}') into d_items from (
-    select unnest(d_items) as id
-    union select id from public.menu_items where category_id = any(d_cats) and tenant_id = p_tenant_id
-  ) t;
-  select coalesce(array_agg(distinct id), '{}') into d_sizes from (
-    select unnest(d_sizes) as id
-    union select id from public.item_sizes where item_id = any(d_items)
-  ) t;
-  select coalesce(array_agg(distinct id), '{}') into d_mods from (
-    select unnest(d_mods) as id
-    union select id from public.modifiers where group_id = any(d_groups)
-  ) t;
+  -- ---------------------------------------------------------------- inserts
+  if exists (select 1 from jsonb_populate_recordset(null::public.menu_categories, v_cats) r
+              where r.tenant_id is distinct from p_tenant_id)
+     or exists (select 1 from jsonb_populate_recordset(null::public.menu_items, v_items) r
+              where r.tenant_id is distinct from p_tenant_id)
+     or exists (select 1 from jsonb_populate_recordset(null::public.modifier_groups, v_groups) r
+              where r.tenant_id is distinct from p_tenant_id) then
+    raise exception 'import_menu: row belongs to another tenant';
+  end if;
 
-  delete from public.item_inventory_links
-   where tenant_id = p_tenant_id
-     and ((source_type = 'item' and source_id = any(d_items))
-       or (source_type = 'modifier' and source_id = any(d_mods)));
-  delete from public.menu_allergen_rows
-   where tenant_id = p_tenant_id
-     and ((target_type = 'item' and target_id = any(d_items))
-       or (target_type = 'size' and target_id = any(d_sizes))
-       or (target_type = 'modifier' and target_id = any(d_mods)));
-  delete from public.item_modifier_groups l
-   using jsonb_to_recordset(coalesce(del -> 'itemModifierGroups', '[]'::jsonb)) as r(item_id uuid, group_id uuid)
-   where l.item_id = r.item_id and l.group_id = r.group_id
-     and exists (select 1 from public.menu_items i where i.id = l.item_id and i.tenant_id = p_tenant_id);
-  delete from public.item_sizes where id = any(d_sizes);
-  delete from public.modifiers where id = any(d_mods);
-  delete from public.menu_items where id = any(d_items) and tenant_id = p_tenant_id;
-  delete from public.menu_categories where id = any(d_cats) and tenant_id = p_tenant_id;
-  delete from public.modifier_groups where id = any(d_groups) and tenant_id = p_tenant_id;
-  -- After the targets are gone, so core_trg_menu_overrides emits nothing for them.
-  delete from public.location_menu_overrides
-   where tenant_id = p_tenant_id
-     and target_id = any(d_items || d_sizes || d_mods);
+  -- Parents first (new categories / modifier groups), so updates below can
+  -- move items into them. The preview was built from a snapshot: if a name now
+  -- exists the menu changed (or a duplicate apply raced us): refuse, don't
+  -- duplicate.
+  if exists (select 1 from jsonb_populate_recordset(null::public.menu_categories, v_cats) r
+               join public.menu_categories c on c.tenant_id = p_tenant_id and lower(btrim(c.name)) = lower(btrim(r.name)))
+     or exists (select 1 from jsonb_populate_recordset(null::public.modifier_groups, v_groups) r
+               join public.modifier_groups g on g.tenant_id = p_tenant_id and lower(btrim(g.name)) = lower(btrim(r.name))) then
+    raise exception 'import_menu: menu changed while importing, preview again';
+  end if;
+  insert into public.menu_categories
+    select * from jsonb_populate_recordset(null::public.menu_categories, v_cats);
+  insert into public.modifier_groups
+    select * from jsonb_populate_recordset(null::public.modifier_groups, v_groups);
 
-  -- ---------------------------------------------------------------- updates
+  -- ---------------------------------------------------------------- updates (ids kept)
   update public.menu_categories c set name = r.name, sort_order = r.sort_order
     from jsonb_to_recordset(coalesce(upd -> 'categories', '[]'::jsonb)) as r(id uuid, name text, sort_order integer)
    where c.id = r.id and c.tenant_id = p_tenant_id;
@@ -311,23 +299,49 @@ begin
   get diagnostics n = row_count;
   if n <> jsonb_array_length(coalesce(upd -> 'itemModifierGroups', '[]'::jsonb)) then raise exception 'import_menu: row not found'; end if;
 
-  -- ---------------------------------------------------------------- inserts
-  if exists (select 1 from jsonb_populate_recordset(null::public.menu_categories, v_cats) r
-              where r.tenant_id is distinct from p_tenant_id)
-     or exists (select 1 from jsonb_populate_recordset(null::public.menu_items, v_items) r
-              where r.tenant_id is distinct from p_tenant_id)
-     or exists (select 1 from jsonb_populate_recordset(null::public.modifier_groups, v_groups) r
-              where r.tenant_id is distinct from p_tenant_id) then
-    raise exception 'import_menu: row belongs to another tenant';
-  end if;
+  -- ORDER MATTERS: parents are inserted and updates (incl. items MOVED to
+  -- another or a new category) are applied first, so this cascade sees the
+  -- final category_id and never deletes an item that was moved out of a
+  -- deleted category.
+  -- Everything that goes with a deleted parent.
+  select coalesce(array_agg(distinct id), '{}') into d_items from (
+    select unnest(d_items) as id
+    union select id from public.menu_items where category_id = any(d_cats) and tenant_id = p_tenant_id
+  ) t;
+  select coalesce(array_agg(distinct id), '{}') into d_sizes from (
+    select unnest(d_sizes) as id
+    union select id from public.item_sizes where item_id = any(d_items)
+  ) t;
+  select coalesce(array_agg(distinct id), '{}') into d_mods from (
+    select unnest(d_mods) as id
+    union select id from public.modifiers where group_id = any(d_groups)
+  ) t;
 
-  -- The preview was built from a snapshot: if any name now exists, the menu
-  -- changed (or a duplicate apply raced us). Refuse rather than duplicate.
-  if exists (select 1 from jsonb_populate_recordset(null::public.menu_categories, v_cats) r
-               join public.menu_categories c on c.tenant_id = p_tenant_id and lower(btrim(c.name)) = lower(btrim(r.name)))
-     or exists (select 1 from jsonb_populate_recordset(null::public.modifier_groups, v_groups) r
-               join public.modifier_groups g on g.tenant_id = p_tenant_id and lower(btrim(g.name)) = lower(btrim(r.name)))
-     or exists (select 1 from jsonb_populate_recordset(null::public.menu_items, v_items) r
+  delete from public.item_inventory_links
+   where tenant_id = p_tenant_id
+     and ((source_type = 'item' and source_id = any(d_items))
+       or (source_type = 'modifier' and source_id = any(d_mods)));
+  delete from public.menu_allergen_rows
+   where tenant_id = p_tenant_id
+     and ((target_type = 'item' and target_id = any(d_items))
+       or (target_type = 'size' and target_id = any(d_sizes))
+       or (target_type = 'modifier' and target_id = any(d_mods)));
+  delete from public.item_modifier_groups l
+   using jsonb_to_recordset(coalesce(del -> 'itemModifierGroups', '[]'::jsonb)) as r(item_id uuid, group_id uuid)
+   where l.item_id = r.item_id and l.group_id = r.group_id
+     and exists (select 1 from public.menu_items i where i.id = l.item_id and i.tenant_id = p_tenant_id);
+  delete from public.item_sizes where id = any(d_sizes);
+  delete from public.modifiers where id = any(d_mods);
+  delete from public.menu_items where id = any(d_items) and tenant_id = p_tenant_id;
+  delete from public.menu_categories where id = any(d_cats) and tenant_id = p_tenant_id;
+  delete from public.modifier_groups where id = any(d_groups) and tenant_id = p_tenant_id;
+  -- After the targets are gone, so core_trg_menu_overrides emits nothing for them.
+  delete from public.location_menu_overrides
+   where tenant_id = p_tenant_id
+     and target_id = any(d_items || d_sizes || d_mods);
+
+  -- ---------------------------------------------------------------- child inserts
+  if exists (select 1 from jsonb_populate_recordset(null::public.menu_items, v_items) r
                join public.menu_items i on i.category_id = r.category_id and lower(btrim(i.name)) = lower(btrim(r.name)))
      or exists (select 1 from jsonb_populate_recordset(null::public.item_sizes, v_sizes) r
                join public.item_sizes s on s.item_id = r.item_id and lower(btrim(s.name)) = lower(btrim(r.name)))
@@ -338,10 +352,6 @@ begin
     raise exception 'import_menu: menu changed while importing, preview again';
   end if;
 
-  insert into public.menu_categories
-    select * from jsonb_populate_recordset(null::public.menu_categories, v_cats);
-  insert into public.modifier_groups
-    select * from jsonb_populate_recordset(null::public.modifier_groups, v_groups);
   insert into public.menu_items
     select * from jsonb_populate_recordset(null::public.menu_items, v_items);
   insert into public.item_sizes

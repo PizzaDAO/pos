@@ -103,4 +103,38 @@ begin
 end
 $$;
 
+do $$
+declare
+  t uuid := '10000000-0000-0000-0000-000000000001';
+  c_old uuid := gen_random_uuid(); c_keep uuid := gen_random_uuid(); c_new uuid := gen_random_uuid();
+  i1 uuid := gen_random_uuid(); i2 uuid := gen_random_uuid();
+begin
+  insert into public.menu_categories values (c_old, t, 'OldCat', 50), (c_keep, t, 'KeepCat', 51);
+  insert into public.menu_items (id, tenant_id, category_id, name) values (i1, t, c_old, 'MoveMe'), (i2, t, c_old, 'MoveMe2');
+
+  -- replace with renamed category keeps item ids: "OldCat" -> new "NewCat".
+  perform public.import_menu(t, jsonb_build_object(
+    'insert', jsonb_build_object('categories', jsonb_build_array(jsonb_build_object('id', c_new, 'tenant_id', t, 'name', 'NewCat', 'sort_order', 1))),
+    'update', jsonb_build_object('items', jsonb_build_array(
+      jsonb_build_object('id', i1, 'category_id', c_new, 'name', 'MoveMe', 'description', null, 'is_half_and_half_capable', false, 'station', 'oven'))),
+    'delete', jsonb_build_object('categories', jsonb_build_array(c_old), 'items', '[]'::jsonb)));
+  if (select category_id from public.menu_items where id = i1) is distinct from c_new then
+    raise exception 'renamed category: item did not move / lost its id';
+  end if;
+  if exists (select 1 from public.menu_categories where id = c_old) then raise exception 'old category not deleted'; end if;
+
+  -- move into an existing category while the old category is deleted keeps ids.
+  -- (scenario 1 deleted c_old and, by cascade, the unmoved i2: recreate both.)
+  insert into public.menu_categories values (c_old, t, 'OldCat2', 52);
+  insert into public.menu_items (id, tenant_id, category_id, name) values (i2, t, c_old, 'MoveMe2');
+  perform public.import_menu(t, jsonb_build_object(
+    'delete', jsonb_build_object('categories', jsonb_build_array(c_old)),
+    'update', jsonb_build_object('items', jsonb_build_array(
+      jsonb_build_object('id', i2, 'category_id', c_keep, 'name', 'MoveMe2', 'description', null, 'is_half_and_half_capable', false, 'station', 'oven')))));
+  if (select category_id from public.menu_items where id = i2) is distinct from c_keep then
+    raise exception 'move out of a deleted category lost the item';
+  end if;
+end
+$$;
+
 rollback;
