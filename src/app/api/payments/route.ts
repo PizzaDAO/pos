@@ -21,6 +21,7 @@
  * No env vars are required; with none, rails settle via the simulated path.
  */
 import { NextResponse } from "next/server";
+import { MARKETPLACE_NOT_PAYABLE_MESSAGE } from "@/lib/marketplace/guard";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
 import { publicTender } from "@/lib/payments/public";
@@ -113,6 +114,15 @@ export async function POST(request: Request) {
   const order = await driver.getOrder(body.orderId);
   if (!order) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
+  }
+
+  // Paid by the marketplace: no tender of any rail, for anyone (409, before auth
+  // or any tender lookup).
+  if (order.channel === "marketplace") {
+    return NextResponse.json(
+      { error: MARKETPLACE_NOT_PAYABLE_MESSAGE, code: "marketplace_order" },
+      { status: 409 },
+    );
   }
 
   // NEVER trust the client's tenant/location: the order is the source of truth.

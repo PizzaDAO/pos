@@ -1,0 +1,8 @@
+Token,Item Name,Variation Name,SKU,Description,Categories,Reporting Category,SEO Title,SEO Description,Permalink,GTIN,Square Online Item Visibility,Item Type,Weight (lb),Social Media Link Title,Social Media Link Description,Shipping Enabled,Self-serve Ordering Enabled,Delivery Enabled,Pickup Enabled,Price,Online Sale Price,Archived,Sellable,Stockable,Skip Detail Screen in POS,Option Name 1,Option Value 1,Default Unit Cost,Default Vendor Name,Default Vendor Code,Current Quantity Downtown,New Quantity Downtown,Stock Alert Enabled Downtown,Stock Alert Count Downtown,Tax - Sales Tax (8%),Modifier Set - Toppings,Modifier Set - Crust,Mystery Column
+T1,Margherita,Small,,"Tomato, mozzarella, basil",Pizzas,Pizzas,,,,,visible,Prepared food and beverage,,,,N,N,N,N,12.00,,N,Y,N,N,Size,Small,,,,,,,,Y,Y,Y,
+T1,Margherita,Large,,,Pizzas,Pizzas,,,,,visible,Prepared food and beverage,,,,N,N,N,N,18.00,,N,Y,N,N,Size,Large,,,,,,,,Y,Y,Y,
+T2,Pepperoni,Regular,,Classic,Pizzas,Pizzas,,,,,visible,Prepared food and beverage,,,,N,N,N,N,$19.50,,N,Y,N,N,,,,,,,,,,Y,Y,N,
+T3,Cola,Regular,,,Drinks,Drinks,,,,,visible,Prepared food and beverage,,,,N,N,N,N,2.5,,N,Y,N,N,,,,,,,,,,Y,N,N,
+T4,Old Special,Regular,,,Pizzas,Pizzas,,,,,visible,Prepared food and beverage,,,,N,N,N,N,10.00,,Y,Y,N,N,,,,,,,,,,Y,N,N,
+T5,Build Your Own,Regular,,,Pizzas,Pizzas,,,,,visible,Prepared food and beverage,,,,N,N,N,N,,,N,Y,N,N,,,,,,,,,,Y,N,N,
+T6,Tiramisu,Regular,,House made,"Desserts, Sweets","Desserts, Sweets",,,,,visible,Prepared food and beverage,,,,N,N,N,N,7.25,,N,Y,N,N,,,,,,,,,,Y,N,N,x

@@ -65,6 +65,8 @@ export function buildTickets(
 
   return orders
     .filter((o) => active.has(o.status))
+    // A marketplace order the cashier has not accepted yet is not for the kitchen.
+    .filter((o) => o.fulfillment?.marketplace?.acceptance !== "pending")
     .map((order) => {
       const placedMs = new Date(order.created_at).getTime();
       const elapsedSeconds = Math.max(

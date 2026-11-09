@@ -708,6 +708,12 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
   "orders.cancel": async (ctx) => {
     await requireActiveTenant(ctx);
     const order = await ownedOrder(ctx, ctx.params.order_id!);
+    if (order.channel === "marketplace") {
+      // Reject / cancel go through the marketplace flow so the provider is told.
+      throw ProblemError.of("INVALID_TRANSITION", {
+        detail: "A marketplace order is accepted, rejected or cancelled through the marketplace.",
+      });
+    }
     const parsed = OrderCancelInputSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
     if (order.status === "voided") {
@@ -2121,6 +2127,14 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     taxExemptIn = input.tax_exempt || req.tax_exempt;
   }
 
+  // `marketplace` origin is reserved for the provider webhook ingest.
+  if (String(input.source.type) === "marketplace") {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: "source.type `marketplace` is reserved for provider webhook ingest.",
+      path: "source",
+    });
+  }
+
   // Discounts/comps are an owner/manager power in POS: callers need an explicit scope.
   if ((adjustmentsIn?.length ?? 0) > 0) {
     if (!hasLiteralScope(ctx.principal, "orders:discount")) {
@@ -2596,6 +2610,11 @@ async function recordExternalTender(ctx: Ctx): Promise<Reply> {
 
   for (let attempt = 0; attempt < 4; attempt++) {
     const current = await ownedOrder(ctx, order.id);
+    if (current.channel === "marketplace") {
+      throw ProblemError.of("INVALID_TRANSITION", {
+        detail: "This order was paid on the marketplace; it cannot take a payment.",
+      });
+    }
     if (CLOSED_FOR_TENDERS.includes(current.status)) {
       throw ProblemError.of("INVALID_TRANSITION", {
         detail: `Order is ${current.status}; it can no longer take a payment.`,

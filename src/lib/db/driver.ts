@@ -21,6 +21,7 @@ import type {
   OrderStatus,
   OrderTotals,
   StoreSettings,
+  MarketplaceSettings,
 } from "./menu-types";
 import type {
   ConnectAccount,
@@ -100,6 +101,9 @@ import type {
   TenantHealth,
   TenantOnboarding,
 } from "./saas-types";
+
+import type { MenuSnapshot } from "@/lib/menu-import/types";
+import type { ImportChanges } from "@/lib/menu-import/apply";
 
 /** Menu entity kinds addressable by the back-office menu editor. */
 export type MenuEntityKind =
@@ -467,6 +471,45 @@ export interface PosDriver {
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
+
+  /**
+   * Replace a location's marketplace inbox settings (off by default; absent =
+   * off). Creates the store settings row from defaults if it does not exist.
+   */
+  setMarketplaceSettings(
+    tenantId: string,
+    locationId: string,
+    marketplace: MarketplaceSettings,
+  ): Promise<StoreSettings>;
+
+  /**
+   * Locations whose marketplace settings register `storeId` for `provider`
+   * (webhook routing: the provider's store id is the only thing a signed payload
+   * can be trusted to name). More than one hit is a misconfiguration.
+   */
+  findMarketplaceLocations(
+    provider: string,
+    storeId: string,
+  ): Promise<{ tenant_id: string; location_id: string }[]>;
+
+  /**
+   * Platform-admin assignment of a provider store id to a location (null
+   * clears it). One (provider, store id) belongs to one location, enforced by a
+   * unique key: throws `MarketplaceStoreTakenError` when another location holds it.
+   */
+  assignMarketplaceStore(input: {
+    provider: string;
+    tenantId: string;
+    locationId: string;
+    storeId: string | null;
+    assignedBy?: string | null;
+  }): Promise<void>;
+
+  /** Existing marketplace orders for (provider, provider order id), any location. */
+  findMarketplaceOrdersByRef(
+    provider: string,
+    externalId: string,
+  ): Promise<Order[]>;
 
   /**
    * [SHARED: online checkout + terminal card reader] Compare-and-set status
@@ -1260,6 +1303,24 @@ export interface PosDriver {
     entity: MenuEntityKind,
     id: string,
   ): Promise<string | null>;
+
+  /**
+   * Raw (override-free) names + ids of the tenant's whole menu, for the menu
+   * importer's add-mode matching.
+   */
+  getMenuSnapshot(tenantId: string): Promise<MenuSnapshot>;
+
+  /**
+   * Menu import apply. ATOMIC: the whole change set (in-place updates of
+   * matched rows, inserts, and deletes of rows absent from a replace file, plus
+   * the recipe / allergen / override rows of deleted targets) runs in ONE
+   * transaction; any failure rolls everything back. Matched rows keep their ids
+   * so carts, queued orders and recipes keep working; historical orders are
+   * untouched (order lines snapshot name/size/price; item ids have no FK).
+   * Every id and row must belong to `tenantId`, and inserts must not collide
+   * with names already present (a concurrent change): either throws.
+   */
+  applyMenuImport(tenantId: string, changes: ImportChanges): Promise<void>;
 
   listCategories(tenantId: string): Promise<MenuCategory[]>;
   upsertCategory(input: CategoryInput): Promise<MenuCategory>;

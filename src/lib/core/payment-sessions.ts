@@ -564,6 +564,11 @@ async function nextSessionTenderId(driver: PosDriver, orderId: string): Promise<
 
 /** Order statuses a session may be created for: a live hold, or `placed` with a balance. */
 function assertPayable(order: Order, now: Date): void {
+  if (order.channel === "marketplace") {
+    throw ProblemError.of("INVALID_TRANSITION", {
+      detail: "This order was paid on the marketplace; it cannot take a payment.",
+    });
+  }
   switch (order.status) {
     case "draft": {
       if (!order.hold) {

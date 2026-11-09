@@ -23,6 +23,7 @@
  *
  * Money is always integer minor units; nothing here uses floats.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
@@ -224,6 +225,7 @@ function mapStoreSettings(r: Row): StoreSettings {
     kds_thresholds:
       (r.kds_thresholds as StoreSettings["kds_thresholds"]) ?? undefined,
     fulfillment: (r.fulfillment as StoreSettings["fulfillment"]) ?? undefined,
+    marketplace: (r.marketplace as StoreSettings["marketplace"]) ?? undefined,
   };
 }
 
@@ -767,6 +769,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     table: string,
     column: string,
     ids: string[],
+    tieBreak = "id",
   ): Promise<Row[]> {
     const out: Row[] = [];
     for (let i = 0; i < ids.length; i += 100) {
@@ -779,7 +782,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               .select("*")
               .in(column, chunk)
               .order(column)
-              .order("id")
+              .order(tieBreak)
               .range(from, to),
           ) as Row[],
         )),
@@ -1699,6 +1702,99 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         tip_presets_bps: [1500, 1800, 2000],
         kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
       };
+    },
+
+    async setMarketplaceSettings(tenantId, locationId, marketplace) {
+      // Touch ONLY the marketplace column: never rewrite tax/tips/currency from a
+      // possibly stale read.
+      const updated = unwrap(
+        await sb
+          .from("store_settings")
+          .update({ marketplace })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .select(),
+      ) as Row[];
+      if (updated[0]) return mapStoreSettings(updated[0]);
+      // No settings row yet: create it from the defaults.
+      const base = await this.getStoreSettings(tenantId, locationId);
+      const r = unwrap(
+        await sb
+          .from("store_settings")
+          .upsert(
+            {
+              tenant_id: tenantId,
+              location_id: locationId,
+              currency: base.currency,
+              tax_rate_bps: base.tax_rate_bps,
+              tip_presets_bps: base.tip_presets_bps,
+              kds_thresholds: base.kds_thresholds ?? null,
+              marketplace,
+            },
+            { onConflict: "tenant_id,location_id", ignoreDuplicates: true },
+          )
+          .select(),
+      ) as Row[];
+      return r[0] ? mapStoreSettings(r[0]) : { ...base, marketplace };
+    },
+
+    async findMarketplaceLocations(provider, storeId) {
+      const rows = unwrap(
+        await sb
+          .from("marketplace_stores")
+          .select("tenant_id,location_id")
+          .eq("provider", provider)
+          .eq("store_id", storeId)
+          .limit(2),
+      ) as Row[];
+      return rows.map((r) => ({
+        tenant_id: r.tenant_id as string,
+        location_id: r.location_id as string,
+      }));
+    },
+
+    async assignMarketplaceStore(input) {
+      if (input.storeId === null) {
+        unwrap(
+          await sb
+            .from("marketplace_stores")
+            .delete()
+            .eq("provider", input.provider)
+            .eq("location_id", input.locationId),
+        );
+        return;
+      }
+      // ONE upsert on (location_id, provider): it replaces this location's store,
+      // and a clash with another location's store id (primary key) fails the whole
+      // statement, leaving the old assignment intact.
+      const { error } = await sb.from("marketplace_stores").upsert(
+        {
+          provider: input.provider,
+          store_id: input.storeId,
+          tenant_id: input.tenantId,
+          location_id: input.locationId,
+          assigned_by: input.assignedBy ?? null,
+          assigned_at: new Date().toISOString(),
+        },
+        { onConflict: "location_id,provider" },
+      );
+      if (error) {
+        if (error.code === "23505") throw new MarketplaceStoreTakenError();
+        throw new Error(error.message);
+      }
+    },
+
+    async findMarketplaceOrdersByRef(provider, externalId) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .eq("source->>type", "marketplace")
+          .eq("source->>module", provider)
+          .eq("source->>external_ref", externalId)
+          .limit(5),
+      ) as Row[];
+      return readOrderRows(rows);
     },
 
     // -- Orders ------------------------------------------------------------
@@ -3395,6 +3491,99 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         default:
           return null;
       }
+    },
+
+    async getMenuSnapshot(tenantId) {
+      // Every read is paged (PostgREST caps responses at max_rows ~ 1000) and
+      // every `in` list is chunked.
+      const tenantRows = (
+        table: string,
+        cols: string,
+        order: string,
+      ) =>
+        fetchAllPages<Row>(async (from, to) => {
+          let q = sb.from(table).select(cols).eq("tenant_id", tenantId);
+          // Stable total order: every column of the (composite) key.
+          for (const o of order.split(",")) q = q.order(o.trim());
+          return unwrap(await q.range(from, to)) as unknown as Row[];
+        });
+      const [cats, items, groups, recipes, allergens] = await Promise.all([
+        tenantRows("menu_categories", "id,name,sort_order", "id"),
+        tenantRows(
+          "menu_items",
+          "id,category_id,name,description,is_half_and_half_capable,station",
+          "id",
+        ),
+        tenantRows(
+          "modifier_groups",
+          "id,name,min_select,max_select,supports_half",
+          "id",
+        ),
+        tenantRows("item_inventory_links", "id,source_id", "id"),
+        tenantRows("menu_allergen_rows", "publication_id,target_id,target_type", "publication_id,target_type,target_id"),
+      ]);
+      const itemIds = items.map((r) => r.id as string);
+      const groupIds = groups.map((r) => r.id as string);
+      const [sizes, mods, links] = await Promise.all([
+        selectIn("item_sizes", "item_id", itemIds),
+        selectIn("modifiers", "group_id", groupIds),
+        selectIn("item_modifier_groups", "item_id", itemIds, "group_id"),
+      ]);
+      return {
+        categories: cats.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          sort_order: r.sort_order as number,
+        })),
+        items: items.map((r) => ({
+          id: r.id as string,
+          category_id: r.category_id as string,
+          name: r.name as string,
+          description: (r.description as string | null) ?? null,
+          is_half_and_half_capable: r.is_half_and_half_capable as boolean,
+          station: r.station as MenuItem["station"],
+        })),
+        sizes: sizes.map((r) => ({
+          id: r.id as string,
+          item_id: r.item_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        modifierGroups: groups.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          min_select: r.min_select as number,
+          max_select: r.max_select as number,
+          supports_half: r.supports_half as boolean,
+        })),
+        modifiers: mods.map((r) => ({
+          id: r.id as string,
+          group_id: r.group_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        links: links.map((r) => ({
+          item_id: r.item_id as string,
+          group_id: r.group_id as string,
+          sort_order: r.sort_order as number,
+        })),
+        inventoryLinkSourceIds: recipes.map((r) => r.source_id as string),
+        allergenTargetIds: allergens.map((r) => r.target_id as string),
+      };
+    },
+
+    // ONE transaction inside public.import_menu() (migration
+    // 20261113000100): a PostgREST client can't span statements, so the whole
+    // replace/insert runs server-side and rolls back as a unit.
+    async applyMenuImport(tenantId, changes) {
+      unwrap(
+        await sb.rpc("import_menu", {
+          p_tenant_id: tenantId,
+          p_changes: changes,
+        }),
+      );
     },
 
     async listCategories(tenantId) {

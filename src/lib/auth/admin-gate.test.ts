@@ -139,6 +139,7 @@ function requestFor(rel: string, method: string, cookie?: string): Request {
           entity: "category",
           target_type: "item",
           target_id: "gate-item",
+          simulate: true,
           ...(rel === "admin/menu"
             ? { action: "delete", payload: { id: "gate-cat" } }
             : {}),
