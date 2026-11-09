@@ -3,6 +3,7 @@
  * No I/O: the route loads orders + tenders and hands them here.
  */
 import type { Order, Payment } from "@/lib/db";
+import { isAcceptFailed } from "@/lib/marketplace/service";
 import { isFullyRefunded } from "./refund-state";
 import { orderBalanceFromPayments } from "./service";
 
@@ -32,6 +33,10 @@ export interface OpenOrderRow {
     provider: string;
     display_id: string | null;
     acceptance: "pending" | "accepted" | "rejected";
+    /** The accept callback failed at the provider: still pending, retry. */
+    accept_failed?: boolean;
+    /** The provider cancelled an order the kitchen already started. */
+    cancel_requested?: boolean;
   };
 }
 
@@ -63,6 +68,8 @@ export function selectOpenOrders(
             provider: mk.provider,
             display_id: mk.display_id,
             acceptance: mk.acceptance,
+            accept_failed: isAcceptFailed(mk),
+            cancel_requested: !!mk.cancel_requested,
           },
         });
         if (rows.length >= limit) break;

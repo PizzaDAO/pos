@@ -97,7 +97,15 @@ export type ParsedWebhook =
   | { kind: "order"; order: NormalizedOrder }
   /** The webhook only points at the order; call {@link MarketplaceAdapter.fetchOrder}. */
   | { kind: "order_ref"; externalId: string; href: string | null }
-  | { kind: "cancel"; externalId: string; reason: string | null }
+  | {
+      kind: "cancel";
+      externalId: string;
+      reason: string | null;
+      /** Provider event time, when it supplies one (replay window for cancels). */
+      eventTime?: Date | null;
+      /** The provider's store id, when the cancel event carries it. */
+      storeId?: string | null;
+    }
   | { kind: "ignore"; reason: string };
 
 export interface WebhookRequest {

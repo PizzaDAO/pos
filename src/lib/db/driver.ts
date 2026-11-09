@@ -472,6 +472,16 @@ export interface PosDriver {
   ): Promise<StoreSettings>;
 
   /**
+   * Locations whose marketplace settings register `storeId` for `provider`
+   * (webhook routing: the provider's store id is the only thing a signed payload
+   * can be trusted to name). More than one hit is a misconfiguration.
+   */
+  findMarketplaceLocations(
+    provider: string,
+    storeId: string,
+  ): Promise<{ tenant_id: string; location_id: string }[]>;
+
+  /**
    * [SHARED: online checkout + terminal card reader] Compare-and-set status
    * transition: `UPDATE ... WHERE id = ? AND status IN (from) RETURNING`. Returns
    * the updated order, or null when the order is missing or no longer in one of

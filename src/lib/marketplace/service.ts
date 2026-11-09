@@ -1,17 +1,26 @@
 /**
- * Marketplace inbox service: webhook -> verified -> mapped -> idempotent POS
- * order, plus the accept / reject / ready callbacks.
+ * Marketplace inbox service: webhook -> verified -> routed -> mapped ->
+ * idempotent POS order, plus the accept / reject / ready callbacks.
  *
  * Lifecycle (status + `fulfillment.marketplace.acceptance`):
  *   ingest   status `placed`, acceptance `pending`  (terminal list only; the
  *            kitchen board hides it until accepted)
- *   accept   status `paid`, acceptance `accepted`   (kitchen board "New")
- *   reject   status `voided`, acceptance `rejected`
- *   ready    kitchen bump to `ready` -> provider "ready" callback
+ *   accept   provider callback FIRST (a failed callback leaves the order pending
+ *            and flagged "accept failed at provider", retryable); then ONE
+ *            compare-and-set writes status `paid` + acceptance `accepted`
+ *   reject   one compare-and-set to `voided` + acceptance `rejected`, then callback
+ *   ready    kitchen bump to `ready` -> provider "ready" callback, once
+ *   cancel   provider cancel: CAS void only while `placed`/`paid`; past that the
+ *            order is flagged (`cancel_requested`), never voided under the cook
+ *
+ * Routing: the signature is verified with the provider's env secret BEFORE the
+ * body is parsed; the tenant/location is then found by the provider's STORE ID
+ * in the signed payload (never from the URL). A real provider's payload must
+ * name a store id.
  *
  * Payment: the marketplace collects it. These orders carry NO tender; the balance
- * rule (payments/service `orderBalanceFromPayments`) returns 0 for channel
- * `marketplace`, and because no cash tender exists they never reach the drawer.
+ * rule returns 0 for channel `marketplace`, every tender path refuses them
+ * (marketplace/guard), and with no cash tender they never reach the drawer.
  *
  * Inert by default: ingest requires the location's marketplace settings to be
  * enabled, and callbacks only go out when {@link canCallProvider}.
@@ -21,6 +30,7 @@ import type {
   MarketplaceOrderMeta,
   MarketplaceProviderKey,
   Order,
+  OrderFulfillment,
   StoreSettings,
 } from "@/lib/db";
 import { getAdapter } from "./adapters";
@@ -32,6 +42,11 @@ import {
   type NormalizedOrder,
   type ProviderCallResult,
 } from "./types";
+
+/** A provider callback that has not answered in this long is a failure. */
+export const PROVIDER_TIMEOUT_MS = 5000;
+/** Cancel events older than this are rejected (replay window, where the provider gives a time). */
+export const CANCEL_REPLAY_WINDOW_MS = 60 * 60 * 1000;
 
 export function isMarketplaceOrder(order: Pick<Order, "channel">): boolean {
   return order.channel === "marketplace";
@@ -49,6 +64,17 @@ export function isPendingAcceptance(order: Order): boolean {
   );
 }
 
+/** The accept callback failed at the provider: still pending, retryable. */
+export function isAcceptFailed(
+  meta: MarketplaceOrderMeta | null | undefined,
+): boolean {
+  return (
+    meta?.acceptance === "pending" &&
+    meta.last_callback?.action === "accept" &&
+    meta.last_callback.outcome === "failed"
+  );
+}
+
 /** Location enablement: master switch AND the provider's own switch. Off by default. */
 export function isProviderEnabled(
   settings: Pick<StoreSettings, "marketplace">,
@@ -59,7 +85,7 @@ export function isProviderEnabled(
 }
 
 export interface IngestResult {
-  status: "created" | "duplicate" | "ignored" | "cancelled";
+  status: "created" | "duplicate" | "ignored" | "cancelled" | "cancel_flagged";
   orderId?: string;
   accepted?: boolean;
   reason?: string;
@@ -67,13 +93,26 @@ export interface IngestResult {
 
 export interface IngestInput {
   provider: MarketplaceProviderKey;
-  tenantId: string;
-  locationId: string;
   rawBody: string;
   /** Lower-cased header names. */
   headers: Record<string, string>;
+  /**
+   * Trusted internal callers only (the admin simulator button): skip store-id
+   * routing. The public webhook route NEVER sets this.
+   */
+  location?: { tenantId: string; locationId: string };
   fetch?: typeof fetch;
   now?: Date;
+}
+
+/** `fetch` with a hard timeout, so a slow provider can never hang the caller. */
+function withTimeout(
+  f: typeof fetch | undefined,
+  ms = PROVIDER_TIMEOUT_MS,
+): typeof fetch {
+  const base = f ?? fetch;
+  return ((input: RequestInfo | URL, init?: RequestInit) =>
+    base(input, { ...init, signal: AbortSignal.timeout(ms) })) as typeof fetch;
 }
 
 function callCtx(
@@ -86,7 +125,7 @@ function callCtx(
     tenantId: o.tenant_id,
     locationId: o.location_id,
     storeId: settings.marketplace?.providers[provider]?.store_id ?? null,
-    fetch: f ?? fetch,
+    fetch: withTimeout(f),
   };
 }
 
@@ -94,15 +133,8 @@ function callCtx(
 export async function ingestMarketplaceWebhook(
   input: IngestInput,
 ): Promise<IngestResult> {
-  const { provider, tenantId, locationId } = input;
+  const { provider } = input;
   const driver = getPosDriver();
-  const settings = await driver.getStoreSettings(tenantId, locationId);
-  if (!isProviderEnabled(settings, provider)) {
-    throw new MarketplaceError(
-      "disabled",
-      `${provider} is not enabled for this location.`,
-    );
-  }
   const config = getProviderConfig(provider);
   if (!config) {
     throw new MarketplaceError(
@@ -125,57 +157,99 @@ export async function ingestMarketplaceWebhook(
   if (parsed.kind === "ignore")
     return { status: "ignored", reason: parsed.reason };
 
+  if (parsed.kind === "cancel" && parsed.eventTime) {
+    const age = Math.abs(
+      (input.now ?? new Date()).getTime() - parsed.eventTime.getTime(),
+    );
+    if (age > CANCEL_REPLAY_WINDOW_MS) {
+      throw new MarketplaceError(
+        "bad_signature",
+        "Stale webhook (outside the replay window).",
+      );
+    }
+  }
+
+  // Which provider store is this about? Order references (Uber Eats) and cancels
+  // without a store id are resolved by fetching the order (needs API credentials).
+  let normalized: NormalizedOrder | null = null;
+  let storeId: string | null = null;
+  if (parsed.kind === "order") {
+    normalized = parsed.order;
+    storeId = normalized.storeId;
+  } else if (parsed.kind === "cancel") {
+    storeId = parsed.storeId ?? null;
+  }
+  if (
+    (parsed.kind === "order_ref" || (parsed.kind === "cancel" && !storeId)) &&
+    adapter.fetchOrder &&
+    canCallProvider(provider)
+  ) {
+    const fetched = await adapter.fetchOrder(
+      {
+        externalId: parsed.externalId,
+        href: parsed.kind === "order_ref" ? parsed.href : null,
+      },
+      {
+        tenantId: "",
+        locationId: "",
+        storeId: null,
+        fetch: withTimeout(input.fetch),
+      },
+    );
+    if (parsed.kind === "order_ref") normalized = fetched;
+    storeId = fetched.storeId;
+  } else if (parsed.kind === "order_ref") {
+    throw new MarketplaceError(
+      "not_configured",
+      `${provider} API credentials are needed to fetch the order.`,
+    );
+  }
+
+  // A real provider's payload must name its store: it is the tenant binding.
+  if (provider !== "simulator" && !storeId) {
+    throw new MarketplaceError("bad_payload", "Payload names no store id.");
+  }
+
+  let tenantId: string;
+  let locationId: string;
+  if (input.location) {
+    ({ tenantId, locationId } = input.location);
+  } else {
+    const hits = storeId
+      ? await driver.findMarketplaceLocations(provider, storeId)
+      : [];
+    // Unknown store, or one registered twice: indistinguishable from "disabled".
+    if (hits.length !== 1)
+      throw new MarketplaceError("disabled", "Not available.");
+    tenantId = hits[0]!.tenant_id;
+    locationId = hits[0]!.location_id;
+  }
+
+  const settings = await driver.getStoreSettings(tenantId, locationId);
+  if (!isProviderEnabled(settings, provider)) {
+    throw new MarketplaceError("disabled", "Not available.");
+  }
+  const wantStore = settings.marketplace?.providers[provider]?.store_id ?? null;
+  if (provider !== "simulator" && (!wantStore || wantStore !== storeId)) {
+    throw new MarketplaceError("disabled", "Not available.");
+  }
+  if (wantStore && storeId && wantStore !== storeId) {
+    return { status: "ignored", reason: "order is for a different store" };
+  }
+
   if (parsed.kind === "cancel") {
-    const id = marketplaceOrderId(
+    return cancelOrder(
       tenantId,
       locationId,
       provider,
       parsed.externalId,
+      parsed.reason,
     );
-    const existing = await driver.getOrder(id);
-    if (!existing) return { status: "ignored", reason: "unknown order" };
-    if (existing.status === "voided")
-      return { status: "cancelled", orderId: id };
-    await driver.updateOrderStatus(id, "voided");
-    const meta = marketplaceMeta(existing);
-    if (meta) {
-      await driver.mergeOrderFulfillment(id, {
-        marketplace: {
-          ...meta,
-          acceptance: "rejected",
-          rejected_reason: parsed.reason ?? "cancelled by provider",
-        },
-      });
-    }
-    return { status: "cancelled", orderId: id };
   }
 
-  let normalized: NormalizedOrder;
-  if (parsed.kind === "order_ref") {
-    if (!adapter.fetchOrder || !canCallProvider(provider)) {
-      throw new MarketplaceError(
-        "not_configured",
-        `${provider} API credentials are needed to fetch the order.`,
-      );
-    }
-    normalized = await adapter.fetchOrder(parsed, {
-      tenantId,
-      locationId,
-      storeId: settings.marketplace?.providers[provider]?.store_id ?? null,
-      fetch: input.fetch ?? fetch,
-    });
-  } else {
-    normalized = parsed.order;
-  }
-  if (!normalized.externalId)
+  if (!normalized || !normalized.externalId) {
     throw new MarketplaceError("bad_payload", "Order has no id.");
-
-  // A validly signed order for ANOTHER store must not land in this location.
-  const wantStore = settings.marketplace?.providers[provider]?.store_id;
-  if (wantStore && normalized.storeId && normalized.storeId !== wantStore) {
-    return { status: "ignored", reason: "order is for a different store" };
   }
-
   const create = mapToCreateOrderInput(normalized, {
     tenantId,
     locationId,
@@ -209,27 +283,80 @@ export async function ingestMarketplaceWebhook(
   return { status: "created", orderId: order.id, accepted: false };
 }
 
+/** Provider cancel: compare-and-set; never voids an order the kitchen has started. */
+async function cancelOrder(
+  tenantId: string,
+  locationId: string,
+  provider: MarketplaceProviderKey,
+  externalId: string,
+  reason: string | null,
+): Promise<IngestResult> {
+  const driver = getPosDriver();
+  const id = marketplaceOrderId(tenantId, locationId, provider, externalId);
+  const existing = await driver.getOrder(id);
+  if (!existing || !marketplaceMeta(existing))
+    return { status: "ignored", reason: "unknown order" };
+  if (existing.status === "voided") return { status: "cancelled", orderId: id };
+  const meta = marketplaceMeta(existing)!;
+  const voided = await driver.transitionOrderStatus(
+    id,
+    ["placed", "paid"],
+    "voided",
+    {
+      fulfillment: {
+        ...(existing.fulfillment as OrderFulfillment),
+        marketplace: {
+          ...meta,
+          acceptance: "rejected",
+          rejected_reason: reason ?? "cancelled by provider",
+        },
+      },
+    },
+  );
+  if (voided) return { status: "cancelled", orderId: id };
+  // Already cooking / ready / done: flag loudly for staff instead.
+  const fresh = (await driver.getOrder(id)) ?? existing;
+  const freshMeta = marketplaceMeta(fresh) ?? meta;
+  if (!freshMeta.cancel_requested) {
+    await driver.mergeOrderFulfillment(id, {
+      marketplace: {
+        ...freshMeta,
+        cancel_requested: { at: new Date().toISOString(), reason },
+      },
+    });
+  }
+  return { status: "cancel_flagged", orderId: id };
+}
+
+/**
+ * Record a callback outcome. Re-reads the order and changes ONLY the callback
+ * keys, so a stale copy can never overwrite an acceptance written meanwhile.
+ */
 async function recordCallback(
-  order: Order,
+  orderId: string,
   action: MarketplaceAction,
   result: ProviderCallResult,
-  patch: Partial<MarketplaceOrderMeta> = {},
-): Promise<Order> {
-  const meta = marketplaceMeta(order)!;
+): Promise<Order | null> {
+  const driver = getPosDriver();
+  const fresh = await driver.getOrder(orderId);
+  const meta = fresh ? marketplaceMeta(fresh) : null;
+  if (!fresh || !meta) return fresh;
+  const at = new Date().toISOString();
   const next: MarketplaceOrderMeta = {
     ...meta,
-    ...patch,
+    ...(action === "ready" && result.outcome === "sent" && !meta.ready_sent_at
+      ? { ready_sent_at: at }
+      : {}),
     last_callback: {
       action,
-      at: new Date().toISOString(),
+      at,
       outcome: result.outcome,
       ...(result.detail ? { detail: result.detail } : {}),
     },
   };
   return (
-    (await getPosDriver().mergeOrderFulfillment(order.id, {
-      marketplace: next,
-    })) ?? order
+    (await driver.mergeOrderFulfillment(orderId, { marketplace: next })) ??
+    fresh
   );
 }
 
@@ -268,6 +395,8 @@ export interface RespondResult {
   acceptance: MarketplaceOrderMeta["acceptance"];
   changed: boolean;
   callback: ProviderCallResult | null;
+  /** The provider refused / timed out on accept: the order stays pending, retry. */
+  acceptFailed?: boolean;
 }
 
 /**
@@ -301,6 +430,9 @@ export async function respondToMarketplaceOrder(
         "Only an accepted order can be marked ready.",
       );
     }
+    // Once is enough: a recall + re-bump must not tell the provider twice.
+    if (meta.ready_sent_at)
+      return { order, acceptance: "accepted", changed: false, callback: null };
     const callback = await sendCallback(
       order,
       "ready",
@@ -308,7 +440,8 @@ export async function respondToMarketplaceOrder(
       settings,
       opts.fetch,
     );
-    const updated = await recordCallback(order, "ready", callback);
+    const updated =
+      (await recordCallback(order.id, "ready", callback)) ?? order;
     return { order: updated, acceptance: "accepted", changed: false, callback };
   }
 
@@ -323,11 +456,56 @@ export async function respondToMarketplaceOrder(
     );
   }
 
-  // Compare-and-set so two taps / two tablets cannot both win.
+  const now = new Date().toISOString();
+  let callback: ProviderCallResult | null = null;
+  if (action === "accept") {
+    // Tell the provider first: if it refuses (or times out) the order must NOT
+    // reach the kitchen. It stays pending, flagged, and can be retried.
+    callback = await sendCallback(order, "accept", null, settings, opts.fetch);
+    if (callback.outcome === "failed") {
+      const updated =
+        (await recordCallback(order.id, "accept", callback)) ?? order;
+      return {
+        order: updated,
+        acceptance: "pending",
+        changed: false,
+        callback,
+        acceptFailed: true,
+      };
+    }
+  }
+
+  const nextMeta: MarketplaceOrderMeta =
+    action === "accept"
+      ? {
+          ...meta,
+          acceptance: "accepted",
+          accepted_at: now,
+          last_callback: {
+            action: "accept",
+            at: now,
+            outcome: callback!.outcome,
+            ...(callback!.detail ? { detail: callback!.detail } : {}),
+          },
+        }
+      : {
+          ...meta,
+          acceptance: "rejected",
+          rejected_reason: opts.reason ?? "rejected by restaurant",
+        };
+
+  // ONE compare-and-set writes the status AND the acceptance together, so two
+  // taps / two tablets cannot both win and the two can never disagree.
   const moved = await driver.transitionOrderStatus(
     order.id,
     ["placed"],
     action === "accept" ? "paid" : "voided",
+    {
+      fulfillment: {
+        ...(order.fulfillment as OrderFulfillment),
+        marketplace: nextMeta,
+      },
+    },
   );
   if (!moved) {
     const fresh = await driver.getOrder(order.id);
@@ -344,33 +522,28 @@ export async function respondToMarketplaceOrder(
       "Order changed; refresh and try again.",
     );
   }
-  const callback = await sendCallback(
-    moved,
-    action,
-    opts.reason ?? null,
-    settings,
-    opts.fetch,
-  );
-  const now = new Date().toISOString();
-  const updated = await recordCallback(
-    moved,
-    action,
-    callback,
-    action === "accept"
-      ? { acceptance: "accepted", accepted_at: now }
-      : {
-          acceptance: "rejected",
-          rejected_reason: opts.reason ?? "rejected by restaurant",
-        },
-  );
-  return { order: updated, acceptance: target, changed: true, callback };
+  if (action === "reject") {
+    callback = await sendCallback(
+      moved,
+      "reject",
+      opts.reason ?? null,
+      settings,
+      opts.fetch,
+    );
+    const updated =
+      (await recordCallback(moved.id, "reject", callback)) ?? moved;
+    return { order: updated, acceptance: target, changed: true, callback };
+  }
+  return { order: moved, acceptance: target, changed: true, callback };
 }
 
-/** Best-effort "ready" callback after a kitchen bump (never throws). */
+/** Best-effort "ready" callback after a kitchen bump (never throws, sent at most once). */
 export async function notifyMarketplaceReady(order: Order): Promise<void> {
+  const meta = marketplaceMeta(order);
   if (
     !isMarketplaceOrder(order) ||
-    marketplaceMeta(order)?.acceptance !== "accepted"
+    meta?.acceptance !== "accepted" ||
+    meta.ready_sent_at
   )
     return;
   try {

@@ -203,6 +203,13 @@ export interface MarketplaceOrderMeta {
   rejected_reason?: string;
   customer_name?: string | null;
   customer_phone?: string | null;
+  /** Set once the provider was told the order is ready (never sent twice). */
+  ready_sent_at?: string;
+  /**
+   * The provider cancelled an order that was already past acceptance (in the
+   * kitchen or later): it is NOT voided automatically; staff must act on it.
+   */
+  cancel_requested?: { at: string; reason: string | null };
   /** Last status callback sent to the provider (or why it was skipped). */
   last_callback?: {
     action: "accept" | "reject" | "ready";

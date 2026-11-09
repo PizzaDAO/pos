@@ -110,7 +110,15 @@ export const simulatorAdapter: MarketplaceAdapter = {
     const externalId = str(j.order_id);
     if (!externalId) return { kind: "ignore", reason: "no order_id" };
     if (j.event === "order.cancelled") {
-      return { kind: "cancel", externalId, reason: str(j.reason) };
+      const t =
+        typeof j.event_time === "number" ? new Date(j.event_time * 1000) : null;
+      return {
+        kind: "cancel",
+        externalId,
+        reason: str(j.reason),
+        eventTime: t,
+        storeId: str(j.store_id),
+      };
     }
     if (j.event !== "order.created")
       return { kind: "ignore", reason: `event ${String(j.event)}` };

@@ -26,6 +26,8 @@ export interface OpenOrder {
     provider: string;
     display_id: string | null;
     acceptance: "pending" | "accepted" | "rejected";
+    accept_failed?: boolean;
+    cancel_requested?: boolean;
   };
 }
 
@@ -142,10 +144,18 @@ export function OpenOrdersPanel({
                     </div>
                     <div className="text-xs text-muted-foreground">
                       {order.marketplace.acceptance === "pending"
-                        ? "Needs acceptance"
+                        ? order.marketplace.accept_failed
+                          ? "Accept failed at provider"
+                          : "Needs acceptance"
                         : statusLabel(order.status)}{" "}
                       · Paid by {providerLabel(order.marketplace.provider)}
                     </div>
+                    {order.marketplace.cancel_requested && (
+                      <div className="text-xs font-semibold text-destructive">
+                        Cancelled by {providerLabel(order.marketplace.provider)}{" "}
+                        while in progress: check with the kitchen
+                      </div>
+                    )}
                   </div>
                   {order.marketplace.acceptance === "pending" && (
                     <div className="flex gap-2">
@@ -155,7 +165,7 @@ export function OpenOrdersPanel({
                         onClick={() => void respond(order.id, "accept")}
                         aria-label={`Accept order ${order.order_number}`}
                       >
-                        Accept
+                        {order.marketplace.accept_failed ? "Retry accept" : "Accept"}
                       </Button>
                       <Button
                         variant="outline"

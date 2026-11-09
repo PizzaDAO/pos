@@ -124,6 +124,15 @@ function TicketCardImpl({
         </div>
       </header>
 
+      {order.fulfillment?.marketplace?.cancel_requested && (
+        <div
+          role="alert"
+          className="bg-red-600 px-3 py-1 text-sm font-bold text-white"
+        >
+          CANCELLED BY PROVIDER: check with the front
+        </div>
+      )}
+
       <div className="flex-1 px-3 py-2">
         <TicketItems items={order.items} stationFilter={stationFilter} />
         {order.notes && (

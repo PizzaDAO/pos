@@ -125,7 +125,14 @@ export const uberEatsAdapter: MarketplaceAdapter = {
       return { kind: "order_ref", externalId, href: str(j.resource_href) };
     }
     if (type === "orders.cancel" && externalId) {
-      return { kind: "cancel", externalId, reason: str(meta.status) };
+      const t =
+        typeof j.event_time === "number" ? new Date(j.event_time * 1000) : null;
+      return {
+        kind: "cancel",
+        externalId,
+        reason: str(meta.status),
+        eventTime: t,
+      };
     }
     return { kind: "ignore", reason: `event ${type ?? "?"}` };
   },

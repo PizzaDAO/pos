@@ -1,18 +1,19 @@
 /**
  * Marketplace order webhook.
  *
- * POST /api/marketplace/{provider}/webhook?tenantId=&locationId=
- *   provider: doordash | ubereats | grubhub | simulator
+ * POST /api/marketplace/{provider}/webhook      provider: doordash | ubereats | grubhub
  *
  * Public (the provider calls it), so authentication is the provider's signature
- * over the raw body, checked against env secrets BEFORE anything is parsed or
- * stored. Inert by default: a location that has not enabled the provider gets
- * 403, a provider with no credentials in env gets 503. Idempotent: a replayed
- * order id returns 200 `duplicate` (providers retry on non-2xx, so duplicates
- * must be a success).
+ * over the raw body, checked against env secrets BEFORE anything is parsed. The
+ * tenant/location is NOT taken from the URL: it is found by the provider store id
+ * named in the signed payload (one URL per provider app, as Uber Eats does).
+ * Inert by default: a store nobody enabled, an unknown store and a disabled
+ * location all answer the same 404; a provider with no credentials in env gets
+ * 503. The simulator is not reachable here (the admin "simulate" action calls
+ * ingest directly). Idempotent: a replayed order id returns 200 `duplicate`
+ * (providers retry on non-2xx).
  */
 import { NextResponse } from "next/server";
-import { getPosDriver } from "@/lib/db";
 import { ingestMarketplaceWebhook } from "@/lib/marketplace/service";
 import {
   isMarketplaceProvider,
@@ -23,7 +24,7 @@ import { captureError } from "@/lib/observability";
 export const runtime = "nodejs";
 
 const STATUS: Record<MarketplaceError["code"], number> = {
-  disabled: 403,
+  disabled: 404,
   not_configured: 503,
   bad_signature: 401,
   bad_payload: 422,
@@ -37,23 +38,8 @@ export async function POST(
   { params }: { params: Promise<{ provider: string }> },
 ) {
   const { provider } = await params;
-  if (!isMarketplaceProvider(provider)) {
-    return NextResponse.json({ error: "Unknown provider." }, { status: 404 });
-  }
-  const { searchParams } = new URL(request.url);
-  const tenantId = searchParams.get("tenantId");
-  const locationId = searchParams.get("locationId");
-  if (!tenantId || !locationId) {
-    return NextResponse.json(
-      { error: "tenantId and locationId are required." },
-      { status: 400 },
-    );
-  }
-
-  // The location must belong to the tenant (ids come from the URL, not the signer).
-  const locations = await getPosDriver().listLocations(tenantId);
-  if (!locations.some((l) => l.id === locationId)) {
-    return NextResponse.json({ error: "Unknown location." }, { status: 404 });
+  if (!isMarketplaceProvider(provider) || provider === "simulator") {
+    return NextResponse.json({ error: "Not found." }, { status: 404 });
   }
 
   const rawBody = await request.text();
@@ -63,17 +49,19 @@ export async function POST(
   try {
     const result = await ingestMarketplaceWebhook({
       provider,
-      tenantId,
-      locationId,
       rawBody,
       headers,
     });
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof MarketplaceError) {
+      const status = STATUS[err.code];
       return NextResponse.json(
-        { error: err.message, code: err.code },
-        { status: STATUS[err.code] },
+        {
+          error: status === 404 ? "Not found." : err.message,
+          code: status === 404 ? undefined : err.code,
+        },
+        { status },
       );
     }
     captureError(err, { scope: "marketplace.webhook", provider });

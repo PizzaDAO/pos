@@ -1643,6 +1643,18 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async setMarketplaceSettings(tenantId, locationId, marketplace) {
+      // Touch ONLY the marketplace column: never rewrite tax/tips/currency from a
+      // possibly stale read.
+      const updated = unwrap(
+        await sb
+          .from("store_settings")
+          .update({ marketplace })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .select(),
+      ) as Row[];
+      if (updated[0]) return mapStoreSettings(updated[0]);
+      // No settings row yet: create it from the defaults.
       const base = await this.getStoreSettings(tenantId, locationId);
       const r = unwrap(
         await sb
@@ -1655,15 +1667,27 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               tax_rate_bps: base.tax_rate_bps,
               tip_presets_bps: base.tip_presets_bps,
               kds_thresholds: base.kds_thresholds ?? null,
-              fulfillment: base.fulfillment ?? null,
               marketplace,
             },
-            { onConflict: "tenant_id,location_id" },
+            { onConflict: "tenant_id,location_id", ignoreDuplicates: true },
           )
-          .select()
-          .single(),
-      ) as Row;
-      return mapStoreSettings(r);
+          .select(),
+      ) as Row[];
+      return r[0] ? mapStoreSettings(r[0]) : { ...base, marketplace };
+    },
+
+    async findMarketplaceLocations(provider, storeId) {
+      const rows = unwrap(
+        await sb
+          .from("store_settings")
+          .select("tenant_id,location_id")
+          .eq(`marketplace->providers->${provider}->>store_id`, storeId)
+          .limit(5),
+      ) as Row[];
+      return rows.map((r) => ({
+        tenant_id: r.tenant_id as string,
+        location_id: r.location_id as string,
+      }));
     },
 
     // -- Orders ------------------------------------------------------------

@@ -13,13 +13,24 @@
  *                          (the client secret also signs webhooks: X-Uber-Signature)
  *   Grubhub                GRUBHUB_WEBHOOK_SECRET
  *                          GRUBHUB_CLIENT_ID / GRUBHUB_CLIENT_SECRET (callbacks)
- *   Simulator              MARKETPLACE_SIMULATOR_SECRET (optional; default dev secret)
+ *   Simulator              MARKETPLACE_SIMULATOR_SECRET (optional; else a per-process random secret)
  *   Base URLs              DOORDASH_MARKETPLACE_BASE_URL, UBEREATS_BASE_URL,
  *                          GRUBHUB_BASE_URL (override, e.g. sandbox)
  */
+import { randomBytes } from "node:crypto";
 import type { MarketplaceProviderKey } from "./types";
 
+/** Test-only fixed secret. Outside NODE_ENV=test the simulator uses env or a per-process random one. */
 export const SIMULATOR_DEV_SECRET = "marketplace-simulator-dev-secret";
+let processSecret: string | null = null;
+function simulatorSecret(): string {
+  const fromEnv = env("MARKETPLACE_SIMULATOR_SECRET");
+  if (fromEnv) return fromEnv;
+  if (process.env.NODE_ENV === "test") return SIMULATOR_DEV_SECRET;
+  // Never a guessable default: only this process (the admin "simulate" button) can sign.
+  processSecret ??= randomBytes(32).toString("hex");
+  return processSecret;
+}
 
 export interface ProviderConfig {
   /** Verifies inbound webhooks. */
@@ -77,8 +88,7 @@ export function getProviderConfig(
         return null;
       }
       return {
-        webhookSecret:
-          env("MARKETPLACE_SIMULATOR_SECRET") ?? SIMULATOR_DEV_SECRET,
+        webhookSecret: simulatorSecret(),
         clientId: null,
         clientSecret: null,
         baseUrl: "",

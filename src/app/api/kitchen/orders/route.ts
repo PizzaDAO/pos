@@ -20,7 +20,7 @@
  *
  * No env vars are read — everything runs against the in-memory mock driver.
  */
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { notifyMarketplaceReady } from "@/lib/marketplace/service";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
@@ -109,6 +109,15 @@ export async function POST(request: Request) {
   const updated = await driver.updateOrderStatus(id, next);
   // Marketplace order bumped to ready: tell the provider (best effort, inert
   // unless the provider is configured).
-  if (updated && next === "ready") await notifyMarketplaceReady(updated);
+  // Never awaited by the bump: runs after the response (or detached, outside a
+  // request scope such as tests).
+  if (updated && next === "ready" && updated.channel === "marketplace") {
+    const notify = () => notifyMarketplaceReady(updated);
+    try {
+      after(notify);
+    } catch {
+      void notify();
+    }
+  }
   return NextResponse.json({ order: updated, changed: true });
 }

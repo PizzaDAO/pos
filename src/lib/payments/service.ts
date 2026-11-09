@@ -19,6 +19,7 @@
  * funnels through `applyRailStatus`, which never downgrades a captured/refunded
  * tender and ALWAYS re-evaluates whether the order is now paid.
  */
+import { assertTakesPayment } from "@/lib/marketplace/guard";
 import "./rails";
 import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
@@ -226,6 +227,10 @@ export async function takePaymentDetailed(
     if (existing.order_id !== input.orderId) throw new PaymentConflictError();
     return { payment: existing };
   }
+
+  // Paid by the marketplace: never takes a tender, whatever route got here.
+  const target = await driver.getOrder(input.orderId);
+  if (target) assertTakesPayment(target);
 
   // Defense in depth: in real mode a card rail must always be scoped to a real
   // connected account — never fall back to the platform account.

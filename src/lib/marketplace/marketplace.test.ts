@@ -30,6 +30,7 @@ import { MarketplaceError } from "./types";
 
 const T = DEMO_TENANT_ID;
 const L = DEMO_LOCATION_DOWNTOWN_ID;
+const LOC = { tenantId: T, locationId: L };
 
 const ON: MarketplaceSettings = {
   enabled: true,
@@ -52,8 +53,7 @@ async function ingestSim(seed = 1234, externalId?: string) {
   const s = simDelivery(seed, externalId);
   return ingestMarketplaceWebhook({
     provider: "simulator",
-    tenantId: T,
-    locationId: L,
+    location: LOC,
     rawBody: s.rawBody,
     headers: s.headers,
   });
@@ -137,8 +137,7 @@ describe("signature verification", () => {
     await expect(
       ingestMarketplaceWebhook({
         provider: "simulator",
-        tenantId: T,
-        locationId: L,
+        location: LOC,
         rawBody: s.rawBody,
         headers: {
           [SIMULATOR_SIGNATURE_HEADER]: hmacSha256Hex("attacker", s.rawBody),
@@ -170,8 +169,6 @@ describe("inert by default", () => {
     await expect(
       ingestMarketplaceWebhook({
         provider: "doordash",
-        tenantId: T,
-        locationId: L,
         rawBody: "{}",
         headers: {},
       }),
@@ -183,11 +180,12 @@ describe("inert by default", () => {
     await configure({
       enabled: true,
       auto_accept: false,
-      providers: { grubhub: { enabled: true, store_id: null } },
+      providers: { grubhub: { enabled: true, store_id: "gh-store" } },
     });
     const raw = JSON.stringify({
       event_type: "order.created",
       order_id: "GH-1",
+      merchant_id: "gh-store",
       order_type: "PICKUP",
       items: [{ id: "i1", name: "Slice", quantity: 2, price: 450 }],
       tax: 74,
@@ -195,8 +193,6 @@ describe("inert by default", () => {
     const fetchSpy = vi.fn();
     const res = await ingestMarketplaceWebhook({
       provider: "grubhub",
-      tenantId: T,
-      locationId: L,
       rawBody: raw,
       headers: { "x-grubhub-signature": hmacSha256Hex("gh-secret", raw) },
       fetch: fetchSpy as unknown as typeof fetch,
@@ -347,8 +343,6 @@ describe("mapping", () => {
     });
     const res = await ingestMarketplaceWebhook({
       provider: "ubereats",
-      tenantId: T,
-      locationId: L,
       rawBody: raw,
       headers: { "x-uber-signature": hmacSha256Hex("csecret", raw) },
       fetch: fakeFetch as unknown as typeof fetch,
@@ -379,8 +373,7 @@ describe("mapping", () => {
     );
     const res = await ingestMarketplaceWebhook({
       provider: "simulator",
-      tenantId: T,
-      locationId: L,
+      location: LOC,
       rawBody: s.rawBody,
       headers: s.headers,
     });
@@ -442,8 +435,7 @@ describe("idempotent ingest", () => {
     };
     const input = {
       provider: "simulator" as const,
-      tenantId: T,
-      locationId: L,
+      location: LOC,
       rawBody: raw,
       headers: h,
     };
@@ -593,5 +585,201 @@ describe("already paid: balance, open orders, drawer, reports", () => {
       label: "Simulator (marketplace)",
       count: 1,
     });
+  });
+});
+
+describe("hardening", () => {
+  it("a non-hex or short signature is false, never a throw", () => {
+    const sim = getAdapter("simulator");
+    for (const bad of ["zz", "abc", "g".repeat(64), "", "sha256="]) {
+      expect(
+        sim.verifyWebhook(
+          { rawBody: "{}", headers: { [SIMULATOR_SIGNATURE_HEADER]: bad } },
+          "k",
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it("the simulator secret is never the dev default outside tests", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    const { getProviderConfig } = await import("./env");
+    const secret = getProviderConfig("simulator")!.webhookSecret;
+    expect(secret).not.toBe(SIMULATOR_DEV_SECRET);
+    expect(secret.length).toBeGreaterThanOrEqual(32);
+  });
+
+  it("a failed accept callback keeps the order pending and off the kitchen board, and is retryable", async () => {
+    vi.stubEnv("UBEREATS_CLIENT_ID", "cid");
+    vi.stubEnv("UBEREATS_CLIENT_SECRET", "csecret");
+    await configure({
+      enabled: true,
+      auto_accept: false,
+      providers: { ubereats: { enabled: true, store_id: "s1" } },
+    });
+    const raw = JSON.stringify({
+      event_type: "orders.notification",
+      meta: { resource_id: "u-1", status: "pos" },
+      resource_href: "https://api.uber.com/v2/eats/order/u-1",
+    });
+    let acceptStatus = 500;
+    const f = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("oauth"))
+        return new Response(JSON.stringify({ access_token: "t" }), {
+          status: 200,
+        });
+      if (u.endsWith("/u-1")) {
+        return new Response(
+          JSON.stringify({
+            id: "u-1",
+            store: { id: "s1" },
+            cart: {
+              items: [
+                {
+                  id: "a",
+                  title: "Soda",
+                  quantity: 1,
+                  price: { unit_price: { amount: 300 } },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", { status: acceptStatus });
+    }) as unknown as typeof fetch;
+    const created = await ingestMarketplaceWebhook({
+      provider: "ubereats",
+      rawBody: raw,
+      headers: { "x-uber-signature": hmacSha256Hex("csecret", raw) },
+      fetch: f,
+    });
+    const id = created.orderId!;
+    const failed = await respondToMarketplaceOrder(id, "accept", { fetch: f });
+    expect(failed.acceptFailed).toBe(true);
+    const o = (await getPosDriver().getOrder(id))!;
+    expect(o.status).toBe("placed");
+    expect(o.fulfillment?.marketplace).toMatchObject({
+      acceptance: "pending",
+      last_callback: { action: "accept", outcome: "failed" },
+    });
+    expect(buildTickets([o], new Date(), DEFAULT_KDS_THRESHOLDS)).toHaveLength(
+      0,
+    );
+    acceptStatus = 200;
+    const ok = await respondToMarketplaceOrder(id, "accept", { fetch: f });
+    expect(ok).toMatchObject({ acceptance: "accepted", changed: true });
+    expect((await getPosDriver().getOrder(id))!.status).toBe("paid");
+  });
+
+  it("every provider call carries a timeout signal; an aborted call is a failed callback", async () => {
+    vi.stubEnv("UBEREATS_CLIENT_ID", "cid");
+    vi.stubEnv("UBEREATS_CLIENT_SECRET", "csecret");
+    await configure(ON);
+    const r = await ingestSim(61, "SIM-TO");
+    // Simulator answers in-process; flip the stored order to a real provider to hit fetch.
+    const o = (await getPosDriver().getOrder(r.orderId!))!;
+    await getPosDriver().mergeOrderFulfillment(o.id, {
+      marketplace: { ...o.fulfillment!.marketplace!, provider: "ubereats" },
+    });
+    const signals: (AbortSignal | undefined | null)[] = [];
+    const aborting = vi.fn(async (_u: unknown, init?: RequestInit) => {
+      signals.push(init?.signal);
+      throw new DOMException("The operation timed out.", "TimeoutError");
+    }) as unknown as typeof fetch;
+    const res = await respondToMarketplaceOrder(o.id, "accept", {
+      fetch: aborting,
+    });
+    expect(res.acceptFailed).toBe(true);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+  });
+
+  it("two simultaneous accepts: one wins, the other is a no-op, acceptance matches status", async () => {
+    await configure(ON);
+    const r = await ingestSim(62, "SIM-RACE-ACC");
+    const [a, b] = await Promise.all([
+      respondToMarketplaceOrder(r.orderId!, "accept"),
+      respondToMarketplaceOrder(r.orderId!, "accept"),
+    ]);
+    expect([a.changed, b.changed].filter(Boolean)).toHaveLength(1);
+    const o = (await getPosDriver().getOrder(r.orderId!))!;
+    expect(o.status).toBe("paid");
+    expect(o.fulfillment?.marketplace?.acceptance).toBe("accepted");
+  });
+
+  it("ready is sent to the provider once, even after a recall and re-bump", async () => {
+    await configure(ON);
+    const r = await ingestSim(63, "SIM-RDY1");
+    await respondToMarketplaceOrder(r.orderId!, "accept");
+    const first = await respondToMarketplaceOrder(r.orderId!, "ready");
+    expect(first.callback?.outcome).toBe("sent");
+    const second = await respondToMarketplaceOrder(r.orderId!, "ready");
+    expect(second.callback).toBeNull();
+  });
+
+  it("provider cancel voids a pending/accepted order but only flags one already in the kitchen", async () => {
+    await configure({ ...ON, auto_accept: true });
+    const early = await ingestSim(64, "SIM-CX-EARLY");
+    const cancel = (id: string) => {
+      const raw = JSON.stringify({
+        event: "order.cancelled",
+        order_id: id,
+        reason: "customer",
+      });
+      return ingestMarketplaceWebhook({
+        provider: "simulator",
+        location: LOC,
+        rawBody: raw,
+        headers: {
+          [SIMULATOR_SIGNATURE_HEADER]: hmacSha256Hex(
+            SIMULATOR_DEV_SECRET,
+            raw,
+          ),
+        },
+      });
+    };
+    expect((await cancel("SIM-CX-EARLY")).status).toBe("cancelled");
+    expect((await getPosDriver().getOrder(early.orderId!))!.status).toBe(
+      "voided",
+    );
+
+    const cooking = await ingestSim(65, "SIM-CX-LATE");
+    await getPosDriver().updateOrderStatus(cooking.orderId!, "in_kitchen");
+    expect((await cancel("SIM-CX-LATE")).status).toBe("cancel_flagged");
+    const o = (await getPosDriver().getOrder(cooking.orderId!))!;
+    expect(o.status).toBe("in_kitchen");
+    expect(o.fulfillment?.marketplace?.cancel_requested).toBeTruthy();
+
+    const done = await ingestSim(66, "SIM-CX-DONE");
+    await getPosDriver().updateOrderStatus(done.orderId!, "completed");
+    expect((await cancel("SIM-CX-DONE")).status).toBe("cancel_flagged");
+    expect((await getPosDriver().getOrder(done.orderId!))!.status).toBe(
+      "completed",
+    );
+  });
+
+  it("a stale cancel event is rejected (replay window)", async () => {
+    await configure(ON);
+    await ingestSim(67, "SIM-STALE");
+    const raw = JSON.stringify({
+      event: "order.cancelled",
+      order_id: "SIM-STALE",
+      event_time: Math.floor(Date.now() / 1000) - 3 * 3600,
+    });
+    await expect(
+      ingestMarketplaceWebhook({
+        provider: "simulator",
+        location: LOC,
+        rawBody: raw,
+        headers: {
+          [SIMULATOR_SIGNATURE_HEADER]: hmacSha256Hex(
+            SIMULATOR_DEV_SECRET,
+            raw,
+          ),
+        },
+      }),
+    ).rejects.toMatchObject({ code: "bad_signature" });
   });
 });

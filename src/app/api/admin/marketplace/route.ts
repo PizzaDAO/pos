@@ -89,6 +89,27 @@ export async function PUT(request: Request) {
           : null,
     };
   }
+  // A real provider needs its store id (it is how webhooks are routed and the
+  // tenant binding), and one store id belongs to exactly one location.
+  for (const key of MARKETPLACE_PROVIDERS) {
+    const p = providers[key];
+    if (!p?.enabled || key === "simulator") continue;
+    if (!p.store_id) {
+      return NextResponse.json(
+        {
+          error: `${providerLabel(key)} needs a store id before it can be enabled.`,
+        },
+        { status: 422 },
+      );
+    }
+    const hits = await getPosDriver().findMarketplaceLocations(key, p.store_id);
+    if (hits.some((h) => h.location_id !== auth.locationId)) {
+      return NextResponse.json(
+        { error: `That ${providerLabel(key)} store id is already in use.` },
+        { status: 409 },
+      );
+    }
+  }
   const next: MarketplaceSettings = {
     enabled: body.enabled === true,
     auto_accept: body.auto_accept === true,
@@ -139,8 +160,10 @@ export async function POST(request: Request) {
   try {
     const result = await ingestMarketplaceWebhook({
       provider: "simulator",
-      tenantId: auth.tenantId,
-      locationId: auth.locationId as string,
+      location: {
+        tenantId: auth.tenantId,
+        locationId: auth.locationId as string,
+      },
       rawBody: signed.rawBody,
       headers: signed.headers,
     });

@@ -14,7 +14,8 @@ export function safeEqualHex(a: string, b: string): boolean {
       .replace(/^sha256=/, "");
   const x = norm(a);
   const y = norm(b);
-  if (!/^[0-9a-f]+$/.test(x) || x.length !== y.length) return false;
+  if (!/^[0-9a-f]+$/.test(x) || !/^[0-9a-f]+$/.test(y) || x.length !== y.length)
+    return false;
   return timingSafeEqual(Buffer.from(x, "hex"), Buffer.from(y, "hex"));
 }
 

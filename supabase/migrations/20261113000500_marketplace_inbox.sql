@@ -26,6 +26,9 @@ alter type public.order_channel add value if not exists 'marketplace';
 
 alter table public.store_settings add column if not exists marketplace jsonb;
 
+-- NOTE: if public.orders is large, build this index CONCURRENTLY outside a
+-- transaction instead (it takes a write lock on orders while building). Volume
+-- is tiny today, so the plain statement is fine.
 create unique index if not exists orders_marketplace_ref_uq
   on public.orders (location_id, (source->>'module'), (source->>'external_ref'))
   where source->>'type' = 'marketplace';

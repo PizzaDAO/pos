@@ -42,6 +42,17 @@ export async function POST(
     const reason =
       typeof body.reason === "string" ? body.reason.slice(0, 200) : null;
     const result = await respondToMarketplaceOrder(id, action, { reason });
+    if (result.acceptFailed) {
+      return NextResponse.json(
+        {
+          error:
+            "Accept failed at the provider. The order is still waiting; try again.",
+          code: "accept_failed",
+          order: result.order,
+        },
+        { status: 502 },
+      );
+    }
     return NextResponse.json({
       order: result.order,
       acceptance: result.acceptance,

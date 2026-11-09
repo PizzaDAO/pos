@@ -37,6 +37,7 @@ import type {
   OrderItem,
   OrderStatus,
   StoreSettings,
+  MarketplaceProviderKey,
 } from "./menu-types";
 import type {
   ConnectAccount,
@@ -1050,6 +1051,15 @@ export const mockDriver: PosDriver = {
     if (i >= 0) storeSettings[i] = next;
     else storeSettings.push(next);
     return next;
+  },
+
+  async findMarketplaceLocations(provider, storeId) {
+    return storeSettings
+      .filter(
+        (s) =>
+          s.marketplace?.providers[provider as MarketplaceProviderKey]?.store_id === storeId,
+      )
+      .map((s) => ({ tenant_id: s.tenant_id, location_id: s.location_id }));
   },
 
   async createOrder(input: CreateOrderInput): Promise<Order> {
