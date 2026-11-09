@@ -8,8 +8,10 @@
  *     the rest of the window once over the limit, even for a correct code, so a
  *     guesser cannot keep trying between successes.
  *
- * Process-local, like src/lib/security/rate-limit.ts (same serverless caveat).
- * Codes carry 80 bits, so this mainly protects low-entropy printed card numbers.
+ * This class is the process-local layer (the burst cap; the routes use only
+ * `admit`). The failure lockout the routes rely on lives in the DATABASE
+ * (stored_value_guard via StoredValueStore.guardFail/guardCheck), shared across
+ * instances and keyed on IP + tenant and device + tenant (giftcards/http.ts).
  * Disabled under tests/RATE_LIMIT_DISABLED like the other limiters; the classes
  * are unit-tested directly.
  */

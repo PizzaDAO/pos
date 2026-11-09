@@ -25,6 +25,14 @@ export function storeCreditApprovalThresholdCents(): number {
   return Number.isInteger(raw) && raw >= 0 ? raw : STORE_CREDIT_APPROVAL_DEFAULT_CENTS;
 }
 
+/** A non-manager's store credit issued per day (UTC) above this needs a manager (default $100). */
+export const STORE_CREDIT_DAILY_CAP_DEFAULT_CENTS = 10_000;
+
+export function storeCreditDailyCapCents(): number {
+  const raw = Number(process.env.STORE_CREDIT_DAILY_CAP_CENTS);
+  return Number.isInteger(raw) && raw >= 0 ? raw : STORE_CREDIT_DAILY_CAP_DEFAULT_CENTS;
+}
+
 export function giftCardsEnabled(): boolean {
   if (!codePepper()) return false;
   if (!isRealMode()) return true;

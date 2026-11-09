@@ -17,6 +17,9 @@ import type {
 
 type Row = Record<string, unknown>;
 
+/** PostgREST returns at most this many rows per request (its default cap). */
+const PAGE = 1000;
+
 const ACCOUNT_COLUMNS =
   "id, tenant_id, kind, status, currency, balance_cents, code_last4, physical, customer_id, recipient_name, recipient_email, sale_order_id, source, created_by, created_at, updated_at, activated_at, voided_at";
 
@@ -97,11 +100,11 @@ export function createSupabaseStoredValueStore(config: SupabaseDriverConfig): St
     name: "supabase",
 
     async createAccount(row) {
-      const res = await sb.from("stored_value_accounts").insert(row).select(ACCOUNT_COLUMNS).single();
-      if (res.error?.message.includes("stored_value_accounts_code_uq")) {
-        return { ok: false, reason: "code_taken" };
-      }
-      return { ok: true, account: mapAccount(unwrap(res) as Row) };
+      // The service role cannot write the table: sv_create_account does.
+      const out = unwrap(await sb.rpc("sv_create_account", { p_row: row })) as RpcOut;
+      if (out.outcome === "code_taken") return { ok: false, reason: "code_taken" };
+      if (out.outcome !== "ok" || !out.account) throw new Error(`sv_create_account: ${out.outcome}`);
+      return { ok: true, account: mapAccount(out.account) };
     },
 
     async getAccount(tenantId, id) {
@@ -141,30 +144,102 @@ export function createSupabaseStoredValueStore(config: SupabaseDriverConfig): St
     },
 
     async listLedger(tenantId, accountId) {
+      // Page past PostgREST's row cap (default 1000).
+      const out: LedgerEntry[] = [];
+      for (let from = 0; ; from += PAGE) {
+        const rows = (unwrap(
+          await sb
+            .from("stored_value_ledger")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("account_id", accountId)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true })
+            .range(from, from + PAGE - 1),
+        ) as Row[] | null) ?? [];
+        out.push(...rows.map(mapEntry));
+        if (rows.length < PAGE) return out;
+      }
+    },
+
+    async listRecentRedemptions(sinceIso, limit) {
       const rows = unwrap(
         await sb
           .from("stored_value_ledger")
           .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("account_id", accountId)
+          .eq("kind", "redeem")
+          .gte("created_at", sinceIso)
           .order("created_at", { ascending: true })
-          .limit(5000),
+          .limit(Math.min(Math.max(limit, 1), PAGE)),
       ) as Row[] | null;
       return (rows ?? []).map(mapEntry);
     },
 
-    async listLedgerBetween(tenantId, fromIso, toIso) {
-      const rows = unwrap(
-        await sb
-          .from("stored_value_ledger")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .gte("created_at", fromIso)
-          .lt("created_at", toIso)
-          .order("created_at", { ascending: true })
-          .limit(10000),
-      ) as Row[] | null;
-      return (rows ?? []).map(mapEntry);
+    async summary(tenantId, locationId, fromIso, toIso) {
+      const out = unwrap(
+        await sb.rpc("sv_summary", {
+          p_tenant_id: tenantId,
+          p_location_id: locationId,
+          p_from: fromIso,
+          p_to: toIso,
+        }),
+      ) as Record<string, unknown>;
+      return {
+        outstanding_cents: Number(out.outstanding_cents ?? 0),
+        store_credit_issued_count: Number(out.store_credit_issued_count ?? 0),
+        store_credit_issued_cents: Number(out.store_credit_issued_cents ?? 0),
+      };
+    },
+
+    async issueStoreCredit(input) {
+      const out = unwrap(
+        await sb.rpc("sv_issue_store_credit", {
+          p_tenant_id: input.tenantId,
+          p_account_id: input.accountId,
+          p_location_id: input.locationId,
+          p_currency: input.currency,
+          p_code_hash: input.codeHash,
+          p_code_last4: input.codeLast4,
+          p_customer_id: input.customerId,
+          p_amount: input.amountCents,
+          p_reason: input.reason,
+          p_actor_id: input.actorId,
+          p_is_manager: input.isManager,
+          p_daily_cap: input.dailyCapCents,
+        }),
+      ) as RpcOut;
+      if (out.outcome === "ok" && out.account && out.entry) {
+        return { outcome: "ok", account: mapAccount(out.account), entry: mapEntry(out.entry) };
+      }
+      if (out.outcome === "replayed" && out.account) {
+        return { outcome: "replayed", account: mapAccount(out.account) };
+      }
+      if (out.outcome === "approval_required" || out.outcome === "code_taken" || out.outcome === "bad_amount") {
+        return { outcome: out.outcome };
+      }
+      throw new Error(`sv_issue_store_credit: ${out.outcome}`);
+    },
+
+    async markCodeRevealed(tenantId, accountId) {
+      return unwrap(
+        await sb.rpc("sv_mark_revealed", { p_tenant_id: tenantId, p_account_id: accountId }),
+      ) === true;
+    },
+
+    async guardCheck(keys) {
+      return Number(unwrap(await sb.rpc("sv_guard_check", { p_keys: keys })) ?? 0);
+    },
+
+    async guardFail(keys, limit, windowSeconds) {
+      return Number(
+        unwrap(
+          await sb.rpc("sv_guard_fail", {
+            p_keys: keys,
+            p_limit: limit,
+            p_window_seconds: windowSeconds,
+          }),
+        ) ?? 0,
+      );
     },
 
     async getLedgerEntry(id) {

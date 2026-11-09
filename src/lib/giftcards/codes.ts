@@ -122,3 +122,38 @@ export function codeLast4(normalized: string): string {
 export function maskedCode(last4: string): string {
   return `•••• ${last4}`;
 }
+
+/** How long a buyer's reveal token is valid after checkout. */
+export const REVEAL_TTL_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * A short-lived token binding an online purchase to the buyer's browser (set as
+ * an httpOnly cookie at checkout). It lets ONLY that browser reveal the code
+ * once after paying; a replayed purchase request never returns the code.
+ */
+export function signRevealToken(orderId: string, now = Date.now(), pepper?: string | null): string {
+  const exp = now + REVEAL_TTL_MS;
+  const payload = `${orderId}.${exp}`;
+  const sig = createHmac("sha256", requirePepper(pepper))
+    .update(`giftcard-reveal:v1:${payload}`)
+    .digest("hex");
+  return `${payload}.${sig}`;
+}
+
+/** True when `token` is a valid, unexpired reveal token for `orderId`. */
+export function verifyRevealToken(
+  token: string | null | undefined,
+  orderId: string,
+  now = Date.now(),
+  pepper?: string | null,
+): boolean {
+  if (!token) return false;
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+  const [id, exp, sig] = parts as [string, string, string];
+  if (id !== orderId || !/^\d+$/.test(exp) || Number(exp) <= now) return false;
+  const want = createHmac("sha256", requirePepper(pepper))
+    .update(`giftcard-reveal:v1:${id}.${exp}`)
+    .digest("hex");
+  return sameHash(want, sig);
+}

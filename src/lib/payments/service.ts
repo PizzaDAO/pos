@@ -968,8 +968,7 @@ export async function refundPayment(input: {
   if (payment.rail === "external") throw new ExternalRefundUnsupportedError();
 
   const total = payment.amount_cents + payment.tip_cents;
-  const refundId = input.refundId ?? null;
-  if (refundId && (payment.refund_ids ?? []).includes(refundId)) {
+  if (input.refundId && (payment.refund_ids ?? []).includes(input.refundId)) {
     return { ...payment, replayed: true, refundedNowCents: 0 };
   }
 
@@ -978,12 +977,17 @@ export async function refundPayment(input: {
   if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
     throw new RefundExceedsError();
   }
-  // Gift-card SALE tenders: refundable only once the card is voided (or the
-  // reload reversed), so the card and the money never both survive.
-  await (await import("@/lib/giftcards/service")).assertStoredValueRefundAllowed(
-    payment,
-    refundAmount,
-  );
+  // Stored value (src/lib/giftcards): a refund OF a gift card tender is credited
+  // to the card before it is recorded (like a card refund), so a crash can never
+  // record a refund the card did not get; it always carries a refund id so the
+  // retry is the same credit (the credit is idempotent on it and capped at the
+  // redeemed amount). A refund of a tender that BOUGHT a gift card is checked
+  // after an atomic reservation (see below).
+  const giftcards = await import("@/lib/giftcards/service");
+  const storedValueRail = payment.rail === "gift_card" || payment.rail === "store_credit";
+  const refundId =
+    input.refundId ?? (storedValueRail ? `auto_${payment.refunded_cents}_${refundAmount}` : null);
+  const saleTender = await giftcards.isStoredValueSaleTender(payment);
 
   const callRail = () =>
     rail.refund({
@@ -1004,7 +1008,7 @@ export async function refundPayment(input: {
     });
 
   let recorded: RefundReservation;
-  if (isCardRail(payment.rail)) {
+  if (!saleTender && (isCardRail(payment.rail) || storedValueRail)) {
     const railRefund = await callRail();
     recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
       // Stripe's refund id (re_...) rides on the payment's refunds[] entry.
@@ -1017,6 +1021,10 @@ export async function refundPayment(input: {
     });
     if (recorded.ok) {
       try {
+        // Gift-card SALE tenders: refundable only once the card is voided (or
+        // the reload reversed), or as excess money. Checked after the atomic
+        // reservation, so concurrent refunds cannot both pass.
+        if (saleTender) await giftcards.assertStoredValueRefundAllowed(recorded.payment);
         await callRail();
       } catch (err) {
         await driver.releasePaymentRefund(payment.id, refundAmount, refundId);

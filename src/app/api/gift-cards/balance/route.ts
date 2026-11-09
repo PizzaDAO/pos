@@ -31,11 +31,11 @@ export async function POST(request: Request) {
   const auth = await requireTillStaff(request, b.tenantId);
   if (!auth.ok) return auth.res;
   const id = lookupIdentity(request, "till", auth.grant.user.id);
-  const blocked = admitLookup(id);
+  const blocked = await admitLookup(id, auth.grant.tenantId);
   if (blocked) return blocked;
   try {
     const account = await findAccountByCode(auth.grant.tenantId, b.code);
-    if (!account) return unknownCode(id);
+    if (!account) return unknownCode(id, auth.grant.tenantId);
     return NextResponse.json({ account: accountView(account) });
   } catch (err) {
     return errorResponse(err, "giftcard-balance");

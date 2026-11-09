@@ -43,11 +43,12 @@ import { redeemableCents } from "./ledger";
 import {
   GIFT_CARD_MAX_BALANCE_CENTS,
   storeCreditApprovalThresholdCents,
+  storeCreditDailyCapCents,
   validLoadAmount,
   validStoreCreditAmount,
 } from "./limits";
 import { isSettled, remainingCents } from "./order-math";
-import { getStoredValueStore } from "./store";
+import { getStoredValueStore, type IssueStoreCreditOutcome } from "./store";
 import type {
   LedgerEntry,
   MutationFailure,
@@ -141,12 +142,16 @@ export function accountView(a: StoredValueAccount): AccountView {
 export async function findAccountByCode(
   tenantId: string,
   rawCode: unknown,
+  opts: { anonymous?: boolean } = {},
 ): Promise<StoredValueAccount | null> {
   const code = normalizeCode(rawCode);
   if (!code) return null;
   const store = await getStoredValueStore();
   const account = await store.findByCodeHash(tenantId, hashCode(tenantId, code));
   if (!account) return null;
+  // Pre-printed card numbers are low entropy: usable at the till only, never
+  // from an anonymous storefront lookup (reported as unknown, like a guess).
+  if (opts.anonymous && account.physical) return null;
   if (account.status === "pending" && account.sale_order_id) {
     await settleStoredValueOrder(account.sale_order_id).catch((err) =>
       captureError(err, { scope: "giftcard-lazy-activate", accountId: account.id }),
@@ -224,11 +229,40 @@ async function replaySale(
   const store = await getStoredValueStore();
   const account = await store.getAccount(input.tenantId, ext.account_id);
   if (!account) throw fail("not_found");
-  const code =
-    ext.op === "sell" && account.source === "online" && !account.physical
-      ? formatCode(deriveCode(account.id))
-      : null;
-  return { order: existing, account: accountView(account), code, replayed: true };
+  // A replay NEVER returns the code: it is shown once at creation, and online
+  // buyers get it once more through the signed one-time reveal (revealOnlineCode).
+  return { order: existing, account: accountView(account), code: null, replayed: true };
+}
+
+/**
+ * The buyer's one-time reveal of an ONLINE card's code after paying. The caller
+ * must already have verified the buyer's signed reveal token for this order.
+ * Returns null when the card is not active yet (keep waiting) and throws
+ * `already_revealed` the second time.
+ */
+export async function revealOnlineCode(
+  tenantId: string,
+  orderId: string,
+): Promise<{ code: string; account: AccountView } | null> {
+  const order = await getPosDriver().getOrder(orderId);
+  const ext = storedValueExt(order);
+  if (!order || order.tenant_id !== tenantId || !ext || ext.op !== "sell") {
+    throw new StoredValueError("not_found", "Gift card not found.", 404);
+  }
+  const store = await getStoredValueStore();
+  let account = await store.getAccount(tenantId, ext.account_id);
+  if (account?.status === "pending") {
+    await settleStoredValueOrder(order.id);
+    account = await store.getAccount(tenantId, ext.account_id);
+  }
+  if (!account || account.source !== "online" || account.physical) {
+    throw new StoredValueError("not_found", "Gift card not found.", 404);
+  }
+  if (account.status !== "active") return null;
+  if (!(await store.markCodeRevealed(tenantId, account.id))) {
+    throw new StoredValueError("already_revealed", "This code was already shown.", 410);
+  }
+  return { code: formatCode(deriveCode(account.id)), account: accountView(account) };
 }
 
 /** Create a gift card SALE: a pending card plus its unpaid, untaxed order. */
@@ -474,6 +508,15 @@ export async function redeemStoredValue(
   return { payment, account: accountView(result.account), replayed: result.replayed };
 }
 
+/** Give one stored-value tender back to its card (idempotent: fixed refund id). */
+export async function releaseStoredValueTender(paymentId: string): Promise<void> {
+  await refundPayment({
+    paymentId,
+    refundId: `release_${paymentId}`,
+    reason: "Not used: returned to card",
+  }).catch((err) => captureError(err, { scope: "giftcard-release", paymentId }));
+}
+
 /**
  * Online checkout gives up an order (cancel / expiry): every stored-value
  * tender on it goes back to its card. Idempotent (the refund id is fixed per
@@ -494,19 +537,61 @@ export async function releaseStoredValueTenders(orderId: string): Promise<void> 
   }
 }
 
+/** How far back the sweeper re-checks redemptions on abandoned checkouts. */
+export const RELEASE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Sweep: an abandoned online checkout that STILL holds a captured stored-value
+ * tender (a release that failed or never ran) gets it released again. The
+ * refund id is fixed per tender (`release_<id>`), so this is idempotent with
+ * the release that ran at abandonment. Returns how many orders it released.
+ */
+export async function sweepUnreleasedStoredValue(now: Date = new Date()): Promise<number> {
+  const store = await getStoredValueStore();
+  const driver = getPosDriver();
+  const since = new Date(now.getTime() - RELEASE_LOOKBACK_MS).toISOString();
+  const seen = new Set<string>();
+  let released = 0;
+  for (const e of await store.listRecentRedemptions(since, 1000)) {
+    if (!e.order_id || seen.has(e.order_id)) continue;
+    seen.add(e.order_id);
+    const order = await driver.getOrder(e.order_id);
+    if (!order || order.status !== "abandoned") continue;
+    const held = (await driver.listPaymentsForOrder(order.id)).some(
+      (p) =>
+        (p.rail === "gift_card" || p.rail === "store_credit") &&
+        p.status === "captured" &&
+        p.refunded_cents < p.amount_cents + p.tip_cents,
+    );
+    if (!held) continue;
+    await releaseStoredValueTenders(order.id);
+    released += 1;
+  }
+  return released;
+}
+
 // ---------------------------------------------------------------------------
 // Refund guard (called by refundPayment)
 // ---------------------------------------------------------------------------
 
+/** True for a tender on a gift-card SALE / RELOAD order (refundPayment's policy). */
+export async function isStoredValueSaleTender(payment: Payment): Promise<boolean> {
+  return !!storedValueExt(await getPosDriver().getOrder(payment.order_id));
+}
+
 /**
  * A tender of a stored-value SALE/RELOAD order may be refunded only once the
- * value it bought has left the card (the card voided / the reload reversed), or
- * when it is excess money (the order holds more than it is worth).
+ * value it bought has left the card (the card voided / the reload reversed /
+ * never credited), or when it is EXCESS money (the order still holds the card's
+ * value without it).
+ *
+ * Called by refundPayment AFTER the refund was reserved (atomically) and
+ * before any money moves, so the order's tenders already show this refund and
+ * every concurrent one reserved before it: of two racing "excess" refunds the
+ * later check sees both, so they can never both pass. On a throw the caller
+ * releases its reservation.
  */
-export async function assertStoredValueRefundAllowed(
-  payment: Payment,
-  refundCents: number,
-): Promise<void> {
+export async function assertStoredValueRefundAllowed(payment: Payment): Promise<void> {
   const driver = getPosDriver();
   const order = await driver.getOrder(payment.order_id);
   const ext = storedValueExt(order);
@@ -514,21 +599,19 @@ export async function assertStoredValueRefundAllowed(
 
   const payments = await driver.listPaymentsForOrder(order.id);
   const held = payments
-    .filter((p) => p.status === "captured" || p.status === "authorized")
+    .filter((p) => p.status === "captured" || p.status === "authorized" || p.status === "refunded")
     .reduce((n, p) => n + Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents), 0);
-  if (held - refundCents >= ext.amount_cents) return; // excess (a duplicate tender)
+  if (held >= ext.amount_cents) return; // excess (a duplicate tender)
 
   const store = await getStoredValueStore();
+  const ledger = await store.listLedger(order.tenant_id, ext.account_id);
+  // Paid but never credited (the card refused it): nothing to take back.
+  if (!ledger.some((e) => e.idempotency_key === `sale:${order.id}`)) return;
   if (ext.op === "sell") {
     const account = await store.getAccount(order.tenant_id, ext.account_id);
     if (!account || account.status === "voided") return;
-    // Paid but never credited (the card refused it): nothing to take back.
-    const ledger = await store.listLedger(order.tenant_id, ext.account_id);
-    if (!ledger.some((e) => e.idempotency_key === `sale:${order.id}`)) return;
-  } else {
-    const ledger = await store.listLedger(order.tenant_id, ext.account_id);
-    if (!ledger.some((e) => e.idempotency_key === `sale:${order.id}`)) return;
-    if (ledger.some((e) => e.idempotency_key === `reverse:${order.id}`)) return;
+  } else if (ledger.some((e) => e.idempotency_key === `reverse:${order.id}`)) {
+    return;
   }
   throw new StoredValueRefundBlockedError();
 }
@@ -702,60 +785,39 @@ export async function issueStoreCredit(
   }
 
   const store = await getStoredValueStore();
-  const existing = await store.getAccount(input.tenantId, input.accountId);
-  if (existing) {
-    return { account: accountView(existing), code: null, replayed: true, entry: null };
-  }
-  let code = generateCode();
-  let created = await store.createAccount({
-    id: input.accountId,
-    tenant_id: input.tenantId,
-    kind: "store_credit",
-    status: "active",
-    currency: input.currency,
-    code_hash: hashCode(input.tenantId, code),
-    code_last4: codeLast4(code),
-    physical: false,
-    customer_id: input.customerId ?? null,
-    recipient_name: null,
-    recipient_email: null,
-    sale_order_id: null,
-    source: "issued",
-    created_by: input.actor.id,
-  });
-  if (!created.ok) {
-    // An 80-bit collision is not a real event; one retry with a fresh code.
-    code = generateCode();
-    created = await store.createAccount({
-      id: input.accountId,
-      tenant_id: input.tenantId,
-      kind: "store_credit",
-      status: "active",
+  // Create + credit in ONE atomic write (sv_issue_store_credit), which also
+  // enforces the per-staff daily cap for non-managers.
+  let code = "";
+  let out: IssueStoreCreditOutcome = { outcome: "code_taken" };
+  for (let attempt = 0; attempt < 2 && out.outcome === "code_taken"; attempt += 1) {
+    code = generateCode(); // an 80-bit collision is not a real event: one retry
+    out = await store.issueStoreCredit({
+      tenantId: input.tenantId,
+      accountId: input.accountId,
+      locationId: input.locationId,
       currency: input.currency,
-      code_hash: hashCode(input.tenantId, code),
-      code_last4: codeLast4(code),
-      physical: false,
-      customer_id: input.customerId ?? null,
-      recipient_name: null,
-      recipient_email: null,
-      sale_order_id: null,
-      source: "issued",
-      created_by: input.actor.id,
+      codeHash: hashCode(input.tenantId, code),
+      codeLast4: codeLast4(code),
+      customerId: input.customerId ?? null,
+      amountCents: input.amountCents,
+      reason,
+      actorId: input.actor.id,
+      isManager: manager,
+      dailyCapCents: storeCreditDailyCapCents(),
     });
-    if (!created.ok) throw new Error("store credit code collision");
   }
-  const credited = await store.credit({
-    tenantId: input.tenantId,
-    accountId: input.accountId,
-    locationId: input.locationId,
-    kind: "issue",
-    amountCents: input.amountCents,
-    key: `issue:${input.accountId}`,
-    reason,
-    actorId: input.actor.id,
-    approvedBy: manager ? input.actor.id : null,
-  });
-  if (!credited.ok) throw fail(credited.reason);
+  if (out.outcome === "replayed") {
+    return { account: accountView(out.account), code: null, replayed: true, entry: null };
+  }
+  if (out.outcome === "approval_required") {
+    throw new StoredValueError(
+      "approval_required",
+      "That is over your store credit limit for today. Switch to a manager to issue it.",
+      403,
+    );
+  }
+  if (out.outcome !== "ok") throw fail(out.outcome === "bad_amount" ? "bad_amount" : "conflict");
+  const credited = out;
   await recordAudit({
     actor: input.actor,
     action: "store_credit_issue",

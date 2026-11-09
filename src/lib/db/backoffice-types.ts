@@ -401,6 +401,8 @@ export interface StoredValueReport {
   /** Store credit issued in the range (added by the reports route, live). */
   store_credit_issued_count?: number;
   store_credit_issued_cents?: number;
+  /** Current outstanding liability across the tenant (reports route, live). */
+  outstanding_cents?: number;
 }
 
 // ----------------------------------------------------------------------------

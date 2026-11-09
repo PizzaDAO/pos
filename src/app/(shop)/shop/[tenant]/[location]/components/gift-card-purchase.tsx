@@ -2,8 +2,9 @@
  * Online gift card purchase (customer). Creates the sale (POST
  * /api/shop/gift-cards: an untaxed order for the card) and pays it through the
  * normal online card path (`useShopCheckout().pay`), then waits for it to
- * settle. The code is shown once paid; it is kept in this tab's session storage
- * so a reload still shows it. Recipient email delivery is not wired yet (the
+ * settle. The code comes back once, in the purchase response, and is kept in
+ * this tab's session storage so a reload still shows it; failing that, this
+ * browser may reveal it ONCE after paying (signed cookie, /reveal). Recipient email delivery is not wired yet (the
  * server hook is inert), so the buyer passes the code on.
  */
 "use client";
@@ -101,6 +102,39 @@ export function GiftCardPurchase({
       clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, pending]);
+
+  // Paid but the code is not on hand (a retried purchase never returns it): ask
+  // once for this browser's one-time reveal (signed cookie set at checkout).
+  useEffect(() => {
+    if (step !== "done" || !pending || pending.code) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ask = async () => {
+      const res = await fetch("/api/shop/gift-cards/reveal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId: pending.orderId }),
+      }).catch(() => null);
+      if (cancelled || !res) return;
+      if (res.status === 202) {
+        timer = setTimeout(() => void ask(), 3000);
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as { code?: string; error?: string };
+      if (res.ok && data.code) {
+        const next = { ...pending, code: data.code };
+        save(next);
+        setPending(next);
+      } else {
+        setError(data.error ?? "The code can no longer be shown here.");
+      }
+    };
+    void ask();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [step, pending]);
 
   const cents = Math.round(parseFloat(amount) * 100);
@@ -238,6 +272,11 @@ export function GiftCardPurchase({
               {pending?.code ?? "—"}
             </div>
           </div>
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
           <p className="text-sm text-muted-foreground">
             Save this code: it is the gift card. Use it at checkout or in store.
           </p>

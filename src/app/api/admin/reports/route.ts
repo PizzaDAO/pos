@@ -18,7 +18,6 @@ import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { giftCardsEnabled } from "@/lib/giftcards/limits";
-import { storeCreditIssued } from "@/lib/giftcards/report";
 import { getStoredValueStore } from "@/lib/giftcards/store";
 import { captureError } from "@/lib/observability";
 
@@ -48,16 +47,10 @@ export async function GET(request: Request) {
       const toIso = to
         ? new Date(Date.parse(`${to}T00:00:00.000Z`) + 86_400_000).toISOString()
         : "9999-12-31T00:00:00.000Z";
-      const credits = new Set(
-        (await store.listAccounts(tenantId, { kind: "store_credit", limit: 500 })).map((a) => a.id),
-      );
-      const issued = storeCreditIssued(
-        await store.listLedgerBetween(tenantId, fromIso, toIso),
-        credits,
-        locationId,
-      );
-      report.stored_value.store_credit_issued_count = issued.issued_count;
-      report.stored_value.store_credit_issued_cents = issued.issued_cents;
+      const sum = await store.summary(tenantId, locationId, fromIso, toIso);
+      report.stored_value.store_credit_issued_count = sum.store_credit_issued_count;
+      report.stored_value.store_credit_issued_cents = sum.store_credit_issued_cents;
+      report.stored_value.outstanding_cents = sum.outstanding_cents;
     } catch (err) {
       captureError(err, { scope: "reports-store-credit", tenantId });
     }

@@ -268,6 +268,8 @@ export async function enqueueTestTicket(printer: Printer, now = new Date()): Pro
 export async function autoPrintOnFire(order: Order): Promise<number> {
   try {
     if (!isLiveOrderStatus(order.status) || order.hold) return 0;
+    // A gift card sale / reload has nothing to cook.
+    if (order.core_ext?.stored_value) return 0;
     const settings = await getPosDriver().getPrintSettings(order.location_id);
     if (!settings?.auto_print) return 0;
     const jobs = await enqueueOrderTicket(order, { dedupeKey: `fire:${order.id}` });
@@ -284,6 +286,8 @@ export async function autoPrintOnFire(order: Order): Promise<number> {
  * scripts) it falls back to fire-and-forget. Never throws.
  */
 export function scheduleAutoPrint(order: Order): void {
+  // A gift card sale / reload has nothing to cook: never print a kitchen ticket.
+  if (order.core_ext?.stored_value) return;
   const run = () => autoPrintOnFire(order).then(() => undefined);
   try {
     after(run);

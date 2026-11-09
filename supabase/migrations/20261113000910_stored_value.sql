@@ -26,7 +26,7 @@
 -- No client access: RLS on with no policies, and every grant revoked from anon
 -- and authenticated. The app reads and writes with the service role only.
 --
--- Additive and live-safe: two new tables, five new functions. Needs
+-- Additive and live-safe: three new tables, new functions only. Needs
 -- 20261113000900 (the enum values) applied first.
 -- ============================================================================
 
@@ -53,6 +53,8 @@ create table if not exists public.stored_value_accounts (
   updated_at timestamptz not null default now(),
   activated_at timestamptz,
   voided_at timestamptz,
+  -- Online purchases: when the buyer's one-time code reveal was used.
+  code_revealed_at timestamptz,
   constraint stored_value_accounts_code_uq unique (tenant_id, code_hash)
 );
 create index if not exists stored_value_accounts_tenant_idx
@@ -103,19 +105,38 @@ create trigger stored_value_ledger_append_only
   before update or delete on public.stored_value_ledger
   for each row execute function public.sv_ledger_append_only();
 
+-- ---- code-guess limiter (shared across app instances) ----------------------------
+-- One row per limiter key (e.g. `shop:ip:<ip>:<tenant>`): failures inside the
+-- current window, and a lockout once over the limit. Written only by
+-- sv_guard_fail; read by sv_guard_check.
+create table if not exists public.stored_value_guard (
+  key text primary key,
+  window_start timestamptz not null default now(),
+  failures integer not null default 0,
+  locked_until timestamptz
+);
+create index if not exists stored_value_guard_window_idx
+  on public.stored_value_guard (window_start);
+alter table public.stored_value_guard enable row level security;
+
 -- ---- no client access ---------------------------------------------------------
 alter table public.stored_value_accounts enable row level security;
 alter table public.stored_value_ledger enable row level security;
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
-    revoke all on table public.stored_value_accounts, public.stored_value_ledger from anon;
+    revoke all on table public.stored_value_accounts, public.stored_value_ledger, public.stored_value_guard from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    revoke all on table public.stored_value_accounts, public.stored_value_ledger from authenticated;
+    revoke all on table public.stored_value_accounts, public.stored_value_ledger, public.stored_value_guard from authenticated;
   end if;
+  -- The service role only READS; every write goes through the SECURITY DEFINER
+  -- functions below (owned by the migration owner).
   if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant select, insert on table public.stored_value_accounts, public.stored_value_ledger to service_role;
+    revoke insert, update, delete, truncate on table
+      public.stored_value_accounts, public.stored_value_ledger, public.stored_value_guard
+      from service_role;
+    grant select on table public.stored_value_accounts, public.stored_value_ledger to service_role;
   end if;
 end
 $$;
@@ -142,7 +163,7 @@ create or replace function public.sv_order_sum(p_order public.orders, p_statuses
 returns bigint
 language sql
 stable
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select coalesce(sum(p.amount_cents), 0)::bigint
     from public.payments p
@@ -173,7 +194,7 @@ create or replace function public.sv_credit(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_acct public.stored_value_accounts;
@@ -218,6 +239,19 @@ begin
   if p_amount is null or p_amount <= 0 then
     return jsonb_build_object('outcome', 'bad_amount', 'account', to_jsonb(v_acct));
   end if;
+  -- A refund back to the card never exceeds what that tender redeemed (the
+  -- credit runs BEFORE the refund is recorded, so it must cap itself).
+  if p_kind = 'refund' then
+    if p_payment_id is null or coalesce((
+         select -sum(amount_cents) from public.stored_value_ledger
+          where account_id = p_account_id and payment_id = p_payment_id and kind = 'redeem'
+       ), 0) < coalesce((
+         select sum(amount_cents) from public.stored_value_ledger
+          where account_id = p_account_id and payment_id = p_payment_id and kind = 'refund'
+       ), 0) + p_amount then
+      return jsonb_build_object('outcome', 'exceeds_max', 'account', to_jsonb(v_acct));
+    end if;
+  end if;
   v_after := v_acct.balance_cents::bigint + p_amount;
   if p_max_balance is not null and v_after > p_max_balance then
     return jsonb_build_object('outcome', 'exceeds_max', 'account', to_jsonb(v_acct));
@@ -260,7 +294,7 @@ create or replace function public.sv_debit(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_acct public.stored_value_accounts;
@@ -326,7 +360,7 @@ create or replace function public.sv_void(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_acct public.stored_value_accounts;
@@ -391,7 +425,7 @@ create or replace function public.sv_redeem(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_order public.orders;
@@ -487,6 +521,215 @@ begin
 end;
 $$;
 
+-- ---- sv_create_account ---------------------------------------------------------
+-- Outcomes: ok | code_taken. `p_row` carries the NewAccount fields.
+create or replace function public.sv_create_account(p_row jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+begin
+  begin
+    insert into public.stored_value_accounts (
+      id, tenant_id, kind, status, currency, code_hash, code_last4, physical,
+      customer_id, recipient_name, recipient_email, sale_order_id, source, created_by,
+      activated_at
+    ) values (
+      (p_row ->> 'id')::uuid, (p_row ->> 'tenant_id')::uuid, p_row ->> 'kind',
+      p_row ->> 'status', coalesce(p_row ->> 'currency', 'USD'), p_row ->> 'code_hash',
+      p_row ->> 'code_last4', coalesce((p_row ->> 'physical')::boolean, false),
+      (p_row ->> 'customer_id')::uuid, p_row ->> 'recipient_name', p_row ->> 'recipient_email',
+      (p_row ->> 'sale_order_id')::uuid, p_row ->> 'source', p_row ->> 'created_by',
+      case when p_row ->> 'status' = 'active' then now() end
+    ) returning * into v_acct;
+  exception when unique_violation then
+    return jsonb_build_object('outcome', 'code_taken');
+  end;
+  return jsonb_build_object('outcome', 'ok', 'account', to_jsonb(v_acct));
+end;
+$$;
+
+-- ---- sv_issue_store_credit (create + credit, one transaction) -------------------
+-- Outcomes: ok | replayed | approval_required | code_taken | bad_amount
+-- A non-manager may not take their own store credit issued today (UTC) above
+-- p_daily_cap; serialized per (tenant, actor) by an advisory lock.
+create or replace function public.sv_issue_store_credit(
+  p_tenant_id uuid,
+  p_account_id uuid,
+  p_location_id uuid,
+  p_currency text,
+  p_code_hash text,
+  p_code_last4 text,
+  p_customer_id uuid,
+  p_amount integer,
+  p_reason text,
+  p_actor_id text,
+  p_is_manager boolean,
+  p_daily_cap integer
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+  v_entry public.stored_value_ledger;
+  v_today bigint;
+begin
+  if p_amount is null or p_amount <= 0 then
+    return jsonb_build_object('outcome', 'bad_amount');
+  end if;
+  perform pg_advisory_xact_lock(hashtext('sv_issue:' || p_tenant_id::text || ':' || coalesce(p_actor_id, '')));
+
+  select * into v_acct from public.stored_value_accounts
+   where id = p_account_id and tenant_id = p_tenant_id;
+  if found then
+    return jsonb_build_object('outcome', 'replayed', 'account', to_jsonb(v_acct));
+  end if;
+
+  if not p_is_manager and p_daily_cap is not null then
+    select coalesce(sum(l.amount_cents), 0) into v_today
+      from public.stored_value_ledger l
+      join public.stored_value_accounts a on a.id = l.account_id
+     where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
+       and l.actor_id = p_actor_id
+       and l.created_at >= date_trunc('day', now() at time zone 'UTC') at time zone 'UTC';
+    if v_today + p_amount > p_daily_cap then
+      return jsonb_build_object('outcome', 'approval_required');
+    end if;
+  end if;
+
+  begin
+    insert into public.stored_value_accounts (
+      id, tenant_id, kind, status, currency, balance_cents, code_hash, code_last4,
+      customer_id, source, created_by, activated_at
+    ) values (
+      p_account_id, p_tenant_id, 'store_credit', 'active', coalesce(p_currency, 'USD'), p_amount,
+      p_code_hash, p_code_last4, p_customer_id, 'issued', p_actor_id, now()
+    ) returning * into v_acct;
+  exception when unique_violation then
+    return jsonb_build_object('outcome', 'code_taken');
+  end;
+
+  insert into public.stored_value_ledger (
+    account_id, tenant_id, location_id, kind, amount_cents, balance_after_cents,
+    idempotency_key, reason, actor_id, approved_by
+  ) values (
+    p_account_id, p_tenant_id, p_location_id, 'issue', p_amount, p_amount,
+    'issue:' || p_account_id::text, p_reason, p_actor_id,
+    case when p_is_manager then p_actor_id end
+  ) returning * into v_entry;
+
+  return jsonb_build_object('outcome', 'ok', 'account', to_jsonb(v_acct), 'entry', to_jsonb(v_entry));
+end;
+$$;
+
+-- ---- sv_mark_revealed (the buyer's one-time code reveal) ------------------------
+create or replace function public.sv_mark_revealed(p_tenant_id uuid, p_account_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  update public.stored_value_accounts
+     set code_revealed_at = now()
+   where id = p_account_id and tenant_id = p_tenant_id
+     and source = 'online' and status = 'active' and code_revealed_at is null;
+  return found;
+end;
+$$;
+
+-- ---- guess limiter ---------------------------------------------------------------
+-- Seconds the most-locked of `p_keys` is still locked out (0 = free).
+create or replace function public.sv_guard_check(p_keys text[])
+returns integer
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select coalesce(max(ceil(extract(epoch from (locked_until - now()))))::integer, 0)
+    from public.stored_value_guard
+   where key = any (p_keys) and locked_until > now();
+$$;
+
+-- Count one failed lookup on every key; lock a key out for the rest of its
+-- window once it is over `p_limit`. Returns seconds locked (0 = not locked).
+create or replace function public.sv_guard_fail(p_keys text[], p_limit integer, p_window_seconds integer)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  k text;
+  v_wait integer := 0;
+  v_row public.stored_value_guard;
+begin
+  foreach k in array p_keys loop
+    insert into public.stored_value_guard as g (key, window_start, failures)
+    values (k, now(), 1)
+    on conflict (key) do update
+      set window_start = case when g.window_start + make_interval(secs => p_window_seconds) <= now()
+                              then now() else g.window_start end,
+          failures = case when g.window_start + make_interval(secs => p_window_seconds) <= now()
+                          then 1 else g.failures + 1 end
+    returning * into v_row;
+    if v_row.failures > p_limit then
+      update public.stored_value_guard
+         set locked_until = v_row.window_start + make_interval(secs => p_window_seconds)
+       where key = k;
+      v_wait := greatest(v_wait, ceil(extract(epoch from
+        (v_row.window_start + make_interval(secs => p_window_seconds) - now())))::integer);
+    end if;
+  end loop;
+  -- Opportunistic prune of stale keys.
+  if random() < 0.01 then
+    delete from public.stored_value_guard
+     where window_start < now() - interval '1 day'
+       and (locked_until is null or locked_until < now());
+  end if;
+  return v_wait;
+end;
+$$;
+
+-- ---- sv_summary (report aggregates, in SQL) --------------------------------------
+create or replace function public.sv_summary(
+  p_tenant_id uuid,
+  p_location_id uuid,
+  p_from timestamptz,
+  p_to timestamptz
+)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select jsonb_build_object(
+    'outstanding_cents', coalesce((
+      select sum(balance_cents) from public.stored_value_accounts
+       where tenant_id = p_tenant_id and status = 'active'), 0),
+    'store_credit_issued_count', coalesce((
+      select count(*) from public.stored_value_ledger l
+        join public.stored_value_accounts a on a.id = l.account_id
+       where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
+         and l.created_at >= p_from and l.created_at < p_to
+         and (p_location_id is null or l.location_id is null or l.location_id = p_location_id)), 0),
+    'store_credit_issued_cents', coalesce((
+      select sum(l.amount_cents) from public.stored_value_ledger l
+        join public.stored_value_accounts a on a.id = l.account_id
+       where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
+         and l.created_at >= p_from and l.created_at < p_to
+         and (p_location_id is null or l.location_id is null or l.location_id = p_location_id)), 0)
+  );
+$$;
+
 -- ---- grants: service_role only ---------------------------------------------------
 do $$
 declare
@@ -497,6 +740,12 @@ begin
     'public.sv_debit(uuid, uuid, uuid, text, integer, text, uuid, text, text)',
     'public.sv_void(uuid, uuid, uuid, text, text, text)',
     'public.sv_redeem(uuid, uuid, uuid, uuid, integer, text, uuid)',
+    'public.sv_create_account(jsonb)',
+    'public.sv_issue_store_credit(uuid, uuid, uuid, text, text, text, uuid, integer, text, text, boolean, integer)',
+    'public.sv_mark_revealed(uuid, uuid)',
+    'public.sv_guard_check(text[])',
+    'public.sv_guard_fail(text[], integer, integer)',
+    'public.sv_summary(uuid, uuid, timestamptz, timestamptz)',
     'public.sv_order_due(public.orders)',
     'public.sv_order_sum(public.orders, text[])'
   ] loop

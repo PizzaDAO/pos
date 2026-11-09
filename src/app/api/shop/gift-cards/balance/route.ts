@@ -4,8 +4,9 @@
  *
  * Body: { tenantSlug?, locationSlug, code } -> { balanceCents, currency, last4,
  * status, kind }. Anonymous, so brute-force limited per IP AND per device
- * (`gc_device` cookie): unknown codes are a uniform 404 and lock the caller out
- * after too many.
+ * (`gc_device` cookie), each scoped to the tenant, in a lockout table shared by
+ * every instance: unknown codes are a uniform 404 and lock the caller out after
+ * too many. Pre-printed physical card numbers are till-only (a uniform 404 here).
  */
 import { NextResponse } from "next/server";
 import { readJsonBody } from "@/lib/security";
@@ -28,8 +29,6 @@ export async function POST(request: Request) {
   if (off) return off;
   const device = shopDevice(request);
   const id = lookupIdentity(request, "shop", device.id);
-  const blocked = admitLookup(id);
-  if (blocked) return withDeviceCookie(blocked, device);
   const parsed = await readJsonBody(request);
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
   const b = parsed.body as Record<string, unknown>;
@@ -40,9 +39,14 @@ export async function POST(request: Request) {
   if (!resolved.ok) {
     return NextResponse.json({ error: resolved.error }, { status: resolved.status });
   }
+  const tenantId = resolved.location.tenant_id;
+  const blocked = await admitLookup(id, tenantId);
+  if (blocked) return withDeviceCookie(blocked, device);
   try {
-    const account = await findAccountByCode(resolved.location.tenant_id, b.code);
-    if (!account || account.status === "pending") return withDeviceCookie(unknownCode(id), device);
+    const account = await findAccountByCode(tenantId, b.code, { anonymous: true });
+    if (!account || account.status === "pending") {
+      return withDeviceCookie(await unknownCode(id, tenantId), device);
+    }
     return withDeviceCookie(
       NextResponse.json({
         balanceCents: account.status === "active" ? account.balance_cents : 0,

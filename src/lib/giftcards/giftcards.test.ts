@@ -31,9 +31,13 @@ import {
   findAccountByCode,
   issueStoreCredit,
   redeemStoredValue,
+  revealOnlineCode,
   reverseReload,
+  sweepUnreleasedStoredValue,
   voidStoredValue,
 } from "./service";
+import { expireOnlineOrders } from "@/lib/shop/lifecycle";
+import { vi } from "vitest";
 
 const TENANT = DEMO_TENANT_ID;
 const LOCATION = DEMO_LOCATION_DOWNTOWN_ID;
@@ -487,7 +491,7 @@ describe("store credit", () => {
 });
 
 describe("online", () => {
-  it("an online purchase settles through the online lifecycle, and the code can be re-derived", async () => {
+  it("an online purchase settles through the online lifecycle; a replay never returns the code, the one-time reveal does once", async () => {
     const orderId = randomUUID();
     const input = {
       tenantId: TENANT,
@@ -500,10 +504,15 @@ describe("online", () => {
     };
     const sale = await createGiftCardSale(input);
     expect(sale.order).toMatchObject({ channel: "online_pickup", status: "awaiting_payment" });
-    expect((await createGiftCardSale(input)).code).toBe(sale.code);
+    expect(sale.code).toMatch(/^.{4}-.{4}-.{4}-.{4}$/);
+    expect((await createGiftCardSale(input)).code).toBeNull();
+    expect(await revealOnlineCode(TENANT, orderId)).toBeNull(); // not paid yet
     await payCash(orderId, 4000);
+    expect((await createGiftCardSale(input)).code).toBeNull(); // not even after payment
     expect((await getPosDriver().getOrder(orderId))!.status).toBe("completed");
     expect((await findAccountByCode(TENANT, sale.code))?.balance_cents).toBe(4000);
+    expect((await revealOnlineCode(TENANT, orderId))?.code).toBe(sale.code);
+    await expect(revealOnlineCode(TENANT, orderId)).rejects.toMatchObject({ code: "already_revealed" });
   });
 
   it("a gift card applied to a checkout goes back to the card when the checkout is canceled", async () => {
@@ -563,5 +572,93 @@ describe("accounting: gift card sales are a liability, redemptions are taxed sal
       redeemed_gift_card_cents: 2000,
       redeemed_store_credit_cents: 0,
     });
+  });
+});
+
+describe("review fixes", () => {
+  it("physical card numbers are invisible to anonymous (storefront) lookups", async () => {
+    const { code } = await soldCard(2000, "6000 1234 5678 9012");
+    expect(await findAccountByCode(TENANT, code)).not.toBeNull();
+    expect(await findAccountByCode(TENANT, code, { anonymous: true })).toBeNull();
+  });
+
+  it("a refund of a gift card tender credits the card BEFORE it is recorded; a crash then a retry credits once", async () => {
+    const { code, accountId } = await soldCard(5000);
+    const food = await foodOrder(2000); // 2165
+    const { payment } = await redeem(food, code);
+    const driver = getPosDriver();
+    const reserve = vi.spyOn(driver, "reservePaymentRefund").mockRejectedValueOnce(new Error("crash"));
+    await expect(refundPayment({ paymentId: payment.id, amountCents: 1000, refundId: "r-crash" })).rejects.toThrow("crash");
+    // The card already has the value (never "recorded but not credited")...
+    expect((await account(accountId)).balance_cents).toBe(2835 + 1000);
+    expect((await driver.getPayment(payment.id))!.refunded_cents).toBe(0);
+    reserve.mockRestore();
+    // ...and the retry records it without crediting again.
+    await refundPayment({ paymentId: payment.id, amountCents: 1000, refundId: "r-crash" });
+    expect((await account(accountId)).balance_cents).toBe(3835);
+    expect((await driver.getPayment(payment.id))!.refunded_cents).toBe(1000);
+    expect((await ledgerOk(accountId)).ok).toBe(true);
+  });
+
+  it("refunds without a refund id still credit the card exactly once per recorded refund", async () => {
+    const { code, accountId } = await soldCard(5000);
+    const food = await foodOrder(2000);
+    const { payment } = await redeem(food, code);
+    await refundPayment({ paymentId: payment.id, amountCents: 500 });
+    await refundPayment({ paymentId: payment.id, amountCents: 500 });
+    expect((await account(accountId)).balance_cents).toBe(2835 + 1000);
+    expect((await getPosDriver().getPayment(payment.id))!.refunded_cents).toBe(1000);
+  });
+
+  it("two racing refunds of duplicate gift-card-sale tenders cannot both pass as excess", async () => {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT,
+      locationId: LOCATION,
+      orderId: randomUUID(),
+      amountCents: 2000,
+      channel: "in_store",
+      currency: "USD",
+    });
+    const p1 = await payCash(sale.order.id, 2000);
+    // A second (duplicate) cash tender written straight to the driver.
+    const p2 = await getPosDriver().upsertPayment({ ...p1, id: randomUUID(), created_at: new Date().toISOString() });
+    const results = await Promise.allSettled([
+      refundPayment({ paymentId: p1.id, refundId: "a" }),
+      refundPayment({ paymentId: p2.id, refundId: "b" }),
+    ]);
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    expect(ok).toBeLessThanOrEqual(1);
+    const held = (await getPosDriver().listPaymentsForOrder(sale.order.id)).reduce(
+      (n, p) => n + p.amount_cents - p.refunded_cents,
+      0,
+    );
+    expect(held).toBeGreaterThanOrEqual(2000); // the live card's value never left
+  });
+
+  it("the sweeper re-releases an abandoned checkout that still holds a gift card tender", async () => {
+    const { code, accountId } = await soldCard(1000);
+    const food = await foodOrder(2000, { online: true });
+    await redeem(food, code);
+    // Abandoned WITHOUT the release running (e.g. it failed).
+    await getPosDriver().transitionOrderStatus(food.id, ["awaiting_payment"], "abandoned");
+    expect((await account(accountId)).balance_cents).toBe(0);
+    expect(await sweepUnreleasedStoredValue()).toBe(1);
+    expect((await account(accountId)).balance_cents).toBe(1000);
+    expect(await sweepUnreleasedStoredValue()).toBe(0); // idempotent
+    await expireOnlineOrders(); // the cron path runs it too, harmlessly
+    expect((await account(accountId)).balance_cents).toBe(1000);
+  });
+
+  it("caps a non-manager's store credit per day; a manager is exempt", async () => {
+    const base = { tenantId: TENANT, locationId: LOCATION, reason: "late", currency: "USD" };
+    const cashier = { id: "cashier-1", label: "c" };
+    for (let i = 0; i < 4; i += 1) {
+      await issueStoreCredit({ ...base, accountId: randomUUID(), amountCents: 2500, role: "cashier", actor: cashier });
+    }
+    await expect(
+      issueStoreCredit({ ...base, accountId: randomUUID(), amountCents: 100, role: "cashier", actor: cashier }),
+    ).rejects.toMatchObject({ code: "approval_required" });
+    const mgr = await issueStoreCredit({ ...base, accountId: randomUUID(), amountCents: 2500, role: "manager", actor: ACTOR });
+    expect(mgr.account.balance_cents).toBe(2500);
   });
 });

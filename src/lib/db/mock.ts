@@ -2828,12 +2828,16 @@ export const mockDriver: PosDriver = {
     topN?: number,
   ): Promise<OwnerReportBundle> {
     ensureKitchenSeed();
+    // Stored-value liability lives in the stored-value store (src/lib/giftcards).
+    const { mockStoredValueStore } = await import("@/lib/giftcards/store-mock");
+    const sv = await mockStoredValueStore.summary(tenantId, null, from, from);
     return buildOwnerBundle({
       tenantId,
       locationId,
       from,
       to,
       topN,
+      storedValueOutstandingCents: sv.outstanding_cents,
       orders: [...orders.values()].filter((o) => o.tenant_id === tenantId),
       payments: [...payments.values()].filter((p) => p.tenant_id === tenantId),
       locations: locations.filter((l) => l.tenant_id === tenantId),

@@ -344,7 +344,7 @@ describe("comparison + csv", () => {
     const bundle = buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [pay(o)] });
     const lines = bundleToCsv("accountant", bundle, (k) => k).trim().split("\r\n");
     expect(lines).toHaveLength(3);
-    expect(lines[1]).toBe("2026-03-10,NY,1,10.00,0.00,0.00,10.00,0.80,0.00,0.00,0,0.00,10.80,0.00,0.00,0.00");
+    expect(lines[1]).toBe("2026-03-10,NY,1,10.00,0.00,0.00,10.00,0.80,0.00,0.00,0,0.00,10.80,0.00,0.00,0.00,0.00,0.00");
     expect(lines[2]).toMatch(/^# Refunds are dated to the original order's business day/);
   });
 });
@@ -353,6 +353,67 @@ function emptyDay() {
   return {
     location_id: "x", location_name: "x", business_date: "2026-03-10", orders: 0, gross_cents: 0, discount_cents: 0,
     refund_cents: 0, refund_sales_cents: 0, refund_tax_cents: 0, refund_fees_cents: 0, fees_cents: 0, refund_tip_cents: 0, tax_cents: 0, tip_cents: 0, void_count: 0, void_cents: 0, cash_cents: 0, card_cents: 0,
-    crypto_cents: 0, other_cents: 0,
+    crypto_cents: 0, gift_card_cents: 0, store_credit_cents: 0, other_cents: 0,
   };
 }
+
+describe("stored value (gift cards) in owner reports", () => {
+  it("keeps a gift card sale out of every sales figure and reports it as a liability", () => {
+    const sale = order({
+      items: [],
+      totals: { subtotal_cents: 0, discount_cents: 0, taxable_cents: 0, tax_cents: 0, tip_cents: 0, total_cents: 5000 },
+      core_ext: { stored_value: { op: "sell", account_id: "a1", amount_cents: 5000, code_last4: "ABCD" } },
+    });
+    const food = order({ price: 3000, totals: { subtotal_cents: 3000, discount_cents: 0, taxable_cents: 3000, tax_cents: 250, tip_cents: 0, total_cents: 3250 } });
+    const b = buildOwnerBundle({
+      ...base,
+      from: "2026-03-10",
+      to: "2026-03-10",
+      orders: [sale, food],
+      payments: [
+        pay(sale, { amount_cents: 5000 }),
+        pay(food, { rail: "gift_card", amount_cents: 2000 }),
+        pay(food, { rail: "store_credit", amount_cents: 500 }),
+        pay(food, { amount_cents: 750 }),
+      ],
+      storedValueOutstandingCents: 3000,
+    });
+    const s = summarize(b.daily);
+    expect(s.orders).toBe(1);
+    expect(s.gross_cents).toBe(3000);
+    expect(s.tax_cents).toBe(250);
+    expect(s.cash_cents).toBe(750); // the 5000 that bought the card is not a sale
+    expect(s.gift_card_cents).toBe(2000);
+    expect(s.store_credit_cents).toBe(500);
+    expect(s.other_cents).toBe(0);
+    expect(b.tenders.map((t) => [t.key, t.amount_cents])).toEqual([
+      ["gift_card", 2000],
+      ["cash", 750],
+      ["store_credit", 500],
+    ]);
+    expect(b.staff.reduce((n, r) => n + r.orders, 0)).toBe(1);
+    expect(b.stored_value).toEqual({
+      sold_count: 1,
+      sold_cents: 5000,
+      sold_refunded_cents: 0,
+      redeemed_gift_card_cents: 2000,
+      redeemed_store_credit_cents: 500,
+      outstanding_cents: 3000,
+    });
+  });
+
+  it("an unpaid (draft) gift card sale is nothing, and a voided card's refund is tracked", () => {
+    const ext = { stored_value: { op: "sell" as const, account_id: "a1", amount_cents: 2000, code_last4: "ABCD" } };
+    const draft = order({ items: [], status: "draft", core_ext: ext });
+    const voided = order({ items: [], status: "refunded", core_ext: ext });
+    const b = buildOwnerBundle({
+      ...base,
+      from: "2026-03-10",
+      to: "2026-03-10",
+      orders: [draft, voided],
+      payments: [pay(voided, { amount_cents: 2000, refunded_cents: 2000, status: "refunded" })],
+    });
+    expect(b.daily).toEqual([]);
+    expect(b.stored_value).toMatchObject({ sold_count: 1, sold_cents: 2000, sold_refunded_cents: 2000 });
+  });
+});

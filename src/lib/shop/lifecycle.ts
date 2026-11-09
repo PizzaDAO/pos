@@ -378,6 +378,11 @@ export async function expireOnlineOrders(
   }
   await sweepForeignModeOrders(now, mode, summary);
   summary.recovered = await recoverUnfinalizedOrders(now);
+  // Abandoned checkouts still holding a gift card / store credit tender (a
+  // release that failed at abandonment) give it back to the card. Idempotent.
+  await import("@/lib/giftcards/service")
+    .then((m) => m.sweepUnreleasedStoredValue(now))
+    .catch((err) => captureError(err, { scope: "expireOnlineOrders.storedValue" }));
   return summary;
 }
 

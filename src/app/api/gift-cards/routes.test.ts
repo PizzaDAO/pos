@@ -39,6 +39,7 @@ import { POST as creditPOST } from "./store-credit/route";
 import { POST as shopBalancePOST } from "@/app/api/shop/gift-cards/balance/route";
 import { POST as shopRedeemPOST } from "@/app/api/shop/gift-cards/redeem/route";
 import { POST as shopBuyPOST } from "@/app/api/shop/gift-cards/route";
+import { POST as shopRevealPOST } from "@/app/api/shop/gift-cards/reveal/route";
 
 const TENANT = DEMO_TENANT_ID;
 const LOCATION = DEMO_LOCATION_DOWNTOWN_ID;
@@ -209,4 +210,72 @@ describe("storefront routes", () => {
     expect((await again.json()).payment.amount_cents).toBe(1500);
     expect((await getPosDriver().listPaymentsForOrder(checkout.id)).length).toBe(1);
   });
+
+  it("never returns the code on a replayed purchase; the buyer's signed cookie reveals it once", async () => {
+    const loc = (await getPosDriver().listLocations(TENANT)).find((l) => l.id === LOCATION)!;
+    const tenant = (await getPosDriver().getTenant(TENANT))!;
+    const body = { orderId: randomUUID(), tenantSlug: tenant.slug, locationSlug: loc.slug, amountCents: 2000, email: "b@example.com" };
+    const first = await shopBuyPOST(req(body));
+    const cookie = first.headers.get("set-cookie") ?? "";
+    expect(cookie).toContain("gc_reveal=");
+    expect(cookie.toLowerCase()).toContain("httponly");
+    const { code, order: o } = (await first.json()) as { code: string; order: { id: string } };
+    expect(code).toBeTruthy();
+    const replay = await shopBuyPOST(req(body));
+    expect((await replay.json()).code).toBeNull();
+    expect(replay.headers.get("set-cookie") ?? "").not.toContain("gc_reveal=");
+
+    const token = cookie.split(";")[0]!; // gc_reveal=...
+    const reveal = (c?: string) =>
+      shopRevealPOST(
+        new Request("https://pos.test/api/shop/gift-cards/reveal", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(c ? { cookie: c } : {}) },
+          body: JSON.stringify({ orderId: o.id }),
+        }),
+      );
+    expect((await reveal()).status).toBe(403); // no token: some other browser
+    expect((await reveal("gc_reveal=" + o.id + ".99999999999999.deadbeef")).status).toBe(403); // forged
+    expect((await reveal(token)).status).toBe(202); // not paid yet
+    await takePayment({
+      paymentId: randomUUID(), orderId: o.id, tenantId: TENANT, locationId: LOCATION,
+      rail: "cash", amountCents: 2000, tipCents: 0, currency: "USD",
+    });
+    const ok = await reveal(token);
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).code).toBe(code);
+    expect((await reveal(token)).status).toBe(410); // one time only
+  });
+
+  it("refuses physical card numbers on the anonymous storefront (uniform 404)", async () => {
+    auth.role = "manager";
+    const res = await salePOST(
+      req({ tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: 2000, physicalCode: "6000 1111 2222 3333" }),
+    );
+    const sale = (await res.json()) as { order: { id: string } };
+    await takePayment({
+      paymentId: randomUUID(), orderId: sale.order.id, tenantId: TENANT, locationId: LOCATION,
+      rail: "cash", amountCents: 2000, tipCents: 0, currency: "USD",
+    });
+    // The till sees it...
+    expect((await balancePOST(req({ tenantId: TENANT, code: "6000111122223333" }))).status).toBe(200);
+    // ...the storefront does not.
+    const loc = (await getPosDriver().listLocations(TENANT)).find((l) => l.id === LOCATION)!;
+    const tenant = (await getPosDriver().getTenant(TENANT))!;
+    const shop = await shopBalancePOST(req({ tenantSlug: tenant.slug, locationSlug: loc.slug, code: "6000111122223333" }));
+    expect(shop.status).toBe(404);
+    const checkout = await order(4000, true);
+    expect((await shopRedeemPOST(req({ orderId: checkout.id, code: "6000111122223333" }))).status).toBe(404);
+  });
+
+  it("anonymous redeem responses carry no card digits", async () => {
+    const sale = await sellAndPay(1500);
+    const checkout = await order(4000, true);
+    const res = await shopRedeemPOST(req({ orderId: checkout.id, code: sale.code }));
+    const body = (await res.json()) as { payment: { raw: Record<string, unknown> | null }; account: Record<string, unknown> };
+    expect(res.status).toBe(200);
+    expect(body.payment.raw?.code_last4).toBeUndefined();
+    expect(body.account.code_last4).toBeUndefined();
+  });
 });
+

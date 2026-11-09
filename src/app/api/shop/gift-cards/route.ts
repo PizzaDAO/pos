@@ -7,9 +7,10 @@
  * Creates the pending card and its online sale order (`awaiting_payment`, no
  * menu lines, no tax). The buyer then pays it through the normal online payment
  * path (POST /api/payments with the card rail); the card activates once that
- * settles, and the (inert) recipient delivery hook runs. `code` is returned so
- * the buyer can see it after paying; a retry with the same orderId returns it
- * again (online codes are derived from the card id under the server pepper).
+ * settles, and the (inert) recipient delivery hook runs. `code` is returned in
+ * the FIRST creation response only; a retry with the same orderId gets
+ * `code: null`. The response also sets a short-lived signed `gc_reveal` cookie
+ * so this browser alone can reveal the code once after paying (/reveal).
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
@@ -22,7 +23,8 @@ import {
   anyOnlinePaymentAllowed,
 } from "@/lib/shop/training-online";
 import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlements";
-import { cleanText, errorResponse, featureOff } from "@/lib/giftcards/http";
+import { REVEAL_COOKIE, cleanText, errorResponse, featureOff } from "@/lib/giftcards/http";
+import { REVEAL_TTL_MS, signRevealToken } from "@/lib/giftcards/codes";
 import { createGiftCardSale } from "@/lib/giftcards/service";
 
 export const runtime = "nodejs";
@@ -88,10 +90,22 @@ export async function POST(request: Request) {
       customerId: customer?.id ?? null,
       currency: settings.currency,
     });
-    return NextResponse.json(
+    const res = NextResponse.json(
       { order: sale.order, code: sale.code, account: sale.account },
       { status: sale.replayed ? 200 : 201 },
     );
+    // Bind the purchase to this browser: only it can reveal the code once after
+    // paying (POST /api/shop/gift-cards/reveal). A replay never re-issues it.
+    if (!sale.replayed) {
+      res.cookies.set(REVEAL_COOKIE, signRevealToken(sale.order.id), {
+        httpOnly: true,
+        sameSite: "strict",
+        secure: process.env.NODE_ENV === "production",
+        path: "/api/shop/gift-cards",
+        maxAge: REVEAL_TTL_MS / 1000,
+      });
+    }
+    return res;
   } catch (err) {
     return errorResponse(err, "shop-giftcard-sale");
   }

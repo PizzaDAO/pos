@@ -393,8 +393,12 @@ export function toContractMenu(input: {
 // Payments + orders
 // ---------------------------------------------------------------------------
 
-export function railToMethod(rail: string): "card" | "cash" | "crypto" | "other" {
+export function railToMethod(
+  rail: string,
+): "card" | "cash" | "crypto" | "gift_card" | "store_credit" | "other" {
   if (rail === "cash") return "cash";
+  // Stored value (src/lib/giftcards): its own tender method, never "other".
+  if (rail === "gift_card" || rail === "store_credit") return rail;
   if (rail.startsWith("stripe")) return "card";
   if (rail.startsWith("crypto")) return "crypto";
   return "other";
@@ -402,6 +406,7 @@ export function railToMethod(rail: string): "card" | "cash" | "crypto" | "other"
 
 export function railToProcessor(rail: string): string {
   if (rail.startsWith("stripe")) return "stripe";
+  if (rail === "gift_card" || rail === "store_credit") return "pos";
   if (rail === "crypto_coinbase") return "coinbase";
   return rail;
 }
@@ -729,7 +734,14 @@ export function toContractOrder(input: {
     quote_id: null,
     tax_exempt: order.core_ext?.tax_exempt ?? false,
     business_date: businessDate(order.created_at, timezone),
-    metadata: order.core_ext?.metadata ?? {},
+    // A gift card sale / reload is flagged so hub consumers never treat it as
+    // food revenue: "gift_card_sale" | "gift_card_reload".
+    metadata: order.core_ext?.stored_value
+      ? {
+          ...(order.core_ext?.metadata ?? {}),
+          stored_value: order.core_ext.stored_value.op === "sell" ? "gift_card_sale" : "gift_card_reload",
+        }
+      : (order.core_ext?.metadata ?? {}),
     callout_name:
       order.core_ext?.callout_name ??
       calloutName({ name: contact.name }) ??

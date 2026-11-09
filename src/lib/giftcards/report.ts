@@ -11,7 +11,6 @@
  */
 import type { Order, Payment } from "@/lib/db";
 import type { StoredValueReport } from "@/lib/db/backoffice-types";
-import type { LedgerEntry } from "./types";
 
 export function isStoredValueOrder(order: Pick<Order, "core_ext">): boolean {
   return !!order.core_ext?.stored_value;
@@ -65,21 +64,4 @@ export function buildStoredValueReport(
   }
   out.sold_count = soldOrders.size;
   return out;
-}
-
-/** Store credit issued / voided in a ledger slice (the reports route adds it). */
-export function storeCreditIssued(
-  entries: readonly LedgerEntry[],
-  storeCreditAccountIds: ReadonlySet<string>,
-  locationId: string | null,
-): { issued_count: number; issued_cents: number } {
-  let issued_count = 0;
-  let issued_cents = 0;
-  for (const e of entries) {
-    if (!storeCreditAccountIds.has(e.account_id) || e.kind !== "issue") continue;
-    if (locationId && e.location_id && e.location_id !== locationId) continue;
-    issued_count += 1;
-    issued_cents += e.amount_cents;
-  }
-  return { issued_count, issued_cents };
 }

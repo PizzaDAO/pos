@@ -14,6 +14,8 @@ declare
   cash uuid := gen_random_uuid();
   acct uuid := gen_random_uuid();
   acct2 uuid := gen_random_uuid();
+  acct3 uuid := gen_random_uuid();
+  i int;
   p1 uuid := gen_random_uuid();
   p2 uuid := gen_random_uuid();
   r jsonb;
@@ -110,6 +112,48 @@ begin
   select balance_cents into bal from public.stored_value_accounts where id = acct;
   select sum(amount_cents) into n from public.stored_value_ledger where account_id = acct;
   if bal <> n then raise exception 'cache % <> ledger %', bal, n; end if;
+
+  -- ---- owner reports (20261113000920): the sale is a liability, not a sale ------
+  update public.orders set status = 'completed' where id = sale;
+  r := public.report_sales_bundle(t, loc, current_date - 2, current_date + 2);
+  select coalesce(sum((d ->> 'orders')::int), 0) into n from jsonb_array_elements(r -> 'daily') d;
+  if n <> 1 then raise exception 'report counted % orders (sale must be excluded): %', n, r -> 'daily'; end if;
+  select coalesce(sum((d ->> 'cash_cents')::int), 0) into n from jsonb_array_elements(r -> 'daily') d;
+  if n <> 0 then raise exception 'gift card sale cash counted as sales tender: %', n; end if;
+  select coalesce(sum((d ->> 'gift_card_cents')::int), 0) into n from jsonb_array_elements(r -> 'daily') d;
+  if n <> 2000 then raise exception 'gift_card tender line: %', n; end if;
+  select coalesce(sum((d ->> 'other_cents')::int), 0) into n from jsonb_array_elements(r -> 'daily') d;
+  if n <> 0 then raise exception 'gift card fell into other: %', n; end if;
+  if (r -> 'stored_value' ->> 'sold_cents')::int <> 5000
+     or (r -> 'stored_value' ->> 'redeemed_gift_card_cents')::int <> 2000
+     or (r -> 'stored_value' ->> 'outstanding_cents')::int <> 5000 then
+    raise exception 'stored_value section: %', r -> 'stored_value';
+  end if;
+  if exists (select 1 from jsonb_array_elements(r -> 'tenders') x where x ->> 'key' = 'cash') then
+    raise exception 'sale tender in the tender list: %', r -> 'tenders';
+  end if;
+
+  -- ---- one-time reveal, guard, atomic store credit ------------------------------
+  update public.stored_value_accounts set source = 'online' where id = acct;
+  if not public.sv_mark_revealed(t, acct) then raise exception 'first reveal refused'; end if;
+  if public.sv_mark_revealed(t, acct) then raise exception 'second reveal allowed'; end if;
+
+  for i in 1..3 loop perform public.sv_guard_fail(array['k1', 'k2'], 2, 900); end loop;
+  if public.sv_guard_check(array['k1']) <= 0 then raise exception 'guard did not lock'; end if;
+  if public.sv_guard_check(array['k3']) <> 0 then raise exception 'guard locked an unrelated key'; end if;
+
+  r := public.sv_issue_store_credit(t, acct3, loc, 'USD', 'hash-3', 'AAAA', null, 6000, 'late', 'cashier1', false, 10000);
+  if r ->> 'outcome' <> 'ok' or (r -> 'account' ->> 'balance_cents')::int <> 6000 then raise exception 'issue: %', r; end if;
+  r := public.sv_issue_store_credit(t, acct3, loc, 'USD', 'hash-3', 'AAAA', null, 6000, 'late', 'cashier1', false, 10000);
+  if r ->> 'outcome' <> 'replayed' then raise exception 'issue replay: %', r; end if;
+  r := public.sv_issue_store_credit(t, gen_random_uuid(), loc, 'USD', 'hash-4', 'BBBB', null, 5000, 'late', 'cashier1', false, 10000);
+  if r ->> 'outcome' <> 'approval_required' then raise exception 'daily cap: %', r; end if;
+  r := public.sv_issue_store_credit(t, gen_random_uuid(), loc, 'USD', 'hash-4', 'BBBB', null, 5000, 'late', 'mgr1', true, 10000);
+  if r ->> 'outcome' <> 'ok' or (r -> 'entry' ->> 'approved_by') <> 'mgr1' then raise exception 'manager issue: %', r; end if;
+
+  -- refund-to-card is capped at what the tender redeemed
+  r := public.sv_credit(t, acct, loc, 'refund', 1, 'refund-extra', food, p1);
+  if r ->> 'outcome' <> 'exceeds_max' then raise exception 'refund over the redemption: %', r; end if;
 
   -- ---- append-only + sign rules --------------------------------------------------
   begin

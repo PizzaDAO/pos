@@ -13,10 +13,14 @@ import { captureError } from "@/lib/observability";
 import { clientIp } from "@/lib/security/http";
 import { GiftCardsUnavailableError } from "./codes";
 import { giftCardsEnabled } from "./limits";
-import { lookupGuard, type LookupIdentity } from "./lockout";
+import { LOOKUP_RULES, lookupGuard, type LookupIdentity } from "./lockout";
+import { getStoredValueStore } from "./store";
+import { rateLimitEnabled } from "@/lib/security/rate-limit";
 import { StoredValueError } from "./service";
 
 export const DEVICE_COOKIE = "gc_device";
+/** Signed one-time reveal token for an online purchase (see codes.signRevealToken). */
+export const REVEAL_COOKIE = "gc_reveal";
 
 export function featureOff(): NextResponse | null {
   if (giftCardsEnabled()) return null;
@@ -98,10 +102,14 @@ export function lookupIdentity(
   return { ip: clientIp(request.headers), device, surface };
 }
 
-/** 429 when the caller is over the lookup limits, else null (and counted). */
-export function admitLookup(id: LookupIdentity): NextResponse | null {
-  const wait = lookupGuard.admit(id);
-  if (wait <= 0) return null;
+/** Limiter keys: per IP AND per device, each scoped to the tenant. */
+export function lookupKeys(id: LookupIdentity, tenantId: string): string[] {
+  const keys = [`${id.surface}:ip:${id.ip}:${tenantId}`];
+  if (id.device) keys.push(`${id.surface}:dev:${id.device}:${tenantId}`);
+  return keys;
+}
+
+function tooMany(wait: number): NextResponse {
   const res = NextResponse.json(
     { error: "Too many gift card attempts. Try again later.", code: "too_many_attempts" },
     { status: 429 },
@@ -110,9 +118,28 @@ export function admitLookup(id: LookupIdentity): NextResponse | null {
   return res;
 }
 
-/** The uniform "unknown code" answer (counts toward the lockout). */
-export function unknownCode(id: LookupIdentity): NextResponse {
-  lookupGuard.fail(id);
+/**
+ * 429 when the caller is over the lookup limits, else null. Two layers: a
+ * process-local burst cap, and the failure lockout kept in the DATABASE (shared
+ * by every app instance), keyed on IP + tenant and device + tenant.
+ */
+export async function admitLookup(id: LookupIdentity, tenantId: string): Promise<NextResponse | null> {
+  const burst = lookupGuard.admit(id);
+  if (burst > 0) return tooMany(burst);
+  if (!rateLimitEnabled()) return null;
+  const store = await getStoredValueStore();
+  const wait = await store.guardCheck(lookupKeys(id, tenantId));
+  return wait > 0 ? tooMany(wait) : null;
+}
+
+/** The uniform "unknown code" answer (counts toward the shared lockout). */
+export async function unknownCode(id: LookupIdentity, tenantId: string): Promise<NextResponse> {
+  if (rateLimitEnabled()) {
+    const store = await getStoredValueStore();
+    await store
+      .guardFail(lookupKeys(id, tenantId), LOOKUP_RULES.failures.limit, LOOKUP_RULES.failures.windowMs / 1000)
+      .catch((err) => captureError(err, { scope: "giftcard-guard" }));
+  }
   return NextResponse.json(
     { error: "That code was not found.", code: "not_found" },
     { status: 404 },

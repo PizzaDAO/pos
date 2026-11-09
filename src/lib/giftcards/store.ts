@@ -1,8 +1,8 @@
 /**
  * Stored-value persistence contract + driver selection (server-only).
  *
- * Its own small store (not new PosDriver methods), selected exactly like
- * `getPosDriver()`: the Supabase writer when Supabase env is present, else the
+ * Its own small store (not new PosDriver methods), paired with the active
+ * PosDriver: the Supabase writer when the PosDriver is Supabase, else the
  * in-memory mock. Every mutating method is ONE atomic operation:
  *
  *   - Postgres: a SECURITY DEFINER function that locks the account row (and,
@@ -14,6 +14,7 @@
  * Every mutation is idempotent on (account, idempotency key); a redemption is
  * also idempotent on its payment id.
  */
+import { getPosDriver } from "@/lib/db";
 import { readSupabaseConfig } from "@/lib/db/supabase";
 import type {
   CreditInput,
@@ -28,6 +29,34 @@ import type {
   VoidInput,
 } from "./types";
 
+export interface StoredValueSummary {
+  outstanding_cents: number;
+  store_credit_issued_count: number;
+  store_credit_issued_cents: number;
+}
+
+export interface IssueStoreCreditWrite {
+  tenantId: string;
+  accountId: string;
+  locationId: string | null;
+  currency: string;
+  codeHash: string;
+  codeLast4: string;
+  customerId: string | null;
+  amountCents: number;
+  reason: string;
+  actorId: string;
+  /** Owner/manager: recorded as approved_by and exempt from the daily cap. */
+  isManager: boolean;
+  /** A non-manager's store credit issued today (UTC) may not exceed this. */
+  dailyCapCents: number | null;
+}
+
+export type IssueStoreCreditOutcome =
+  | { outcome: "ok"; account: StoredValueAccount; entry: LedgerEntry }
+  | { outcome: "replayed"; account: StoredValueAccount }
+  | { outcome: "approval_required" | "code_taken" | "bad_amount" };
+
 export interface StoredValueStore {
   readonly name: "mock" | "supabase";
   createAccount(
@@ -41,9 +70,24 @@ export interface StoredValueStore {
   ): Promise<StoredValueAccount[]>;
   /** One account's ledger, oldest first. */
   listLedger(tenantId: string, accountId: string): Promise<LedgerEntry[]>;
-  /** A tenant's ledger rows created in [fromIso, toIso), oldest first. */
-  listLedgerBetween(tenantId: string, fromIso: string, toIso: string): Promise<LedgerEntry[]>;
   getLedgerEntry(id: string): Promise<LedgerEntry | null>;
+  /** Redeem rows (all tenants) created since `sinceIso`, oldest first (release sweep). */
+  listRecentRedemptions(sinceIso: string, limit: number): Promise<LedgerEntry[]>;
+  /** Aggregates for reports, computed by the store (SQL), never by paging rows. */
+  summary(
+    tenantId: string,
+    locationId: string | null,
+    fromIso: string,
+    toIso: string,
+  ): Promise<StoredValueSummary>;
+  /** Store credit: create the account AND credit it in one atomic step. */
+  issueStoreCredit(input: IssueStoreCreditWrite): Promise<IssueStoreCreditOutcome>;
+  /** The buyer's one-time code reveal (online cards): true only the first time. */
+  markCodeRevealed(tenantId: string, accountId: string): Promise<boolean>;
+  /** Guess limiter, shared across instances: seconds any key is locked out (0 = free). */
+  guardCheck(keys: string[]): Promise<number>;
+  /** Count one failed lookup on every key; returns seconds locked after it. */
+  guardFail(keys: string[], limit: number, windowSeconds: number): Promise<number>;
   credit(input: CreditInput): Promise<MutationResult>;
   debit(input: DebitInput): Promise<MutationResult>;
   voidAccount(input: VoidInput): Promise<MutationResult>;
@@ -54,7 +98,9 @@ let cached: StoredValueStore | null = null;
 
 export async function getStoredValueStore(): Promise<StoredValueStore> {
   if (cached) return cached;
-  const config = readSupabaseConfig();
+  // Follow the ACTIVE PosDriver (orders + tenders live there): a mock driver
+  // always pairs with the mock store, whatever env changed since.
+  const config = getPosDriver().name === "mock" ? null : readSupabaseConfig();
   if (config) {
     const { createSupabaseStoredValueStore } = await import("./store-supabase");
     cached = createSupabaseStoredValueStore(config);

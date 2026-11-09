@@ -22,6 +22,8 @@ interface MockAccount extends StoredValueAccount {
 
 const accounts = new Map<string, MockAccount>();
 const ledger: LedgerEntry[] = [];
+const revealed = new Set<string>();
+const guard = new Map<string, { windowStart: number; failures: number; lockedUntil: number | null }>();
 
 let chain: Promise<unknown> = Promise.resolve();
 /** Run `fn` exclusively (FIFO). A failure never poisons the queue. */
@@ -134,10 +136,128 @@ export const mockStoredValueStore: StoredValueStore = {
       .map((e) => ({ ...e }));
   },
 
-  async listLedgerBetween(tenantId, fromIso, toIso) {
+  async listRecentRedemptions(sinceIso, limit) {
     return ledger
-      .filter((e) => e.tenant_id === tenantId && e.created_at >= fromIso && e.created_at < toIso)
+      .filter((e) => e.kind === "redeem" && e.created_at >= sinceIso)
+      .slice(0, limit)
       .map((e) => ({ ...e }));
+  },
+
+  async summary(tenantId, locationId, fromIso, toIso) {
+    let outstanding = 0;
+    const credits = new Set<string>();
+    for (const a of accounts.values()) {
+      if (a.tenant_id !== tenantId) continue;
+      if (a.status === "active") outstanding += a.balance_cents;
+      if (a.kind === "store_credit") credits.add(a.id);
+    }
+    let count = 0;
+    let cents = 0;
+    for (const e of ledger) {
+      if (e.tenant_id !== tenantId || e.kind !== "issue" || !credits.has(e.account_id)) continue;
+      if (e.created_at < fromIso || e.created_at >= toIso) continue;
+      if (locationId && e.location_id && e.location_id !== locationId) continue;
+      count += 1;
+      cents += e.amount_cents;
+    }
+    return { outstanding_cents: outstanding, store_credit_issued_count: count, store_credit_issued_cents: cents };
+  },
+
+  async issueStoreCredit(input) {
+    return exclusive(async () => {
+      if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) {
+        return { outcome: "bad_amount" as const };
+      }
+      const existing = owned(input.tenantId, input.accountId);
+      if (existing) return { outcome: "replayed" as const, account: publicAccount(existing) };
+      if (!input.isManager && input.dailyCapCents != null) {
+        const day = nowIso().slice(0, 10);
+        const today = ledger
+          .filter(
+            (e) =>
+              e.tenant_id === input.tenantId &&
+              e.kind === "issue" &&
+              e.actor_id === input.actorId &&
+              e.created_at.slice(0, 10) === day &&
+              accounts.get(e.account_id)?.kind === "store_credit",
+          )
+          .reduce((n, e) => n + e.amount_cents, 0);
+        if (today + input.amountCents > input.dailyCapCents) {
+          return { outcome: "approval_required" as const };
+        }
+      }
+      for (const a of accounts.values()) {
+        if (a.tenant_id === input.tenantId && a.code_hash === input.codeHash) {
+          return { outcome: "code_taken" as const };
+        }
+      }
+      const at = nowIso();
+      const a: MockAccount = {
+        id: input.accountId,
+        tenant_id: input.tenantId,
+        kind: "store_credit",
+        status: "active",
+        currency: input.currency,
+        balance_cents: 0,
+        code_hash: input.codeHash,
+        code_last4: input.codeLast4,
+        physical: false,
+        customer_id: input.customerId,
+        recipient_name: null,
+        recipient_email: null,
+        sale_order_id: null,
+        source: "issued",
+        created_by: input.actorId,
+        created_at: at,
+        updated_at: at,
+        activated_at: at,
+        voided_at: null,
+      };
+      accounts.set(a.id, a);
+      const entry = append(a, "issue", input.amountCents, input.amountCents, {
+        idempotency_key: `issue:${a.id}`,
+        location_id: input.locationId,
+        reason: input.reason,
+        actor_id: input.actorId,
+        approved_by: input.isManager ? input.actorId : null,
+      });
+      return { outcome: "ok" as const, account: publicAccount(a), entry };
+    });
+  },
+
+  async markCodeRevealed(tenantId, accountId) {
+    return exclusive(async () => {
+      const a = owned(tenantId, accountId);
+      if (!a || a.source !== "online" || a.status !== "active" || revealed.has(a.id)) return false;
+      revealed.add(a.id);
+      return true;
+    });
+  },
+
+  async guardCheck(keys) {
+    const t = Date.now();
+    let wait = 0;
+    for (const k of keys) {
+      const g = guard.get(k);
+      if (g?.lockedUntil && g.lockedUntil > t) wait = Math.max(wait, Math.ceil((g.lockedUntil - t) / 1000));
+    }
+    return wait;
+  },
+
+  async guardFail(keys, limit, windowSeconds) {
+    const t = Date.now();
+    let wait = 0;
+    for (const k of keys) {
+      let g = guard.get(k);
+      if (!g || g.windowStart + windowSeconds * 1000 <= t) g = { windowStart: t, failures: 0, lockedUntil: null };
+      g.failures += 1;
+      if (g.failures > limit) {
+        g.lockedUntil = g.windowStart + windowSeconds * 1000;
+        wait = Math.max(wait, Math.ceil((g.lockedUntil - t) / 1000));
+      }
+      guard.set(k, g);
+    }
+    return wait;
   },
 
   async getLedgerEntry(id) {
@@ -165,6 +285,17 @@ export const mockStoredValueStore: StoredValueStore = {
           !isSettled(order, await driver.listPaymentsForOrder(order.id))
         ) {
           return { ok: false, reason: "not_settled", account: publicAccount(a) };
+        }
+      }
+      if (input.kind === "refund") {
+        // Capped at what the tender redeemed (the credit runs before the refund
+        // is recorded): same rule as sv_credit.
+        const of = (k: LedgerKind) =>
+          ledger
+            .filter((e) => e.account_id === a.id && e.payment_id === input.paymentId && e.kind === k)
+            .reduce((n, e) => n + e.amount_cents, 0);
+        if (!input.paymentId || -of("redeem") < of("refund") + input.amountCents) {
+          return { ok: false, reason: "exceeds_max", account: publicAccount(a) };
         }
       }
       const moved = applyMovement(a.balance_cents, input.kind, input.amountCents, input.maxBalanceCents);
@@ -338,4 +469,6 @@ export const mockStoredValueStore: StoredValueStore = {
 export function resetMockStoredValue(): void {
   accounts.clear();
   ledger.length = 0;
+  revealed.clear();
+  guard.clear();
 }

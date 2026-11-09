@@ -43,7 +43,7 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.res;
   const { grant } = auth;
   const id = lookupIdentity(request, "till", grant.user.id);
-  const blocked = admitLookup(id);
+  const blocked = await admitLookup(id, grant.tenantId);
   if (blocked) return blocked;
   try {
     const settings = await getPosDriver().getStoreSettings(grant.tenantId, b.locationId);
@@ -58,7 +58,7 @@ export async function POST(request: Request) {
     });
     return NextResponse.json(out, { status: out.replayed ? 200 : 201 });
   } catch (err) {
-    if (err instanceof StoredValueError && err.code === "not_found") return unknownCode(id);
+    if (err instanceof StoredValueError && err.code === "not_found") return unknownCode(id, grant.tenantId);
     return errorResponse(err, "giftcard-reload");
   }
 }

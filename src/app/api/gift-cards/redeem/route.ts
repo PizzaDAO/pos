@@ -23,7 +23,11 @@ import {
   requireTillStaff,
   unknownCode,
 } from "@/lib/giftcards/http";
-import { findAccountByCode, redeemStoredValue } from "@/lib/giftcards/service";
+import {
+  findAccountByCode,
+  redeemStoredValue,
+  releaseStoredValueTender,
+} from "@/lib/giftcards/service";
 
 export const runtime = "nodejs";
 
@@ -55,28 +59,12 @@ export async function POST(request: Request) {
     );
   }
   const id = lookupIdentity(request, "till", auth.grant.user.id);
-  const blocked = admitLookup(id);
+  const blocked = await admitLookup(id, order.tenant_id);
   if (blocked) return blocked;
 
   try {
     const account = await findAccountByCode(order.tenant_id, b.code);
-    if (!account) return unknownCode(id);
-
-    // A card tender may still be live on the reader: close it first, strictly
-    // (same rule as every other in-store tender), so nothing double-pays.
-    const closed = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
-    if (closed === "settled" || closed === "in_flight" || closed === "needs_review") {
-      return NextResponse.json(
-        {
-          error:
-            closed === "settled"
-              ? "This order was already paid by card. Check the balance."
-              : "A card payment is in progress on this order. Finish or cancel it first.",
-          code: "card_in_progress",
-        },
-        { status: 409 },
-      );
-    }
+    if (!account) return unknownCode(id, order.tenant_id);
 
     const { payment, account: after, replayed } = await redeemStoredValue({
       order,
@@ -86,10 +74,34 @@ export async function POST(request: Request) {
       actorId: auth.grant.user.id,
       staffId: auth.grant.staff?.id ?? null,
     });
+
+    // A card tender may still be live on the reader: close it now (strictly,
+    // same rule as every other in-store tender). If it went through or is still
+    // in flight, give the gift card value back rather than risk double pay.
+    if (!replayed) {
+      const closed = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
+      if (closed === "settled" || closed === "in_flight" || closed === "needs_review") {
+        await releaseStoredValueTender(payment.id);
+        return NextResponse.json(
+          {
+            error:
+              closed === "settled"
+                ? "This order was just paid by card. The gift card was not charged."
+                : "A card payment is in progress on this order. Finish or cancel it first.",
+            code: "card_in_progress",
+          },
+          { status: 409 },
+        );
+      }
+    }
     const current = await driver.getOrder(order.id);
     return NextResponse.json(
       {
-        payment: publicTender(payment),
+        // Staff only: the card's last 4 for the till / receipt.
+        payment: {
+          ...publicTender(payment),
+          raw: { ...(publicTender(payment).raw ?? {}), code_last4: after.code_last4 },
+        },
         account: after,
         balanceCents: current ? await getOrderBalance(current) : 0,
         orderStatus: current?.status,
