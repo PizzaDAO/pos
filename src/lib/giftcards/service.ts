@@ -573,12 +573,13 @@ export async function sweepUnreleasedStoredValue(): Promise<number> {
  * refundPayment's policy for a tender, decided BEFORE any money moves:
  *  - null: not a gift-card sale/reload tender (normal rules);
  *  - "released": the value it bought already left the card (voided, reload
- *    reversed, never credited): refund normally (card rails Stripe-first with
- *    the fixed idempotency key, then record), no crash window;
+ *    reversed, never credited): refund normally (card rails: reserved pending,
+ *    Stripe under the fixed idempotency key, confirmed with the re_ id);
  *  - "excess": the order would still hold the card's value without it (a
  *    duplicate tender): reserve first, re-check (assertStoredValueRefundAllowed)
- *    after the atomic reservation, then call the rail.
+ *    after the atomic reservation, then the same reserve / Stripe / confirm.
  * Throws StoredValueRefundBlockedError while the card still holds the value.
+ * refundPayment refuses a sale tender's refund without a client refund id.
  */
 export async function storedValueSaleRefundMode(
   payment: Payment,
@@ -650,20 +651,58 @@ export interface Actor {
   label: string;
 }
 
-async function refundOrderTenders(order: Order, refundId: string, reason: string) {
-  const payments = await getPosDriver().listPaymentsForOrder(order.id);
+/** This operation's refund ids on a tender: `<base>` (older) or `<base>_<n>`. */
+function isOpRefundId(id: string | null | undefined, base: string): id is string {
+  return typeof id === "string" && (id === base || (id.startsWith(`${base}_`) && /^\d+$/.test(id.slice(base.length + 1))));
+}
+
+/** Money a tender still holds (settled, not refunded, or held by a pending refund). */
+function stillHeld(p: Payment): boolean {
+  if (p.status === "pending") return true;
+  if (p.status !== "captured" && p.status !== "authorized") return false;
+  return p.refunded_cents < p.amount_cents + p.tip_cents || (p.refund_reserved_cents ?? 0) > 0;
+}
+
+/**
+ * Refund everything the order's tenders still hold, for one void / reversal
+ * (`base` = `gcvoid_<card>` / `gcreverse_<order>`). Retry-safe per tender:
+ *  - a refund of this operation still PENDING (unknown outcome at Stripe) is
+ *    resumed under its own id (same idempotency key);
+ *  - otherwise a NEW id `<base>_<n>`, n counting every id of this operation the
+ *    tender ever used (tombstones included), so a refund Stripe failed and
+ *    released is retried under a fresh key, never "replayed" as done.
+ * Afterwards the tenders are re-read: throws `refund_incomplete` while any
+ * money is still held (the caller leaves the sale open; a retry finishes it).
+ */
+async function refundOrderTenders(order: Order, base: string, reason: string) {
+  const driver = getPosDriver();
   const out: { paymentId: string; refundedCents: number; manual: boolean }[] = [];
-  for (const p of payments) {
+  for (const p of await driver.listPaymentsForOrder(order.id)) {
     if (p.status !== "captured" && p.status !== "authorized") continue;
-    if (p.refunded_cents >= p.amount_cents + p.tip_cents) continue;
+    const pendingEntry = (p.refunds ?? []).find((e) => e.state === "pending" && isOpRefundId(e.request_id, base));
+    let refundId: string;
+    if (pendingEntry) {
+      refundId = pendingEntry.request_id!;
+    } else {
+      if (p.refunded_cents + (p.refund_reserved_cents ?? 0) >= p.amount_cents + p.tip_cents) continue;
+      const used = (p.refund_ids ?? []).filter((id) => isOpRefundId(id, base)).length;
+      refundId = `${base}_${used}`;
+    }
     const r = await refundPayment({ paymentId: p.id, refundId, reason });
-    if (r) {
+    if (r && (r.refundedNowCents ?? 0) > 0) {
       out.push({
         paymentId: p.id,
         refundedCents: r.refundedNowCents ?? 0,
         manual: r.manualRefund === true,
       });
     }
+  }
+  if ((await driver.listPaymentsForOrder(order.id)).some(stillHeld)) {
+    throw new StoredValueError(
+      "refund_incomplete",
+      "Not all of this sale's money could be returned yet (a refund is still in progress). Try again.",
+      409,
+    );
   }
   return out;
 }
@@ -691,10 +730,11 @@ export async function voidStoredValue(input: {
   const sale = account.sale_order_id ? await driver.getOrder(account.sale_order_id) : null;
 
   if (account.status === "pending" && sale) {
-    const live = (await driver.listPaymentsForOrder(sale.id)).some(
-      (p) => p.status === "pending" || p.status === "authorized" || p.status === "captured",
-    );
-    if (live) {
+    // A payment still confirming, or money that already covers the sale (its
+    // settlement is about to activate the card): wait for it. A PART payment
+    // on an unsettled sale is no reason to wait: it is refunded below.
+    const payments = await driver.listPaymentsForOrder(sale.id);
+    if (payments.some((p) => p.status === "pending") || isSettled(sale, payments)) {
       throw new StoredValueError("payment_in_progress", "A payment for this card is in progress. Refresh and try again.");
     }
   }
@@ -717,9 +757,12 @@ export async function voidStoredValue(input: {
     );
     if (settled) {
       refunds = await refundOrderTenders(sale, `gcvoid_${account.id}`, `Gift card voided: ${input.reason}`);
-    } else if (sale.status === "draft" || sale.status === "awaiting_payment") {
-      await driver.transitionOrderStatus(sale.id, ["draft", "awaiting_payment"], "voided");
     }
+    // An unsettled sale (nothing paid, or part payments now given back) is
+    // voided with its card. Only reached once every refund above went through
+    // (a pending one throws; the retry finishes it and lands here). A sale that
+    // was paid in full keeps its status (refunded by maybeMarkOrderRefunded).
+    await driver.transitionOrderStatus(sale.id, ["draft", "awaiting_payment"], "voided");
   }
   if (!voided.replayed) {
     await recordAudit({

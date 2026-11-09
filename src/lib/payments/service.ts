@@ -46,6 +46,8 @@ import { requirePaymentRail } from "./registry";
 import {
   mapIntentStatus,
   StripeError,
+  StripeTimeoutError,
+  STRIPE_TIMEOUT_MS,
   stripeGet,
   stripeRequest,
 } from "./providers/stripe-client";
@@ -991,6 +993,8 @@ function isCardRail(rail: Payment["rail"]): boolean {
  */
 export function isDefiniteRefundFailure(err: unknown): boolean {
   if (err instanceof RefundRefusedError) return true;
+  // A timeout is an unknown outcome (Stripe may have refunded): never definite.
+  if (err instanceof StripeTimeoutError) return false;
   // An idempotency error means this key was already used (with other params):
   // the original refund may well exist. Never "definite": leave it pending.
   if (err instanceof StripeError && isIdempotencyError(err)) return false;
@@ -1044,6 +1048,42 @@ export class RefundPendingError extends Error {
   constructor(message = "The refund is still in progress at the card processor: retry to finish it.") {
     super(message);
     this.name = "RefundPendingError";
+  }
+}
+
+/**
+ * Stripe keeps an idempotency key for 24 h: after that the same key is a NEW
+ * request, so replaying a card refund older than this could refund twice. Older
+ * card refunds are never sent again automatically; they are alerted and resolved
+ * by a manager (`resolveStuckCardRefund`, which looks the refund up at Stripe).
+ */
+export const STRIPE_IDEMPOTENCY_SAFE_MS = 23 * 60 * 60_000;
+
+/** The refund entry is too old to replay under its Stripe idempotency key. */
+export function isPastIdempotencyWindow(entry: { at: string }, now = Date.now()): boolean {
+  const at = Date.parse(entry.at);
+  // No usable timestamp: assume the worst (never replay).
+  return !Number.isFinite(at) || now - at > STRIPE_IDEMPOTENCY_SAFE_MS;
+}
+
+/** A pending card refund older than Stripe's idempotency window: a manager must resolve it. */
+export class RefundNeedsResolutionError extends RefundPendingError {
+  constructor() {
+    super(
+      "This card refund is stuck at the card processor for over a day. A manager must resolve it in the back office (look it up at Stripe) before it can finish.",
+    );
+    this.name = "RefundNeedsResolutionError";
+  }
+}
+
+/** How long a card refund replay holds the tender's refund lock (one Stripe call + margin). */
+const REPLAY_LOCK_MS = STRIPE_TIMEOUT_MS + 20_000;
+
+/** A gift card sale / reload tender is refunded only under a client refund id (retry-safe). */
+export class RefundIdRequiredError extends Error {
+  constructor() {
+    super("A refund id is required to refund a gift card sale.");
+    this.name = "RefundIdRequiredError";
   }
 }
 
@@ -1189,8 +1229,41 @@ export async function refundPayment(input: {
   if ((payment.refund_ids ?? []).includes(refundId)) {
     const entry = (payment.refunds ?? []).find((r) => r.request_id === refundId);
     if (providerFirst && entry?.state === "pending") {
+      if (card && isPastIdempotencyWindow(entry)) {
+        // Replaying under an expired key could refund twice: alert, never resend.
+        captureError(new Error("card refund pending past the Stripe idempotency window"), {
+          scope: "refund-needs-resolution",
+          paymentId: payment.id,
+          refundId,
+          sinceIso: entry.at,
+        });
+        throw new RefundNeedsResolutionError();
+      }
       const tip = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
-      const ref = await settle(entry);
+      if (!card) {
+        const ref = await settle(entry);
+        return finish(entry.amount_cents, tip, ref);
+      }
+      // A card replay holds the tender's refund lock while it talks to Stripe,
+      // so the stuck-refund resolver (refund-resolve.ts) never looks it up and
+      // releases it at the same moment.
+      const owner = `replay:${globalThis.crypto.randomUUID()}`;
+      const until = new Date(Date.now() + REPLAY_LOCK_MS).toISOString();
+      if (!(await driver.takePaymentRefundLock(payment.id, owner, until))) {
+        throw new RefundPendingError("A manager is resolving this card refund right now: try again in a moment.");
+      }
+      let ref: string | null;
+      try {
+        // Re-read under the lock: the resolver may have just finished it.
+        const now = ((await driver.getPayment(payment.id))?.refunds ?? []).find((r) => r.request_id === refundId);
+        if (now?.state !== "pending") {
+          const fresh = (await driver.getPayment(payment.id)) ?? payment;
+          return { ...fresh, replayed: true, refundedNowCents: 0, tipRefundedNowCents: 0 };
+        }
+        ref = await settle(entry);
+      } finally {
+        await driver.releasePaymentRefundLock(payment.id, owner).catch(() => undefined);
+      }
       return finish(entry.amount_cents, tip, ref);
     }
     const repaired = await repairReplayedCardRefund(payment, refundId, rail);
@@ -1220,6 +1293,9 @@ export async function refundPayment(input: {
   // tender bought still holds its value).
   const giftcards = await import("@/lib/giftcards/service");
   const saleMode = await giftcards.storedValueSaleRefundMode(payment, refundAmount);
+  // A sale tender's refund must be retry-safe: a fresh random id on a retry
+  // would be a second refund of the money that bought the card.
+  if (saleMode !== null && input.refundId === undefined) throw new RefundIdRequiredError();
 
   // Whether the order was paid in full when this refund is made: only then does
   // the refunded tender keep covering its balance (refund-state.ts).
@@ -1251,8 +1327,10 @@ export async function refundPayment(input: {
   };
   const tipNow = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
 
-  if (saleMode === "excess") {
-    // Re-checked after the atomic reservation (it sees every concurrent one).
+  if (saleMode !== null) {
+    // Re-checked after the atomic reservation (it sees every concurrent one):
+    // "excess" against racing refunds, "released" against a settlement that
+    // credited the card between the decision and the reservation.
     try {
       await giftcards.assertStoredValueRefundAllowed(recorded.payment);
     } catch (err) {
@@ -1288,8 +1366,11 @@ export async function maybeMarkOrderRefunded(orderId: string): Promise<void> {
   const all = await driver.listPaymentsForOrder(orderId);
   if (!isFullyRefunded(null, all)) return;
   // Money given back on an order that was never paid in full does not close it
-  // out as `refunded`: it is still open (or voided by the void flow).
-  if (liveTenders(all).some((p) => (p.refunds ?? []).some((r) => r.covering === false))) return;
+  // out as `refunded`: it is still open (or voided by the void flow). Only when
+  // EVERY refund was made while unpaid: a part payment given back earlier must
+  // not block an order later paid in full and then fully refunded.
+  const entries = liveTenders(all).flatMap((p) => p.refunds ?? []);
+  if (entries.length > 0 && entries.every((r) => r.covering === false)) return;
   await driver.transitionOrderStatus(
     orderId,
     [
@@ -1311,6 +1392,7 @@ export async function maybeMarkOrderRefunded(orderId: string): Promise<void> {
  * died between recording it and the Stripe call, or Stripe returned none):
  * call the rail again with the SAME idempotency key (Stripe returns the
  * original refund, or makes it now if it never happened) and record the id.
+ * Only within Stripe's idempotency window (~23 h); after it, alert only.
  * Best effort: a failure leaves the entry as it was and is alerted.
  */
 async function repairReplayedCardRefund(
@@ -1323,6 +1405,17 @@ async function repairReplayedCardRefund(
   if (!entry || entry.processor_ref) return payment;
   const driver = getPosDriver();
   if (!driver.setRefundProcessorRef) return payment;
+  if (isPastIdempotencyWindow(entry)) {
+    // The key has expired at Stripe: calling again would be a NEW refund (a
+    // double refund if the first one happened). Alert; a manager resolves it.
+    captureError(new Error("card refund without a Stripe id past the idempotency window"), {
+      scope: "refund-needs-resolution",
+      paymentId: payment.id,
+      refundId,
+      sinceIso: entry.at,
+    });
+    return payment;
+  }
   try {
     // The same parameters as the original call (from the stored entry): a
     // different body under the same key is a Stripe idempotency error.

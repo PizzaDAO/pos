@@ -8,7 +8,7 @@ import { DEMO_LOCATION_DOWNTOWN_ID, DEMO_TENANT_ID, getPosDriver, type Order, ty
 import { resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 import { railToMethod, toContractOrder, toContractPayment } from "@/lib/core/mappers";
 import { autoPrintOnFire } from "@/lib/printing/queue";
-import { OrderSchema, PaymentSchema } from "@openpizza/core";
+import { OrderSchema, PaymentSchema, totalsViolations } from "@openpizza/core";
 import { lookupKeys } from "./http";
 import { mockStoredValueStore, resetMockStoredValue } from "./store-mock";
 
@@ -72,8 +72,13 @@ describe("hub mapping", () => {
     expect(mapped.lines).toEqual([
       expect.objectContaining({ line_type: "gift_card_load", kind: "gift_card", line_total_cents: 5000, tax_exempt: true }),
     ]);
-    // The hub contract accepts it as is.
+    // The hub contract accepts it as is, and its totals are consistent with
+    // the synthetic line (subtotal = Σ live lines, untaxed, total = subtotal).
     expect(() => OrderSchema.parse(mapped)).not.toThrow();
+    expect(mapped.totals).toMatchObject({ subtotal_cents: 5000, taxable_cents: 0, tax_cents: 0, total_cents: 5000 });
+    expect(totalsViolations(mapped.totals, mapped.lines)).toEqual([]);
+    const reloadMapped = toContractOrder({ order: reload, payments: [], timezone: "UTC" });
+    expect(totalsViolations(reloadMapped.totals, reloadMapped.lines)).toEqual([]);
     const p = {
       id: randomUUID(), order_id: o.id, tenant_id: o.tenant_id, location_id: o.location_id, rail: "gift_card",
       status: "captured", amount_cents: 100, tip_cents: 0, application_fee_cents: 0, currency: "USD",

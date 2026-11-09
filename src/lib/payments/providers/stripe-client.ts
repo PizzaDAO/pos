@@ -22,7 +22,15 @@ export interface StripeRequestOptions {
   stripeAccount?: string | null;
   /** Idempotency key forwarded to Stripe to dedupe retries. */
   idempotencyKey?: string;
+  /** Abort the call after this many ms (default STRIPE_TIMEOUT_MS). */
+  timeoutMs?: number;
 }
+
+/**
+ * No Stripe call may outlive the route that makes it (refund / void routes run
+ * up to 60 s): each request (and reading its body) is aborted after 25 s.
+ */
+export const STRIPE_TIMEOUT_MS = 25_000;
 
 /** Flatten a nested object into Stripe's form-encoded `a[b][c]=v` syntax. */
 function encodeForm(
@@ -73,6 +81,56 @@ export class StripeError extends Error {
   }
 }
 
+/**
+ * A Stripe call timed out (or its connection dropped mid-answer). The OUTCOME
+ * IS UNKNOWN: Stripe may have done it. Never a definite failure: callers keep
+ * whatever they reserved and retry under the same idempotency key. Deliberately
+ * not a StripeError (no HTTP status: nothing may read it as a 4xx refusal).
+ */
+export class StripeTimeoutError extends Error {
+  constructor(readonly path: string, readonly timeoutMs: number) {
+    super(`Stripe did not answer within ${Math.round(timeoutMs / 1000)}s: the outcome is unknown, retry.`);
+    this.name = "StripeTimeoutError";
+  }
+}
+
+function isAbort(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+/**
+ * fetch + JSON body under one timeout. A timeout anywhere (connect, headers or
+ * body) is a StripeTimeoutError; a non-2xx answer a StripeError.
+ */
+async function stripeFetch<T>(
+  path: string,
+  init: RequestInit,
+  timeoutMs: number = STRIPE_TIMEOUT_MS,
+): Promise<T> {
+  let res: Response;
+  let json: Record<string, unknown>;
+  try {
+    res = await fetch(`${STRIPE_API}${path}`, {
+      ...init,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    json = (await res.json()) as Record<string, unknown>;
+  } catch (err) {
+    if (isAbort(err)) throw new StripeTimeoutError(path.split("?")[0]!, timeoutMs);
+    throw err;
+  }
+  if (!res.ok) {
+    const err = (json.error ?? {}) as { message?: string };
+    throw new StripeError(
+      err.message ?? `Stripe request failed (HTTP ${res.status})`,
+      res.status,
+      json,
+    );
+  }
+  return json as T;
+}
+
 /** POST a form-encoded request to the Stripe API. Throws on non-2xx. */
 export async function stripeRequest<T = Record<string, unknown>>(
   path: string,
@@ -91,22 +149,11 @@ export async function stripeRequest<T = Record<string, unknown>>(
   if (opts.stripeAccount) headers["Stripe-Account"] = opts.stripeAccount;
   if (opts.idempotencyKey) headers["Idempotency-Key"] = opts.idempotencyKey;
 
-  const res = await fetch(`${STRIPE_API}${path}`, {
-    method: "POST",
-    headers,
-    body: encodeForm(body).join("&"),
-  });
-
-  const json = (await res.json()) as Record<string, unknown>;
-  if (!res.ok) {
-    const err = (json.error ?? {}) as { message?: string };
-    throw new StripeError(
-      err.message ?? `Stripe request failed (HTTP ${res.status})`,
-      res.status,
-      json,
-    );
-  }
-  return json as T;
+  return stripeFetch<T>(
+    path,
+    { method: "POST", headers, body: encodeForm(body).join("&") },
+    opts.timeoutMs,
+  );
 }
 
 /** DELETE a Stripe resource (e.g. a Terminal reader). Throws on non-2xx. */
@@ -122,17 +169,7 @@ export async function stripeDelete<T = Record<string, unknown>>(
     Authorization: `Bearer ${config.secretKey}`,
   };
   if (opts.stripeAccount) headers["Stripe-Account"] = opts.stripeAccount;
-  const res = await fetch(`${STRIPE_API}${path}`, { method: "DELETE", headers });
-  const json = (await res.json()) as Record<string, unknown>;
-  if (!res.ok) {
-    const err = (json.error ?? {}) as { message?: string };
-    throw new StripeError(
-      err.message ?? `Stripe request failed (HTTP ${res.status})`,
-      res.status,
-      json,
-    );
-  }
-  return json as T;
+  return stripeFetch<T>(path, { method: "DELETE", headers }, opts.timeoutMs);
 }
 
 /** GET a Stripe resource (e.g. account or payment_intent status). */
@@ -149,17 +186,7 @@ export async function stripeGet<T = Record<string, unknown>>(
   };
   if (opts.stripeAccount) headers["Stripe-Account"] = opts.stripeAccount;
 
-  const res = await fetch(`${STRIPE_API}${path}`, { method: "GET", headers });
-  const json = (await res.json()) as Record<string, unknown>;
-  if (!res.ok) {
-    const err = (json.error ?? {}) as { message?: string };
-    throw new StripeError(
-      err.message ?? `Stripe request failed (HTTP ${res.status})`,
-      res.status,
-      json,
-    );
-  }
-  return json as T;
+  return stripeFetch<T>(path, { method: "GET", headers }, opts.timeoutMs);
 }
 
 /** Stripe's recommended replay window for webhook timestamps, in seconds. */

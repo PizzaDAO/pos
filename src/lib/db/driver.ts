@@ -405,12 +405,17 @@ export interface PosDriver {
   /** Refund records still `pending` since before `beforeIso` (oldest first), any tenant. */
   listStalePendingRefunds(beforeIso: string, limit: number): Promise<AdjustmentRecord[]>;
 
-  /** Record what a refund actually moved (status, allocations, meta). */
+  /**
+   * Record what a refund actually moved (status, allocations, meta). Releases
+   * the execution claim, unless `keepClaim` (a writer that does not own it,
+   * e.g. the Stripe webhook, must not free a live claim).
+   */
   finishOrderAdjustment(
     orderId: string,
     id: string,
     patch: Pick<AdjustmentRecord, "status" | "allocations"> & {
       meta?: Record<string, unknown> | null;
+      keepClaim?: boolean;
     },
   ): Promise<AdjustmentRecord | null>;
 
@@ -771,6 +776,40 @@ export interface PosDriver {
     refundId: string,
     opts?: { tombstone?: boolean },
   ): Promise<void>;
+
+  /**
+   * Compare-and-set release: undo the reservation under `refundId` ONLY while
+   * it is still `pending` (as `releasePaymentRefund`). False when the entry is
+   * gone or was confirmed meanwhile: nothing changes, a refund that went
+   * through is never undone.
+   */
+  releasePendingPaymentRefund(
+    paymentId: string,
+    refundId: string,
+    opts?: { tombstone?: boolean },
+  ): Promise<boolean>;
+
+  /**
+   * A short per-tender lock between the stuck-refund resolver and any replay of
+   * a pending card refund (they must never talk to Stripe about the same tender
+   * at once). True when `owner` holds it until `untilIso` (re-entrant for the
+   * same owner); false while another owner's lock is live.
+   */
+  takePaymentRefundLock(paymentId: string, owner: string, untilIso: string): Promise<boolean>;
+  /** Drop the lock if `owner` still holds it. */
+  releasePaymentRefundLock(paymentId: string, owner: string): Promise<void>;
+
+  /**
+   * Live card tenders of the tenant (optionally one location) with a refund
+   * still pending, or one recorded without a provider id: candidates for the
+   * back office's stuck-refund list (the caller picks the entries). Newest
+   * first, capped at `limit`.
+   */
+  listCardTendersWithOpenRefunds(
+    tenantId: string,
+    locationId: string | null,
+    limit: number,
+  ): Promise<Payment[]>;
 
   /**
    * Fill in the provider refund id on the refunds[] entry recorded under

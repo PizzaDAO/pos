@@ -48,6 +48,7 @@ import {
   getOrderBalance,
   orderPaidInFull,
   isManualRefundRail,
+  isPastIdempotencyWindow,
   refundPayment,
   RefundExceedsError,
   RefundPendingError,
@@ -184,6 +185,8 @@ export async function refreshRefundRecord(
   orderId: string,
   recordId: string,
   meta?: Record<string, unknown>,
+  /** The caller does not own the execution claim: leave it as it is. */
+  opts: { keepClaim?: boolean } = {},
 ): Promise<AdjustmentRecord | null> {
   const driver = getPosDriver();
   const record = (await driver.listOrderAdjustments(orderId)).find((r) => r.id === recordId);
@@ -201,7 +204,15 @@ export async function refreshRefundRecord(
       return p ? { ...a, drawer_event_id: p.drawer_event_id, drawer_note: p.drawer_note } : a;
     }),
     meta,
+    ...(opts.keepClaim ? { keepClaim: true } : {}),
   });
+}
+
+/** A stuck refund request is alerted at most this often. */
+export const STUCK_ALERT_EVERY_MS = 24 * 60 * 60_000;
+
+function isCardTender(p: Payment): boolean {
+  return p.rail === "stripe_terminal" || p.rail === "stripe_online";
 }
 
 /** Refund records pending this long are swept (alerted; card ones resumed). */
@@ -228,17 +239,32 @@ export async function sweepPendingRefunds(
     });
   for (const record of stale) {
     try {
-      captureError(new Error("refund request stuck pending"), {
-        scope: "refund-stuck",
-        orderId: record.order_id,
-        requestId: record.id,
-        sinceIso: record.updated_at,
-      });
       if (!(await driver.claimOrderAdjustment(record.order_id, record.id, claimUntil()))) continue;
       const summary = reasonSummary("refund", record.reason_code, record.reason_text);
-      for (const p of await driver.listPaymentsForOrder(record.order_id)) {
+      const tenders = await driver.listPaymentsForOrder(record.order_id);
+      // Card refunds past Stripe's idempotency window are never resent: they
+      // wait for a manager (Back office > Late payments > Stuck card refunds).
+      const needsResolution = tenders.some((p) =>
+        entriesOfRequest(p, record.id).some(
+          (e) => e.state === "pending" && isCardTender(p) && isPastIdempotencyWindow(e, now.getTime()),
+        ),
+      );
+      // One alert per request per day, not one per sweep run.
+      const lastAlert = Date.parse(String(record.meta?.stuck_alerted_at ?? ""));
+      const alertNow = !Number.isFinite(lastAlert) || now.getTime() - lastAlert >= STUCK_ALERT_EVERY_MS;
+      if (alertNow) {
+        captureError(new Error("refund request stuck pending"), {
+          scope: "refund-stuck",
+          orderId: record.order_id,
+          requestId: record.id,
+          sinceIso: record.updated_at,
+          needsResolution,
+        });
+      }
+      for (const p of tenders) {
         for (const e of entriesOfRequest(p, record.id)) {
           if (e.state !== "pending" || !e.request_id) continue;
+          if (isCardTender(p) && isPastIdempotencyWindow(e, now.getTime())) continue;
           try {
             await refundPayment({ paymentId: p.id, refundId: e.request_id, reason: summary });
             resumed += 1;
@@ -249,7 +275,11 @@ export async function sweepPendingRefunds(
       }
       // Re-derive (also releases the claim); still pending if the provider still
       // has not answered, so the next sweep tries again.
-      await refreshRefundRecord(record.order_id, record.id, { swept_at: now.toISOString() });
+      await refreshRefundRecord(record.order_id, record.id, {
+        swept_at: now.toISOString(),
+        ...(alertNow ? { stuck_alerted_at: now.toISOString() } : {}),
+        ...(needsResolution ? { needs_resolution: true } : {}),
+      });
     } catch (err) {
       captureError(err, { scope: "refund-sweep", orderId: record.order_id, requestId: record.id });
     }
