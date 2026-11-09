@@ -27,6 +27,7 @@ import {
 import { enforceRateLimit, isMoneyCents, readJsonBody } from "@/lib/security";
 import { priceOrder } from "@/lib/order-pricing";
 import { RepriceError } from "@/lib/reprice";
+import { sanitizeTillCoreExt } from "@/lib/till/order-meta";
 import { effectiveTerminalRole } from "@/lib/auth/active-staff";
 import {
   captureError,
@@ -203,6 +204,10 @@ export async function POST(request: Request) {
       order_number: body.order_number,
       status: "placed",
       staff_id: staffId,
+      // Order type + customer name from the till (nothing else of core_ext).
+      ...(sanitizeTillCoreExt(body.core_ext)
+        ? { core_ext: sanitizeTillCoreExt(body.core_ext) }
+        : {}),
       // The till's order-level discount, as a recorded adjustment (core
       // `adjustments`); comps/discounts added later append to it.
       ...(priced.totals.discount_cents > 0

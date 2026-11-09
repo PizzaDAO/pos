@@ -13,13 +13,28 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { ShoppingCart } from "lucide-react";
+import { buildLine } from "@/lib/build-line";
+import { cn } from "@/lib/utils";
+import {
+  buildTillCoreExt,
+  type TillOrderType,
+} from "@/lib/till/order-meta";
+import {
+  FALLBACK_DEFAULT_SIZE,
+  clearDefaultSizeName,
+  defaultSizeFor,
+  isKnownSizeName,
+  readDefaultSizeName,
+  writeDefaultSizeName,
+} from "@/lib/till/default-size";
 import { AlertTriangle } from "lucide-react";
 import type { CreateOrderInput, MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/empty-state";
 import { useToast } from "@/components/ui/toast";
-import { computeOrderTotals } from "@/lib/pricing";
+import { computeOrderTotals, formatMoney } from "@/lib/pricing";
 import { useCartStore } from "@/lib/store/cart";
 import { useMenu } from "@/lib/store/use-menu";
 import { isItemSoldOut, soldOutSets } from "@/lib/menu-availability";
@@ -131,6 +146,25 @@ export function TerminalClient({
     if (!canDiscount && discountCents > 0) setDiscount(0);
   }, [canDiscount, discountCents, setDiscount]);
 
+  // Order type + call-out name for the order being rung (reset after each order).
+  const [orderType, setOrderType] = useState<TillOrderType | null>(null);
+  const [customerName, setCustomerName] = useState("");
+  // Default pizza size (device-local, per location). Large unless changed.
+  const [defaultSizeName, setDefaultSizeName] = useState(FALLBACK_DEFAULT_SIZE);
+  const locationKey = data?.menu.locationId;
+  const menuData = data?.menu;
+  useEffect(() => {
+    if (!locationKey || !menuData) return;
+    const saved = readDefaultSizeName(locationKey);
+    const known =
+      saved && isKnownSizeName(menuData.categories.flatMap((c) => c.items), saved);
+    // A saved size the menu no longer has is dropped (items fall back to their first size).
+    if (saved && !known) clearDefaultSizeName(locationKey);
+    setDefaultSizeName(known && saved ? saved : FALLBACK_DEFAULT_SIZE);
+  }, [locationKey, menuData]);
+  // Below `lg` the cart is a sticky bar that expands on demand.
+  const [cartOpen, setCartOpen] = useState(false);
+
   const [builderItem, setBuilderItem] = useState<MenuItemDetail | null>(null);
   const [editingLine, setEditingLine] = useState<OrderItem | null>(null);
   const [placing, setPlacing] = useState(false);
@@ -185,10 +219,32 @@ export function TerminalClient({
 
   const { menu, settings, paymentSettings } = data;
   const location = menu.locationId;
+  const cartSummary = {
+    count: items.filter((i) => !i.voided).reduce((n, i) => n + i.quantity, 0),
+    totalCents: computeOrderTotals({
+      items,
+      discountCents,
+      taxRateBps: settings.tax_rate_bps,
+      tipCents: 0,
+    }).total_cents,
+  };
 
   function openBuilderForItem(item: MenuItemDetail) {
     setEditingLine(null);
     setBuilderItem(item);
+  }
+
+  /** One-tap add for items with nothing to choose (a soda). */
+  function quickAddItem(item: MenuItemDetail) {
+    const size = defaultSizeFor(item, soldOut.sizes, defaultSizeName);
+    addLine(
+      buildLine({ item, size, selections: [], quantity: 1, notes: "" }),
+    );
+  }
+
+  function changeDefaultSize(name: string) {
+    setDefaultSizeName(name);
+    writeDefaultSizeName(menu.locationId, name);
   }
 
   function openBuilderForLine(line: OrderItem) {
@@ -293,6 +349,8 @@ export function TerminalClient({
         // Attribute to the PIN-switched active staff (if any) so orders/shifts
         // tie to the person at the till.
         staff_id: activeStaff?.id ?? null,
+        // Order type + call-out name: the server keeps only these two fields.
+        core_ext: buildTillCoreExt(orderType, customerName),
       };
 
       // Record who was at the till (and their staff session) with the queued
@@ -313,6 +371,9 @@ export function TerminalClient({
       }
 
       clear();
+      setCustomerName("");
+      setOrderType(null);
+      setCartOpen(false);
       if (outcome.status === "synced") {
         // Order reached the server → go straight to taking payment.
         toast({ title: `Order ${orderNumber} placed`, variant: "success" });
@@ -362,13 +423,23 @@ export function TerminalClient({
         onGiftCards={giftCards && sync.online ? () => setShowGiftCards(true) : undefined}
       />
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1.2fr)] lg:grid-cols-[1fr_400px] lg:grid-rows-1">
+      <div
+        className={cn(
+          "grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[1fr_400px] lg:grid-rows-1",
+          cartOpen
+            ? "grid-rows-[minmax(0,1fr)_minmax(0,60%)]"
+            : "grid-rows-[minmax(0,1fr)_auto]",
+        )}
+      >
         {/* Menu */}
         <div className="min-h-0 border-r">
           <MenuBrowse
             menu={menu}
             currency={settings.currency}
             onSelectItem={openBuilderForItem}
+            onQuickAdd={quickAddItem}
+            defaultSizeName={defaultSizeName}
+            onDefaultSizeChange={changeDefaultSize}
             soldOut={soldOut}
             canEightySix={canEightySix}
             onSetItem86={(item, on) => void setItem86(item, on)}
@@ -377,14 +448,45 @@ export function TerminalClient({
         </div>
 
         {/* Cart */}
-        <div className="min-h-0">
+        <div className="flex min-h-0 flex-col border-t lg:border-t-0">
+          {/* Portrait tablet / phone: a sticky summary bar instead of a full cart. */}
+          <div className="flex items-center gap-2 p-2 lg:hidden">
+            <button
+              type="button"
+              aria-expanded={cartOpen}
+              onClick={() => setCartOpen((o) => !o)}
+              className="flex min-h-12 flex-1 items-center gap-2 rounded-lg border px-3 text-left touch-manipulation"
+            >
+              <ShoppingCart className="h-5 w-5" aria-hidden="true" />
+              <span className="font-medium">
+                {cartSummary.count} item{cartSummary.count === 1 ? "" : "s"} ·{" "}
+                {formatMoney(cartSummary.totalCents, settings.currency)}
+              </span>
+              <span className="ml-auto text-sm text-muted-foreground">
+                {cartOpen ? "Hide order" : "View order"}
+              </span>
+            </button>
+            <Button
+              className="h-12 px-5 text-base"
+              disabled={cartSummary.count === 0 || placing}
+              onClick={handlePlaceOrder}
+            >
+              {placing ? "Placing…" : "Place order"}
+            </Button>
+          </div>
+          <div className={cn("min-h-0 flex-1", cartOpen ? "block" : "hidden", "lg:block")}>
           <CartPanel
             settings={settings}
             onEditLine={openBuilderForLine}
             onPlaceOrder={handlePlaceOrder}
             placing={placing}
             canDiscount={canDiscount}
+            orderType={orderType}
+            onOrderType={setOrderType}
+            customerName={customerName}
+            onCustomerName={setCustomerName}
           />
+          </div>
         </div>
       </div>
 
@@ -394,6 +496,7 @@ export function TerminalClient({
           currency={settings.currency}
           editing={editingLine ?? undefined}
           soldOut={soldOut}
+          defaultSizeName={defaultSizeName}
           onCancel={() => {
             setBuilderItem(null);
             setEditingLine(null);

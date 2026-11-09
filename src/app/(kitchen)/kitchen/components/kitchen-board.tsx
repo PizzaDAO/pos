@@ -8,18 +8,33 @@
  */
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChefHat } from "lucide-react";
-import { DEFAULT_KDS_THRESHOLDS, lineMatchesStation } from "@/lib/kds/board";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChefHat, Volume2, VolumeX } from "lucide-react";
+import {
+  DEFAULT_KDS_THRESHOLDS,
+  lineMatchesStation,
+} from "@/lib/kds/board";
+import {
+  isAudioRunning,
+  newTickets,
+  playChime,
+  primeAudio,
+  readMuted,
+  writeMuted,
+} from "@/lib/kds/alert";
 import { DEMO_LOCATION_DOWNTOWN_ID, DEMO_TENANT_ID } from "@/lib/db";
 import { useKitchenBoard } from "@/lib/kds/use-kitchen-board";
-import { isHandoffStatus as isHandoff } from "@/lib/kds/status";
+import { isHandoffStatus as isHandoff, noPrepBumpCount } from "@/lib/kds/status";
 import type { StationFilter } from "@/lib/kds/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/empty-state";
 import { StationFilterBar } from "./station-filter";
 import { PrinterBanner } from "@/components/printer-banner";
 import { TicketCard } from "./ticket-card";
+
+/** Columns: 4 on a laptop, 5-6 on a wall-mounted 1080p display (compact tickets). */
+const GRID =
+  "grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 min-[1800px]:grid-cols-6";
 
 
 const STATION_VALUES: StationFilter[] = [
@@ -95,20 +110,82 @@ export function KitchenBoard({
   // before (and it isn't the very first load), announce the order number.
   const knownIds = useRef<Set<string> | null>(null);
   const [announcement, setAnnouncement] = useState("");
+  const [muted, setMuted] = useState(false);
+  const mutedRef = useRef(false);
+  const [flash, setFlash] = useState(false);
+  // Browsers keep audio suspended until a gesture: prime on the first
+  // interaction, and until then say so instead of showing "sound on".
+  const [audioReady, setAudioReady] = useState(false);
   useEffect(() => {
-    const currentIds = new Set(tickets.map((t) => t.order.id));
-    if (knownIds.current === null) {
-      knownIds.current = currentIds;
-      return;
-    }
-    const fresh = tickets.filter((t) => !knownIds.current!.has(t.order.id));
-    knownIds.current = currentIds;
+    const m = readMuted();
+    mutedRef.current = m;
+    setMuted(m);
+    const prime = () => {
+      void primeAudio().then(setAudioReady);
+    };
+    window.addEventListener("pointerdown", prime, { once: true });
+    window.addEventListener("keydown", prime, { once: true });
+    void Promise.resolve().then(() => setAudioReady(isAudioRunning()));
+    return () => {
+      window.removeEventListener("pointerdown", prime);
+      window.removeEventListener("keydown", prime);
+    };
+  }, []);
+  useEffect(() => {
+    const fresh = newTickets(knownIds.current, tickets);
+    knownIds.current = new Set(tickets.map((t) => t.order.id));
     if (fresh.length === 1) {
       setAnnouncement(`New order ${fresh[0]!.order.order_number} received.`);
     } else if (fresh.length > 1) {
       setAnnouncement(`${fresh.length} new orders received.`);
     }
+    if (fresh.length > 0) {
+      // Sound + a brief screen flash (the flash stays on when muted).
+      if (!mutedRef.current) playChime();
+      setFlash(true);
+    }
   }, [tickets]);
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(false), 1400);
+    return () => clearTimeout(t);
+  }, [flash]);
+
+  function toggleMute() {
+    const next = !muted;
+    mutedRef.current = next;
+    setMuted(next);
+    writeMuted(next);
+    if (!next) {
+      // This tap is the gesture that lets later chimes play.
+      void primeAudio().then((ok) => {
+        setAudioReady(ok);
+        if (ok) playChime();
+      });
+    }
+  }
+
+  // "N more below": tickets whose top edge is under the visible screen.
+  const gridRef = useRef<HTMLElement | null>(null);
+  const [below, setBelow] = useState(0);
+  const measureBelow = useCallback(() => {
+    const root = gridRef.current;
+    if (!root) return;
+    let n = 0;
+    root.querySelectorAll("[data-ticket]").forEach((el) => {
+      if (el.getBoundingClientRect().top >= window.innerHeight - 8) n++;
+    });
+    setBelow(n);
+  }, []);
+  useEffect(() => {
+    measureBelow();
+    window.addEventListener("scroll", measureBelow, { passive: true });
+    window.addEventListener("resize", measureBelow);
+    return () => {
+      window.removeEventListener("scroll", measureBelow);
+      window.removeEventListener("resize", measureBelow);
+    };
+  }, [measureBelow, tickets, station]);
 
   async function withBusy(id: string, fn: () => Promise<void>) {
     setBusyId(id);
@@ -119,12 +196,21 @@ export function KitchenBoard({
     }
   }
 
+  async function handoffNoPrep(
+    ticket: (typeof tickets)[number],
+    doBump: (id: string) => Promise<void>,
+  ) {
+    const n = noPrepBumpCount(ticket.order.status, ticket.order.channel);
+    for (let i = 0; i < n; i++) await doBump(ticket.order.id);
+  }
+
   const renderTicket = (ticket: (typeof tickets)[number]) => (
     <TicketCard
       key={ticket.order.id}
       ticket={ticket}
       thresholds={thresholds}
       stationFilter={station}
+      onNoPrepHandoff={(id) => void withBusy(id, () => handoffNoPrep(ticket, bump))}
       busy={busyId === ticket.order.id}
       onBump={(id) => void withBusy(id, () => bump(id))}
       onRecall={(id) => void withBusy(id, () => recall(id))}
@@ -147,7 +233,7 @@ export function KitchenBoard({
             <h1 className="text-xl font-bold tracking-tight">
               Kitchen Display
             </h1>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-sm text-foreground/80">
               {locationName} ·{" "}
               <span className="inline-flex items-center gap-1 font-medium">
                 <span
@@ -156,16 +242,50 @@ export function KitchenBoard({
                 />
                 {source ? "Live" : "Connecting"}
               </span>
+              {" · "}
+              <span data-testid="ticket-count" className="font-semibold">
+                {liveTickets.length} live
+                {readyTickets.length > 0 ? `, ${readyTickets.length} ready` : ""}
+              </span>
               {lastUpdated
                 ? ` · updated ${new Date(lastUpdated).toLocaleTimeString()}`
                 : ""}
             </p>
           </div>
-          <StationFilterBar
-            value={station}
-            counts={counts}
-            onChange={setStation}
-          />
+          <div className="flex flex-wrap items-center gap-2">
+            <StationFilterBar
+              value={station}
+              counts={counts}
+              onChange={setStation}
+            />
+            <button
+              type="button"
+              aria-pressed={muted}
+              aria-label={
+                muted
+                  ? "Unmute new-ticket sound"
+                  : audioReady
+                    ? "Mute new-ticket sound"
+                    : "Tap to enable new-ticket sound"
+              }
+              onClick={() => {
+                if (!muted && !audioReady) {
+                  void primeAudio().then(setAudioReady);
+                } else {
+                  toggleMute();
+                }
+              }}
+              className="inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-full border border-input bg-background px-3 hover:bg-accent touch-manipulation"
+            >
+              {!muted && !audioReady ? (
+                <span className="text-sm font-semibold">Tap to enable sound</span>
+              ) : muted ? (
+                <VolumeX className="h-5 w-5" aria-hidden="true" />
+              ) : (
+                <Volume2 className="h-5 w-5" aria-hidden="true" />
+              )}
+            </button>
+          </div>
         </div>
       </header>
       <PrinterBanner
@@ -198,10 +318,33 @@ export function KitchenBoard({
         </section>
       )}
 
-      <section className="flex-1 p-4" aria-busy={loading && !board}>
+      {flash && (
+        <div
+          aria-hidden="true"
+          data-testid="new-ticket-flash"
+          className="pointer-events-none fixed inset-0 z-30 ring-8 ring-inset ring-amber-400/80"
+        />
+      )}
+      {below > 0 && (
+        <div
+          role="status"
+          data-testid="more-below"
+          className="pointer-events-none fixed inset-x-0 bottom-3 z-20 flex justify-center"
+        >
+          <span className="rounded-full bg-foreground px-5 py-2 text-lg font-bold text-background shadow-lg">
+            {below} more below ↓
+          </span>
+        </div>
+      )}
+
+      <section
+        ref={gridRef}
+        className="flex-1 p-4"
+        aria-busy={loading && !board}
+      >
         {loading && !board ? (
           <div
-            className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+            className={GRID}
             aria-hidden="true"
           >
             {Array.from({ length: 8 }).map((_, i) => (
@@ -225,7 +368,7 @@ export function KitchenBoard({
                 No live tickets. New orders will appear here automatically.
               </p>
             ) : (
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <div className={GRID}>
                 {liveTickets.map(renderTicket)}
               </div>
             )}
@@ -237,7 +380,7 @@ export function KitchenBoard({
                 >
                   Ready for hand-off ({readyTickets.length})
                 </h2>
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                <div className={GRID}>
                   {readyTickets.map(renderTicket)}
                 </div>
               </section>

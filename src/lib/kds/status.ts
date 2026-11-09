@@ -46,6 +46,28 @@ export function nextBumpStatus(
   return BUMP_NEXT[current] ?? null;
 }
 
+/**
+ * Bumps that carry a no-prep (drink-only) ticket to hand-off in one tap: through
+ * in_kitchen to ready, then on to completed for in-store orders. Pickup,
+ * marketplace and delivery stop at Ready, where the usual hand-off button takes over. Each step goes
+ * through the normal bump route, so ready callbacks and events all still fire.
+ */
+export function noPrepBumpCount(
+  status: OrderStatus,
+  channel?: OrderChannel,
+): number {
+  let n = 0;
+  let cur: OrderStatus | null = status;
+  while (cur && cur !== "ready" && n < 4) {
+    cur = nextBumpStatus(cur, channel);
+    n++;
+  }
+  // Only in-store orders are handed over at the counter; pickup, marketplace and
+  // delivery stop at Ready for the normal Picked up / Out with driver hand-off.
+  if (cur === "ready" && channel === "in_store") n++;
+  return n;
+}
+
 /** Statuses that sit in the KDS hand-off lane (done cooking, not yet gone). */
 export function isHandoffStatus(status: OrderStatus): boolean {
   return (

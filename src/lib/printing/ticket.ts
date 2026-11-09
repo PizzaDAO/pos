@@ -9,6 +9,7 @@
  */
 import type { Order, OrderItem } from "@/lib/db";
 import { channelLabel, groupModifiersByPlacement } from "@/lib/kds/format";
+import { orderTypeLabel } from "@/lib/till/order-meta";
 import type { PrintLine, PrintTicketDoc, PrinterColumns } from "./types";
 
 export interface BuildTicketOptions {
@@ -66,6 +67,8 @@ function fulfilmentLabel(order: Order): string {
   const f = order.fulfillment;
   if (f?.type === "delivery") return "DELIVERY";
   if (f?.type === "pickup") return "PICKUP";
+  const type = orderTypeLabel(order);
+  if (type) return type.toUpperCase();
   return order.channel === "in_store" ? "COUNTER / DINE-IN" : channelLabel(order.channel).toUpperCase();
 }
 
