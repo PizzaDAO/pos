@@ -8,6 +8,7 @@
  */
 import type { Order, OrderItem, Payment } from "@/lib/db";
 import { tenderRailLabel } from "./registry";
+import { orderTypeLabel } from "@/lib/till/order-meta";
 import {
   coveringBaseCents,
   isFullyRefunded,
@@ -92,6 +93,10 @@ export function cardReceiptOf(p: Payment): ReceiptCard | null {
 
 export interface Receipt {
   orderNumber: string;
+  /** "Dine-in" / "Pickup" / "Delivery" from the till, when recorded. */
+  orderType: string | null;
+  /** Customer name for call-out, when recorded. */
+  customerName: string | null;
   currency: string;
   lines: ReceiptLine[];
   subtotalCents: number;
@@ -211,6 +216,8 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
     refunds,
     fullyRefunded,
     orderNumber: order.order_number,
+    orderType: orderTypeLabel(order),
+    customerName: order.core_ext?.callout_name ?? null,
     currency: order.currency,
     lines,
     subtotalCents: order.totals.subtotal_cents,

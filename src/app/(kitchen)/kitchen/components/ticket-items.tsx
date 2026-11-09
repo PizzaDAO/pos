@@ -16,7 +16,10 @@ import type { StationFilter } from "@/lib/kds/types";
 import {
   groupModifiersByPlacement,
   isHalfAndHalf,
+  withoutDefaultModifiers,
 } from "@/lib/kds/format";
+
+const NO_DEFAULTS: ReadonlySet<string> = new Set();
 
 function ModifierList({
   label,
@@ -40,9 +43,17 @@ function ModifierList({
   );
 }
 
-function LineRow({ line }: { line: OrderItem }) {
-  const grouped = groupModifiersByPlacement(line.modifiers);
-  const half = isHalfAndHalf(line.modifiers);
+function LineRow({
+  line,
+  defaultIds,
+}: {
+  line: OrderItem;
+  defaultIds: ReadonlySet<string>;
+}) {
+  // Only changes from the standard pie (default crust/sauce are hidden).
+  const mods = withoutDefaultModifiers(line.modifiers, defaultIds);
+  const grouped = groupModifiersByPlacement(mods);
+  const half = isHalfAndHalf(mods);
 
   return (
     <li className="border-b border-dashed py-2 last:border-b-0">
@@ -67,11 +78,11 @@ function LineRow({ line }: { line: OrderItem }) {
         <ModifierList mods={grouped.whole} />
 
         {half && (
-          <div className="mt-1 grid grid-cols-2 gap-1 rounded border border-foreground/30 p-1">
-            <div className="border-r border-foreground/30 pr-1">
+          <div className="mt-1 grid grid-cols-1 gap-1 rounded border border-foreground/30 p-1">
+            <div className="border-b border-foreground/30 pb-1">
               <ModifierList label="Left" mods={grouped.left} />
             </div>
-            <div className="pl-1">
+            <div>
               <ModifierList label="Right" mods={grouped.right} />
             </div>
           </div>
@@ -90,9 +101,12 @@ function LineRow({ line }: { line: OrderItem }) {
 export function TicketItems({
   items,
   stationFilter = "all",
+  defaultModifierIds = NO_DEFAULTS,
 }: {
   items: OrderItem[];
   stationFilter?: StationFilter;
+  /** Modifier ids that are the group default; hidden from the ticket. */
+  defaultModifierIds?: ReadonlySet<string>;
 }) {
   const visible = items.filter(
     (i) => !i.voided && lineMatchesStation(i, stationFilter),
@@ -113,7 +127,7 @@ export function TicketItems({
   return (
     <ul className="divide-y-0">
       {visible.map((line) => (
-        <LineRow key={line.id} line={line} />
+        <LineRow key={line.id} line={line} defaultIds={defaultModifierIds} />
       ))}
       {stopped.map((line) => (
         <li

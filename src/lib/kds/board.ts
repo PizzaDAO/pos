@@ -6,7 +6,7 @@
  * server so every client renders identical colors (no clock drift). Station
  * filtering and age thresholds are pure helpers reused by the API + UI.
  */
-import type { KdsThresholds, Order, OrderItem, Station } from "@/lib/db";
+import type { KdsThresholds, Menu, Order, OrderItem, Station } from "@/lib/db";
 import { KDS_ACTIVE_STATUSES } from "@/lib/db";
 import type { AgeLevel, KitchenTicket, StationFilter, VoidNotice } from "./types";
 import { lineStation } from "./types";
@@ -39,6 +39,33 @@ export function orderStations(order: Order): Station[] {
   return [...seen];
 }
 
+/** Whether an order has any line for a station, or fired food voided since. */
+export function hasKitchenWork(order: Order): boolean {
+  if (order.items.length === 0) return true; // nothing to judge by: leave it on the board
+  return order.items.some((i) =>
+    i.voided ? !!i.fired_at && lineStation(i) !== "none" : lineStation(i) !== "none",
+  );
+}
+
+/**
+ * Modifier ids that are the group's default (the first option of a required,
+ * single-select group such as crust or sauce). Tickets hide these so the kitchen
+ * reads only what differs from the standard pie.
+ */
+export function defaultModifierIds(menu: Menu): string[] {
+  const ids = new Set<string>();
+  for (const cat of menu.categories) {
+    for (const item of cat.items) {
+      for (const g of item.modifierGroups) {
+        if (g.supports_half || g.min_select < 1) continue;
+        const first = g.modifiers[0];
+        if (first) ids.add(first.id);
+      }
+    }
+  }
+  return [...ids];
+}
+
 /** Whether a line belongs to the given station filter. */
 export function lineMatchesStation(
   item: OrderItem,
@@ -68,6 +95,9 @@ export function buildTickets(
     .filter((o) => active.has(o.status) && !o.core_ext?.stored_value)
     // A marketplace order the cashier has not accepted yet is not for the kitchen.
     .filter((o) => o.fulfillment?.marketplace?.acceptance !== "pending")
+    // A drink-only order has nothing for any station: no empty ticket to bump.
+    // (Food voided after it was fired keeps its STOP ticket.)
+    .filter((o) => hasKitchenWork(o))
     .map((order) => {
       const placedMs = new Date(order.created_at).getTime();
       const elapsedSeconds = Math.max(

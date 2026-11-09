@@ -10,6 +10,7 @@ import type { Order, Payment } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 import { buildReceipt } from "@/lib/payments/receipt";
+import { displayOrderNumber } from "@/lib/till/order-meta";
 
 export function ReceiptView({
   order,
@@ -34,7 +35,14 @@ export function ReceiptView({
       <div className="rounded-lg border bg-background p-4 font-mono text-sm">
         <div className="text-center">
           <div className="text-base font-bold">{businessName ?? "Receipt"}</div>
-          <div className="text-xs text-muted-foreground">Order {r.orderNumber}</div>
+          <div className="text-xs text-muted-foreground">
+            Order {displayOrderNumber(r.orderNumber)}
+          </div>
+          {(r.orderType || r.customerName) && (
+            <div className="text-xs text-muted-foreground">
+              {[r.orderType, r.customerName].filter(Boolean).join(" · ")}
+            </div>
+          )}
         </div>
         <hr className="my-3 border-dashed" />
 
@@ -206,13 +214,13 @@ export function ReceiptView({
       </div>
 
       <div className="grid grid-cols-3 gap-2">
-        <Button variant="outline" size="sm" onClick={() => stub("Print")}>
+        <Button variant="outline" className="h-12" onClick={() => stub("Print")}>
           <Printer className="mr-1 h-4 w-4" /> Print
         </Button>
-        <Button variant="outline" size="sm" onClick={() => stub("Email")}>
+        <Button variant="outline" className="h-12" onClick={() => stub("Email")}>
           <Mail className="mr-1 h-4 w-4" /> Email
         </Button>
-        <Button variant="outline" size="sm" onClick={() => stub("SMS")}>
+        <Button variant="outline" className="h-12" onClick={() => stub("SMS")}>
           <MessageSquare className="mr-1 h-4 w-4" /> SMS
         </Button>
       </div>

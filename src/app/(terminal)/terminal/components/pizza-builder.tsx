@@ -15,6 +15,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { soldOutSets, type SoldOut } from "@/lib/menu-availability";
 import { formatMoney, withLinePricing } from "@/lib/pricing";
+import { pickDefaultSize } from "@/lib/till/default-size";
 import {
   buildLine,
   placementPriceCents,
@@ -33,15 +34,11 @@ export interface PizzaBuilderProps {
   onConfirm: (line: OrderItem) => void;
   /** What is 86'd at this location. */
   soldOut?: SoldOut;
+  /** Size name to preselect for a new line (the till's default size). */
+  defaultSizeName?: string | null;
 }
 
 const NONE_SOLD_OUT = soldOutSets(null);
-
-const PLACEMENTS: { value: HalfPlacement; label: string }[] = [
-  { value: "left", label: "L" },
-  { value: "whole", label: "Whole" },
-  { value: "right", label: "R" },
-];
 
 export function PizzaBuilder({
   item,
@@ -50,6 +47,7 @@ export function PizzaBuilder({
   onCancel,
   onConfirm,
   soldOut = NONE_SOLD_OUT,
+  defaultSizeName = null,
 }: PizzaBuilderProps) {
   const singleGroups = item.modifierGroups.filter((g) => !g.supports_half);
   const halfGroups = item.modifierGroups.filter((g) => g.supports_half);
@@ -78,7 +76,7 @@ export function PizzaBuilder({
 
     const sizeId =
       editing?.size_id ??
-      item.sizes.find((s) => !soldOut.sizes.has(s.id))?.id ??
+      pickDefaultSize(item.sizes, soldOut.sizes, defaultSizeName)?.id ??
       null;
     return {
       single,
@@ -134,9 +132,6 @@ export function PizzaBuilder({
   // Server rules (see lib/shop/reprice.ts) the builder must never violate:
   // half placements only on half-and-half-capable items, max_select per group.
   const halfAllowed = item.is_half_and_half_capable;
-  const placementOptions = halfAllowed
-    ? PLACEMENTS
-    : PLACEMENTS.filter((p) => p.value === "whole");
   const pickedIn = (g: (typeof halfGroups)[number]) =>
     g.modifiers.filter((m) => toppings[m.id]).length;
   const overMax = halfGroups.filter((g) => pickedIn(g) > g.max_select);
@@ -192,9 +187,9 @@ export function PizzaBuilder({
       ariaLabel={`Build ${item.name}`}
       placement="center"
     >
-      <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl bg-background shadow-xl sm:rounded-2xl">
+      <div className="flex max-h-[96dvh] w-full max-w-4xl flex-col overflow-hidden rounded-t-2xl bg-background shadow-xl sm:rounded-2xl">
         {/* Header */}
-        <div className="flex items-center justify-between border-b p-4">
+        <div className="flex items-center justify-between border-b px-4 py-2">
           <div>
             <h2 className="text-lg font-bold">{item.name}</h2>
             {item.description && (
@@ -215,14 +210,14 @@ export function PizzaBuilder({
         </div>
 
         {/* Body */}
-        <div className="flex-1 space-y-6 overflow-y-auto p-4">
+        <div className="flex-1 space-y-4 overflow-y-auto p-4">
           {/* Sizes */}
           {item.sizes.length > 0 && (
             <section>
               <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                 Size
               </h3>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
                 {item.sizes.map((s) => {
                   const out = soldOut.sizes.has(s.id);
                   return (
@@ -232,7 +227,7 @@ export function PizzaBuilder({
                       disabled={out}
                       onClick={() => setSizeId(s.id)}
                       className={cn(
-                        "flex flex-col items-center rounded-lg border p-3 text-sm transition-colors disabled:cursor-not-allowed disabled:border-dashed disabled:bg-muted",
+                        "flex min-h-14 flex-col items-center justify-center rounded-lg border px-2 py-1.5 text-sm transition-colors touch-manipulation disabled:cursor-not-allowed disabled:border-dashed disabled:bg-muted",
                         sizeId === s.id
                           ? "border-primary bg-primary/10 font-semibold"
                           : "hover:bg-accent",
@@ -249,7 +244,8 @@ export function PizzaBuilder({
             </section>
           )}
 
-          {/* Single-select groups (crust, sauce) */}
+          {/* Single-select groups (crust, sauce) sit side by side to save height */}
+          <div className="grid gap-4 md:grid-cols-2">
           {singleGroups.map((g) => (
             <section key={g.id}>
               <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
@@ -258,7 +254,7 @@ export function PizzaBuilder({
                   <span className="ml-1 text-destructive">*</span>
                 )}
               </h3>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2 lg:grid-cols-3">
                 {g.modifiers.map((m) => {
                   const out = soldOut.modifiers.has(m.id);
                   return (
@@ -270,7 +266,7 @@ export function PizzaBuilder({
                         setSingle((prev) => ({ ...prev, [g.id]: m.id }))
                       }
                       className={cn(
-                        "flex flex-col items-center rounded-lg border p-3 text-sm transition-colors disabled:cursor-not-allowed disabled:border-dashed disabled:bg-muted",
+                        "flex min-h-14 flex-col items-center justify-center rounded-lg border px-2 py-1.5 text-sm transition-colors touch-manipulation disabled:cursor-not-allowed disabled:border-dashed disabled:bg-muted",
                         single[g.id] === m.id
                           ? "border-primary bg-primary/10 font-semibold"
                           : "hover:bg-accent",
@@ -292,6 +288,7 @@ export function PizzaBuilder({
               </div>
             </section>
           ))}
+          </div>
 
           {/* Half-and-half topping groups */}
           {halfGroups.map((g) => (
@@ -299,72 +296,93 @@ export function PizzaBuilder({
               <h3 className="mb-1 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                 {g.name}
               </h3>
-              <p className="mb-2 text-xs text-muted-foreground">
+              <p className="mb-1.5 text-xs text-muted-foreground">
                 {halfAllowed
-                  ? "Place each topping on the Left half, Right half, or the Whole pizza. Half placements are charged at half price."
+                  ? "Tap a topping for the whole pizza, or L / R for one half (half price)."
                   : "Choose the toppings for the whole pizza."}{" "}
                 {`Up to ${g.max_select}.`}
               </p>
-              <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2 lg:grid-cols-3">
                 {g.modifiers.map((m) => {
                   const placement = toppings[m.id];
                   const out = soldOut.modifiers.has(m.id);
                   const atMax = !placement && pickedIn(g) >= g.max_select;
+                  const pick = (p: HalfPlacement) =>
+                    setToppingPlacement(
+                      m.id,
+                      p,
+                      g.max_select,
+                      g.modifiers.map((x) => x.id),
+                    );
                   return (
                     <div
                       key={m.id}
-                      className="flex items-center justify-between gap-2 rounded-lg border p-2"
+                      data-topping={m.name}
+                      className={cn(
+                        "flex items-stretch gap-1 rounded-lg border p-1",
+                        placement && "border-primary bg-primary/5",
+                      )}
                     >
-                      <div className="min-w-0">
-                        <div
+                      {/* Whole is the main tap; L / R are secondary toggles. */}
+                      <button
+                        type="button"
+                        aria-pressed={placement === "whole"}
+                        disabled={atMax || (out && placement !== "whole")}
+                        onClick={() => pick("whole")}
+                        className={cn(
+                          "flex min-h-12 min-w-0 flex-1 flex-col items-start justify-center rounded-md px-2 text-left transition-colors touch-manipulation disabled:cursor-not-allowed disabled:opacity-40",
+                          placement === "whole"
+                            ? "bg-primary text-primary-foreground"
+                            : placement
+                              ? "bg-primary/10"
+                              : "hover:bg-accent",
+                        )}
+                      >
+                        <span
                           className={cn(
-                            "truncate text-sm font-medium",
-                            out && "text-muted-foreground line-through",
+                            "w-full truncate text-sm font-medium",
+                            out && "line-through",
                           )}
                         >
                           {m.name}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {out ? (
-                            <span className="font-semibold uppercase">Sold out</span>
-                          ) : (
-                            <>
-                              whole +{formatMoney(m.price_cents, currency)} · half +
-                              {formatMoney(
-                                placementPriceCents(m.price_cents, "left"),
-                                currency,
-                              )}
-                            </>
+                        </span>
+                        <span
+                          className={cn(
+                            "text-xs",
+                            placement === "whole"
+                              ? "text-primary-foreground/80"
+                              : "text-muted-foreground",
                           )}
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 overflow-hidden rounded-md border">
-                        {placementOptions.map((p) => (
+                        >
+                          {out
+                            ? "Sold out"
+                            : placement === "left"
+                              ? `Left +${formatMoney(placementPriceCents(m.price_cents, "left"), currency)}`
+                              : placement === "right"
+                                ? `Right +${formatMoney(placementPriceCents(m.price_cents, "right"), currency)}`
+                                : `+${formatMoney(m.price_cents, currency)}`}
+                        </span>
+                      </button>
+                      {halfAllowed &&
+                        (["left", "right"] as const).map((side) => (
                           <button
-                            key={p.value}
+                            key={side}
                             type="button"
-                            aria-pressed={placement === p.value}
-                            // A sold-out topping can only be taken OFF (an edited line).
-                            disabled={atMax || (out && placement !== p.value)}
-                            onClick={() =>
-                              setToppingPlacement(
-                                m.id,
-                                p.value,
-                                g.max_select,
-                                g.modifiers.map((x) => x.id),
-                              )
-                            }
+                            aria-pressed={placement === side}
+                            aria-label={side === "left" ? "L" : "R"}
+                            title={`${side === "left" ? "Left" : "Right"} half only`}
+                            disabled={atMax || (out && placement !== side)}
+                            onClick={() => pick(side)}
                             className={cn(
-                              "h-11 min-w-[44px] px-2.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40",
-                              placement === p.value
-                                ? "bg-primary text-primary-foreground"
+                              "h-12 w-12 shrink-0 rounded-md border text-sm font-semibold transition-colors touch-manipulation disabled:cursor-not-allowed disabled:opacity-40",
+                              placement === side
+                                ? "border-primary bg-primary text-primary-foreground"
                                 : "bg-background hover:bg-accent",
                             )}
                           >
-                            {p.label}
+                            {side === "left" ? "L" : "R"}
                           </button>
                         ))}
-                      </div>
                     </div>
                   );
                 })}
@@ -372,54 +390,55 @@ export function PizzaBuilder({
             </section>
           ))}
 
-          {/* Quantity */}
-          <section>
-            <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-              Quantity
-            </h3>
-            <div className="flex items-center gap-3">
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-11 w-11"
-                onClick={() => setQty((q) => Math.max(1, q - 1))}
-                aria-label="Decrease quantity"
-              >
-                −
-              </Button>
-              <span className="w-10 text-center text-lg font-semibold">
-                {qty}
-              </span>
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-11 w-11"
-                onClick={() => setQty((q) => Math.min(MAX_LINE_QUANTITY, q + 1))}
-                disabled={qty >= MAX_LINE_QUANTITY}
-                aria-label="Increase quantity"
-              >
-                +
-              </Button>
+          {/* Quantity + special instructions */}
+          <section className="flex flex-wrap items-end gap-4">
+            <div>
+              <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                Quantity
+              </h3>
+              <div className="flex items-center gap-3">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-11 w-11"
+                  onClick={() => setQty((q) => Math.max(1, q - 1))}
+                  aria-label="Decrease quantity"
+                >
+                  −
+                </Button>
+                <span className="w-10 text-center text-lg font-semibold">
+                  {qty}
+                </span>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-11 w-11"
+                  onClick={() => setQty((q) => Math.min(MAX_LINE_QUANTITY, q + 1))}
+                  disabled={qty >= MAX_LINE_QUANTITY}
+                  aria-label="Increase quantity"
+                >
+                  +
+                </Button>
+              </div>
             </div>
-          </section>
-
-          {/* Special instructions */}
-          <section>
-            <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-              Special instructions
-            </h3>
-            <textarea
-              aria-label="Special instructions"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="e.g. well done, cut in squares"
-              className="min-h-[60px] w-full rounded-lg border bg-background p-2 text-base sm:text-sm"
-            />
+            <div className="min-w-[200px] flex-1">
+              <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                Special instructions
+              </h3>
+              <textarea
+                aria-label="Special instructions"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="e.g. well done, cut in squares"
+                rows={1}
+                className="min-h-11 w-full rounded-lg border bg-background p-2 text-base sm:text-sm"
+              />
+            </div>
           </section>
         </div>
 
         {/* Footer / live price + confirm */}
-        <div className="border-t p-4">
+        <div className="border-t p-3">
           {missingRequired.length > 0 && (
             <p className="mb-2 text-xs text-destructive">
               Select: {missingRequired.join(", ")}

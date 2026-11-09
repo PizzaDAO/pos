@@ -21,6 +21,7 @@ import type { KdsThresholds } from "@/lib/db";
 import { ageLevelFor } from "@/lib/kds/board";
 import { handoffLabel, isHandoffStatus, statusLabel } from "@/lib/kds/status";
 import { channelLabel, formatElapsed } from "@/lib/kds/format";
+import { displayOrderNumber, orderTypeLabel } from "@/lib/till/order-meta";
 import type { AgeLevel, KitchenTicket, StationFilter } from "@/lib/kds/types";
 import { MarketplaceBadge } from "@/components/marketplace-badge";
 import { TicketItems } from "./ticket-items";
@@ -40,8 +41,12 @@ const AGE_STYLES: Record<AgeLevel, { card: string; header: string }> = {
   },
 };
 
+/** Dark mode: a calm green Bump, not a solid-white slab (glare on a dark wall). */
+const BUMP_DARK =
+  "dark:border dark:border-emerald-600 dark:bg-emerald-900 dark:text-emerald-50 dark:hover:bg-emerald-800";
+
 const READY_STYLE = {
-  card: "border-muted-foreground/40 opacity-80",
+  card: "border-muted-foreground/40",
   header: "bg-muted text-foreground",
 };
 
@@ -69,6 +74,7 @@ function TicketCardImpl({
   onBump,
   onRecall,
   busy,
+  defaultModifierIds,
 }: {
   ticket: KitchenTicket;
   thresholds: KdsThresholds;
@@ -76,8 +82,11 @@ function TicketCardImpl({
   onBump: (orderId: string) => void;
   onRecall: (orderId: string) => void;
   busy: boolean;
+  defaultModifierIds?: ReadonlySet<string>;
 }) {
   const { order } = ticket;
+  const typeLabel = orderTypeLabel(order);
+  const customer = order.core_ext?.callout_name ?? null;
   const elapsed = useLiveElapsed(order.created_at);
   const ageLevel = ageLevelFor(elapsed, thresholds);
   const isBumped = isHandoffStatus(order.status);
@@ -89,7 +98,8 @@ function TicketCardImpl({
 
   return (
     <article
-      aria-label={`Order ${order.order_number}, ${statusLabel(order.status)}, ${channelLabel(order.channel)}`}
+      data-ticket=""
+      aria-label={`Order ${displayOrderNumber(order.order_number)}, ${statusLabel(order.status)}, ${typeLabel ?? channelLabel(order.channel)}${customer ? `, ${customer}` : ""}`}
       className={cn(
         "flex flex-col overflow-hidden rounded-lg border-2 bg-card shadow-sm",
         styles.card,
@@ -98,7 +108,7 @@ function TicketCardImpl({
       <header className={cn("px-3 py-2", styles.header)}>
         <div className="flex items-center justify-between">
           <span className="text-2xl font-bold tracking-tight">
-            {order.order_number}
+            {displayOrderNumber(order.order_number)}
           </span>
           <span className="font-mono text-lg font-bold tabular-nums">
             {formatElapsed(elapsed)}
@@ -111,7 +121,10 @@ function TicketCardImpl({
               displayId={order.fulfillment.marketplace.display_id}
             />
           ) : (
-            <span>{channelLabel(order.channel)}</span>
+            <span>
+              {typeLabel ?? channelLabel(order.channel)}
+              {customer && <span className="ml-1 font-bold">· {customer}</span>}
+            </span>
           )}
           <span
             className={cn(
@@ -138,7 +151,11 @@ function TicketCardImpl({
       )}
 
       <div className="flex-1 px-3 py-2">
-        <TicketItems items={order.items} stationFilter={stationFilter} />
+        <TicketItems
+          items={order.items}
+          stationFilter={stationFilter}
+          defaultModifierIds={defaultModifierIds}
+        />
         {order.notes && (
           <p className="mt-2 rounded bg-amber-50 px-2 py-1 text-sm font-medium text-amber-800">
             Order note: {order.notes}
@@ -150,7 +167,7 @@ function TicketCardImpl({
         {handoff && (
           <Button
             size="lg"
-            className="h-14 flex-1 text-lg"
+            className={cn("h-14 flex-1 text-lg", BUMP_DARK)}
             disabled={busy}
             aria-label={`${handoff}: hand off order ${order.order_number}`}
             onClick={() => onBump(order.id)}
@@ -172,7 +189,7 @@ function TicketCardImpl({
         ) : (
           <Button
             size="lg"
-            className="h-14 flex-1 text-lg"
+            className={cn("h-14 flex-1 text-lg", BUMP_DARK)}
             disabled={busy}
             aria-label={`Bump order ${order.order_number}`}
             onClick={() => onBump(order.id)}

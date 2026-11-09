@@ -38,6 +38,7 @@ import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
 import { isFullyRefunded } from "@/lib/payments/refund-state";
 import { planCashTender } from "@/lib/payments/cash-tender";
+import { quickCashNotes } from "@/lib/till/quick-cash";
 import { PAYMENT_RAIL_KEYS } from "@/lib/payments/registry";
 import { useCheckout } from "@/lib/store/use-checkout";
 import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
@@ -55,15 +56,6 @@ const STAFF_RAIL_LABELS: Record<PaymentRailKey, string> = {
   gift_card: "Gift card",
   store_credit: "Store credit",
 };
-
-/** Quick-cash note choices at or above what is owed (plus Exact, always). */
-function quickCashChoices(dueCents: number): number[] {
-  const notes = [2000, 5000, 10000].filter((n) => n >= dueCents);
-  if (notes.length === 0 && dueCents > 0) {
-    notes.push(Math.ceil(dueCents / 10000) * 10000);
-  }
-  return notes;
-}
 
 const ADJUSTMENT_LABELS: Record<AdjustmentKind, string> = {
   refund: "Refund",
@@ -195,16 +187,28 @@ export function PaymentScreen({
   /** What this tender puts through (base + tip). */
   const thisTenderCents = cashPartial ? cashPlan.amountCents : dueWithTip;
 
-  async function handleTake() {
+  /**
+   * `quickTenderedCents`: a quick-cash note tap charges at once with that amount
+   * (Exact = the whole balance + tip), instead of filling the field first.
+   */
+  async function handleTake(quickTenderedCents?: number) {
     if (balance <= 0) return;
     let input: Parameters<typeof checkout.takeTender>[0];
     if (rail === "cash") {
-      if (cashPlan.kind !== "full" && cashPlan.kind !== "partial") return;
+      const plan =
+        quickTenderedCents === undefined
+          ? cashPlan
+          : planCashTender({
+              balanceCents: balance,
+              tipCents: effectiveTipCents,
+              tenderedCents: quickTenderedCents,
+            });
+      if (plan.kind !== "full" && plan.kind !== "partial") return;
       input = {
         rail,
-        amountCents: cashPlan.amountCents,
-        tipCents: cashPlan.tipCents,
-        cashTenderedCents: cashPlan.cashTenderedCents,
+        amountCents: plan.amountCents,
+        tipCents: plan.tipCents,
+        cashTenderedCents: plan.cashTenderedCents,
       };
     } else {
       input = { rail, amountCents: balance, tipCents: effectiveTipCents };
@@ -215,11 +219,10 @@ export function PaymentScreen({
     // keeps them so the cashier can simply press Charge again.
     if (!recorded) return;
     if (rail !== "stripe_terminal") card.clearError();
-    setPartialCashCents(
-      rail === "cash" && cashPlan.kind === "partial" ? cashPlan.amountCents : null,
-    );
+    const tookPartial = rail === "cash" && input.amountCents < balance;
+    setPartialCashCents(tookPartial ? input.amountCents : null);
     // A partial cash tender keeps the tip for the tender that finishes the order.
-    if (!(rail === "cash" && cashPlan.kind === "partial")) setTipCents(0);
+    if (!tookPartial) setTipCents(0);
     setCashTendered("");
   }
 
@@ -325,7 +328,7 @@ export function PaymentScreen({
                   <div className="mb-2 text-sm font-medium text-muted-foreground">
                     Payment method
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
                     {/* "Card — Stripe (online)" makes no sense at the till. */}
                     {PAYMENT_RAIL_KEYS.filter(
                       (key) => key !== "stripe_online",
@@ -339,7 +342,7 @@ export function PaymentScreen({
                         }}
                         aria-pressed={rail === key}
                         className={cn(
-                          "h-16 rounded-lg border px-3 text-center text-base font-semibold touch-manipulation hover:bg-secondary",
+                          "h-14 rounded-lg border px-2 text-center text-base font-semibold touch-manipulation hover:bg-secondary",
                           rail === key &&
                             "border-primary bg-primary/10 ring-2 ring-primary",
                         )}
@@ -428,7 +431,7 @@ export function PaymentScreen({
                       <div className="flex flex-wrap gap-2">
                         {card.phase === "declined" && (
                           <Button
-                            size="sm"
+                            className="h-12 px-4"
                             disabled={card.busy || !card.online}
                             onClick={() => void card.retry()}
                           >
@@ -436,7 +439,7 @@ export function PaymentScreen({
                           </Button>
                         )}
                         <Button
-                          size="sm"
+                          className="h-12 px-4"
                           variant="outline"
                           disabled={card.busy}
                           onClick={() => void card.cancel()}
@@ -444,7 +447,7 @@ export function PaymentScreen({
                           Cancel
                         </Button>
                         <Button
-                          size="sm"
+                          className="h-12 px-4"
                           variant="outline"
                           disabled={card.busy || !card.online}
                           onClick={() => void card.resetReader()}
@@ -457,7 +460,7 @@ export function PaymentScreen({
                     {card.phase === "present" && sandboxReader && (
                       <div className="flex flex-wrap gap-2 border-t pt-2">
                         <Button
-                          size="sm"
+                          className="h-12 px-4"
                           variant="secondary"
                           disabled={card.busy}
                           onClick={() => void card.simulate("approve")}
@@ -465,7 +468,7 @@ export function PaymentScreen({
                           Simulate approve
                         </Button>
                         <Button
-                          size="sm"
+                          className="h-12 px-4"
                           variant="secondary"
                           disabled={card.busy}
                           onClick={() => void card.simulate("decline")}
@@ -480,6 +483,33 @@ export function PaymentScreen({
                 {/* Cash entry */}
                 {rail === "cash" && (
                   <div className="space-y-3 rounded-md border p-3">
+                    <div
+                      className="flex flex-wrap gap-2"
+                      role="group"
+                      aria-label="Quick cash"
+                    >
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="h-12 px-4 text-base"
+                        disabled={checkout.loading || balance <= 0}
+                        onClick={() => void handleTake(dueWithTip)}
+                      >
+                        Exact
+                      </Button>
+                      {quickCashNotes(dueWithTip).map((n) => (
+                        <Button
+                          key={n}
+                          type="button"
+                          variant="outline"
+                          className="h-12 px-4 text-base"
+                          disabled={checkout.loading || balance <= 0}
+                          onClick={() => void handleTake(n)}
+                        >
+                          {formatMoney(n, currency)}
+                        </Button>
+                      ))}
+                    </div>
                     <label
                       htmlFor="cash-tendered"
                       className="text-sm text-muted-foreground"
@@ -499,33 +529,6 @@ export function PaymentScreen({
                         placeholder={(dueWithTip / 100).toFixed(2)}
                         className="h-12 w-full max-w-40 rounded-md border bg-background px-3 text-right text-lg"
                       />
-                    </div>
-                    <div
-                      className="flex flex-wrap gap-2"
-                      role="group"
-                      aria-label="Quick cash"
-                    >
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className="h-12 px-5 text-base"
-                        onClick={() =>
-                          setCashTendered((dueWithTip / 100).toFixed(2))
-                        }
-                      >
-                        Exact
-                      </Button>
-                      {quickCashChoices(dueWithTip).map((n) => (
-                        <Button
-                          key={n}
-                          type="button"
-                          variant="outline"
-                          className="h-12 px-5 text-base"
-                          onClick={() => setCashTendered((n / 100).toFixed(2))}
-                        >
-                          {formatMoney(n, currency)}
-                        </Button>
-                      ))}
                     </div>
                     {cashPartial && cashPlan.kind === "partial" ? (
                       <p
@@ -585,6 +588,8 @@ export function PaymentScreen({
                   </span>
                 </div>
 
+                {/* Sticky: Charge stays on screen at 1024x768 without scrolling. */}
+                <div className="sticky bottom-0 -mx-1 bg-background px-1 pb-1 pt-2">
                 <Button
                   className="h-14 w-full text-base"
                   disabled={
@@ -596,7 +601,7 @@ export function PaymentScreen({
                     cashShortOfTip ||
                     (cardRail && (!!cardBlocked || !card.selectedReaderId))
                   }
-                  onClick={handleTake}
+                  onClick={() => void handleTake()}
                 >
                   {checkout.loading || card.busy ? (
                     <>
@@ -609,6 +614,7 @@ export function PaymentScreen({
                       : `Charge ${formatMoney(thisTenderCents, currency)}`
                   )}
                 </Button>
+                </div>
               </>
             )}
 
