@@ -166,6 +166,52 @@ export interface FulfillmentSettings {
   pickup_address?: string;
 }
 
+/** Third-party marketplace providers (src/lib/marketplace). */
+export type MarketplaceProviderKey =
+  | "doordash"
+  | "ubereats"
+  | "grubhub"
+  | "simulator";
+
+/** Per-provider, per-location marketplace config. */
+export interface MarketplaceProviderSettings {
+  enabled: boolean;
+  /** The provider's id for this store (DoorDash store id, Uber Eats store uuid ...). */
+  store_id: string | null;
+}
+
+/**
+ * Per-location marketplace inbox settings. OFF by default: with `enabled` false
+ * (or absent) nothing is ingested and nothing is ever called out to a provider.
+ */
+export interface MarketplaceSettings {
+  enabled: boolean;
+  /** Accept new marketplace orders automatically (sends the accept callback). */
+  auto_accept: boolean;
+  providers: Partial<Record<MarketplaceProviderKey, MarketplaceProviderSettings>>;
+}
+
+/** What an ingested marketplace order remembers about its origin + acceptance. */
+export interface MarketplaceOrderMeta {
+  provider: MarketplaceProviderKey;
+  /** The provider's order id (unique per provider + location). */
+  external_id: string;
+  /** Short customer-facing code printed on the provider's tablet/receipt. */
+  display_id: string | null;
+  acceptance: "pending" | "accepted" | "rejected";
+  accepted_at?: string;
+  rejected_reason?: string;
+  customer_name?: string | null;
+  customer_phone?: string | null;
+  /** Last status callback sent to the provider (or why it was skipped). */
+  last_callback?: {
+    action: "accept" | "reject" | "ready";
+    at: string;
+    outcome: "sent" | "skipped" | "failed";
+    detail?: string;
+  };
+}
+
 /** Per-location store settings (tax, rounding, currency) — mocked in Phase 1. */
 export interface StoreSettings {
   tenant_id: string;
@@ -179,6 +225,8 @@ export interface StoreSettings {
   kds_thresholds?: KdsThresholds;
   /** Online-ordering / fulfillment config (Phase 4). Optional; a default applies. */
   fulfillment?: FulfillmentSettings;
+  /** Marketplace inbox (DoorDash / Uber Eats / Grubhub). Absent = off. */
+  marketplace?: MarketplaceSettings;
 }
 
 // ----------------------------------------------------------------------------
@@ -267,7 +315,16 @@ export interface OrderHold {
   extend_ttl_seconds?: number | null;
 }
 
-export type OrderChannel = "in_store" | "online_pickup" | "online_delivery";
+/**
+ * `marketplace` = an order ingested from DoorDash / Uber Eats / Grubhub
+ * (src/lib/marketplace). The provider marketplace collects payment, so these
+ * never owe a balance and never touch the cash drawer.
+ */
+export type OrderChannel =
+  | "in_store"
+  | "online_pickup"
+  | "online_delivery"
+  | "marketplace";
 
 /**
  * Where an order came from (core contract `OrderSource`, minus defaults).
@@ -340,6 +397,8 @@ export interface OrderFulfillment {
   recovery_next_at?: string;
   /** Set once an order of another deployment mode was alerted on (not swept again). */
   foreign_alerted_at?: string;
+  /** Marketplace origin + acceptance state (channel `marketplace` only). */
+  marketplace?: MarketplaceOrderMeta;
   /** Delivery fee in cents, already folded into the order subtotal (delivery only). */
   delivery_fee_cents?: number;
   /** Customer-facing delivery instructions (delivery only). */

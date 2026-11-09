@@ -30,7 +30,7 @@ export async function GET(request: Request) {
 
   const driver = getPosDriver();
   const orders = (await driver.listOrders(tenantId, locationId, { limit: 300 }))
-    .filter((o) => o.channel === "in_store");
+    .filter((o) => o.channel === "in_store" || o.channel === "marketplace");
   const payments = await driver.listPaymentsForOrders(orders.map((o) => o.id));
   return NextResponse.json({ orders: selectOpenOrders(orders, payments) });
 }

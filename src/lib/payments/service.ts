@@ -145,6 +145,9 @@ export function orderBalanceFromPayments(
   order: Order,
   all: Payment[],
 ): number {
+  // A marketplace order (DoorDash / Uber Eats / Grubhub) is paid by the
+  // marketplace before it reaches us: it never owes a balance at the till.
+  if (order.channel === "marketplace") return 0;
   const cur = order.currency.toUpperCase();
   const payments = all.filter((p) => p.currency.toUpperCase() === cur);
   return Math.max(0, orderDueCents(order) - coveredCents(payments));

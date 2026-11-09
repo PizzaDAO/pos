@@ -1037,6 +1037,21 @@ export const mockDriver: PosDriver = {
     };
   },
 
+  async setMarketplaceSettings(
+    tenantId,
+    locationId,
+    marketplace,
+  ): Promise<StoreSettings> {
+    const base = await this.getStoreSettings(tenantId, locationId);
+    const next: StoreSettings = { ...base, marketplace };
+    const i = storeSettings.findIndex(
+      (s) => s.tenant_id === tenantId && s.location_id === locationId,
+    );
+    if (i >= 0) storeSettings[i] = next;
+    else storeSettings.push(next);
+    return next;
+  },
+
   async createOrder(input: CreateOrderInput): Promise<Order> {
     const existing = orders.get(input.id);
     if (existing) return existing;

@@ -217,6 +217,7 @@ function mapStoreSettings(r: Row): StoreSettings {
     kds_thresholds:
       (r.kds_thresholds as StoreSettings["kds_thresholds"]) ?? undefined,
     fulfillment: (r.fulfillment as StoreSettings["fulfillment"]) ?? undefined,
+    marketplace: (r.marketplace as StoreSettings["marketplace"]) ?? undefined,
   };
 }
 
@@ -1639,6 +1640,30 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         tip_presets_bps: [1500, 1800, 2000],
         kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
       };
+    },
+
+    async setMarketplaceSettings(tenantId, locationId, marketplace) {
+      const base = await this.getStoreSettings(tenantId, locationId);
+      const r = unwrap(
+        await sb
+          .from("store_settings")
+          .upsert(
+            {
+              tenant_id: tenantId,
+              location_id: locationId,
+              currency: base.currency,
+              tax_rate_bps: base.tax_rate_bps,
+              tip_presets_bps: base.tip_presets_bps,
+              kds_thresholds: base.kds_thresholds ?? null,
+              fulfillment: base.fulfillment ?? null,
+              marketplace,
+            },
+            { onConflict: "tenant_id,location_id" },
+          )
+          .select()
+          .single(),
+      ) as Row;
+      return mapStoreSettings(r);
     },
 
     // -- Orders ------------------------------------------------------------

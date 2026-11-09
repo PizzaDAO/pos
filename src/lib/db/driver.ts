@@ -15,6 +15,7 @@ import type {
   OrderStatus,
   OrderTotals,
   StoreSettings,
+  MarketplaceSettings,
 } from "./menu-types";
 import type {
   ConnectAccount,
@@ -459,6 +460,16 @@ export interface PosDriver {
 
   /** Update an order's status (e.g. → `paid`/`refunded`/`voided`). */
   updateOrderStatus(id: string, status: OrderStatus): Promise<Order | null>;
+
+  /**
+   * Replace a location's marketplace inbox settings (off by default; absent =
+   * off). Creates the store settings row from defaults if it does not exist.
+   */
+  setMarketplaceSettings(
+    tenantId: string,
+    locationId: string,
+    marketplace: MarketplaceSettings,
+  ): Promise<StoreSettings>;
 
   /**
    * [SHARED: online checkout + terminal card reader] Compare-and-set status

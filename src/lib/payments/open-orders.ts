@@ -23,7 +23,20 @@ export interface OpenOrderRow {
   status: Order["status"];
   currency: string;
   balanceCents: number;
+  /**
+   * Set on marketplace orders (DoorDash / Uber Eats / Grubhub): paid by the
+   * marketplace (balanceCents is always 0), shown with a provider badge and, while
+   * `acceptance` is pending, accept / reject controls.
+   */
+  marketplace?: {
+    provider: string;
+    display_id: string | null;
+    acceptance: "pending" | "accepted" | "rejected";
+  };
 }
+
+/** Marketplace orders still live on the till: pending acceptance up to ready. */
+const MARKETPLACE_LIVE_STATUSES = new Set(["placed", "paid", "in_kitchen", "ready", "recall"]);
 
 /**
  * In-store orders that still owe money, newest first. The balance filter runs
@@ -36,6 +49,26 @@ export function selectOpenOrders(
 ): OpenOrderRow[] {
   const rows: OpenOrderRow[] = [];
   for (const order of orders) {
+    const mk = order.fulfillment?.marketplace;
+    if (order.channel === "marketplace") {
+      // Already paid: listed so staff can accept it and see it, never to be paid.
+      if (mk && MARKETPLACE_LIVE_STATUSES.has(order.status)) {
+        rows.push({
+          id: order.id,
+          order_number: order.order_number,
+          status: order.status,
+          currency: order.currency,
+          balanceCents: 0,
+          marketplace: {
+            provider: mk.provider,
+            display_id: mk.display_id,
+            acceptance: mk.acceptance,
+          },
+        });
+        if (rows.length >= limit) break;
+      }
+      continue;
+    }
     if (order.channel !== "in_store" || !OWING_STATUSES.has(order.status)) {
       continue;
     }

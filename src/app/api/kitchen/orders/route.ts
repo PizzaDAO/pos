@@ -22,6 +22,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { notifyMarketplaceReady } from "@/lib/marketplace/service";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
@@ -106,5 +107,8 @@ export async function POST(request: Request) {
   }
 
   const updated = await driver.updateOrderStatus(id, next);
+  // Marketplace order bumped to ready: tell the provider (best effort, inert
+  // unless the provider is configured).
+  if (updated && next === "ready") await notifyMarketplaceReady(updated);
   return NextResponse.json({ order: updated, changed: true });
 }
