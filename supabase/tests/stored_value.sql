@@ -1,5 +1,5 @@
 -- ============================================================================
--- Stored value (gift cards + store credit) checks for 20261113000410 (run by
+-- Stored value (gift cards + store credit) checks for 20261113000910 (run by
 -- scripts/pglite-migrate.mjs after the migrations + seed). Raises on the first
 -- failed expectation; rolled back at the end.
 -- ============================================================================

@@ -27,7 +27,7 @@
 -- and authenticated. The app reads and writes with the service role only.
 --
 -- Additive and live-safe: two new tables, five new functions. Needs
--- 20261113000400 (the enum values) applied first.
+-- 20261113000900 (the enum values) applied first.
 -- ============================================================================
 
 begin;

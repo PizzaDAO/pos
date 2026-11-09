@@ -1,7 +1,7 @@
 /**
  * Pure ledger math (no I/O; shared by the mock writer and the tests, and
  * mirrored line for line by the SQL writers in
- * supabase/migrations/20261113000410_stored_value.sql).
+ * supabase/migrations/20261113000910_stored_value.sql).
  */
 import type { LedgerEntry, LedgerKind, StoredValueAccount } from "./types";
 import { CREDIT_KINDS } from "./types";

@@ -24,6 +24,7 @@ import {
   Gift,
   LayoutGrid,
   MapPin,
+  Printer,
   Receipt,
   Truck,
   Users,
@@ -57,8 +58,8 @@ const InventoryManager = dynamic(
   () => import("./inventory-manager").then((m) => m.InventoryManager),
   { loading: PanelFallback },
 );
-const ReportsView = dynamic(
-  () => import("./reports-view").then((m) => m.ReportsView),
+const OwnerReports = dynamic(
+  () => import("./owner-reports").then((m) => m.OwnerReports),
   { loading: PanelFallback },
 );
 const StaffShifts = dynamic(
@@ -92,6 +93,9 @@ const CardReaders = dynamic(
   () => import("./card-readers").then((m) => m.CardReaders),
   { loading: PanelFallback },
 );
+const Printers = dynamic(() => import("./printers").then((m) => m.Printers), {
+  loading: PanelFallback,
+});
 const DeliveryDispatch = dynamic(
   () => import("../delivery-dispatch").then((m) => m.DeliveryDispatch),
   { loading: PanelFallback },
@@ -107,6 +111,7 @@ type Tab =
   | "plan"
   | "payments"
   | "late"
+  | "printers"
   | "giftcards"
   | "delivery";
 
@@ -187,6 +192,7 @@ export function AdminShell({
       { id: "plan", label: "Plan", icon: Wallet },
       { id: "payments", label: "Payments", icon: CreditCard },
       { id: "late", label: "Late payments", icon: AlertTriangle },
+      { id: "printers", label: "Printers", icon: Printer },
       { id: "giftcards", label: "Gift cards", icon: Gift },
       { id: "delivery", label: "Delivery", icon: Truck },
     ];
@@ -278,7 +284,7 @@ export function AdminShell({
         )}
         {tab === "reports" &&
           (advancedReportsAllowed ? (
-            <ReportsView tenantId={tenantId} locations={locations} />
+            <OwnerReports tenantId={tenantId} locations={locations} />
           ) : (
             <FeatureLocked
               feature="Advanced reports"
@@ -323,6 +329,9 @@ export function AdminShell({
               <CardReaders tenantId={tenantId} locationId={locationId} />
             )}
           </>
+        )}
+        {tab === "printers" && locationId && (
+          <Printers tenantId={tenantId} locationId={locationId} />
         )}
         {tab === "delivery" &&
           (deliveryAllowed ? (

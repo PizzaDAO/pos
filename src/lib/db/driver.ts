@@ -6,6 +6,12 @@
  * same interface WITHOUT touching any UI/call site. Selection happens in
  * `index.ts` via `getPosDriver()`.
  */
+import type { OwnerReportBundle } from "@/lib/owner-reports";
+import type {
+  Printer,
+  PrintJob,
+  PrintLocationSettings,
+} from "@/lib/printing/types";
 import type {
   CreateOrderInput,
   Menu,
@@ -765,6 +771,358 @@ export interface PosDriver {
   listStaleTerminalTenders(olderThan: string, limit: number): Promise<Payment[]>;
 
   // --------------------------------------------------------------------------
+  // Network kitchen printing (Star CloudPRNT / Epson SDP). Server-only: the
+  // tables hold printer credentials (hashed), so no client role can read them.
+  // --------------------------------------------------------------------------
+
+  listPrinters(tenantId: string, locationId: string): Promise<Printer[]>;
+  getPrinter(id: string): Promise<Printer | null>;
+  /** Insert a printer (id/created_at assigned by the driver). */
+  createPrinter(
+    row: Omit<Printer, "id" | "created_at" | "last_seen_at">,
+  ): Promise<Printer>;
+  /** Delete a printer (its jobs go with it). Tenant-scoped; false if not found. */
+  deletePrinter(tenantId: string, id: string): Promise<boolean>;
+  /** Replace a printer's token hash (rotate). Tenant-scoped; null if not found. */
+  setPrinterTokenHash(tenantId: string, id: string, tokenHash: string): Promise<Printer | null>;
+  /** Stamp `last_seen_at` (every poll). */
+  touchPrinter(id: string, at: string): Promise<void>;
+
+  getPrintSettings(locationId: string): Promise<PrintLocationSettings | null>;
+  setPrintAutoPrint(
+    tenantId: string,
+    locationId: string,
+    autoPrint: boolean,
+  ): Promise<PrintLocationSettings>;
+
+  /**
+   * Queue a job. With a `dedupe_key` already used for the same printer, returns
+   * the existing job instead (idempotent auto-print).
+   */
+  enqueuePrintJob(
+    job: Omit<
+      PrintJob,
+      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at" | "retry_after"
+    >,
+  ): Promise<PrintJob>;
+  /** Mark this printer's overdue queued/sent jobs `expired`; returns how many. */
+  expirePrintJobs(printerId: string, nowIso: string): Promise<number>;
+  /**
+   * Atomically claim an unresolved (or refund-owed) late-payment marker for one
+   * actor: sets `late_payment.claim` only if no live claim exists (a claim older
+   * than `staleBeforeIso` is treated as abandoned). Returns the order, or null if
+   * someone else holds it / there is nothing to claim.
+   */
+  claimLatePayment(
+    orderId: string,
+    claim: "accepting" | "refunding" | "marking_refunded" | "canceling",
+    staleBeforeIso: string,
+  ): Promise<Order | null>;
+
+  /**
+   * Atomic nested merge into `fulfillment.late_payment` (null removes a key).
+   * Returns null when the order has no marker.
+   */
+  updateLatePayment(
+    orderId: string,
+    patch: Partial<Record<keyof LatePaymentMarker, unknown>>,
+  ): Promise<Order | null>;
+
+  /**
+   * Orders at a location whose late-payment marker is still open (unresolved or
+   * refund owed), newest first, capped by `limit`. A dedicated query, not a scan
+   * of every order.
+   */
+  listOpenLatePayments(
+    tenantId: string,
+    locationId: string,
+    limit?: number,
+  ): Promise<Order[]>;
+
+  /**
+   * Shallow-merge keys into an order's `fulfillment` WITHOUT touching its status
+   * (lifecycle markers: finalized_at, late_payment). Returns null if the order
+   * does not exist or has no fulfillment (not an online order).
+   */
+  mergeOrderFulfillment(
+    id: string,
+    patch: Partial<OrderFulfillment>,
+  ): Promise<Order | null>;
+
+  // --------------------------------------------------------------------------
+  // Payments (Phase 2)
+  // --------------------------------------------------------------------------
+
+  /** Per-tenant/location platform-fee + tip config (mock store settings). */
+  getPaymentSettings(
+    tenantId: string,
+    locationId: string,
+  ): Promise<PaymentSettings>;
+
+  /**
+   * Idempotent upsert-by-UUID of a payment tender. Re-submitting the same
+   * payment id returns the stored tender unchanged so retries never
+   * double-charge. Updating an existing tender (status/refund) merges fields.
+   */
+  upsertPayment(payment: Payment): Promise<Payment>;
+
+  /**
+   * Record an `external`-rail tender ATOMICALLY (one transaction, the order row
+   * locked): refuse a voided/abandoned order, report a replay (`exists`), refuse
+   * when the order's live tenders no longer match `expect` (`stale`: the caller
+   * re-validates the amounts), refuse a second CAPTURED tender with the same
+   * processor + ref (`duplicate_ref`), insert, and cancel a pending tender with
+   * the same processor + ref (superseded). Insert-if-absent: never a whole-row
+   * upsert, so a stale snapshot cannot overwrite a tender that changed meanwhile.
+   */
+  recordExternalTender(input: ExternalTenderWrite): Promise<ExternalTenderResult>;
+
+  /**
+   * ATOMICALLY reserve a refund on a tender: increment `refunded_cents`, append
+   * `refundId` to `refund_ids`, and flip status to `refunded` when fully refunded
+   * -- all in one step, refused when it would exceed amount + tip, the tender
+   * isn't refundable (captured/authorized only), or `refundId` was already
+   * applied (`duplicate`). `upsertPayment` never touches these fields on an
+   * existing tender, so concurrent refunds can't lose each other's updates.
+   */
+  reservePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string | null,
+    /**
+     * Recorded on the new `payment.refunds[]` entry (which gets a server-minted
+     * stable id, returned as `refundEntryId`): the rail's refund id and the
+     * staff-given reason.
+     */
+    meta?: { processorRef?: string | null; reason?: string | null },
+  ): Promise<RefundReservation>;
+
+  /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */
+  releasePaymentRefund(
+    paymentId: string,
+    amountCents: number,
+    refundId: string | null,
+  ): Promise<void>;
+
+  /**
+   * TRUE compare-and-set: record a Checkout session id on a tender
+   * (`raw.checkout_session_id`) only while the tender is still `requires_action`
+   * and belongs to `tenantId`. One conditional UPDATE (Supabase:
+   * `core_link_tender_session`), never a whole-row write from a stale read, so a
+   * tender closed meanwhile (cash settled the order, a cancel, a supersede, a
+   * webhook) is left exactly as it is: `not_open`.
+   */
+  linkTenderSession(
+    tenantId: string,
+    paymentId: string,
+    sessionId: string,
+  ): Promise<TenderLinkResult>;
+
+  /** Fetch a single payment tender by id, or null. */
+  getPayment(id: string): Promise<Payment | null>;
+
+  /** Fetch a tender by its rail-native charge id (for webhook reconciliation). */
+  getPaymentByChargeId(chargeId: string): Promise<Payment | null>;
+
+  /** All tenders recorded against an order (oldest first). */
+  listPaymentsForOrder(orderId: string): Promise<Payment[]>;
+
+  // --------------------------------------------------------------------------
+  // /v1 payment sessions (hosted pay links) + stored quotes
+  // --------------------------------------------------------------------------
+
+  /**
+   * Insert a payment session. Throws `PaymentSessionConflictError` when the
+   * (tenant, idempotency key) pair or the order's single OPEN slot is taken.
+   */
+  insertPaymentSession(row: PaymentSessionRow): Promise<PaymentSessionRow>;
+  getPaymentSession(id: string): Promise<PaymentSessionRow | null>;
+  getPaymentSessionByKey(
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<PaymentSessionRow | null>;
+  getPaymentSessionByStripeId(
+    stripeSessionId: string,
+  ): Promise<PaymentSessionRow | null>;
+  getOpenPaymentSessionForOrder(
+    orderId: string,
+  ): Promise<PaymentSessionRow | null>;
+  /**
+   * Merge `patch` into a session. A session that already left `open` keeps its
+   * terminal status (a late `canceled` never overwrites `completed`).
+   */
+  updatePaymentSession(
+    id: string,
+    patch: Partial<
+      Pick<PaymentSessionRow, "status" | "payment_id" | "stripe_session_id" | "url" | "expires_at">
+    >,
+  ): Promise<PaymentSessionRow | null>;
+
+  /**
+   * Store a published allergen matrix and announce `menu.allergens.published`
+   * ATOMICALLY (Supabase: `core_publish_allergens`). Same version + hash is a
+   * `replay`; same version, other hash a `conflict`; every target and location
+   * must belong to `tenantId` (`unknown_*`, nothing written); a repeated target is
+   * a `duplicate`. A new version replaces the stored matrix.
+   */
+  publishAllergens(
+    tenantId: string,
+    input: {
+      version: string;
+      payload_hash: string;
+      location_ids: string[] | null;
+      published_by: string | null;
+      rows: AllergenRow[];
+    },
+  ): Promise<AllergenPublishResult>;
+  getAllergenPublication(
+    tenantId: string,
+    id: string,
+  ): Promise<AllergenPublicationRecord | null>;
+
+  /** Persist a validated quote request (idempotent on id). */
+  saveQuote(quote: StoredQuote): Promise<void>;
+  /** A stored quote of this tenant, or null. */
+  getQuote(tenantId: string, id: string): Promise<StoredQuote | null>;
+  /** Delete quotes that expired before `before` (ISO). Returns how many. */
+  pruneExpiredQuotes(before: string): Promise<number>;
+
+  /**
+   * Held (`draft`) orders whose `awaiting_payment` hold expired before `now`,
+   * oldest first, keyset-paged. `checkoutMode` keeps this deployment's orders
+   * (plus legacy orders with no marker). Parked in-store drafts (no hold) and
+   * holds with another reason (`scheduled`, `manual`) are never returned.
+   */
+  listExpiredHolds(
+    now: string,
+    opts?: {
+      limit?: number;
+      after?: { created_at: string; id: string };
+      checkoutMode?: "live" | "test" | "sim";
+      /**
+       * Instead: holds stamped with a mode OTHER than this one that have not been
+       * alerted on yet (`foreign_alerted_at` unset), for the long-grace pass.
+       */
+      foreignOf?: "live" | "test" | "sim";
+    },
+  ): Promise<Order[]>;
+
+  // --------------------------------------------------------------------------
+  // Stripe Connect (Phase 2)
+  // --------------------------------------------------------------------------
+
+  /** Current Connect onboarding status for a tenant, or null if not started. */
+  getConnectAccount(tenantId: string): Promise<ConnectAccount | null>;
+
+  /** Find the Connect row for a Stripe account id (webhook routing). */
+  getConnectAccountByAccountId(accountId: string): Promise<ConnectAccount | null>;
+
+  /** Upsert (persist) a tenant's Connect account status. */
+  upsertConnectAccount(account: ConnectAccount): Promise<ConnectAccount>;
+
+  // --------------------------------------------------------------------------
+  // Stripe Terminal (server-driven card readers). Written by the server only.
+  // --------------------------------------------------------------------------
+
+  /** The Terminal Location + tip mode for a POS location, or null. */
+  getTerminalLocation(locationId: string): Promise<TerminalLocation | null>;
+
+  /** Upsert a location's Terminal Location row (keeps `created_at`). */
+  upsertTerminalLocation(row: TerminalLocation): Promise<TerminalLocation>;
+
+  /** Registered readers at a location (any account/mode; callers filter). */
+  listTerminalReaders(
+    tenantId: string,
+    locationId: string,
+  ): Promise<TerminalReader[]>;
+
+  /** One registered reader by Stripe id (`tmr_`), or null. */
+  getTerminalReader(id: string): Promise<TerminalReader | null>;
+
+  /** Upsert a registered reader (keeps `created_at`). */
+  upsertTerminalReader(row: TerminalReader): Promise<TerminalReader>;
+
+  /** Remove a registered reader row. */
+  deleteTerminalReader(id: string): Promise<void>;
+
+  /**
+   * Card-present tenders still open (`requires_action`/`pending`) and last
+   * touched before `olderThan` (ISO), oldest first, for the reconcile sweep.
+   */
+  listStaleTerminalTenders(olderThan: string, limit: number): Promise<Payment[]>;
+
+  // --------------------------------------------------------------------------
+  // Network kitchen printing (Star CloudPRNT / Epson SDP). Server-only: the
+  // tables hold printer credentials (hashed), so no client role can read them.
+  // --------------------------------------------------------------------------
+
+  listPrinters(tenantId: string, locationId: string): Promise<Printer[]>;
+  getPrinter(id: string): Promise<Printer | null>;
+  /** Insert a printer (id/created_at assigned by the driver). */
+  createPrinter(
+    row: Omit<Printer, "id" | "created_at" | "last_seen_at">,
+  ): Promise<Printer>;
+  /** Delete a printer (its jobs go with it). Tenant-scoped; false if not found. */
+  deletePrinter(tenantId: string, id: string): Promise<boolean>;
+  /** Stamp `last_seen_at` (every poll). */
+  touchPrinter(id: string, at: string): Promise<void>;
+
+  getPrintSettings(locationId: string): Promise<PrintLocationSettings | null>;
+  setPrintAutoPrint(
+    tenantId: string,
+    locationId: string,
+    autoPrint: boolean,
+  ): Promise<PrintLocationSettings>;
+
+  /**
+   * Queue a job. With a `dedupe_key` already used for the same printer, returns
+   * the existing job instead (idempotent auto-print).
+   */
+  enqueuePrintJob(
+    job: Omit<
+      PrintJob,
+      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at"
+    >,
+  ): Promise<PrintJob>;
+  /** Mark this printer's overdue queued/sent jobs `expired`; returns how many. */
+  expirePrintJobs(printerId: string, nowIso: string): Promise<number>;
+  /**
+   * Atomically claim the oldest claimable job for THIS printer (queued, or sent
+   * but unconfirmed since before `reclaimBeforeIso`): status -> sent, attempts+1.
+   */
+  claimPrintJob(
+    printerId: string,
+    nowIso: string,
+    reclaimBeforeIso: string,
+  ): Promise<PrintJob | null>;
+  /** Has any job (any status) ever been queued for this order on this printer? */
+  hasPrintJobForOrder(printerId: string, orderId: string): Promise<boolean>;
+  /** Failed jobs of a location that have not expired go back to `queued` (attempts reset). */
+  retryFailedPrintJobs(tenantId: string, locationId: string, nowIso: string): Promise<number>;
+  /** Retention: delete done/failed/expired jobs created before `beforeIso`. */
+  pruneFinishedPrintJobs(beforeIso: string): Promise<number>;
+  /** One job, scoped to a printer (a printer can never read another's job). */
+  getPrintJobForPrinter(printerId: string, jobId: string): Promise<PrintJob | null>;
+  /**
+   * Printer's answer for a job: done or failed. Idempotent: only a sent/queued
+   * job changes; an already-done/failed/expired job is returned untouched. A
+   * failure with `retryAt` goes back to `queued` (not claimable before then);
+   * without it the job is final (`failed`).
+   */
+  completePrintJob(
+    printerId: string,
+    jobId: string,
+    outcome: { ok: true } | { ok: false; error: string; retryAt?: string | null },
+    nowIso: string,
+  ): Promise<PrintJob | null>;
+  /** Recent jobs for a location (admin UI), newest first. */
+  listPrintJobs(
+    tenantId: string,
+    locationId: string,
+    limit: number,
+  ): Promise<PrintJob[]>;
+
+  // --------------------------------------------------------------------------
   // Customers (Phase 4 — guest checkout + magic-link account stub)
   // --------------------------------------------------------------------------
 
@@ -987,6 +1345,19 @@ export interface PosDriver {
   ): Promise<SalesReport>;
 
   /** Existing close for a (location, business day), or null. */
+  /**
+   * Owner reports for inclusive BUSINESS dates `from..to` (see
+   * `src/lib/owner-reports.ts` for the definitions). Supabase runs
+   * `report_sales_bundle` in SQL; the mock aggregates in memory. Tenant-scoped.
+   */
+  getOwnerReportBundle(
+    tenantId: string,
+    locationId: string | null,
+    from: string,
+    to: string,
+    topN?: number,
+  ): Promise<OwnerReportBundle>;
+
   getBusinessDayClose(
     tenantId: string,
     locationId: string,

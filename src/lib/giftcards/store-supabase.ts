@@ -1,6 +1,6 @@
 /**
  * Supabase stored-value writer: thin RPC glue over the SECURITY DEFINER
- * functions in supabase/migrations/20261113000410_stored_value.sql (all of the
+ * functions in supabase/migrations/20261113000910_stored_value.sql (all of the
  * checking, locking and arithmetic happens there, in one transaction). Uses the
  * service-role client; every query names the tenant.
  */

@@ -30,6 +30,11 @@ export interface Location {
   name: string;
   slug: string;
   timezone: string;
+  /**
+   * Minutes after local midnight at which the business day starts (0 = midnight,
+   * 240 = 04:00). Reports bucket orders by this; absent reads as 0.
+   */
+  business_day_cutoff_minutes?: number;
   address: string | null;
   /** Structured address (core contract). All optional; `address` stays the display line. */
   address_line1?: string | null;

@@ -1,7 +1,7 @@
 /**
  * The order-balance rules the stored-value writers enforce, as pure functions.
  * Same rules as src/lib/payments/service.ts (`orderDueCents`, covering and
- * settled tenders) and the SQL in 20261113000410_stored_value.sql; kept here so
+ * settled tenders) and the SQL in 20261113000910_stored_value.sql; kept here so
  * the writers do not import the payment service (which imports them).
  */
 import type { Order, Payment } from "@/lib/db";

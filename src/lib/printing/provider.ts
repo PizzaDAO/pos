@@ -1,34 +1,38 @@
 /**
- * Kitchen-ticket printer abstraction (Phase 3) — provider seam, STUB only.
+ * Kitchen-ticket printer abstraction: provider seam.
  *
- * Mirrors the realtime/payment-rail pattern: components/routes depend on a
- * `TicketPrinter` interface, never on a concrete device. Today the only
- * implementation is `browserPrinter` (renders a print-friendly page the cashier
- * prints via the browser dialog — no device, no env). A real network-printer
- * implementation (ESC/POS over TCP, Star CloudPRNT, PrintNode, etc.) drops in
- * later behind the SAME interface without touching the print route or the board.
+ * Components/routes depend on `TicketPrinter`, never on a concrete device.
+ *  - `browserPrinter`: renders a print-friendly page the cashier prints through
+ *    the browser dialog (no device, no env). The fallback.
+ *  - `networkPrinter`: queues the ticket for the location's registered
+ *    printers. Printers PULL jobs over HTTPS (Star CloudPRNT, Epson Server
+ *    Direct Print), so this works from serverless with no inbound connection to
+ *    the shop. See `queue.ts` and the routes under `src/app/api/print/`.
  *
- * NOTHING here makes external calls. The network implementation is documented
- * but intentionally NOT wired (the preview has no printer + no env).
+ * `resolveTicketPrinter` picks network when the location has at least one
+ * printer, else browser. Nothing here makes an outbound call.
  */
 import type { Order } from "@/lib/db";
+import { getPosDriver } from "@/lib/db";
+import { enqueueOrderTicket } from "./queue";
 
 export interface PrintResult {
   ok: boolean;
-  /** How the ticket was handled ("browser" today; "network" once wired). */
+  /** How the ticket was handled. */
   via: "browser" | "network" | "noop";
   message: string;
+  /** Network only: how many printers the ticket was queued on. */
+  queued?: number;
 }
 
 export interface TicketPrinter {
   readonly name: "browser" | "network";
   /**
    * Dispatch a ticket for `order`. The browser printer is a no-op on the server
-   * (the actual print happens client-side via `window.print()` in the print
-   * view); a network printer would format ESC/POS bytes and POST them to the
-   * device here.
+   * (the print happens client-side via `window.print()` in the print view); the
+   * network printer queues a job per printer at the order's location.
    */
-  print(order: Order): Promise<PrintResult>;
+  print(order: Order, opts?: { reprint?: boolean; dedupeKey?: string }): Promise<PrintResult>;
 }
 
 /** Default browser printer: relies on the print route + `window.print()`. */
@@ -43,15 +47,26 @@ export const browserPrinter: TicketPrinter = {
   },
 };
 
-/**
- * Selection seam. With no printer env configured (the default/preview) this is
- * always the browser printer. A future network implementation:
- *
- *   if (process.env.KITCHEN_PRINTER_URL) return createNetworkPrinter({...});
- *
- * — formats the ticket as ESC/POS and POSTs to KITCHEN_PRINTER_URL. Documented
- * in `.env.example`; absence → browser/stub path.
- */
-export function getTicketPrinter(): TicketPrinter {
-  return browserPrinter;
+export const networkPrinter: TicketPrinter = {
+  name: "network",
+  async print(order, opts): Promise<PrintResult> {
+    const jobs = await enqueueOrderTicket(order, { reprint: opts?.reprint, dedupeKey: opts?.dedupeKey });
+    return jobs.length > 0
+      ? {
+          ok: true,
+          via: "network",
+          queued: jobs.length,
+          message: `Queued on ${jobs.length} printer${jobs.length === 1 ? "" : "s"}.`,
+        }
+      : { ok: false, via: "noop", message: "No network printer is set up for this location." };
+  },
+};
+
+/** Network printer when the location has one registered, else the browser fallback. */
+export async function resolveTicketPrinter(
+  tenantId: string,
+  locationId: string,
+): Promise<TicketPrinter> {
+  const printers = await getPosDriver().listPrinters(tenantId, locationId);
+  return printers.length > 0 ? networkPrinter : browserPrinter;
 }

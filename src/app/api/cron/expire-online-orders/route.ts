@@ -49,6 +49,13 @@ export async function GET(request: Request) {
       captureError(err, { scope: "prune-quotes-cron" });
       return null;
     });
+  // Print-job retention: finished (done/failed/expired) jobs older than 3 days.
+  const printJobsPruned = await getPosDriver()
+    .pruneFinishedPrintJobs(new Date(startedAt - 3 * 24 * 60 * 60_000).toISOString())
+    .catch((err) => {
+      captureError(err, { scope: "prune-print-jobs-cron" });
+      return null;
+    });
   // Also sweep in-store card-reader tenders left open (tablet died mid-payment):
   // re-read from Stripe, capture if it went through, else cancel. Failure here
   // must not fail the online-order sweep.
@@ -81,7 +88,7 @@ export async function GET(request: Request) {
     return null;
   });
   return NextResponse.json(
-    { ...summary, held, quotesPruned, terminal, driverDispatch },
+    { ...summary, held, quotesPruned, printJobsPruned, terminal, driverDispatch },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

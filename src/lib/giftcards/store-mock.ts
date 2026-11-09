@@ -1,6 +1,6 @@
 /**
  * In-memory stored-value writer (zero-env demo + tests). Mirrors the SQL
- * writers in 20261113000410_stored_value.sql: every mutation runs inside one
+ * writers in 20261113000910_stored_value.sql: every mutation runs inside one
  * process-wide mutex, so a check and its write can never interleave with another
  * mutation (the mock's equivalent of the Postgres row lock). Orders and tenders
  * are read and written through the mock PosDriver.
