@@ -85,7 +85,7 @@ function TicketCardImpl({
   // they are greyed out instead of turning amber/red.
   const styles = isBumped ? READY_STYLE : AGE_STYLES[ageLevel];
   const isRecalled = order.status === "recall";
-  const handoff = handoffLabel(order);
+  const handoff = handoffLabel(order, ticket.deliveryProvider);
 
   return (
     <article

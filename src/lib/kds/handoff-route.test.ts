@@ -5,7 +5,11 @@ import { resetMockOrders } from "@/lib/db/mock";
 vi.mock("@/lib/auth/tenant-guard", async () => {
   const { getPosDriver } = await import("@/lib/db");
   return {
-    requireTenantAccess: async () => ({ ok: true }),
+    requireTenantAccess: async (
+      tenantId: string,
+      _s: string,
+      o?: { locationId?: string },
+    ) => ({ ok: true, tenantId, locationId: o?.locationId ?? null }),
     requireOrderAccess: async (id: string) => ({
       ok: true,
       order: await getPosDriver().getOrder(id),
@@ -13,7 +17,7 @@ vi.mock("@/lib/auth/tenant-guard", async () => {
   };
 });
 
-import { POST } from "@/app/api/kitchen/orders/route";
+import { GET, POST } from "@/app/api/kitchen/orders/route";
 
 const TENANT = "10000000-0000-0000-0000-000000000001";
 const LOCATION = "10000000-0000-0000-0000-000000000101";
@@ -84,5 +88,43 @@ describe("KDS hand-off bump", () => {
     const r = await bump(id);
     expect(r.changed).toBe(false);
     expect((await getPosDriver().getOrder(id))?.status).toBe("ready");
+  });
+
+  it("a delivery switched to in-house (record says in_house_manual, fulfillment still openpizza_driver) can be handed off", async () => {
+    const id = await seed("online_delivery", "openpizza_driver");
+    const now = new Date().toISOString();
+    await getPosDriver().upsertDelivery({
+      id: `del-${id}`,
+      order_id: id,
+      tenant_id: TENANT,
+      location_id: LOCATION,
+      provider: "in_house_manual",
+      status: "pending_assignment",
+      zone_id: null,
+      fee_cents: 0,
+      currency: "USD",
+      eta_minutes: null,
+      provider_delivery_id: null,
+      tracking_ref: null,
+      created_at: now,
+      updated_at: now,
+    } as unknown as Parameters<ReturnType<typeof getPosDriver>["upsertDelivery"]>[0]);
+
+    // The board ticket carries the record's provider (so the card shows the button).
+    const board = await (
+      await GET(
+        new Request(`http://x/api/kitchen/orders?tenantId=${TENANT}&locationId=${LOCATION}`),
+      )
+    ).json();
+    const ticket = board.tickets.find((t: { order: { id: string } }) => t.order.id === id);
+    expect(ticket.deliveryProvider).toBe("in_house_manual");
+
+    expect((await bump(id)).order.status).toBe("out_for_delivery");
+    expect((await bump(id)).order.status).toBe("completed");
+  });
+
+  it("with no delivery record, the fulfillment provider decides (driver module: no bump)", async () => {
+    const id = await seed("online_delivery", "openpizza_driver");
+    expect((await bump(id)).changed).toBe(false);
   });
 });

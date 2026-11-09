@@ -52,6 +52,15 @@ describe("locationBusinessDate", () => {
     expect(locationBusinessDate("2026-11-02T04:30:00Z", NY)).toBe("2026-11-01");
   });
 
+  it("an invalid location time zone falls back to UTC (reported, never throws)", () => {
+    expect(
+      locationBusinessDate("2026-11-10T03:30:00Z", { timezone: "Mars/Olympus_Mons" }),
+    ).toBe("2026-11-10");
+    expect(locationBusinessDate("2026-11-10T03:30:00Z", { timezone: "EST5EDT!" })).toBe(
+      "2026-11-10",
+    );
+  });
+
   it("applies the business-day cutoff (02:00 local belongs to the day before)", () => {
     const late = { ...NY, business_day_cutoff_minutes: 240 };
     // 02:00 EST Nov 10 = 07:00Z Nov 10.

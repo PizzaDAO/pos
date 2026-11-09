@@ -9,7 +9,8 @@
 import type { Order, OrderChannel, Payment } from "@/lib/db";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import { providerLabel } from "@/lib/marketplace/types";
-import { businessDay } from "@/lib/owner-reports";
+import { businessDay, isValidTimezone } from "@/lib/owner-reports";
+import { captureError } from "@/lib/observability";
 import type {
   DateRange,
   PaymentMixSlice,
@@ -118,15 +119,30 @@ export interface LocationClock {
  * Business date ("yyyy-mm-dd") of an instant at a location: the LOCAL date in
  * its time zone, less its business-day cutoff. The same rule as the owner
  * reports (lib/owner-reports `businessDay`, and the SQL bundle) and, at cutoff
- * 0, core's `businessDate(at, tz)`. UTC only when the location is unknown.
+ * 0, core's `businessDate(at, tz)`. UTC when the location is unknown, or when
+ * its time zone is invalid (reported once per zone, never a 500).
  */
 export function locationBusinessDate(
   iso: string,
   loc?: LocationClock | null,
 ): string {
   if (!loc?.timezone) return isoDate(iso);
-  return businessDay(iso, loc.timezone, loc.business_day_cutoff_minutes ?? 0).date;
+  let tz = loc.timezone;
+  if (!isValidTimezone(tz)) {
+    if (!reportedBadZones.has(tz)) {
+      reportedBadZones.add(tz);
+      captureError(new Error("invalid location timezone"), {
+        scope: "business-date",
+        timezone: tz,
+      });
+    }
+    tz = "UTC";
+  }
+  const cutoff = Number(loc.business_day_cutoff_minutes ?? 0);
+  return businessDay(iso, tz, Number.isFinite(cutoff) ? cutoff : 0).date;
 }
+
+const reportedBadZones = new Set<string>();
 
 /**
  * Whether an order's business date falls within an inclusive date range.

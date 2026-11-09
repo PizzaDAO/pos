@@ -56,14 +56,18 @@ export function isHandoffStatus(status: OrderStatus): boolean {
 /**
  * Whether the KITCHEN hands this delivery to the driver itself. Only in-house
  * manual delivery does; for DoorDash / the driver module the provider sets the
- * delivery status, so the KDS must not move it. (Same default as dispatch in
- * lib/shop/finalize: no recorded provider means in-house.)
+ * delivery status, so the KDS must not move it. The DELIVERY RECORD's provider
+ * wins (a delivery switched to in-house keeps its old fulfillment value), then
+ * the order's quoted provider; none means in-house (as dispatch defaults).
  */
 export function kitchenHandsOffDelivery(
   order: Pick<Order, "channel" | "fulfillment">,
+  recordProvider?: string | null,
 ): boolean {
   if (order.channel !== "online_delivery") return true;
-  return (order.fulfillment?.delivery_provider ?? "in_house_manual") === "in_house_manual";
+  const provider =
+    recordProvider ?? order.fulfillment?.delivery_provider ?? "in_house_manual";
+  return provider === "in_house_manual";
 }
 
 /**
@@ -75,9 +79,10 @@ export function kitchenHandsOffDelivery(
  */
 export function handoffLabel(
   order: Pick<Order, "status" | "channel" | "fulfillment">,
+  recordProvider?: string | null,
 ): string | null {
   if (order.channel === "online_delivery") {
-    if (!kitchenHandsOffDelivery(order)) return null;
+    if (!kitchenHandsOffDelivery(order, recordProvider)) return null;
     if (order.status === "ready") return "Out with driver";
     if (order.status === "out_for_delivery") return "Delivered";
     return null;

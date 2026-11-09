@@ -74,4 +74,11 @@ describe("KDS hand-off", () => {
     );
     expect(tickets.map((t) => t.order.id)).toEqual(["a"]);
   });
+
+  it("the delivery record's provider wins over the order's quoted one", () => {
+    const switched = o("out_for_delivery", "online_delivery", "openpizza_driver");
+    expect(handoffLabel(switched)).toBeNull();
+    expect(handoffLabel(switched, "in_house_manual")).toBe("Delivered");
+    expect(handoffLabel(o("ready", "online_delivery", "in_house_manual"), "doordash_drive")).toBeNull();
+  });
 });

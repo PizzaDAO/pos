@@ -40,6 +40,15 @@ import {
 // In-memory mock state lives in the Node runtime; force it (not edge).
 export const runtime = "nodejs";
 
+/** The delivery record's provider for an order (null when none / unreadable). */
+async function deliveryProviderOf(orderId: string): Promise<string | null> {
+  try {
+    return (await getPosDriver().getDeliveryForOrder(orderId))?.provider ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const auth = await requireTenantAccess(
@@ -59,7 +68,16 @@ export async function GET(request: Request) {
 
   const now = new Date();
   const thresholds = settings.kds_thresholds ?? DEFAULT_KDS_THRESHOLDS;
-  const tickets = buildTickets(orders, now, thresholds);
+  const built = buildTickets(orders, now, thresholds);
+  // Delivery tickets carry their delivery record's provider: it decides whether
+  // the kitchen offers a hand-off (in-house only).
+  const tickets = await Promise.all(
+    built.map(async (t) =>
+      t.order.channel === "online_delivery"
+        ? { ...t, deliveryProvider: await deliveryProviderOf(t.order.id) }
+        : t,
+    ),
+  );
 
   const body: KitchenBoardResponse = {
     tickets,
@@ -116,7 +134,8 @@ export async function POST(request: Request) {
   const providerOwned =
     action === "bump" &&
     isHandoffStatus(current.status) &&
-    !kitchenHandsOffDelivery(current);
+    current.channel === "online_delivery" &&
+    !kitchenHandsOffDelivery(current, await deliveryProviderOf(current.id));
   const next = providerOwned
     ? null
     : action === "bump"
