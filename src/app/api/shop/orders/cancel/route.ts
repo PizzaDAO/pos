@@ -38,16 +38,26 @@ export async function POST(request: Request) {
 
   const parsed = await readJsonBody(request);
   if (!parsed.ok) {
-    return NextResponse.json({ error: parsed.error }, { status: parsed.status });
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   }
   const orderId = (parsed.body as { orderId?: unknown } | null)?.orderId;
   if (!isClientId(orderId)) {
-    return NextResponse.json({ error: "orderId is required." }, { status: 422 });
+    return NextResponse.json(
+      { error: "orderId is required." },
+      { status: 422 },
+    );
   }
 
   const driver = getPosDriver();
   const order = await driver.getOrder(orderId);
-  if (!order || order.channel === "in_store") {
+  if (
+    !order ||
+    order.channel === "in_store" ||
+    order.channel === "marketplace"
+  ) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
   if (order.status === "voided" || order.status === "abandoned") {
@@ -60,7 +70,10 @@ export async function POST(request: Request) {
       const result = await cancelOnlineCheckout(order.id);
       if (!result.ok) {
         return NextResponse.json(
-          { error: result.reason === "has_payment" ? HAS_PAYMENT : CANNOT_CANCEL },
+          {
+            error:
+              result.reason === "has_payment" ? HAS_PAYMENT : CANNOT_CANCEL,
+          },
           { status: 409 },
         );
       }

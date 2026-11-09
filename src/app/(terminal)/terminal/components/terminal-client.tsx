@@ -428,6 +428,7 @@ export function TerminalClient({
             setPayOrderId(id);
           }}
           onClose={() => setShowOpenOrders(false)}
+          onMarketplaceChanged={() => void openOrders.refresh()}
         />
       )}
 

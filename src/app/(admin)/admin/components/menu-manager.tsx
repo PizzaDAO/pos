@@ -11,7 +11,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Ban, Pencil, Plus, RotateCcw } from "lucide-react";
+import { Ban, FileUp, Pencil, Plus, RotateCcw } from "lucide-react";
 import type {
   LocationMenuOverride,
   MenuCategory,
@@ -25,6 +25,7 @@ import type {
 import { Button } from "@/components/ui/button";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-dialog";
 import { formatMoney } from "@/lib/pricing";
+import { MenuImportDialog } from "./menu-import";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -50,6 +51,7 @@ export function MenuManager({ tenantId, locationId }: Props) {
   const [data, setData] = useState<MenuData | null>(null);
   const [overrides, setOverrides] = useState<LocationMenuOverride[]>([]);
   const [busy, setBusy] = useState(false);
+  const [importing, setImporting] = useState(false);
 
   const load = useCallback(async () => {
     const [menuRes, ovRes] = await Promise.all([
@@ -153,8 +155,25 @@ export function MenuManager({ tenantId, locationId }: Props) {
             Changes flow straight to the terminal &amp; shop.
           </p>
         </div>
-        <AddCategory disabled={busy} onAdd={(name) => mutate({ entity: "category", action: "upsert", payload: { tenant_id: tenantId, name } })} />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => setImporting(true)}
+          >
+            <FileUp className="h-4 w-4" /> Import menu
+          </Button>
+          <AddCategory disabled={busy} onAdd={(name) => mutate({ entity: "category", action: "upsert", payload: { tenant_id: tenantId, name } })} />
+        </div>
       </div>
+      {importing && (
+        <MenuImportDialog
+          tenantId={tenantId}
+          onClose={() => setImporting(false)}
+          onImported={() => void load()}
+        />
+      )}
 
       <div className="space-y-6">
         {data.categories.map((cat) => (

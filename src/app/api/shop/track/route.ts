@@ -24,12 +24,19 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const orderId = searchParams.get("orderId");
   if (!orderId) {
-    return NextResponse.json({ error: "orderId is required." }, { status: 400 });
+    return NextResponse.json(
+      { error: "orderId is required." },
+      { status: 400 },
+    );
   }
 
   const driver = getPosDriver();
   const order = await driver.getOrder(orderId).catch(() => null);
-  if (!order || order.channel === "in_store") {
+  if (
+    !order ||
+    order.channel === "in_store" ||
+    order.channel === "marketplace"
+  ) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
 
@@ -50,7 +57,13 @@ export async function GET(request: Request) {
         totals: order.totals,
         // Server-owned lifecycle markers are not part of the public view.
         fulfillment: order.fulfillment
-          ? (({ late_payment, checkout_mode, paid_at, finalized_at, ...pub }) => {
+          ? (({
+              late_payment,
+              checkout_mode,
+              paid_at,
+              finalized_at,
+              ...pub
+            }) => {
               void late_payment;
               void checkout_mode;
               void paid_at;

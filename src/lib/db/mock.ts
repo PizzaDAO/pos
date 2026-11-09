@@ -15,6 +15,7 @@
  * Everything here is pure data + maps; it never reads env vars and works with no
  * configuration, so the app builds and runs offline in the Vercel preview.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
@@ -137,6 +138,8 @@ import {
   users as seedUsers,
 } from "./seed-data";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
+import type { ImportChanges } from "@/lib/menu-import/apply";
+import type { MenuSnapshot } from "@/lib/menu-import/types";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
 import { buildOwnerBundle, type OwnerReportBundle } from "@/lib/owner-reports";
@@ -180,6 +183,11 @@ const itemModifierGroups = seedItemModifierGroups.map((l) => ({ ...l }));
 const tenants: Tenant[] = seedTenants.map((t) => ({ ...t }));
 const locations: Location[] = seedLocations.map((l) => ({ ...l }));
 const storeSettings = seedStoreSettings.map((s) => ({ ...s }));
+/** `${provider}:${storeId}` -> owning location (platform-admin assigned). */
+const marketplaceStores = new Map<
+  string,
+  { provider: string; tenantId: string; locationId: string }
+>();
 const paymentSettings = seedPaymentSettings.map((s) => ({ ...s }));
 const usersById = new Map<string, User>(seedUsers.map((u) => [u.id, { ...u }]));
 const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({
@@ -1071,6 +1079,57 @@ export const mockDriver: PosDriver = {
       tip_presets_bps: [1500, 1800, 2000],
       kds_thresholds: { warn_seconds: 300, urgent_seconds: 600 },
     };
+  },
+
+  async setMarketplaceSettings(
+    tenantId,
+    locationId,
+    marketplace,
+  ): Promise<StoreSettings> {
+    const base = await this.getStoreSettings(tenantId, locationId);
+    const next: StoreSettings = { ...base, marketplace };
+    const i = storeSettings.findIndex(
+      (s) => s.tenant_id === tenantId && s.location_id === locationId,
+    );
+    if (i >= 0) storeSettings[i] = next;
+    else storeSettings.push(next);
+    return next;
+  },
+
+  async findMarketplaceLocations(provider, storeId) {
+    const row = marketplaceStores.get(`${provider}:${storeId}`);
+    return row ? [{ tenant_id: row.tenantId, location_id: row.locationId }] : [];
+  },
+
+  async assignMarketplaceStore(input) {
+    const mine = () =>
+      [...marketplaceStores].filter(
+        ([, v]) => v.provider === input.provider && v.locationId === input.locationId,
+      );
+    if (input.storeId === null) {
+      for (const [k] of mine()) marketplaceStores.delete(k);
+      return;
+    }
+    const key = `${input.provider}:${input.storeId}`;
+    const holder = marketplaceStores.get(key);
+    // A clash with another location leaves the existing assignment intact.
+    if (holder && holder.locationId !== input.locationId) throw new MarketplaceStoreTakenError();
+    for (const [k] of mine()) marketplaceStores.delete(k);
+    marketplaceStores.set(key, {
+      provider: input.provider,
+      tenantId: input.tenantId,
+      locationId: input.locationId,
+    });
+  },
+
+  async findMarketplaceOrdersByRef(provider, externalId) {
+    ensureKitchenSeed();
+    return [...orders.values()].filter(
+      (o) =>
+        o.source?.type === "marketplace" &&
+        o.source.module === provider &&
+        o.source.external_ref === externalId,
+    );
   },
 
   async createOrder(input: CreateOrderInput): Promise<Order> {
@@ -2492,6 +2551,209 @@ export const mockDriver: PosDriver = {
     }
   },
 
+  async getMenuSnapshot(tenantId: string): Promise<MenuSnapshot> {
+    const items = menuItems.filter((i) => i.tenant_id === tenantId);
+    const itemIds = new Set(items.map((i) => i.id));
+    const groups = modifierGroups.filter((g) => g.tenant_id === tenantId);
+    const groupIds = new Set(groups.map((g) => g.id));
+    return {
+      categories: menuCategories
+        .filter((c) => c.tenant_id === tenantId)
+        .map((c) => ({ id: c.id, name: c.name, sort_order: c.sort_order })),
+      items: items.map((i) => ({
+        id: i.id,
+        category_id: i.category_id,
+        name: i.name,
+        description: i.description,
+        is_half_and_half_capable: i.is_half_and_half_capable,
+        station: i.station,
+      })),
+      sizes: itemSizes.filter((s) => itemIds.has(s.item_id)).map((s) => ({ ...s })),
+      modifierGroups: groups.map((g) => ({
+        id: g.id,
+        name: g.name,
+        min_select: g.min_select,
+        max_select: g.max_select,
+        supports_half: g.supports_half,
+      })),
+      modifiers: modifiers.filter((m) => groupIds.has(m.group_id)).map((m) => ({ ...m })),
+      links: itemModifierGroups
+        .filter((l) => itemIds.has(l.item_id))
+        .map((l) => ({ item_id: l.item_id, group_id: l.group_id, sort_order: l.sort_order })),
+      inventoryLinkSourceIds: itemInventoryLinks
+        .filter((l) => l.tenant_id === tenantId)
+        .map((l) => l.source_id),
+      allergenTargetIds: (allergenRows.get(tenantId) ?? []).map((r) => r.target_id),
+    };
+  },
+
+  // Mirrors public.import_menu(): all-or-nothing. State is snapshotted up front
+  // and restored if any step throws (the SQL function gets this from its
+  // transaction). One synchronous block, so no await can interleave.
+  async applyMenuImport(tenantId: string, ch: ImportChanges): Promise<void> {
+    const saved = {
+      categories: [...menuCategories],
+      items: [...menuItems],
+      sizes: [...itemSizes],
+      groups: [...modifierGroups],
+      mods: [...modifiers],
+      links: [...itemModifierGroups],
+      overrides: new Map(overrides),
+      recipes: [...itemInventoryLinks],
+      allergens: allergenRows.get(tenantId)?.map((r) => ({ ...r })),
+    };
+    const lc = (s: string) => s.trim().toLowerCase();
+    try {
+      const mineCat = (id: string) => menuCategories.find((c) => c.id === id && c.tenant_id === tenantId);
+      const mineItem = (id: string) => menuItems.find((i) => i.id === id && i.tenant_id === tenantId);
+      const mineGroup = (id: string) => modifierGroups.find((g) => g.id === id && g.tenant_id === tenantId);
+      const ownSize = (id: string) => {
+        const s = itemSizes.find((x) => x.id === id);
+        return s && mineItem(s.item_id) ? s : undefined;
+      };
+      const ownMod = (id: string) => {
+        const m = modifiers.find((x) => x.id === id);
+        return m && mineGroup(m.group_id) ? m : undefined;
+      };
+
+      // -- deletes (+ the recipe / allergen / override rows of removed targets)
+      const dItems = new Set(ch.delete.items);
+      const dMods = new Set(ch.delete.modifiers);
+      const dSizes = new Set(ch.delete.sizes);
+      for (const id of ch.delete.categories) {
+        if (!mineCat(id)) throw new Error("Row not found.");
+        for (const i of menuItems) if (i.category_id === id) dItems.add(i.id);
+      }
+      for (const id of ch.delete.modifierGroups) {
+        if (!mineGroup(id)) throw new Error("Row not found.");
+        for (const m of modifiers) if (m.group_id === id) dMods.add(m.id);
+      }
+      for (const id of dItems) {
+        if (!mineItem(id)) throw new Error("Row not found.");
+        for (const s of itemSizes) if (s.item_id === id) dSizes.add(s.id);
+      }
+      for (const id of ch.delete.sizes) if (!ownSize(id)) throw new Error("Row not found.");
+      for (const id of ch.delete.modifiers) if (!ownMod(id)) throw new Error("Row not found.");
+      removeWhere(itemInventoryLinks, (l) =>
+        l.tenant_id === tenantId &&
+        ((l.source_type === "item" && dItems.has(l.source_id)) ||
+          (l.source_type === "modifier" && dMods.has(l.source_id))),
+      );
+      const rows = allergenRows.get(tenantId);
+      if (rows) {
+        allergenRows.set(
+          tenantId,
+          rows.filter(
+            (r) =>
+              !(
+                (r.target_type === "item" && dItems.has(r.target_id)) ||
+                (r.target_type === "size" && dSizes.has(r.target_id)) ||
+                (r.target_type === "modifier" && dMods.has(r.target_id))
+              ),
+          ),
+        );
+      }
+      for (const [k, ov] of overrides) {
+        if (
+          ov.tenant_id === tenantId &&
+          (dItems.has(ov.target_id) || dSizes.has(ov.target_id) || dMods.has(ov.target_id))
+        ) {
+          overrides.delete(k);
+        }
+      }
+      removeWhere(itemSizes, (s) => dSizes.has(s.id));
+      removeWhere(modifiers, (m) => dMods.has(m.id));
+      removeWhere(itemModifierGroups, (l) => dItems.has(l.item_id) || ch.delete.modifierGroups.includes(l.group_id));
+      for (const l of ch.delete.itemModifierGroups) {
+        if (!mineItem(l.item_id)) throw new Error("Row not found.");
+        removeWhere(itemModifierGroups, (x) => x.item_id === l.item_id && x.group_id === l.group_id);
+      }
+      removeWhere(menuItems, (i) => dItems.has(i.id));
+      removeWhere(menuCategories, (c) => ch.delete.categories.includes(c.id));
+      removeWhere(modifierGroups, (g) => ch.delete.modifierGroups.includes(g.id));
+
+      // -- updates in place (ids kept)
+      for (const u of ch.update.categories) {
+        const c = mineCat(u.id);
+        if (!c) throw new Error("Row not found.");
+        c.name = u.name;
+        c.sort_order = u.sort_order;
+      }
+      for (const u of ch.update.items) {
+        const i = mineItem(u.id);
+        if (!i || !mineCat(u.category_id)) throw new Error("Row not found.");
+        Object.assign(i, u);
+      }
+      for (const u of ch.update.sizes) {
+        const s = ownSize(u.id);
+        if (!s) throw new Error("Row not found.");
+        Object.assign(s, u);
+      }
+      for (const u of ch.update.modifierGroups) {
+        const g = mineGroup(u.id);
+        if (!g) throw new Error("Row not found.");
+        Object.assign(g, u);
+      }
+      for (const u of ch.update.modifiers) {
+        const m = ownMod(u.id);
+        if (!m) throw new Error("Row not found.");
+        Object.assign(m, u);
+      }
+      for (const u of ch.update.itemModifierGroups) {
+        const l = itemModifierGroups.find((x) => x.item_id === u.item_id && x.group_id === u.group_id);
+        if (!l || !mineItem(u.item_id)) throw new Error("Row not found.");
+        l.sort_order = u.sort_order;
+      }
+
+      // -- inserts (refuse name collisions: the menu changed under us)
+      const changed = () => new Error("The menu changed while importing. Preview again.");
+      const ins = ch.insert;
+      for (const c of ins.categories) {
+        if (c.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        if (menuCategories.some((x) => x.tenant_id === tenantId && lc(x.name) === lc(c.name))) throw changed();
+        menuCategories.push({ ...c });
+      }
+      for (const g of ins.modifierGroups) {
+        if (g.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        if (modifierGroups.some((x) => x.tenant_id === tenantId && lc(x.name) === lc(g.name))) throw changed();
+        modifierGroups.push({ ...g });
+      }
+      for (const i of ins.items) {
+        if (i.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        if (!mineCat(i.category_id)) throw new Error("Unknown category_id.");
+        if (menuItems.some((x) => x.category_id === i.category_id && lc(x.name) === lc(i.name))) throw changed();
+        menuItems.push({ ...i });
+      }
+      for (const s of ins.sizes) {
+        if (!mineItem(s.item_id)) throw new Error("Unknown item_id.");
+        if (itemSizes.some((x) => x.item_id === s.item_id && lc(x.name) === lc(s.name))) throw changed();
+        itemSizes.push({ ...s });
+      }
+      for (const m of ins.modifiers) {
+        if (!mineGroup(m.group_id)) throw new Error("Unknown group_id.");
+        if (modifiers.some((x) => x.group_id === m.group_id && lc(x.name) === lc(m.name))) throw changed();
+        modifiers.push({ ...m });
+      }
+      for (const l of ins.itemModifierGroups) {
+        if (!mineItem(l.item_id) || !mineGroup(l.group_id)) throw new Error("Unknown item or group in link.");
+        if (itemModifierGroups.some((x) => x.item_id === l.item_id && x.group_id === l.group_id)) throw changed();
+        itemModifierGroups.push({ ...l });
+      }
+    } catch (err) {
+      menuCategories.splice(0, menuCategories.length, ...saved.categories);
+      menuItems.splice(0, menuItems.length, ...saved.items);
+      itemSizes.splice(0, itemSizes.length, ...saved.sizes);
+      modifierGroups.splice(0, modifierGroups.length, ...saved.groups);
+      modifiers.splice(0, modifiers.length, ...saved.mods);
+      itemModifierGroups.splice(0, itemModifierGroups.length, ...saved.links);
+      itemInventoryLinks.splice(0, itemInventoryLinks.length, ...saved.recipes);
+      if (saved.allergens) allergenRows.set(tenantId, saved.allergens);
+      overrides.clear();
+      for (const [k, v] of saved.overrides) overrides.set(k, v);
+      throw err;
+    }
+  },
+
   async listCategories(tenantId: string): Promise<MenuCategory[]> {
     return menuCategories
       .filter((c) => c.tenant_id === tenantId)
@@ -3132,6 +3394,7 @@ export const mockDriver: PosDriver = {
 /** Test helper: clear placed orders + reset the sequence + KDS seed flag. */
 export function resetMockOrders(): void {
   orders.clear();
+  marketplaceStores.clear();
   orderSeq = 0;
   kitchenSeeded = false;
 }

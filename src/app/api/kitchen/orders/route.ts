@@ -20,8 +20,9 @@
  *
  * No env vars are read — everything runs against the in-memory mock driver.
  */
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
@@ -95,6 +96,15 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.res;
   const current = auth.order;
 
+  // A marketplace order the cashier has not accepted is not the kitchen's yet:
+  // no bump, no recall (accept / reject / provider cancel are its only moves).
+  if (isPendingAcceptance(current)) {
+    return NextResponse.json(
+      { error: "Accept this marketplace order before the kitchen can bump it." },
+      { status: 409 },
+    );
+  }
+
   const next =
     action === "bump"
       ? nextBumpStatus(current.status, current.channel)
@@ -106,5 +116,17 @@ export async function POST(request: Request) {
   }
 
   const updated = await driver.updateOrderStatus(id, next);
+  // Marketplace order bumped to ready: tell the provider (best effort, inert
+  // unless the provider is configured).
+  // Never awaited by the bump: runs after the response (or detached, outside a
+  // request scope such as tests).
+  if (updated && next === "ready" && updated.channel === "marketplace") {
+    const notify = () => notifyMarketplaceReady(updated);
+    try {
+      after(notify);
+    } catch {
+      void notify();
+    }
+  }
   return NextResponse.json({ order: updated, changed: true });
 }

@@ -149,6 +149,10 @@ export async function POST(request: Request) {
   // Idempotency: if this order id was already placed, return it unchanged.
   const existing = await driver.getOrder(body.id);
   if (existing) {
+    // A marketplace order is never visible to the storefront.
+    if (existing.channel === "marketplace") {
+      return NextResponse.json({ error: "Order not found." }, { status: 404 });
+    }
     // An abandoned checkout can never be revived: the client must start again
     // with a fresh order id.
     if (existing.status === "abandoned") {

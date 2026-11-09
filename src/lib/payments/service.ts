@@ -19,6 +19,7 @@
  * funnels through `applyRailStatus`, which never downgrades a captured/refunded
  * tender and ALWAYS re-evaluates whether the order is now paid.
  */
+import { assertTakesPayment } from "@/lib/marketplace/guard";
 import "./rails";
 import { getPosDriver } from "@/lib/db";
 import type { Order, Payment, PaymentStatus } from "@/lib/db";
@@ -158,6 +159,9 @@ export function orderBalanceFromPayments(
   order: Order,
   all: Payment[],
 ): number {
+  // A marketplace order (DoorDash / Uber Eats / Grubhub) is paid by the
+  // marketplace before it reaches us: it never owes a balance at the till.
+  if (order.channel === "marketplace") return 0;
   const cur = order.currency.toUpperCase();
   const payments = all.filter((p) => p.currency.toUpperCase() === cur);
   return Math.max(0, orderDueCents(order) - coveredCents(payments));
@@ -236,6 +240,10 @@ export async function takePaymentDetailed(
     if (existing.order_id !== input.orderId) throw new PaymentConflictError();
     return { payment: existing };
   }
+
+  // Paid by the marketplace: never takes a tender, whatever route got here.
+  const target = await driver.getOrder(input.orderId);
+  if (target) assertTakesPayment(target);
 
   // Cash must be covered by what was handed over: a short tender is never booked
   // as the full amount (it would leave the drawer short and the order "paid").
