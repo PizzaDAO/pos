@@ -21,8 +21,10 @@ import {
   ClipboardList,
   CreditCard,
   Eye,
+  Gift,
   LayoutGrid,
   MapPin,
+  Printer,
   Receipt,
   Truck,
   Users,
@@ -56,12 +58,16 @@ const InventoryManager = dynamic(
   () => import("./inventory-manager").then((m) => m.InventoryManager),
   { loading: PanelFallback },
 );
-const ReportsView = dynamic(
-  () => import("./reports-view").then((m) => m.ReportsView),
+const OwnerReports = dynamic(
+  () => import("./owner-reports").then((m) => m.OwnerReports),
   { loading: PanelFallback },
 );
 const StaffShifts = dynamic(
   () => import("./staff-shifts").then((m) => m.StaffShifts),
+  { loading: PanelFallback },
+);
+const StaffManager = dynamic(
+  () => import("./staff-manager").then((m) => m.StaffManager),
   { loading: PanelFallback },
 );
 const EndOfDay = dynamic(() => import("./end-of-day").then((m) => m.EndOfDay), {
@@ -73,6 +79,10 @@ const LocationsManager = dynamic(
 );
 const LatePayments = dynamic(
   () => import("./late-payments").then((m) => m.LatePayments),
+  { loading: PanelFallback },
+);
+const GiftCardsManager = dynamic(
+  () => import("./gift-cards-manager").then((m) => m.GiftCardsManager),
   { loading: PanelFallback },
 );
 const PlanBilling = dynamic(
@@ -87,6 +97,9 @@ const CardReaders = dynamic(
   () => import("./card-readers").then((m) => m.CardReaders),
   { loading: PanelFallback },
 );
+const Printers = dynamic(() => import("./printers").then((m) => m.Printers), {
+  loading: PanelFallback,
+});
 const DeliveryDispatch = dynamic(
   () => import("../delivery-dispatch").then((m) => m.DeliveryDispatch),
   { loading: PanelFallback },
@@ -102,6 +115,8 @@ type Tab =
   | "plan"
   | "payments"
   | "late"
+  | "printers"
+  | "giftcards"
   | "delivery";
 
 function readTenantParam(fallbackTenantId: string): {
@@ -135,6 +150,8 @@ export function AdminShell({
   const [tenantName, setTenantName] = useState("Back office");
   const [locations, setLocations] = useState<Location[]>([]);
   const [locationId, setLocationId] = useState<string>("");
+  // Bumped after a roster change so the drawer list below reloads.
+  const [rosterVersion, setRosterVersion] = useState(0);
   // Returning from Stripe onboarding (?connect=return|refresh) lands on the
   // Payments tab, whose mount triggers the GET refresh of the account status.
   const [tab, setTab] = useState<Tab>("menu");
@@ -181,6 +198,8 @@ export function AdminShell({
       { id: "plan", label: "Plan", icon: Wallet },
       { id: "payments", label: "Payments", icon: CreditCard },
       { id: "late", label: "Late payments", icon: AlertTriangle },
+      { id: "printers", label: "Printers", icon: Printer },
+      { id: "giftcards", label: "Gift cards", icon: Gift },
       { id: "delivery", label: "Delivery", icon: Truck },
     ];
     return base;
@@ -271,7 +290,7 @@ export function AdminShell({
         )}
         {tab === "reports" &&
           (advancedReportsAllowed ? (
-            <ReportsView tenantId={tenantId} locations={locations} />
+            <OwnerReports tenantId={tenantId} locations={locations} />
           ) : (
             <FeatureLocked
               feature="Advanced reports"
@@ -279,7 +298,19 @@ export function AdminShell({
             />
           ))}
         {tab === "staff" && locationId && (
-          <StaffShifts tenantId={tenantId} locationId={locationId} />
+          <div className="space-y-10">
+            <StaffManager
+              tenantId={tenantId}
+              locationId={locationId}
+              locations={locations}
+              onChanged={() => setRosterVersion((v) => v + 1)}
+            />
+            <StaffShifts
+              key={rosterVersion}
+              tenantId={tenantId}
+              locationId={locationId}
+            />
+          </div>
         )}
         {tab === "eod" && locationId && (
           <EndOfDay
@@ -288,11 +319,18 @@ export function AdminShell({
             locationName={
               locations.find((l) => l.id === locationId)?.name ?? locationId
             }
+            tenantName={tenantName === "Back office" ? undefined : tenantName}
+            timezone={locations.find((l) => l.id === locationId)?.timezone}
+            cutoffMinutes={
+              locations.find((l) => l.id === locationId)
+                ?.business_day_cutoff_minutes ?? 0
+            }
           />
         )}
         {tab === "late" && locationId && (
           <LatePayments tenantId={tenantId} locationId={locationId} />
         )}
+        {tab === "giftcards" && <GiftCardsManager tenantId={tenantId} />}
         {tab === "locations" && (
           <LocationsManager
             tenantId={tenantId}
@@ -315,6 +353,9 @@ export function AdminShell({
               <CardReaders tenantId={tenantId} locationId={locationId} />
             )}
           </>
+        )}
+        {tab === "printers" && locationId && (
+          <Printers tenantId={tenantId} locationId={locationId} />
         )}
         {tab === "delivery" &&
           (deliveryAllowed ? (

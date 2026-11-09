@@ -394,8 +394,11 @@ export function toContractMenu(input: {
 // Payments + orders
 // ---------------------------------------------------------------------------
 
-export function railToMethod(rail: string): "card" | "cash" | "crypto" | "other" {
+export function railToMethod(rail: string): "card" | "cash" | "crypto" | "gift_card" | "other" {
   if (rail === "cash") return "cash";
+  // Stored value (src/lib/giftcards): the contract's `gift_card` method; store
+  // credit is told apart by its processor (`store_credit`, see railToProcessor).
+  if (rail === "gift_card" || rail === "store_credit") return "gift_card";
   if (rail.startsWith("stripe")) return "card";
   if (rail.startsWith("crypto")) return "crypto";
   return "other";
@@ -403,6 +406,8 @@ export function railToMethod(rail: string): "card" | "cash" | "crypto" | "other"
 
 export function railToProcessor(rail: string): string {
   if (rail.startsWith("stripe")) return "stripe";
+  if (rail === "gift_card") return "pos";
+  if (rail === "store_credit") return "store_credit";
   if (rail === "crypto_coinbase") return "coinbase";
   return rail;
 }
@@ -441,7 +446,8 @@ function tenderStatus(p: Payment): string {
  * sum invariant holds and the id is stable across reads.
  */
 export function toContractRefunds(p: Payment): CorePaymentRefund[] {
-  const out: CorePaymentRefund[] = (p.refunds ?? []).map((r) => ({
+  // Pending (card / stored value) reservations are not refunds yet.
+  const out: CorePaymentRefund[] = confirmedRefundEntries(p).map((r) => ({
     id: r.id,
     amount_cents: r.amount_cents,
     at: ts(r.at),
@@ -459,6 +465,11 @@ export function toContractRefunds(p: Payment): CorePaymentRefund[] {
     });
   }
   return out;
+}
+
+/** A tender's refund entries that actually happened (pending reservations excluded). */
+export function confirmedRefundEntries(p: Payment) {
+  return (p.refunds ?? []).filter((r) => r.state !== "pending");
 }
 
 /**
@@ -515,6 +526,10 @@ export function derivePaymentStatus(
   order: Order,
   payments: Payment[],
 ): { payment_status: CoreOrder["payment_status"]; amount_due_cents: number } {
+  // Marketplace orders are paid by the marketplace; they carry no tender.
+  if (order.channel === "marketplace") {
+    return { payment_status: "paid", amount_due_cents: 0 };
+  }
   const live = payments.filter(
     (p) => p.status === "captured" || p.status === "refunded",
   );
@@ -547,10 +562,18 @@ export function derivePaymentStatus(
   return { payment_status: status, amount_due_cents: due };
 }
 
+/**
+ * `fromPosChannel` for a POS channel. A marketplace order is delivered or picked
+ * up by the marketplace; it has no coarser core mapping, so it reads as online.
+ */
+function corePosChannel(channel: Order["channel"]) {
+  return fromPosChannel(channel === "marketplace" ? "online_pickup" : channel);
+}
+
 function contractChannel(order: Order): string {
   const explicit = order.source?.channel;
   if (explicit) return explicit;
-  return fromPosChannel(order.channel).channel;
+  return corePosChannel(order.channel).channel;
 }
 
 function sourceOf(order: Order): CoreOrder["source"] {
@@ -600,6 +623,36 @@ function lineDiscounts(order: Order, live: OrderItem[]): number[] {
 }
 
 function toContractLines(order: Order): CoreOrderLine[] {
+  // A gift card sale / reload has no menu lines: one synthetic `gift_card_load`
+  // line (kind gift_card, tax exempt) so hub consumers see what was sold.
+  const sv = order.core_ext?.stored_value;
+  if (sv && order.items.length === 0) {
+    return [
+      {
+        id: `gift_card_${sv.account_id}`,
+        line_type: "gift_card_load",
+        item_id: sv.account_id,
+        item_name: sv.op === "sell" ? `Gift card ••••${sv.code_last4}` : `Gift card reload ••••${sv.code_last4}`,
+        kind: "gift_card",
+        station: null,
+        size_id: null,
+        size_name: null,
+        quantity: 1,
+        base_price_cents: sv.amount_cents,
+        modifiers: [],
+        unit_price_cents: sv.amount_cents,
+        line_total_cents: sv.amount_cents,
+        discount_cents: 0,
+        net_cents: sv.amount_cents,
+        tax_exempt: true,
+        notes: null,
+        voided: false,
+        fired_at: null,
+        voided_at: null,
+        status_at_void: null,
+      } as CoreOrderLine,
+    ];
+  }
   const live = order.items.filter((i) => !i.voided);
   const discounts = lineDiscounts(order, live);
   let li = 0;
@@ -658,7 +711,7 @@ export function toContractOrder(input: {
 
   const addr = f?.address;
   const fulfillment: CoreOrder["fulfillment"] = {
-    type: f?.type ?? fromPosChannel(order.channel).fulfillment_type,
+    type: f?.type ?? corePosChannel(order.channel).fulfillment_type,
     scheduled_for:
       f && f.scheduled_for !== "asap" ? ts(f.scheduled_for) : null,
     promised_at: f?.promised_at ? ts(f.promised_at) : null,
@@ -749,7 +802,14 @@ export function toContractOrder(input: {
     quote_id: null,
     tax_exempt: order.core_ext?.tax_exempt ?? false,
     business_date: businessDate(order.created_at, timezone),
-    metadata: order.core_ext?.metadata ?? {},
+    // A gift card sale / reload is flagged so hub consumers never treat it as
+    // food revenue: "gift_card_sale" | "gift_card_reload".
+    metadata: order.core_ext?.stored_value
+      ? {
+          ...(order.core_ext?.metadata ?? {}),
+          stored_value: order.core_ext.stored_value.op === "sell" ? "gift_card_sale" : "gift_card_reload",
+        }
+      : (order.core_ext?.metadata ?? {}),
     callout_name:
       order.core_ext?.callout_name ??
       calloutName({ name: contact.name }) ??

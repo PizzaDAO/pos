@@ -18,7 +18,7 @@ describe("service worker NetworkOnly matchers", () => {
     expect(isNetworkOnlyPath("/api/payments")).toBe(false);
   });
 
-  it("leaves the menu (StaleWhileRevalidate) and pages alone", () => {
+  it("leaves the menu (NetworkFirst, cached for offline) and pages alone", () => {
     expect(isNetworkOnlyPath("/api/menu")).toBe(false);
     expect(isNetworkOnlyPath("/terminal")).toBe(false);
     expect(isNetworkOnlyPath("/api/orders")).toBe(false);

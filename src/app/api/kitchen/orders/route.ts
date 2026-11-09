@@ -12,7 +12,8 @@
  *   Advances (bump) or re-opens (recall) an order's status through the DB
  *   abstraction. Idempotent: bumping a `completed` order or recalling an
  *   in-progress one is a no-op that returns the unchanged order, so double-taps
- *   / retries never corrupt state.
+ *   / retries never corrupt state. A Ready / out-for-delivery ticket whose
+ *   delivery is provider-run (not in_house_manual) can't be bumped (no-op).
  *
  * Auth: an operational role (kitchen surface) of the tenant; the location must
  * belong to it. Bump/recall resolves the ORDER first and authorizes against the
@@ -20,10 +21,16 @@
  *
  * No env vars are read — everything runs against the in-memory mock driver.
  */
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
+import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
 import { buildTickets, buildVoidNotices, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
-import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
+import {
+  isHandoffStatus,
+  kitchenHandsOffDelivery,
+  nextBumpStatus,
+  recallStatus,
+} from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
 import {
   requireOrderAccess,
@@ -32,6 +39,15 @@ import {
 
 // In-memory mock state lives in the Node runtime; force it (not edge).
 export const runtime = "nodejs";
+
+/** The delivery record's provider for an order (null when none / unreadable). */
+async function deliveryProviderOf(orderId: string): Promise<string | null> {
+  try {
+    return (await getPosDriver().getDeliveryForOrder(orderId))?.provider ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -52,7 +68,16 @@ export async function GET(request: Request) {
 
   const now = new Date();
   const thresholds = settings.kds_thresholds ?? DEFAULT_KDS_THRESHOLDS;
-  const tickets = buildTickets(orders, now, thresholds);
+  const built = buildTickets(orders, now, thresholds);
+  // Delivery tickets carry their delivery record's provider: it decides whether
+  // the kitchen offers a hand-off (in-house only).
+  const tickets = await Promise.all(
+    built.map(async (t) =>
+      t.order.channel === "online_delivery"
+        ? { ...t, deliveryProvider: await deliveryProviderOf(t.order.id) }
+        : t,
+    ),
+  );
 
   const body: KitchenBoardResponse = {
     tickets,
@@ -96,8 +121,25 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.res;
   const current = auth.order;
 
-  const next =
-    action === "bump"
+  // A marketplace order the cashier has not accepted is not the kitchen's yet:
+  // no bump, no recall (accept / reject / provider cancel are its only moves).
+  if (isPendingAcceptance(current)) {
+    return NextResponse.json(
+      { error: "Accept this marketplace order before the kitchen can bump it." },
+      { status: 409 },
+    );
+  }
+
+  // A provider-run delivery (DoorDash, the driver module) leaves the kitchen
+  // through the provider: the KDS never moves it past Ready.
+  const providerOwned =
+    action === "bump" &&
+    isHandoffStatus(current.status) &&
+    current.channel === "online_delivery" &&
+    !kitchenHandsOffDelivery(current, await deliveryProviderOf(current.id));
+  const next = providerOwned
+    ? null
+    : action === "bump"
       ? nextBumpStatus(current.status, current.channel)
       : recallStatus(current.status);
 
@@ -107,5 +149,17 @@ export async function POST(request: Request) {
   }
 
   const updated = await driver.updateOrderStatus(id, next);
+  // Marketplace order bumped to ready: tell the provider (best effort, inert
+  // unless the provider is configured).
+  // Never awaited by the bump: runs after the response (or detached, outside a
+  // request scope such as tests).
+  if (updated && next === "ready" && updated.channel === "marketplace") {
+    const notify = () => notifyMarketplaceReady(updated);
+    try {
+      after(notify);
+    } catch {
+      void notify();
+    }
+  }
   return NextResponse.json({ order: updated, changed: true });
 }

@@ -22,35 +22,58 @@ export function isFullyRefunded(
   return live.length > 0 && live.every((p) => p.status === "refunded");
 }
 
-type RefundFields = Pick<Payment, "refunded_cents" | "tip_cents" | "tip_refunded_cents">;
+type RefundFields = Pick<
+  Payment,
+  "refunded_cents" | "tip_cents" | "tip_refunded_cents" | "amount_cents"
+>;
 
 /**
- * The gratuity part of a tender's refunds. Recorded explicitly since tip refunds
- * are tracked separately; a row without it (older database / older refunds)
- * follows the legacy rule: refunds came off the tip FIRST.
+ * The gratuity part of a tender's (confirmed) refunds. Recorded explicitly since
+ * tip refunds are tracked separately; a row without it (older database / older
+ * refunds) follows the legacy rule: base first, only what was refunded beyond
+ * the base is tip ("tip last", as the owner reports always read it).
  */
 export function tipRefundedCents(p: RefundFields): number {
   if (typeof p.tip_refunded_cents === "number") {
     return Math.max(0, Math.min(p.tip_refunded_cents, p.tip_cents, p.refunded_cents));
   }
-  return Math.max(0, Math.min(p.refunded_cents, p.tip_cents));
+  return Math.max(0, Math.min(p.refunded_cents - p.amount_cents, p.tip_cents));
 }
 
-/** The base (food) part of a tender's refunds. */
+/** The base (food) part of a tender's (confirmed) refunds. */
 export function baseRefundedCents(p: RefundFields): number {
   return Math.max(0, p.refunded_cents - tipRefundedCents(p));
 }
 
-/** What can still be refunded on a tender, split into base and tip. */
+/** Room held by refunds still `pending` at the provider (not refunded yet). */
+export function pendingRefundParts(p: Pick<Payment, "refunds">): {
+  amountCents: number;
+  tipCents: number;
+} {
+  let amountCents = 0;
+  let tipCents = 0;
+  for (const r of p.refunds ?? []) {
+    if (r.state !== "pending") continue;
+    amountCents += r.amount_cents;
+    tipCents += typeof r.tip_cents === "number" ? r.tip_cents : 0;
+  }
+  return { amountCents, tipCents };
+}
+
+/** What can still be refunded on a tender (pending refunds hold their room), split into base and tip. */
 export function refundableParts(
-  p: Pick<Payment, "amount_cents" | "status"> & RefundFields,
+  p: Pick<Payment, "amount_cents" | "status" | "refunds"> & RefundFields,
 ): { baseCents: number; tipCents: number } {
   if (p.status !== "captured" && p.status !== "authorized") {
     return { baseCents: 0, tipCents: 0 };
   }
+  const pending = pendingRefundParts(p);
   return {
-    baseCents: Math.max(0, p.amount_cents - baseRefundedCents(p)),
-    tipCents: Math.max(0, p.tip_cents - tipRefundedCents(p)),
+    baseCents: Math.max(
+      0,
+      p.amount_cents - baseRefundedCents(p) - (pending.amountCents - pending.tipCents),
+    ),
+    tipCents: Math.max(0, p.tip_cents - tipRefundedCents(p) - pending.tipCents),
   };
 }
 

@@ -23,12 +23,18 @@
  *
  * Money is always integer minor units; nothing here uses floats.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
 } from "@/lib/payments/connect-status";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { captureError } from "@/lib/observability";
+import type {
+  Printer,
+  PrintJob,
+  PrintLocationSettings,
+} from "@/lib/printing/types";
 import type { PosDriver } from "./driver";
 import type { AdjustmentRecord } from "./adjustment-types";
 import type {
@@ -105,7 +111,8 @@ import type {
 } from "./saas-types";
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
-import { buildSalesReport, isoDate } from "@/lib/reports";
+import { buildSalesReport, locationBusinessDate } from "@/lib/reports";
+import { EMPTY_BUNDLE, type OwnerReportBundle } from "@/lib/owner-reports";
 import { fetchAllPages, safeKeyset } from "./paging";
 
 // ---------------------------------------------------------------------------
@@ -179,6 +186,7 @@ function mapLocation(r: Row): Location {
     name: r.name as string,
     slug: r.slug as string,
     timezone: r.timezone as string,
+    business_day_cutoff_minutes: (r.business_day_cutoff_minutes as number | null) ?? 0,
     address: (r.address as string | null) ?? null,
     address_line1: (r.address_line1 as string | null) ?? null,
     address_line2: (r.address_line2 as string | null) ?? null,
@@ -218,6 +226,7 @@ function mapStoreSettings(r: Row): StoreSettings {
     kds_thresholds:
       (r.kds_thresholds as StoreSettings["kds_thresholds"]) ?? undefined,
     fulfillment: (r.fulfillment as StoreSettings["fulfillment"]) ?? undefined,
+    marketplace: (r.marketplace as StoreSettings["marketplace"]) ?? undefined,
     adjustment_policy:
       (r.adjustment_policy as StoreSettings["adjustment_policy"] | null) ?? undefined,
   };
@@ -307,6 +316,9 @@ function mapPayment(r: Row): Payment {
     ...(typeof r.tip_refunded_cents === "number"
       ? { tip_refunded_cents: r.tip_refunded_cents as number }
       : {}),
+    ...(typeof r.refund_reserved_cents === "number"
+      ? { refund_reserved_cents: r.refund_reserved_cents as number }
+      : {}),
     refund_ids: (r.refund_ids as string[] | null) ?? [],
     refunds: (r.refunds as Payment["refunds"] | null) ?? [],
     method: (r.method as string | null) ?? null,
@@ -387,9 +399,17 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
     pin_hash: opts?.includePin
       ? ((r.pin_hash as string | null) ?? null)
       : undefined,
+    pin_previous_hash: opts?.includePin
+      ? ((r.pin_previous_hash as string | null) ?? null)
+      : undefined,
+    pin_previous_until: opts?.includePin
+      ? ((r.pin_previous_until as string | null) ?? null)
+      : undefined,
     user_id: (r.user_id as string | null) ?? null,
     location_ids: (r.location_ids as string[] | null) ?? [],
     module_roles: normalizeModuleRoles(r.module_roles),
+    contact_email: (r.contact_email as string | null) ?? null,
+    contact_phone: (r.contact_phone as string | null) ?? null,
     created_at: r.created_at as string,
   };
 }
@@ -577,6 +597,51 @@ function mapTerminalReader(r: Row): TerminalReader {
   };
 }
 
+function mapPrinter(r: Row): Printer {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    location_id: r.location_id as string,
+    label: (r.label as string) ?? "",
+    protocol: r.protocol as Printer["protocol"],
+    format: r.format as Printer["format"],
+    columns: r.columns as Printer["columns"],
+    token_hash: r.token_hash as string,
+    last_seen_at: (r.last_seen_at as string | null) ?? null,
+    created_at: r.created_at as string,
+  };
+}
+
+function mapPrintJob(r: Row): PrintJob {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    location_id: r.location_id as string,
+    printer_id: r.printer_id as string,
+    order_id: (r.order_id as string | null) ?? null,
+    kind: r.kind as PrintJob["kind"],
+    document: r.document as PrintJob["document"],
+    status: r.status as PrintJob["status"],
+    attempts: (r.attempts as number) ?? 0,
+    error: (r.error as string | null) ?? null,
+    dedupe_key: (r.dedupe_key as string | null) ?? null,
+    created_at: r.created_at as string,
+    expires_at: r.expires_at as string,
+    claimed_at: (r.claimed_at as string | null) ?? null,
+    done_at: (r.done_at as string | null) ?? null,
+    retry_after: (r.retry_after as string | null) ?? null,
+  };
+}
+
+function mapPrintSettings(r: Row): PrintLocationSettings {
+  return {
+    location_id: r.location_id as string,
+    tenant_id: r.tenant_id as string,
+    auto_print: (r.auto_print as boolean) ?? false,
+    updated_at: r.updated_at as string,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Driver factory.
 // ---------------------------------------------------------------------------
@@ -589,9 +654,15 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
   /** Throw on a Supabase error; return data otherwise. */
   function unwrap<T>(res: {
     data: T | null;
-    error: { message: string } | null;
+    error: { message: string; code?: string } | null;
   }): T {
-    if (res.error) throw new Error(`Supabase: ${res.error.message}`);
+    if (res.error) {
+      // Keep the Postgres SQLSTATE (e.g. 40P01) so callers can tell a
+      // retryable conflict from a real failure.
+      throw Object.assign(new Error(`Supabase: ${res.error.message}`), {
+        code: res.error.code,
+      });
+    }
     return res.data as T;
   }
 
@@ -739,6 +810,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     table: string,
     column: string,
     ids: string[],
+    tieBreak = "id",
   ): Promise<Row[]> {
     const out: Row[] = [];
     for (let i = 0; i < ids.length; i += 100) {
@@ -751,7 +823,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               .select("*")
               .in(column, chunk)
               .order(column)
-              .order("id")
+              .order(tieBreak)
               .range(from, to),
           ) as Row[],
         )),
@@ -1784,6 +1856,99 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { outcome: "not_found" };
     },
 
+    async setMarketplaceSettings(tenantId, locationId, marketplace) {
+      // Touch ONLY the marketplace column: never rewrite tax/tips/currency from a
+      // possibly stale read.
+      const updated = unwrap(
+        await sb
+          .from("store_settings")
+          .update({ marketplace })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .select(),
+      ) as Row[];
+      if (updated[0]) return mapStoreSettings(updated[0]);
+      // No settings row yet: create it from the defaults.
+      const base = await this.getStoreSettings(tenantId, locationId);
+      const r = unwrap(
+        await sb
+          .from("store_settings")
+          .upsert(
+            {
+              tenant_id: tenantId,
+              location_id: locationId,
+              currency: base.currency,
+              tax_rate_bps: base.tax_rate_bps,
+              tip_presets_bps: base.tip_presets_bps,
+              kds_thresholds: base.kds_thresholds ?? null,
+              marketplace,
+            },
+            { onConflict: "tenant_id,location_id", ignoreDuplicates: true },
+          )
+          .select(),
+      ) as Row[];
+      return r[0] ? mapStoreSettings(r[0]) : { ...base, marketplace };
+    },
+
+    async findMarketplaceLocations(provider, storeId) {
+      const rows = unwrap(
+        await sb
+          .from("marketplace_stores")
+          .select("tenant_id,location_id")
+          .eq("provider", provider)
+          .eq("store_id", storeId)
+          .limit(2),
+      ) as Row[];
+      return rows.map((r) => ({
+        tenant_id: r.tenant_id as string,
+        location_id: r.location_id as string,
+      }));
+    },
+
+    async assignMarketplaceStore(input) {
+      if (input.storeId === null) {
+        unwrap(
+          await sb
+            .from("marketplace_stores")
+            .delete()
+            .eq("provider", input.provider)
+            .eq("location_id", input.locationId),
+        );
+        return;
+      }
+      // ONE upsert on (location_id, provider): it replaces this location's store,
+      // and a clash with another location's store id (primary key) fails the whole
+      // statement, leaving the old assignment intact.
+      const { error } = await sb.from("marketplace_stores").upsert(
+        {
+          provider: input.provider,
+          store_id: input.storeId,
+          tenant_id: input.tenantId,
+          location_id: input.locationId,
+          assigned_by: input.assignedBy ?? null,
+          assigned_at: new Date().toISOString(),
+        },
+        { onConflict: "location_id,provider" },
+      );
+      if (error) {
+        if (error.code === "23505") throw new MarketplaceStoreTakenError();
+        throw new Error(error.message);
+      }
+    },
+
+    async findMarketplaceOrdersByRef(provider, externalId) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .eq("source->>type", "marketplace")
+          .eq("source->>module", provider)
+          .eq("source->>external_ref", externalId)
+          .limit(5),
+      ) as Row[];
+      return readOrderRows(rows);
+    },
+
     // -- Orders ------------------------------------------------------------
     async createOrder(input) {
       const existingRow = unwrap(
@@ -2330,8 +2495,13 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       // snapshot must never overwrite it on an existing tender.
       // tip_refunded_cents is never written here (the column defaults to 0 on
       // insert; only the reserve/release RPCs move it).
-      const { tip_refunded_cents: _tr, ...insertable } = payment;
+      const {
+        tip_refunded_cents: _tr,
+        refund_reserved_cents: _rr,
+        ...insertable
+      } = payment;
       void _tr;
+      void _rr;
       const {
         refunded_cents: _rc,
         refund_ids: _ri,
@@ -2460,6 +2630,18 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         }),
       ) as Row | null;
       return out ? mapPayment(out) : null;
+    },
+
+    async setRefundProcessorRef(paymentId, requestId, processorRef) {
+      return (
+        unwrap(
+          await sb.rpc("set_payment_refund_ref", {
+            p_payment_id: paymentId,
+            p_request_id: requestId,
+            p_processor_ref: processorRef,
+          }),
+        ) === true
+      );
     },
 
     async releasePaymentRefund(paymentId, amountCents, refundId, opts) {
@@ -2822,6 +3004,259 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     async deleteTerminalReader(id) {
       unwrap(await sb.from("terminal_readers").delete().eq("id", id));
+    },
+
+    // -- Network printing ----------------------------------------------------
+
+    async listPrinters(tenantId, locationId) {
+      return (
+        unwrap(
+          await sb
+            .from("print_printers")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at"),
+        ) as Row[]
+      ).map(mapPrinter);
+    },
+
+    async getPrinter(id) {
+      const r = unwrap(
+        await sb.from("print_printers").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapPrinter(r) : null;
+    },
+
+    async createPrinter(row) {
+      return mapPrinter(
+        unwrap(
+          await sb
+            .from("print_printers")
+            .insert({ ...row, id: genUuid(), created_at: nowIso() })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async deletePrinter(tenantId, id) {
+      const rows = unwrap(
+        await sb
+          .from("print_printers")
+          .delete()
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .select("id"),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async setPrinterTokenHash(tenantId, id, tokenHash) {
+      const rows = unwrap(
+        await sb
+          .from("print_printers")
+          .update({ token_hash: tokenHash })
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .select(),
+      ) as Row[];
+      return rows[0] ? mapPrinter(rows[0]) : null;
+    },
+
+    async touchPrinter(id, at) {
+      unwrap(await sb.from("print_printers").update({ last_seen_at: at }).eq("id", id));
+    },
+
+    async getPrintSettings(locationId) {
+      const r = unwrap(
+        await sb
+          .from("print_location_settings")
+          .select("*")
+          .eq("location_id", locationId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPrintSettings(r) : null;
+    },
+
+    async setPrintAutoPrint(tenantId, locationId, autoPrint) {
+      return mapPrintSettings(
+        unwrap(
+          await sb
+            .from("print_location_settings")
+            .upsert({
+              location_id: locationId,
+              tenant_id: tenantId,
+              auto_print: autoPrint,
+              updated_at: nowIso(),
+            })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async enqueuePrintJob(job) {
+      if (job.dedupe_key) {
+        // Unique (printer_id, dedupe_key): a concurrent duplicate loses the
+        // insert and falls through to the lookup, so a retried fire prints once.
+        const ins = await sb
+          .from("print_jobs")
+          .insert({ ...job, id: genUuid(), status: "queued", created_at: nowIso() })
+          .select()
+          .single();
+        if (!ins.error) return mapPrintJob(ins.data as Row);
+        const dup = unwrap(
+          await sb
+            .from("print_jobs")
+            .select("*")
+            .eq("printer_id", job.printer_id)
+            .eq("dedupe_key", job.dedupe_key)
+            .maybeSingle(),
+        ) as Row | null;
+        if (!dup) throw new Error(`Supabase: ${ins.error.message}`);
+        return mapPrintJob(dup);
+      }
+      return mapPrintJob(
+        unwrap(
+          await sb
+            .from("print_jobs")
+            .insert({ ...job, id: genUuid(), status: "queued", created_at: nowIso() })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async expirePrintJobs(printerId, now) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .update({ status: "expired" })
+          .eq("printer_id", printerId)
+          .in("status", ["queued", "sent"])
+          .lte("expires_at", now)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async claimPrintJob(printerId, now, reclaimBefore) {
+      // Select the oldest candidate, then claim it with a conditional update
+      // (status still claimable). Losing the race returns no row; try the next.
+      for (let i = 0; i < 3; i++) {
+        const cand = unwrap(
+          await sb
+            .from("print_jobs")
+            .select("*")
+            .eq("printer_id", printerId)
+            .gt("expires_at", now)
+            .or(`and(status.eq.queued,or(retry_after.is.null,retry_after.lte.${now})),and(status.eq.sent,claimed_at.lte.${reclaimBefore})`)
+            .order("created_at")
+            .limit(1),
+        ) as Row[];
+        if (cand.length === 0) return null;
+        const c = cand[0]!;
+        const won = unwrap(
+          await sb
+            .from("print_jobs")
+            .update({
+              status: "sent",
+              attempts: ((c.attempts as number) ?? 0) + 1,
+              claimed_at: now,
+            })
+            .eq("id", c.id as string)
+            .eq("printer_id", printerId)
+            .eq("status", c.status as string)
+            .eq("attempts", (c.attempts as number) ?? 0)
+            .select(),
+        ) as Row[];
+        if (won.length > 0) return mapPrintJob(won[0]!);
+      }
+      return null;
+    },
+
+    async hasPrintJobForOrder(printerId, orderId) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .select("id")
+          .eq("printer_id", printerId)
+          .eq("order_id", orderId)
+          .limit(1),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async retryFailedPrintJobs(tenantId, locationId, now) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .update({ status: "queued", attempts: 0, retry_after: null, done_at: null })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .eq("status", "failed")
+          .gt("expires_at", now)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async pruneFinishedPrintJobs(beforeIso) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .delete()
+          .in("status", ["done", "failed", "expired"])
+          .lt("created_at", beforeIso)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async getPrintJobForPrinter(printerId, jobId) {
+      const r = unwrap(
+        await sb
+          .from("print_jobs")
+          .select("*")
+          .eq("id", jobId)
+          .eq("printer_id", printerId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPrintJob(r) : null;
+    },
+
+    async completePrintJob(printerId, jobId, outcome, now) {
+      const retry = !outcome.ok && outcome.retryAt;
+      unwrap(
+        await sb
+          .from("print_jobs")
+          .update(
+            outcome.ok
+              ? { status: "done", error: null, done_at: now }
+              : retry
+                ? { status: "queued", error: outcome.error, retry_after: outcome.retryAt }
+                : { status: "failed", error: outcome.error, done_at: now },
+          )
+          .eq("id", jobId)
+          .eq("printer_id", printerId)
+          .in("status", ["queued", "sent"]),
+      );
+      return this.getPrintJobForPrinter(printerId, jobId);
+    },
+
+    async listPrintJobs(tenantId, locationId, limit) {
+      return (
+        unwrap(
+          await sb
+            .from("print_jobs")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at", { ascending: false })
+            .limit(limit),
+        ) as Row[]
+      ).map(mapPrintJob);
     },
 
     async listStaleTerminalTenders(olderThan, limit) {
@@ -3247,6 +3682,99 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         default:
           return null;
       }
+    },
+
+    async getMenuSnapshot(tenantId) {
+      // Every read is paged (PostgREST caps responses at max_rows ~ 1000) and
+      // every `in` list is chunked.
+      const tenantRows = (
+        table: string,
+        cols: string,
+        order: string,
+      ) =>
+        fetchAllPages<Row>(async (from, to) => {
+          let q = sb.from(table).select(cols).eq("tenant_id", tenantId);
+          // Stable total order: every column of the (composite) key.
+          for (const o of order.split(",")) q = q.order(o.trim());
+          return unwrap(await q.range(from, to)) as unknown as Row[];
+        });
+      const [cats, items, groups, recipes, allergens] = await Promise.all([
+        tenantRows("menu_categories", "id,name,sort_order", "id"),
+        tenantRows(
+          "menu_items",
+          "id,category_id,name,description,is_half_and_half_capable,station",
+          "id",
+        ),
+        tenantRows(
+          "modifier_groups",
+          "id,name,min_select,max_select,supports_half",
+          "id",
+        ),
+        tenantRows("item_inventory_links", "id,source_id", "id"),
+        tenantRows("menu_allergen_rows", "publication_id,target_id,target_type", "publication_id,target_type,target_id"),
+      ]);
+      const itemIds = items.map((r) => r.id as string);
+      const groupIds = groups.map((r) => r.id as string);
+      const [sizes, mods, links] = await Promise.all([
+        selectIn("item_sizes", "item_id", itemIds),
+        selectIn("modifiers", "group_id", groupIds),
+        selectIn("item_modifier_groups", "item_id", itemIds, "group_id"),
+      ]);
+      return {
+        categories: cats.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          sort_order: r.sort_order as number,
+        })),
+        items: items.map((r) => ({
+          id: r.id as string,
+          category_id: r.category_id as string,
+          name: r.name as string,
+          description: (r.description as string | null) ?? null,
+          is_half_and_half_capable: r.is_half_and_half_capable as boolean,
+          station: r.station as MenuItem["station"],
+        })),
+        sizes: sizes.map((r) => ({
+          id: r.id as string,
+          item_id: r.item_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        modifierGroups: groups.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          min_select: r.min_select as number,
+          max_select: r.max_select as number,
+          supports_half: r.supports_half as boolean,
+        })),
+        modifiers: mods.map((r) => ({
+          id: r.id as string,
+          group_id: r.group_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        links: links.map((r) => ({
+          item_id: r.item_id as string,
+          group_id: r.group_id as string,
+          sort_order: r.sort_order as number,
+        })),
+        inventoryLinkSourceIds: recipes.map((r) => r.source_id as string),
+        allergenTargetIds: allergens.map((r) => r.target_id as string),
+      };
+    },
+
+    // ONE transaction inside public.import_menu() (migration
+    // 20261113000100): a PostgREST client can't span statements, so the whole
+    // replace/insert runs server-side and rolls back as a unit.
+    async applyMenuImport(tenantId, changes) {
+      unwrap(
+        await sb.rpc("import_menu", {
+          p_tenant_id: tenantId,
+          p_changes: changes,
+        }),
+      );
     },
 
     async listCategories(tenantId) {
@@ -3787,7 +4315,10 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .eq("tenant_id", tenantId),
       ) as Row[];
       const locRows = unwrap(
-        await sb.from("locations").select("id,name").eq("tenant_id", tenantId),
+        await sb
+          .from("locations")
+          .select("*")
+          .eq("tenant_id", tenantId),
       ) as Row[];
       const catNameById = new Map(
         catRows.map((c) => [c.id as string, c.name as string]),
@@ -3811,7 +4342,32 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           return { id: cid, name: catNameById.get(cid) ?? cid };
         },
         locationName: (id: string) => locNameById.get(id) ?? id,
+        locationClock: (id: string) => {
+          const l = locRows.find((r) => r.id === id);
+          return l
+            ? {
+                timezone: (l.timezone as string | null) ?? null,
+                business_day_cutoff_minutes:
+                  (l.business_day_cutoff_minutes as number | null) ?? 0,
+              }
+            : null;
+        },
       });
+    },
+
+    async getOwnerReportBundle(tenantId, locationId, from, to, topN) {
+      // One SQL call: every aggregate is computed in Postgres, per location
+      // timezone and business-day cutoff (see report_sales_bundle).
+      const data = unwrap(
+        await sb.rpc("report_sales_bundle", {
+          p_tenant_id: tenantId,
+          p_location_id: locationId,
+          p_from: from,
+          p_to: to,
+          p_top_n: topN ?? 50,
+        }),
+      ) as Partial<OwnerReportBundle> | null;
+      return { ...EMPTY_BUNDLE, ...(data ?? {}) };
     },
 
     async getBusinessDayClose(tenantId, locationId, businessDate) {
@@ -3835,7 +4391,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       };
     },
 
-    async closeBusinessDay(tenantId, locationId, businessDate) {
+    async closeBusinessDay(tenantId, locationId, businessDate, opts) {
       const existing = await this.getBusinessDayClose(
         tenantId,
         locationId,
@@ -3856,10 +4412,26 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .eq("status", "closed")
           .not("closed_at", "is", null),
       ) as Row[];
+      const locRow = unwrap(
+        await sb
+          .from("locations")
+          .select("*")
+          .eq("id", locationId)
+          .maybeSingle(),
+      ) as Row | null;
+      const clock = locRow
+        ? {
+            timezone: (locRow.timezone as string | null) ?? null,
+            business_day_cutoff_minutes:
+              (locRow.business_day_cutoff_minutes as number | null) ?? 0,
+          }
+        : null;
       const dayShifts = shiftRows
         .map(mapShift)
         .filter(
-          (s) => s.closed_at != null && isoDate(s.closed_at) === businessDate,
+          (s) =>
+            s.closed_at != null &&
+            locationBusinessDate(s.closed_at, clock) === businessDate,
         );
 
       let openingFloat = 0;
@@ -3891,7 +4463,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         counted += rec.counted_cents ?? rec.expected_cents;
       }
 
-      const drawer = {
+      const drawer = opts?.drawer ?? {
         opening_float_cents: openingFloat,
         cash_sales_cents: cashSales,
         expected_cents: expected,
@@ -3996,12 +4568,58 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             pin_hash: pinHash,
             pin_failed_attempts: 0,
             pin_locked_until: null,
+            pin_previous_hash: null,
+            pin_previous_until: null,
           })
           .eq("id", staffId)
           .eq("tenant_id", tenantId)
           .select("id"),
       ) as Row[];
       return rows.length > 0;
+    },
+
+    async rotateStaffPin(tenantId, staffId, pinHash, graceUntil) {
+      const cur = unwrap(
+        await sb
+          .from("staff")
+          .select("pin_hash, pin_previous_hash, pin_previous_until")
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .maybeSingle(),
+      ) as Row | null;
+      if (!cur) return false;
+      const prevUntil = cur.pin_previous_until as string | null;
+      const keep =
+        !!cur.pin_previous_hash &&
+        !!prevUntil &&
+        new Date(prevUntil).getTime() > Date.now();
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .update({
+            pin_hash: pinHash,
+            pin_failed_attempts: 0,
+            pin_locked_until: null,
+            pin_previous_hash: keep ? cur.pin_previous_hash : cur.pin_hash,
+            pin_previous_until: keep ? prevUntil : graceUntil,
+          })
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .select("id"),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async clearPreviousPin(tenantId, staffId) {
+      unwrap(
+        await sb
+          .from("staff")
+          .update({ pin_previous_hash: null, pin_previous_until: null })
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .not("pin_previous_hash", "is", null)
+          .select("id"),
+      );
     },
 
     async tenantHasStaffPins(tenantId) {
@@ -4015,6 +4633,122 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .limit(1),
       ) as Row[];
       return rows.length > 0;
+    },
+
+    async listStaffPinRecords(tenantId) {
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .select(
+            "id, active, location_ids, pin_hash, pin_previous_hash, pin_previous_until",
+          )
+          .eq("tenant_id", tenantId),
+      ) as Row[];
+      return rows.map((r) => ({
+        id: r.id as string,
+        active: r.active as boolean,
+        location_ids: (r.location_ids as string[] | null) ?? [],
+        pin_hash: (r.pin_hash as string | null) ?? null,
+        pin_previous_hash: (r.pin_previous_hash as string | null) ?? null,
+        pin_previous_until: (r.pin_previous_until as string | null) ?? null,
+      }));
+    },
+
+    async updateStaffProfile(tenantId, staffId, patch) {
+      // Targeted update of the fields present in the patch only, scoped by
+      // tenant AND id (never a whole-row write of a stale snapshot).
+      const row: Record<string, unknown> = {};
+      for (const k of [
+        "name",
+        "role",
+        "active",
+        "contact_email",
+        "contact_phone",
+        "location_ids",
+        "module_roles",
+      ] as const) {
+        if (patch[k] !== undefined) row[k] = patch[k];
+      }
+      if (Object.keys(row).length === 0) {
+        const cur = unwrap(
+          await sb
+            .from("staff")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("id", staffId)
+            .maybeSingle(),
+        ) as Row | null;
+        return cur ? mapStaff(cur) : null;
+      }
+      const r = unwrap(
+        await sb
+          .from("staff")
+          .update(row)
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapStaff(r) : null;
+    },
+
+    async lastStaffSignIns(tenantId) {
+      // Newest first; the first row seen per staff member wins.
+      const rows = unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .select("staff_id, created_at")
+          .eq("tenant_id", tenantId)
+          .order("created_at", { ascending: false })
+          .limit(2000),
+      ) as Row[];
+      const out = new Map<string, string>();
+      for (const r of rows) {
+        const id = r.staff_id as string;
+        if (!out.has(id)) out.set(id, r.created_at as string);
+      }
+      return out;
+    },
+
+    async beginPinLimitAttempt(scope, key, limits) {
+      const res = unwrap(
+        await sb.rpc("begin_pin_limit_attempt", {
+          p_scope: scope,
+          p_key: key,
+          p_max: limits.max,
+          p_window_minutes: limits.windowMinutes,
+          p_lock_minutes: limits.lockMinutes,
+        }),
+      ) as {
+        allowed?: boolean;
+        just_locked?: boolean;
+        attempts?: number;
+        locked_until?: string | null;
+      } | null;
+      return {
+        allowed: res?.allowed === true,
+        justLocked: res?.just_locked === true,
+        attempts: Number(res?.attempts ?? 0),
+        lockedUntil: res?.locked_until ?? null,
+      };
+    },
+
+    async releasePinLimitAttempt(scope, key) {
+      unwrap(
+        await sb.rpc("release_pin_limit_attempt", { p_scope: scope, p_key: key }),
+      );
+    },
+
+    async revokeStaffSessionsForStaff(tenantId, staffId) {
+      unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .update({ revoked_at: nowIso() })
+          .eq("tenant_id", tenantId)
+          .eq("staff_id", staffId)
+          .is("revoked_at", null)
+          .select("id"),
+      );
     },
 
     async createStaffSession(session) {

@@ -146,7 +146,9 @@ export const defaultLimiter = new RateLimiter();
  * class is still unit-tested directly regardless of this flag.
  */
 export function rateLimitEnabled(): boolean {
-  if (process.env.RATE_LIMIT_DISABLED) return false;
+  // The kill switch is for local load tests only; production ignores it.
+  if (process.env.RATE_LIMIT_DISABLED && process.env.VERCEL_ENV !== "production")
+    return false;
   if (process.env.NODE_ENV === "test" || process.env.VITEST) return false;
   return true;
 }

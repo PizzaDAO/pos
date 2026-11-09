@@ -22,7 +22,11 @@ export type PaymentRailKey =
   | "stripe_online"
   | "crypto_onchain_usdc"
   | "crypto_coinbase"
-  | "cash";
+  | "cash"
+  // Stored value (src/lib/giftcards): redeemed through their own atomic writer,
+  // never through `createCharge`; `refund` credits the card's ledger.
+  | "gift_card"
+  | "store_credit";
 
 /**
  * Money as an integer minor-unit amount plus an ISO-4217 currency code.
@@ -147,4 +151,15 @@ export interface PaymentRail {
 
   /** Fetch the current status of a charge (used by watchers/reconciliation). */
   status(context: PaymentContext, chargeId: string): Promise<ChargeStatus>;
+}
+
+/**
+ * A rail refused a refund for sure (nothing was applied): e.g. the gift card
+ * could not take the value back. The caller releases its reservation.
+ */
+export class RefundRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RefundRefusedError";
+  }
 }

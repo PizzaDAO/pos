@@ -42,10 +42,10 @@ export interface PaymentRefund {
    */
   tip_cents?: number | null;
   /**
-   * Card refunds are reserved BEFORE the provider is called: `pending` until the
-   * provider accepted it (`confirmPaymentRefund`), then `succeeded`. Absent =
-   * succeeded (cash / crypto, older entries). A pending entry already counts
-   * against the tender's caps, so concurrent refunds can never overshoot.
+   * Card / stored-value refunds are reserved BEFORE the provider is called:
+   * `pending` until the provider accepted it (`confirmPaymentRefund`), then
+   * `succeeded`. Absent = succeeded (cash / crypto, older entries). A pending
+   * entry holds its room (`refund_reserved_cents`) but is not yet refunded.
    */
   state?: "pending" | "succeeded";
   /** The tender status before this refund (restored if it is released). */
@@ -90,6 +90,13 @@ export interface Payment {
    * that predates it: then refunds came off the tip first (`tipRefundedCents`).
    */
   tip_refunded_cents?: number;
+  /**
+   * Money HELD by `pending` refunds (card / stored value, reserved before the
+   * provider is called): counts against the caps, but not in `refunded_cents`,
+   * the status or any report until confirmed. Written only by the refund
+   * reservation functions.
+   */
+  refund_reserved_cents?: number;
   /** Whether this payment was taken on a simulated rail (no live keys). */
   simulated: boolean;
   /**

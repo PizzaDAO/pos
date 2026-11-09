@@ -2,7 +2,8 @@
  * Checkout hook (client) — drives the payment screen.
  *
  * Loads an order + its tenders, takes new tenders (split payment across rails),
- * polls pending crypto tenders until confirmed, and issues refunds. Every tender
+ * polls pending crypto tenders until confirmed, and posts refunds / voids / comps
+ * (`adjust`, /api/orders/[id]/*). Every tender
  * carries a client UUID that is the idempotency key end-to-end (`/api/payments`
  * upserts by it). The UUID is minted ONCE per pending tender and reused on retry
  * (lost response, double-tap) until the tender is recorded or its amount/rail
@@ -40,8 +41,6 @@ export interface CheckoutState {
   card: UseCardReader;
   /** Take one tender. Resolves when the tender is recorded (may be pending). */
   takeTender: (input: TakeTenderInput) => Promise<Payment | null>;
-  /** Refund/void a tender (full unless amountCents given). */
-  refund: (paymentId: string, amountCents?: number) => Promise<void>;
   /** Refund / void / comp history of the order (oldest first). */
   adjustments: AdjustmentRecord[];
   /** The location's approval thresholds (null until loaded). */
@@ -103,7 +102,6 @@ export function useCheckout(
   const [notice, setNotice] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const pendingIds = useRef(createPendingTenderIds(newUuid));
-  const pendingRefundIds = useRef(createPendingTenderIds(newUuid));
 
   const refresh = useCallback(async () => {
     if (!orderId) return;
@@ -251,41 +249,6 @@ export function useCheckout(
     [orderId, tenantId, locationId, currency, refresh, startCard],
   );
 
-  const refund = useCallback(
-    async (paymentId: string, amountCents?: number) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch("/api/payments/refund", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            paymentId,
-            amountCents,
-            // Same id on retry of the same refund; a new refund gets a new id.
-            refundId: pendingRefundIds.current.get(
-              `${paymentId}|${amountCents ?? "all"}`,
-            ),
-          }),
-        });
-        const data = (await res.json()) as {
-          error?: string;
-          manualRefund?: boolean;
-          note?: string;
-        };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-        setNotice(data.manualRefund ? (data.note ?? "Manual refund required.") : null);
-        pendingRefundIds.current.clear();
-        await refresh();
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Refund failed.");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [refresh],
-  );
-
   const adjust = useCallback(
     async (action: AdjustAction, body: Record<string, unknown>): Promise<AdjustResponse> => {
       if (!orderId) return { ok: false, status: 0, error: "No order." };
@@ -340,7 +303,6 @@ export function useCheckout(
     notice,
     card,
     takeTender,
-    refund,
     adjustments,
     policy,
     adjust,

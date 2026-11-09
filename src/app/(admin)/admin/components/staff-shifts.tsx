@@ -123,7 +123,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
     <div className="space-y-8">
       <div className="flex items-center gap-2">
         <Users className="h-5 w-5" />
-        <h2 className="text-base font-semibold">Staff &amp; drawer</h2>
+        <h2 className="text-base font-semibold">Drawers &amp; module roles</h2>
       </div>
 
       {roleError && (
@@ -135,7 +135,7 @@ export function StaffShifts({ tenantId, locationId }: Props) {
       <ApprovalLimits tenantId={tenantId} locationId={locationId} />
 
       <div className="grid gap-3 sm:grid-cols-2">
-        {data.staff.map((s) => {
+        {data.staff.filter((s) => s.active).map((s) => {
           const open = data.openShifts[s.id] ?? null;
           return (
             <div key={s.id} className="rounded-xl border p-4">

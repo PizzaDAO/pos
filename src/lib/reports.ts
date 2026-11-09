@@ -9,12 +9,16 @@
 import type { Order, OrderChannel, Payment } from "@/lib/db";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
 import { liveTenders, tipRefundedCents } from "@/lib/payments/refund-state";
+import { providerLabel } from "@/lib/marketplace/types";
+import { businessDay, isValidTimezone } from "@/lib/owner-reports";
+import { captureError } from "@/lib/observability";
 import type {
   DateRange,
   PaymentMixSlice,
   SalesBucket,
   SalesReport,
 } from "@/lib/db/backoffice-types";
+import { buildStoredValueReport, isStoredValueOrder } from "@/lib/giftcards/report";
 
 /** Human label for an order channel. */
 export function channelLabel(channel: OrderChannel): string {
@@ -25,9 +29,26 @@ export function channelLabel(channel: OrderChannel): string {
       return "Online pickup";
     case "online_delivery":
       return "Online delivery";
+    case "marketplace":
+      return "Marketplace";
     default:
       return channel;
   }
+}
+
+/**
+ * Report bucket for an order's channel. Marketplace orders split by provider
+ * (`marketplace:doordash` ...) so the owner sees DoorDash vs Uber Eats vs Grubhub.
+ */
+export function channelBucket(order: Order): { key: string; label: string } {
+  const provider = order.fulfillment?.marketplace?.provider;
+  if (order.channel === "marketplace" && provider) {
+    return {
+      key: `marketplace:${provider}`,
+      label: `${providerLabel(provider)} (marketplace)`,
+    };
+  }
+  return { key: order.channel, label: channelLabel(order.channel) };
 }
 
 /** Human label for a payment rail (incl. cash). */
@@ -45,6 +66,10 @@ export function railLabel(rail: string): string {
       return "Crypto (onchain USDC)";
     case "crypto_coinbase":
       return "Crypto (Coinbase)";
+    case "gift_card":
+      return "Gift card";
+    case "store_credit":
+      return "Store credit";
     default:
       return rail;
   }
@@ -82,21 +107,66 @@ export function railFamily(rail: string): "cash" | "card" | "crypto" | "other" {
   }
   if (rail === "cash") return "cash";
   if (rail.startsWith("crypto")) return "crypto";
+  if (rail === "gift_card" || rail === "store_credit") return "other";
   return "card";
 }
 
-/** ISO timestamp → "yyyy-mm-dd" (UTC; the mock seed uses UTC timestamps). */
+/** ISO timestamp → "yyyy-mm-dd" (UTC calendar date; no location known). */
 export function isoDate(iso: string): string {
   return iso.slice(0, 10);
 }
 
-/** Whether an order's created date falls within an inclusive date range. */
-export function inRange(order: Order, range: DateRange): boolean {
-  const day = isoDate(order.created_at);
+/** What a location's business day is measured in. */
+export interface LocationClock {
+  timezone?: string | null;
+  business_day_cutoff_minutes?: number | null;
+}
+
+/**
+ * Business date ("yyyy-mm-dd") of an instant at a location: the LOCAL date in
+ * its time zone, less its business-day cutoff. The same rule as the owner
+ * reports (lib/owner-reports `businessDay`, and the SQL bundle) and, at cutoff
+ * 0, core's `businessDate(at, tz)`. UTC when the location is unknown, or when
+ * its time zone is invalid (reported once per zone, never a 500).
+ */
+export function locationBusinessDate(
+  iso: string,
+  loc?: LocationClock | null,
+): string {
+  if (!loc?.timezone) return isoDate(iso);
+  let tz = loc.timezone;
+  if (!isValidTimezone(tz)) {
+    if (!reportedBadZones.has(tz)) {
+      reportedBadZones.add(tz);
+      captureError(new Error("invalid location timezone"), {
+        scope: "business-date",
+        timezone: tz,
+      });
+    }
+    tz = "UTC";
+  }
+  const cutoff = Number(loc.business_day_cutoff_minutes ?? 0);
+  return businessDay(iso, tz, Number.isFinite(cutoff) ? cutoff : 0).date;
+}
+
+const reportedBadZones = new Set<string>();
+
+/**
+ * Whether an order's business date falls within an inclusive date range.
+ * `dayOf` gives the order's business date (default: UTC calendar date).
+ */
+export function inRange(
+  order: Order,
+  range: DateRange,
+  dayOf: (order: Order) => string = (o) => isoDate(o.created_at),
+): boolean {
+  const day = dayOf(order);
   if (range.from && day < range.from) return false;
   if (range.to && day > range.to) return false;
   return true;
 }
+
+const inRangeBy = inRange;
 
 /** Gross (non-voided line totals) for an order. */
 export function orderGrossCents(order: Order): number {
@@ -139,6 +209,11 @@ export interface BuildReportInput {
   categoryOf: (itemId: string) => { id: string; name: string } | null;
   /** Resolve a location id → display name (for the byLocation slice). */
   locationName: (locationId: string) => string;
+  /**
+   * Resolve a location id → its time zone + cutoff, so orders are bucketed by
+   * the location's business date. Omitted: UTC calendar dates.
+   */
+  locationClock?: (locationId: string) => LocationClock | null | undefined;
 }
 
 /**
@@ -150,9 +225,20 @@ export interface BuildReportInput {
  * failed/canceled.
  */
 export function buildSalesReport(input: BuildReportInput): SalesReport {
-  const { payments, range } = input;
+  const { payments } = input;
+  const dayOf = (o: Order) =>
+    locationBusinessDate(o.created_at, input.locationClock?.(o.location_id));
+  const inRange = (o: Order, r: DateRange) => inRangeBy(o, r, dayOf);
+  const range = input.range;
   // Unpaid online checkouts (awaiting_payment / abandoned) are not sales.
-  const orders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
+  const allOrders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
+  // Gift card sales are a liability, not revenue (no tax): summarized apart.
+  const orders = allOrders.filter((o) => !isStoredValueOrder(o));
+  const storedValue = buildStoredValueReport(
+    allOrders.filter((o) => inRange(o, range)),
+    payments,
+    (p) => railFamily(mixKey(p)),
+  );
 
   const byDay = new Map<string, SalesBucket>();
   const byItem = new Map<string, SalesBucket>();
@@ -220,11 +306,12 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     orderFeesCents += order.totals.fees_cents ?? 0;
     tipCents += order.totals.tip_cents;
 
-    pushBucket(byDay, isoDate(order.created_at), isoDate(order.created_at), gross, 1);
+    pushBucket(byDay, dayOf(order), dayOf(order), gross, 1);
+    const bucket = channelBucket(order);
     pushBucket(
       byChannel,
-      order.channel,
-      channelLabel(order.channel),
+      bucket.key,
+      bucket.label,
       gross,
       1,
       order.totals.fees_cents ?? 0,
@@ -324,5 +411,6 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     paymentMix: [...mixMap.values()].sort(
       (a, b) => b.amount_cents - a.amount_cents,
     ),
+    stored_value: storedValue,
   };
 }

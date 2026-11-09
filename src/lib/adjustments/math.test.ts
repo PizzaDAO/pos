@@ -217,9 +217,11 @@ describe("planRefundAllocation", () => {
     expect(planRefundAllocation([partly], 0, 1)).toBeNull();
   });
 
-  it("legacy rows (no tip_refunded_cents) count refunds off the tip first", () => {
+  it("legacy rows (no tip_refunded_cents) count refunds as base first, tip last", () => {
     const legacy = pay({ ...card, refunded_cents: 400 });
-    expect(refundableTotals([legacy])).toEqual({ baseCents: 1400, tipCents: 0 });
+    expect(refundableTotals([legacy])).toEqual({ baseCents: 1100, tipCents: 300 });
+    const beyond = pay({ ...card, refunded_cents: 1600 });
+    expect(refundableTotals([beyond])).toEqual({ baseCents: 0, tipCents: 200 });
   });
 
   it("honours onlyPaymentId / preferPaymentId and skips external, failed and refunded tenders", () => {

@@ -66,10 +66,10 @@ begin
   select count(*) into n from public.core_outbox where event_type = 'tip.recorded' and subject_id = p1b;
   if n <> 1 then raise exception 'INSERT as captured emitted % tip.recorded', n; end if;
 
-  -- ---- refunds come off the tip first ------------------------------------
-  update public.payments set refunded_cents = 100 where id = p1;           -- tip part 100
-  update public.payments set refunded_cents = 300 where id = p1;           -- cum 300
-  update public.payments set refunded_cents = 800 where id = p1;           -- into the base: no tip part
+  -- ---- a raw refund write: base first, only beyond the base is tip ----------
+  update public.payments set refunded_cents = 800 where id = p1;           -- inside the base: no tip part
+  update public.payments set refunded_cents = 1100 where id = p1;          -- base done + tip part 100
+  update public.payments set refunded_cents = 1300 where id = p1;          -- cum 300
   select count(*) into n from public.core_outbox where event_type = 'tip.adjusted' and subject_id = p1;
   if n <> 2 then raise exception 'expected 2 tip.adjusted (c100, c300), got %', n; end if;
   if not exists (select 1 from public.core_outbox where event_type = 'tip.adjusted'
@@ -80,7 +80,7 @@ begin
                   and row_snapshot ->> 'fact_id' = 'tipadj_' || p1::text || '_c300') then
     raise exception 'missing c300';
   end if;
-  update public.payments set refunded_cents = 50 where id = p1b;
+  update public.payments set refunded_cents = 550 where id = p1b;          -- base 500 + tip 50
   if not exists (select 1 from public.core_outbox where event_type = 'tip.adjusted'
                   and row_snapshot ->> 'fact_id' = 'tipadj_' || p1b::text || '_c50') then
     raise exception 'missing p1b c50';
@@ -151,15 +151,15 @@ begin
     insert into public.orders (id, tenant_id, location_id, status, currency, totals, order_number, core_announced)
     values (o7, t, loc, 'awaiting_payment', 'USD', '{"total_cents":3000,"tip_cents":0}'::jsonb, 'T3-7', false),
            (o8, t, loc, 'awaiting_payment', 'USD', '{"total_cents":3000,"tip_cents":400}'::jsonb, 'T3-8', false);
-    -- tipped tender: 120 recorded as an entry, 80 more unrecorded (legacy remainder first)
+    -- tipped tender: 120 recorded as an entry, 1080 more unrecorded (legacy remainder first)
     insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated, refunded_cents, refunds)
-    values (q1, o7, t, loc, 'stripe_online', 'captured', 1000, 150, 'USD', false, 200,
+    values (q1, o7, t, loc, 'stripe_online', 'captured', 1000, 150, 'USD', false, 1200,
             '[{"id":"r1","amount_cents":120,"at":"2026-06-04T20:00:00Z"}]'::jsonb);
     -- online tip, fully refunded
     insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated, refunded_cents)
     values (q2, o8, t, loc, 'stripe_online', 'refunded', 1000, 0, 'USD', false, 1000);
     update public.orders set status = 'paid' where id in (o7, o8);
-    -- remainder 80 first (cum 80), then the 120 entry (cum 150 = capped at the tip)
+    -- remainder 1080 first (base 1000, tip cum 80), then the 120 entry (cum 150 = capped at the tip)
     if (select array_agg(row_snapshot ->> 'fact_id' order by sequence) from public.core_outbox
          where subject_id = q1 and event_type like 'tip.%')
        is distinct from array['tip_' || q1::text, 'tipadj_' || q1::text || '_c80', 'tipadj_' || q1::text || '_c150'] then

@@ -1,5 +1,6 @@
 -- ============================================================================
--- Migration: refunds_voids_comps
+-- Migration: refunds_voids_comps (20261113001000: after 000800 staff admin gate
+-- and 000900-000940 stored value; nothing here depends on their order)
 --
 -- Partial refunds (by amount or by item, across tenders), voids, comps and
 -- discounts at the till, with reasons, approvals and an audit ledger.
@@ -50,9 +51,13 @@ commit;
 begin;
 set local lock_timeout = '3s';
 
--- ---- 2. tip part of refunds -------------------------------------------------
+-- ---- 2. tip part of refunds; room held by pending refunds -------------------
 alter table public.payments
-  add column if not exists tip_refunded_cents integer not null default 0;
+  add column if not exists tip_refunded_cents integer not null default 0,
+  -- Room held by PENDING refunds (card / stored value: reserved before the
+  -- provider is called). Counts against the caps; NOT refunded yet: status,
+  -- refunded_cents and every report move only when the refund is confirmed.
+  add column if not exists refund_reserved_cents integer not null default 0;
 
 -- Backfill: tip LAST (only what was refunded beyond the base is tip), the rule
 -- the owner reports already in production read refunds with.
@@ -63,22 +68,29 @@ update public.payments
 alter table public.payments drop constraint if exists payments_tip_refunded_bounds;
 alter table public.payments add constraint payments_tip_refunded_bounds
   check (tip_refunded_cents >= 0 and tip_refunded_cents <= refunded_cents);
+alter table public.payments drop constraint if exists payments_refund_reserved_bounds;
+alter table public.payments add constraint payments_refund_reserved_bounds
+  check (refund_reserved_cents >= 0);
 
 -- Any writer that moves refunded_cents WITHOUT going through the reservation
--- functions below (which set the tip part explicitly and say so with the
--- transaction-local flag pos.refund_split) gets the legacy rule: the tip part
--- moves tip first. Keeps tip_refunded_cents consistent for every writer.
+-- functions below (which set the split explicitly and say so with the
+-- transaction-local flag pos.refund_split) gets the same legacy rule as the
+-- backfill: base first, only what is beyond the base is tip ("tip last").
 create or replace function public.payments_tip_refund_split()
 returns trigger
 language plpgsql
 as $$
+declare
+  v_base_left integer;
 begin
   if new.refunded_cents is distinct from old.refunded_cents
      and coalesce(current_setting('pos.refund_split', true), '') <> 'explicit' then
     if new.refunded_cents > old.refunded_cents then
-      new.tip_refunded_cents := old.tip_refunded_cents + least(
-        new.refunded_cents - old.refunded_cents,
-        greatest(0, new.tip_cents - old.tip_refunded_cents));
+      v_base_left := greatest(0, new.amount_cents - (old.refunded_cents - old.tip_refunded_cents));
+      new.tip_refunded_cents := least(
+        new.tip_cents,
+        old.tip_refunded_cents
+          + greatest(0, (new.refunded_cents - old.refunded_cents) - v_base_left));
     else
       new.tip_refunded_cents := least(old.tip_refunded_cents, new.refunded_cents);
     end if;
@@ -92,11 +104,31 @@ create trigger payments_tip_refund_split
   before update of refunded_cents on public.payments
   for each row execute function public.payments_tip_refund_split();
 
+-- The tip part of a tender's PENDING refunds (from refunds[]).
+create or replace function public.payment_pending_refund_tip(p_refunds jsonb)
+returns integer
+language sql
+immutable
+as $$
+  select coalesce(sum(case when (e ->> 'tip_cents') ~ '^[0-9]{1,9}$'
+                           then (e ->> 'tip_cents')::integer else 0 end), 0)::integer
+    from jsonb_array_elements(case when jsonb_typeof(p_refunds) = 'array'
+                                   then p_refunds else '[]'::jsonb end) e
+   where e ->> 'state' = 'pending';
+$$;
+
 -- ---- 3. refund reservation with an explicit tip part ------------------------
 drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text);
 drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text, integer);
+drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean);
 drop function if exists public.release_payment_refund(uuid, integer, text);
+drop function if exists public.release_payment_refund(uuid, integer, text, boolean);
 
+-- Reserve a refund under the row lock. Caps (pending reservations included):
+-- base part <= base left, tip part <= tip left, total <= amount + tip.
+-- p_pending: card / stored value -- only HOLD the room (refund_reserved_cents);
+-- confirm_payment_refund turns it into a refund. Otherwise it is refunded now
+-- (refunded_cents + tip part; status `refunded` once fully refunded).
 create or replace function public.reserve_payment_refund(
   p_payment_id uuid,
   p_amount integer,
@@ -104,7 +136,6 @@ create or replace function public.reserve_payment_refund(
   p_processor_ref text default null,
   p_reason text default null,
   p_tip_amount integer default null,
-  -- Card refunds: reserved BEFORE Stripe is called, confirmed after.
   p_pending boolean default false
 ) returns jsonb
 language plpgsql
@@ -113,6 +144,10 @@ declare
   r public.payments;
   v_entry text := gen_random_uuid()::text;
   v_tip integer;
+  v_pending_tip integer;
+  v_base_left integer;
+  v_tip_left integer;
+  v_pend boolean := coalesce(p_pending, false);
 begin
   select * into r from public.payments where id = p_payment_id for update;
   if not found then
@@ -121,21 +156,25 @@ begin
   if p_refund_id is not null and p_refund_id = any (r.refund_ids) then
     return jsonb_build_object('outcome', 'duplicate', 'payment', to_jsonb(r));
   end if;
-  -- Explicit tip part, else the legacy rule (the refund comes off the tip first).
-  v_tip := coalesce(p_tip_amount,
-                    least(p_amount, greatest(0, r.tip_cents - r.tip_refunded_cents)));
+  v_pending_tip := public.payment_pending_refund_tip(r.refunds);
+  v_base_left := greatest(0, r.amount_cents - (r.refunded_cents - r.tip_refunded_cents)
+                             - (r.refund_reserved_cents - v_pending_tip));
+  v_tip_left := greatest(0, r.tip_cents - r.tip_refunded_cents - v_pending_tip);
+  -- Explicit tip part, else the legacy rule: base first, the rest off the tip.
+  v_tip := coalesce(p_tip_amount, greatest(0, p_amount - v_base_left));
   if p_amount is null or p_amount <= 0 or v_tip < 0 or v_tip > p_amount
      or r.status not in ('captured', 'authorized')
-     or r.tip_refunded_cents + v_tip > r.tip_cents
-     or (r.refunded_cents - r.tip_refunded_cents) + (p_amount - v_tip) > r.amount_cents
-     or r.refunded_cents + p_amount > r.amount_cents + r.tip_cents then
+     or v_tip > v_tip_left
+     or p_amount - v_tip > v_base_left
+     or r.refunded_cents + r.refund_reserved_cents + p_amount > r.amount_cents + r.tip_cents then
     return jsonb_build_object('outcome', 'exceeds', 'payment', to_jsonb(r));
   end if;
 
   perform set_config('pos.refund_split', 'explicit', true);
   update public.payments p
-     set refunded_cents = p.refunded_cents + p_amount,
-         tip_refunded_cents = p.tip_refunded_cents + v_tip,
+     set refunded_cents = p.refunded_cents + case when v_pend then 0 else p_amount end,
+         tip_refunded_cents = p.tip_refunded_cents + case when v_pend then 0 else v_tip end,
+         refund_reserved_cents = p.refund_reserved_cents + case when v_pend then p_amount else 0 end,
          refund_ids = case
            when p_refund_id is null then p.refund_ids
            else p.refund_ids || p_refund_id
@@ -148,11 +187,11 @@ begin
            'processor_ref', p_processor_ref,
            'reason', p_reason,
            'request_id', p_refund_id,
-           'state', case when coalesce(p_pending, false) then 'pending' else 'succeeded' end,
+           'state', case when v_pend then 'pending' else 'succeeded' end,
            'status_before', r.status::text
          )),
          status = case
-           when p.refunded_cents + p_amount >= p.amount_cents + p.tip_cents
+           when not v_pend and p.refunded_cents + p_amount >= p.amount_cents + p.tip_cents
              then 'refunded'::public.payment_status
            else p.status
          end,
@@ -165,7 +204,9 @@ begin
 end;
 $$;
 
--- A pending card refund that Stripe accepted: mark it succeeded + its re_ id.
+-- The provider accepted a PENDING refund: move it from refund_reserved_cents
+-- into refunded_cents (+ its tip part), flip the status when fully refunded and
+-- record the provider id. Idempotent (a confirmed entry only gets its ref).
 create or replace function public.confirm_payment_refund(
   p_payment_id uuid,
   p_refund_id text,
@@ -176,18 +217,27 @@ as $$
 declare
   r public.payments;
   v_idx bigint;
+  v_entry jsonb;
+  v_amount integer;
+  v_tip integer;
+  v_was_pending boolean;
 begin
   select * into r from public.payments where id = p_payment_id for update;
   if not found then
     return null;
   end if;
-  select t.o into v_idx
+  select t.o, t.e into v_idx, v_entry
     from jsonb_array_elements(r.refunds) with ordinality as t(e, o)
    where t.e ->> 'request_id' = p_refund_id
    limit 1;
   if v_idx is null then
     return null;
   end if;
+  v_was_pending := v_entry ->> 'state' = 'pending';
+  v_amount := (v_entry ->> 'amount_cents')::integer;
+  v_tip := coalesce((v_entry ->> 'tip_cents')::integer, 0);
+
+  perform set_config('pos.refund_split', 'explicit', true);
   update public.payments p
      set refunds = (
            select jsonb_agg(
@@ -198,6 +248,17 @@ begin
                          else t.e end
                     order by t.o)
              from jsonb_array_elements(p.refunds) with ordinality as t(e, o)),
+         refunded_cents = p.refunded_cents + case when v_was_pending then v_amount else 0 end,
+         tip_refunded_cents = p.tip_refunded_cents + case when v_was_pending then v_tip else 0 end,
+         refund_reserved_cents = greatest(0,
+           p.refund_reserved_cents - case when v_was_pending then v_amount else 0 end),
+         status = case
+           when v_was_pending
+                and p.status in ('captured', 'authorized')
+                and p.refunded_cents + v_amount >= p.amount_cents + p.tip_cents
+             then 'refunded'::public.payment_status
+           else p.status
+         end,
          updated_at = now()
    where p.id = p_payment_id
   returning * into r;
@@ -205,10 +266,11 @@ begin
 end;
 $$;
 
--- Undo a reservation (the rail call failed, or Stripe later failed the refund):
--- drops the refunds[] entry reserved under p_refund_id (required), gives its
--- base and tip part back and restores the tender status it had before.
--- p_tombstone keeps p_refund_id in refund_ids so the failed refund's
+-- Undo a reservation (the rail call failed, or the provider later failed the
+-- refund): drops the refunds[] entry reserved under p_refund_id (required). A
+-- PENDING one only gives its held room back; a confirmed one gives its base
+-- and tip part back and restores the tender status it had before.
+-- p_tombstone keeps p_refund_id in refund_ids so a failed provider refund's
 -- idempotency key is never reused (Stripe would replay the failed refund).
 create or replace function public.release_payment_refund(
   p_payment_id uuid,
@@ -223,6 +285,7 @@ declare
   v_entry jsonb;
   v_amount integer;
   v_tip integer;
+  v_pending boolean;
   r public.payments;
 begin
   if p_refund_id is null then
@@ -242,6 +305,7 @@ begin
     return;
   end if;
   v_amount := coalesce((v_entry ->> 'amount_cents')::integer, p_amount);
+  v_pending := v_entry ->> 'state' = 'pending';
   v_tip := case
     when (v_entry ->> 'tip_cents') ~ '^[0-9]{1,9}$' then (v_entry ->> 'tip_cents')::integer
     else least(v_amount, r.tip_refunded_cents)
@@ -249,10 +313,14 @@ begin
 
   perform set_config('pos.refund_split', 'explicit', true);
   update public.payments p
-     set refunded_cents = greatest(0, p.refunded_cents - v_amount),
-         tip_refunded_cents = greatest(0, least(
-           p.tip_refunded_cents - v_tip,
-           greatest(0, p.refunded_cents - v_amount))),
+     set refunded_cents = case when v_pending then p.refunded_cents
+                               else greatest(0, p.refunded_cents - v_amount) end,
+         tip_refunded_cents = case when v_pending then p.tip_refunded_cents
+                                   else greatest(0, least(p.tip_refunded_cents - v_tip,
+                                                          greatest(0, p.refunded_cents - v_amount))) end,
+         refund_reserved_cents = case when v_pending
+                                      then greatest(0, p.refund_reserved_cents - v_amount)
+                                      else p.refund_reserved_cents end,
          refund_ids = case
            when coalesce(p_tombstone, false) then p.refund_ids
            else array_remove(p.refund_ids, p_refund_id)
@@ -263,7 +331,7 @@ begin
             where t.o <> v_idx
          ), '[]'::jsonb),
          status = case
-           when p.status = 'refunded' then
+           when not v_pending and p.status = 'refunded' then
              case when v_entry ->> 'status_before' = 'authorized'
                   then 'authorized'::public.payment_status
                   else 'captured'::public.payment_status end
@@ -276,6 +344,7 @@ $$;
 
 revoke all on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean)
   from public, anon, authenticated;
+revoke all on function public.payment_pending_refund_tip(jsonb) from public, anon, authenticated;
 revoke all on function public.confirm_payment_refund(uuid, text, text)
   from public, anon, authenticated;
 revoke all on function public.release_payment_refund(uuid, integer, text, boolean)
@@ -313,6 +382,7 @@ create index if not exists order_adjustments_location_idx
   on public.order_adjustments (tenant_id, location_id, created_at desc);
 
 alter table public.order_adjustments enable row level security;
+alter table public.order_adjustments force row level security;
 drop policy if exists order_adjustments_select on public.order_adjustments;
 create policy order_adjustments_select on public.order_adjustments
   for select using (public.is_platform_admin() or public.is_tenant_member(tenant_id));
@@ -542,7 +612,8 @@ begin
   -- line void (a whole-order void is still allowed).
   if not v_void_order and exists (
        select 1 from public.payments p
-        where p.order_id = v_order.id and p.refunded_cents > 0) then
+        where p.order_id = v_order.id
+          and (p.refunded_cents > 0 or p.refund_reserved_cents > 0)) then
     return jsonb_build_object('outcome', 'invalid_state', 'reason', 'refund_exists');
   end if;
 
@@ -649,6 +720,7 @@ begin
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean)
       to service_role;
+    grant execute on function public.payment_pending_refund_tip(jsonb) to service_role;
     grant execute on function public.confirm_payment_refund(uuid, text, text) to service_role;
     grant execute on function public.release_payment_refund(uuid, integer, text, boolean) to service_role;
     grant execute on function public.reopen_order_refund(uuid, text) to service_role;
@@ -681,12 +753,13 @@ declare
   v_part bigint;
   v_prev bigint;
   v_cum bigint;
+  v_run bigint;
 begin
   begin
     select public.core_order_tip_cents(o.totals) into v_tip
       from public.orders o where o.id = p_order;
     for r in
-      select p.id, p.tenant_id, p.location_id, p.tip_cents, p.refunded_cents, p.refunds
+      select p.id, p.tenant_id, p.location_id, p.amount_cents, p.tip_cents, p.refunded_cents, p.refunds
         from public.payments p
        where p.order_id = p_order and p.status::text in ('captured', 'refunded')
        order by p.created_at, p.id
@@ -702,17 +775,21 @@ begin
         -- Refunds that happened before the hub saw the order: one tip.adjusted per
         -- step that moved the tip, with the cumulative ids tips.ts derives
         -- (tipRefundSteps): an entry's own tip_cents, else (older entries, and an
-        -- unrecorded remainder, which comes first) tip first.
+        -- unrecorded remainder, which comes first) base first, tip last. Pending
+        -- (unconfirmed) reservations are not refunds.
         if r.refunded_cents > 0 then
           v_known := coalesce((
             select sum(case when (x ->> 'amount_cents') ~ '^[0-9]{1,12}$'
                             then (x ->> 'amount_cents')::bigint else 0 end)
               from jsonb_array_elements(
-                     case when jsonb_typeof(r.refunds) = 'array' then r.refunds else '[]'::jsonb end) x), 0);
+                     case when jsonb_typeof(r.refunds) = 'array' then r.refunds else '[]'::jsonb end) x
+             where coalesce(x ->> 'state', '') <> 'pending'), 0);
           v_cum := 0;
           v_prev := 0;
+          v_run := 0;
           if r.refunded_cents > v_known then
-            v_cum := least(r.refunded_cents - v_known, r.tip_cents);
+            v_run := r.refunded_cents - v_known;
+            v_cum := least(greatest(v_run - r.amount_cents, 0), r.tip_cents);
             if v_cum > v_prev then
               perform public.core_emit(r.tenant_id, r.location_id, 'tip.adjusted',
                 'payment', r.id, null, null,
@@ -725,14 +802,17 @@ begin
             select t.x from jsonb_array_elements(
               case when jsonb_typeof(r.refunds) = 'array' then r.refunds else '[]'::jsonb end)
               with ordinality as t(x, n)
+             where coalesce(t.x ->> 'state', '') <> 'pending'
              order by t.n
           loop
             v_amt := case when (e ->> 'amount_cents') ~ '^[0-9]{1,12}$'
                           then (e ->> 'amount_cents')::bigint else 0 end;
+            v_run := v_run + v_amt;
             v_part := case
               when (e ->> 'tip_cents') ~ '^[0-9]{1,12}$'
                 then least((e ->> 'tip_cents')::bigint, greatest(0, r.tip_cents - v_cum))
-              else least(v_amt, greatest(0, r.tip_cents - v_cum))
+              else least(greatest(0, r.tip_cents - v_cum),
+                         greatest(0, v_run - r.amount_cents - v_cum))
             end;
             v_cum := v_cum + greatest(0, v_part);
             if v_cum > v_prev then

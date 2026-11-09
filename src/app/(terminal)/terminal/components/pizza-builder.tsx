@@ -1,7 +1,8 @@
 /**
  * Pizza builder — size, crust, sauce, toppings (with half-and-half), quantity,
  * and special instructions, with a live line-price preview. Used both for adding
- * a new line and editing an existing one.
+ * a new line and editing an existing one. Sizes and options 86'd at this
+ * location show "Sold out" and can't be picked.
  */
 "use client";
 
@@ -12,6 +13,7 @@ import type { HalfPlacement, MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { soldOutSets, type SoldOut } from "@/lib/menu-availability";
 import { formatMoney, withLinePricing } from "@/lib/pricing";
 import {
   buildLine,
@@ -29,7 +31,11 @@ export interface PizzaBuilderProps {
   editing?: OrderItem;
   onCancel: () => void;
   onConfirm: (line: OrderItem) => void;
+  /** What is 86'd at this location. */
+  soldOut?: SoldOut;
 }
+
+const NONE_SOLD_OUT = soldOutSets(null);
 
 const PLACEMENTS: { value: HalfPlacement; label: string }[] = [
   { value: "left", label: "L" },
@@ -43,6 +49,7 @@ export function PizzaBuilder({
   editing,
   onCancel,
   onConfirm,
+  soldOut = NONE_SOLD_OUT,
 }: PizzaBuilderProps) {
   const singleGroups = item.modifierGroups.filter((g) => !g.supports_half);
   const halfGroups = item.modifierGroups.filter((g) => g.supports_half);
@@ -60,15 +67,19 @@ export function PizzaBuilder({
         else single[m.group_id] = m.modifier_id;
       }
     } else {
-      // Default required single-select groups to their first option.
+      // Default required single-select groups to their first in-stock option.
       for (const g of singleGroups) {
-        if (g.min_select >= 1 && g.modifiers[0]) {
-          single[g.id] = g.modifiers[0].id;
+        const first = g.modifiers.find((m) => !soldOut.modifiers.has(m.id));
+        if (g.min_select >= 1 && first) {
+          single[g.id] = first.id;
         }
       }
     }
 
-    const sizeId = editing?.size_id ?? item.sizes[0]?.id ?? null;
+    const sizeId =
+      editing?.size_id ??
+      item.sizes.find((s) => !soldOut.sizes.has(s.id))?.id ??
+      null;
     return {
       single,
       toppings,
@@ -139,8 +150,21 @@ export function PizzaBuilder({
       .map((g) => `${g.name} (at least ${g.min_select})`),
   ];
   const needsSize = item.sizes.length > 0 && !sizeId;
+  // A sold-out size/option (e.g. on a line being edited) must be swapped out:
+  // the server would refuse the order at Place order.
+  const soldOutPicked = [
+    ...(size && soldOut.sizes.has(size.id) ? [size.name] : []),
+    ...selections
+      .filter((sel) => soldOut.modifiers.has(sel.modifier.id))
+      .map((sel) => sel.modifier.name),
+  ];
+  const itemSoldOut = soldOut.items.has(item.id);
   const valid =
-    missingRequired.length === 0 && !needsSize && overMax.length === 0;
+    missingRequired.length === 0 &&
+    !needsSize &&
+    overMax.length === 0 &&
+    soldOutPicked.length === 0 &&
+    !itemSoldOut;
 
   function setToppingPlacement(
     modId: string,
@@ -199,24 +223,28 @@ export function PizzaBuilder({
                 Size
               </h3>
               <div className="grid grid-cols-3 gap-2">
-                {item.sizes.map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    onClick={() => setSizeId(s.id)}
-                    className={cn(
-                      "flex flex-col items-center rounded-lg border p-3 text-sm transition-colors",
-                      sizeId === s.id
-                        ? "border-primary bg-primary/10 font-semibold"
-                        : "hover:bg-accent",
-                    )}
-                  >
-                    <span>{s.name}</span>
-                    <span className="text-muted-foreground">
-                      {formatMoney(s.price_cents, currency)}
-                    </span>
-                  </button>
-                ))}
+                {item.sizes.map((s) => {
+                  const out = soldOut.sizes.has(s.id);
+                  return (
+                    <button
+                      key={s.id}
+                      type="button"
+                      disabled={out}
+                      onClick={() => setSizeId(s.id)}
+                      className={cn(
+                        "flex flex-col items-center rounded-lg border p-3 text-sm transition-colors disabled:cursor-not-allowed disabled:border-dashed disabled:bg-muted",
+                        sizeId === s.id
+                          ? "border-primary bg-primary/10 font-semibold"
+                          : "hover:bg-accent",
+                      )}
+                    >
+                      <span className={cn(out && "line-through")}>{s.name}</span>
+                      <span className="text-muted-foreground">
+                        {out ? "Sold out" : formatMoney(s.price_cents, currency)}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             </section>
           )}
@@ -231,28 +259,36 @@ export function PizzaBuilder({
                 )}
               </h3>
               <div className="grid grid-cols-3 gap-2">
-                {g.modifiers.map((m) => (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() =>
-                      setSingle((prev) => ({ ...prev, [g.id]: m.id }))
-                    }
-                    className={cn(
-                      "flex flex-col items-center rounded-lg border p-3 text-sm transition-colors",
-                      single[g.id] === m.id
-                        ? "border-primary bg-primary/10 font-semibold"
-                        : "hover:bg-accent",
-                    )}
-                  >
-                    <span>{m.name}</span>
-                    {m.price_cents > 0 && (
-                      <span className="text-muted-foreground">
-                        +{formatMoney(m.price_cents, currency)}
-                      </span>
-                    )}
-                  </button>
-                ))}
+                {g.modifiers.map((m) => {
+                  const out = soldOut.modifiers.has(m.id);
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      disabled={out}
+                      onClick={() =>
+                        setSingle((prev) => ({ ...prev, [g.id]: m.id }))
+                      }
+                      className={cn(
+                        "flex flex-col items-center rounded-lg border p-3 text-sm transition-colors disabled:cursor-not-allowed disabled:border-dashed disabled:bg-muted",
+                        single[g.id] === m.id
+                          ? "border-primary bg-primary/10 font-semibold"
+                          : "hover:bg-accent",
+                      )}
+                    >
+                      <span className={cn(out && "line-through")}>{m.name}</span>
+                      {out ? (
+                        <span className="text-muted-foreground">Sold out</span>
+                      ) : (
+                        m.price_cents > 0 && (
+                          <span className="text-muted-foreground">
+                            +{formatMoney(m.price_cents, currency)}
+                          </span>
+                        )
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             </section>
           ))}
@@ -272,6 +308,7 @@ export function PizzaBuilder({
               <div className="space-y-2">
                 {g.modifiers.map((m) => {
                   const placement = toppings[m.id];
+                  const out = soldOut.modifiers.has(m.id);
                   const atMax = !placement && pickedIn(g) >= g.max_select;
                   return (
                     <div
@@ -279,14 +316,25 @@ export function PizzaBuilder({
                       className="flex items-center justify-between gap-2 rounded-lg border p-2"
                     >
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-medium">
+                        <div
+                          className={cn(
+                            "truncate text-sm font-medium",
+                            out && "text-muted-foreground line-through",
+                          )}
+                        >
                           {m.name}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          whole +{formatMoney(m.price_cents, currency)} · half +
-                          {formatMoney(
-                            placementPriceCents(m.price_cents, "left"),
-                            currency,
+                          {out ? (
+                            <span className="font-semibold uppercase">Sold out</span>
+                          ) : (
+                            <>
+                              whole +{formatMoney(m.price_cents, currency)} · half +
+                              {formatMoney(
+                                placementPriceCents(m.price_cents, "left"),
+                                currency,
+                              )}
+                            </>
                           )}
                         </div>
                       </div>
@@ -296,7 +344,8 @@ export function PizzaBuilder({
                             key={p.value}
                             type="button"
                             aria-pressed={placement === p.value}
-                            disabled={atMax}
+                            // A sold-out topping can only be taken OFF (an edited line).
+                            disabled={atMax || (out && placement !== p.value)}
                             onClick={() =>
                               setToppingPlacement(
                                 m.id,
@@ -374,6 +423,13 @@ export function PizzaBuilder({
           {missingRequired.length > 0 && (
             <p className="mb-2 text-xs text-destructive">
               Select: {missingRequired.join(", ")}
+            </p>
+          )}
+          {(itemSoldOut || soldOutPicked.length > 0) && (
+            <p role="alert" className="mb-2 text-sm font-medium text-destructive">
+              {itemSoldOut
+                ? `${item.name} is sold out here.`
+                : `Sold out: ${soldOutPicked.join(", ")}. Pick something else.`}
             </p>
           )}
           <Button

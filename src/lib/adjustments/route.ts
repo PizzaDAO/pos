@@ -80,6 +80,7 @@ export async function prepareAction(
         actor,
         authorize: (kind, amountCents, opts) =>
           authorizeAdjustment({
+            request,
             tenantId,
             locationId,
             actor,

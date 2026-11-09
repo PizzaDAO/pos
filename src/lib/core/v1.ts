@@ -25,6 +25,7 @@
  * mode or a positively identified Stripe TEST key only; live keys answer 501
  * unless the tenant is explicitly allow-listed.
  */
+import { scheduleAutoPrint } from "@/lib/printing/queue";
 import {
   AllergenPublishInputSchema,
   AvailabilityUpdateSchema,
@@ -126,7 +127,7 @@ import type {
   OrderCoreExt,
   OrderFeeLine,
 } from "@/lib/db";
-import { hashPin, verifyPin } from "@/lib/auth/pin";
+import { hashPin, matchStaffPin, verifyPin } from "@/lib/auth/pin";
 import { tenderFingerprint } from "@/lib/db/payment-types";
 import { netSettledBaseCents } from "./money";
 import {
@@ -707,6 +708,12 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
   "orders.cancel": async (ctx) => {
     await requireActiveTenant(ctx);
     const order = await ownedOrder(ctx, ctx.params.order_id!);
+    if (order.channel === "marketplace") {
+      // Reject / cancel go through the marketplace flow so the provider is told.
+      throw ProblemError.of("INVALID_TRANSITION", {
+        detail: "A marketplace order is accepted, rejected or cancelled through the marketplace.",
+      });
+    }
     const parsed = OrderCancelInputSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
     if (order.status === "voided") {
@@ -886,6 +893,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!res.ok && res.reason === "conflict" && res.order.status === "voided") {
       throw ProblemError.of("INVALID_TRANSITION", { detail: "Order was canceled." });
     }
+    if (res.ok) scheduleAutoPrint(res.order);
     // Released by hand after all: a still-open "stranded" flag is moot.
     const flag = order.fulfillment?.late_payment;
     if (res.ok && flag && flag.kind === "scheduled" && !flag.resolved) {
@@ -1274,16 +1282,28 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     }
     // A member with no PIN set costs the same scrypt as a wrong PIN (and can
     // never match: the dummy is a random secret, and the result is ANDed).
-    const ok =
+    const current =
       verifyPin(pin, staff.pin_hash ?? dummyPinHash()) && Boolean(staff.pin_hash);
-    if (!ok) throw mismatch();
+    // A replaced short PIN stays valid for a short grace (see rotateStaffPin).
+    const previous =
+      !current && matchStaffPin(pin, { ...staff, pin_hash: null }) === "previous";
+    if (!current && !previous) throw mismatch();
     await ctx.driver.clearPinAttempts(tenantId, staff.id);
+    if (current && staff.pin_previous_hash) {
+      await ctx.driver.clearPreviousPin(tenantId, staff.id);
+    }
 
     const email = staff.user_id
       ? ((await ctx.driver.getUserEmails([staff.user_id])).get(staff.user_id) ?? null)
       : null;
     return {
-      body: { staff: toContractStaff({ ...staff, pin_hash: undefined }, true, email) },
+      body: {
+        staff: toContractStaff(
+          { ...staff, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined },
+          true,
+          email,
+        ),
+      },
     };
   },
 
@@ -1292,6 +1312,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
    * checked role rank and location). POS re-checks the TENANT (and a
    * location-limited token's reach) and hashes with the till's scrypt. `null`
    * clears the PIN. One targeted update of `pin_hash`; the PIN is never logged.
+   * Every live till / back-office session of the member is revoked.
    */
   "staff.setPin": async (ctx) => {
     requireHubSigned(ctx);
@@ -1315,6 +1336,9 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!(await ctx.driver.setStaffPinHash(tenantId, staff.id, hash))) {
       throw notFound("Staff member");
     }
+    // Whoever is signed in on the old PIN (till switch-in or back-office
+    // unlock) is signed out with it.
+    await ctx.driver.revokeStaffSessionsForStaff(tenantId, staff.id);
     const member = (await loadStaffList(tenantId, ctx.driver)).find((s) => s.id === staff.id);
     if (!member) throw notFound("Staff member");
     return { body: member };
@@ -2115,6 +2139,14 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     taxExemptIn = input.tax_exempt || req.tax_exempt;
   }
 
+  // `marketplace` origin is reserved for the provider webhook ingest.
+  if (String(input.source.type) === "marketplace") {
+    throw ProblemError.of("VALIDATION_FAILED", {
+      detail: "source.type `marketplace` is reserved for provider webhook ingest.",
+      path: "source",
+    });
+  }
+
   // Discounts/comps are an owner/manager power in POS: callers need an explicit scope.
   if ((adjustmentsIn?.length ?? 0) > 0) {
     if (!hasLiteralScope(ctx.principal, "orders:discount")) {
@@ -2394,6 +2426,8 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     },
   };
   const order = await ctx.driver.createOrder(create);
+  // Held (draft) orders print when released; placed orders fire now.
+  scheduleAutoPrint(order);
   const tz = bundle.location.timezone;
   const body = await mapOrder(order, tz, ctx.driver);
   return { status: 201, body, headers: { location: `/api/v1/orders/${order.id}` } };
@@ -2588,6 +2622,11 @@ async function recordExternalTender(ctx: Ctx): Promise<Reply> {
 
   for (let attempt = 0; attempt < 4; attempt++) {
     const current = await ownedOrder(ctx, order.id);
+    if (current.channel === "marketplace") {
+      throw ProblemError.of("INVALID_TRANSITION", {
+        detail: "This order was paid on the marketplace; it cannot take a payment.",
+      });
+    }
     if (CLOSED_FOR_TENDERS.includes(current.status)) {
       throw ProblemError.of("INVALID_TRANSITION", {
         detail: `Order is ${current.status}; it can no longer take a payment.`,

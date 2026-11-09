@@ -19,7 +19,7 @@
  * No env vars are read; everything runs against the in-memory mock driver.
  */
 import { NextResponse } from "next/server";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import {
   getPosDriver,
   type CategoryInput,
@@ -35,7 +35,7 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId: searchParams.get("locationId"),
   });
   if (!auth.ok) return auth.res;
@@ -96,7 +96,7 @@ export async function POST(request: Request) {
     body.tenantId ??
     (typeof payload.tenant_id === "string" ? payload.tenant_id : undefined);
   if (!requestedTenant) return bad("tenant_id is required.");
-  const auth = await requireTenantAccess(requestedTenant, "admin");
+  const auth = await requireAdminAccess(request, requestedTenant);
   if (!auth.ok) return auth.res;
   const tenantId = auth.tenantId;
 

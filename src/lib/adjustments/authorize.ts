@@ -5,8 +5,8 @@
  * (see `effectiveTerminalRole`), else the device login's role when the tenant
  * has no staff PINs. Above the location threshold a non-manager needs an
  * owner/manager to approve: the request carries `approval: { staffId, pin }`,
- * verified here with the same per-staff lockout as the PIN switch (each attempt
- * counted atomically BEFORE the PIN is checked). The approval is per request:
+ * verified through `attemptStaffPin` with the same budgets as every staff PIN
+ * (device, location and per-staff lockout, each counted before the check). The approval is per request:
  * it opens no session and changes nobody's active staff.
  */
 import { NextResponse } from "next/server";
@@ -15,7 +15,8 @@ import type { SessionUser } from "@/lib/auth/session";
 import { requireTenantRole } from "@/lib/auth/api";
 import { effectiveTerminalRole } from "@/lib/auth/active-staff";
 import { sessionRoleIn } from "@/lib/auth/tenant-guard";
-import { isValidPinFormat, verifyPin } from "@/lib/auth/pin";
+import { isValidPinFormat } from "@/lib/auth/pin";
+import { attemptStaffPin } from "@/lib/auth/pin-attempt";
 import type { AdjustmentKind, AdjustmentPolicy } from "@/lib/db/adjustment-types";
 import { isManagerRole, needsApproval, resolvePolicy, thresholdFor } from "./policy";
 
@@ -79,6 +80,7 @@ export type ApprovalOutcome =
  * asks for a manager PIN and resends), 401 `approval_pin_incorrect`, 423 locked.
  */
 export async function authorizeAdjustment(input: {
+  request: Request;
   tenantId: string;
   /** The order's location: the approving manager must work there. */
   locationId: string;
@@ -117,28 +119,39 @@ export async function authorizeAdjustment(input: {
       { error: "Manager PIN incorrect.", code: "approval_pin_incorrect" },
       { status: 401 },
     );
-  const driver = getPosDriver();
-  const staff = await driver.getStaffById(input.tenantId, input.approval.staffId);
-  if (!staff || !staff.active || !isManagerRole(staff.role)) return { ok: false, res: incorrect() };
+  // The same brute-force budgets as every staff PIN (device, location, staff).
+  const attempt = await attemptStaffPin({
+    request: input.request,
+    user: input.actor.user,
+    tenantIds: [input.tenantId],
+    staffId: input.approval.staffId,
+    pin: input.approval.pin,
+    locationId: input.locationId,
+    roles: ["owner", "manager"],
+    context: "Refund / void / comp approval",
+  });
+  if (!attempt.ok) {
+    if (attempt.res.status === 423) {
+      const body = (await attempt.res.json().catch(() => ({}))) as { lockedUntil?: string };
+      return {
+        ok: false,
+        res: NextResponse.json(
+          {
+            error: "Too many incorrect PINs. Try again later.",
+            code: "approval_locked",
+            lockedUntil: body.lockedUntil ?? null,
+          },
+          { status: 423 },
+        ),
+      };
+    }
+    return { ok: false, res: incorrect() };
+  }
+  const staff = attempt.staff;
+  if (!isManagerRole(staff.role)) return { ok: false, res: incorrect() };
   // A manager scoped to other locations cannot approve here (empty = all).
   if (staff.location_ids?.length && !staff.location_ids.includes(input.locationId)) {
     return { ok: false, res: incorrect() };
   }
-  const attempt = await driver.beginPinAttempt(input.tenantId, staff.id);
-  if (!attempt.allowed) {
-    return {
-      ok: false,
-      res: NextResponse.json(
-        {
-          error: "Too many incorrect PINs. Try again later.",
-          code: "approval_locked",
-          lockedUntil: attempt.lockedUntil,
-        },
-        { status: 423 },
-      ),
-    };
-  }
-  if (!verifyPin(input.approval.pin, staff.pin_hash)) return { ok: false, res: incorrect() };
-  await driver.clearPinAttempts(input.tenantId, staff.id);
   return { ok: true, approver: { ...staff, pin_hash: undefined } };
 }

@@ -44,6 +44,7 @@ import { POST as voidPOST } from "@/app/api/orders/[id]/void/route";
 import { POST as discountPOST } from "@/app/api/orders/[id]/discount/route";
 import { GET as kitchenGET } from "@/app/api/kitchen/orders/route";
 import { POST as webhookPOST } from "@/app/api/payments/stripe/webhook/route";
+import { POST as legacyRefundPOST } from "@/app/api/payments/refund/route";
 import { refundPayment, getOrderBalance } from "@/lib/payments/service";
 import { selectOpenOrders, selectRecentOrders } from "@/lib/payments/open-orders";
 import { buildReceipt } from "@/lib/payments/receipt";
@@ -716,6 +717,9 @@ describe("Stripe card refunds (real mode)", () => {
     // Reserved (holds the cap) but not confirmed.
     const p1 = (await getPosDriver().listPaymentsForOrder(order.id))[0]!;
     expect(p1.refunds![0]).toMatchObject({ state: "pending", amount_cents: 400 });
+    // Held, not refunded: status, refunded_cents and reports wait for the confirm.
+    expect(p1).toMatchObject({ status: "captured", refunded_cents: 0, refund_reserved_cents: 400 });
+    expect(selectRecentOrders([(await getPosDriver().getOrder(order.id))!], new Map([[order.id, [p1]]]))[0]!.money).toBe("paid");
     stripeRequest.mockResolvedValue({ id: "re_live_2", status: "succeeded" });
     const second = await refund(order.id, { amountCents: 400, requestId });
     expect(second.status).toBe(200);
@@ -1123,5 +1127,72 @@ describe("webhook: failed refund on a voided order", () => {
     );
     expect((await getPosDriver().getOrder(order.id))!.status).toBe("paid");
     expect((await getPosDriver().getPayment(card.id))!.status).toBe("captured");
+  });
+});
+
+describe("legacy single-tender refund route", () => {
+  it("refuses a refund without a client refund id", async () => {
+    const order = await seedOrder([item("l-ga", 1000, 1)], { status: "paid" });
+    const t = await seedTender(order);
+    const res = await legacyRefundPOST(
+      new Request("http://localhost/api/payments/refund", {
+        method: "POST",
+        headers: { "x-forwarded-for": nextIp() },
+        body: JSON.stringify({ paymentId: t.id, amountCents: 100 }),
+      }),
+    );
+    expect(res.status).toBe(422);
+    expect((await getPosDriver().getPayment(t.id))!.refunded_cents).toBe(0);
+  });
+});
+
+describe("pending card refunds never flip the status", () => {
+  it("a full card refund pending at Stripe leaves the tender captured and the order paid", async () => {
+    vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_adj");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "http://localhost:54321");
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "test-service-key");
+    stripeRequest.mockRejectedValueOnce(new Error("timeout"));
+    const order = await seedOrder([item("l-ha", 1000, 1)], { status: "paid" });
+    const card = await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_ha", connect_account_id: ACCT, simulated: false });
+    const requestId = rid("ha");
+    await refund(order.id, { amountCents: 1000, requestId });
+    expect((await getPosDriver().getPayment(card.id))!.status).toBe("captured");
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("paid");
+    // A second refund cannot take the held room meanwhile.
+    expect((await refund(order.id, { amountCents: 1 })).status).toBe(409);
+    stripeRequest.mockResolvedValue({ id: "re_ha", status: "succeeded" });
+    await refund(order.id, { amountCents: 1000, requestId });
+    expect((await getPosDriver().getPayment(card.id))!).toMatchObject({ status: "refunded", refunded_cents: 1000, refund_reserved_cents: 0 });
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("refunded");
+  });
+});
+
+describe("VOID ticket for fired food", () => {
+  it("prints a VOID ticket on the location's network printer, once per void", async () => {
+    const { createPrinter, printVoidTicket } = await import("@/lib/printing/queue");
+    const { printer } = await createPrinter({
+      tenantId: TENANT,
+      locationId: LOCATION,
+      label: "Line",
+      protocol: "star_cloudprnt",
+    });
+    const order = await seedOrder([item("l-pa", 1000, 2), item("l-pb", 500, 1)]);
+    const requestId = rid("vprint");
+    expect((await voidReq(order.id, { lines: [{ lineId: "l-pa", quantity: 1 }], requestId })).status).toBe(200);
+    // The hook runs after the response; run it again directly: idempotent per void.
+    const after = (await getPosDriver().getOrder(order.id))!;
+    await printVoidTicket({
+      order: after,
+      items: after.items.filter((i) => i.voided),
+      scope: "lines",
+      dedupeKey: requestId,
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    const jobs = (await getPosDriver().listPrintJobs(TENANT, LOCATION, 50)).filter(
+      (j) => j.printer_id === printer.id && j.order_id === order.id,
+    );
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]!.document.lines.map((l) => l.text).join("\n")).toMatch(/\*\*\* VOID \*\*\*/);
+    expect(jobs[0]!.document.lines.map((l) => l.text).join("\n")).toMatch(/1x Pizza/);
   });
 });

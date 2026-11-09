@@ -523,6 +523,10 @@ describe("assign route (M8) and the manual fallback", () => {
     expect(res.ok).toBe(true);
     const stored = (await getPosDriver().getDelivery(rec.id))!;
     expect(stored).toMatchObject({ provider: "in_house_manual", status: "pending_assignment" });
+    // The order's quoted provider follows the switch (the KDS hand-off reads it).
+    expect((await getPosDriver().getOrder(orderId))?.fulfillment?.delivery_provider).toBe(
+      "in_house_manual",
+    );
     // From here it is an ordinary in-house delivery: hand-assignable, and the sweep leaves it.
     await sweepDriverDispatches(new Date(Date.now() + 10 * 60_000));
     expect(driverCalls()).toHaveLength(1);

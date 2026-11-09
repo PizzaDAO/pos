@@ -19,8 +19,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { signingSecret } from "./signing-secret";
 import { getPosDriver } from "@/lib/db";
 import type { SessionUser } from "./session";
-import { requireTenantAccess, type GuardFailure } from "./tenant-guard";
-import { requireTenantRole } from "./api";
+import type { GuardFailure } from "./tenant-guard";
+import { requireAdminAccess, requireAdminRole } from "./admin-gate";
 
 export const ONBOARDING_TOKEN_HEADER = "x-onboarding-token";
 
@@ -119,13 +119,15 @@ export async function requireTenantAdminOrOnboarding(
     return { ok: true, tenantId, user: null, via: "onboarding" };
   }
   if (tenantId) {
-    // Same session gate main uses for tenant-admin routes (owner|manager).
-    const auth = await requireTenantRole(tenantId, ["owner", "manager"]);
+    // Same session gate main uses for tenant-admin routes (owner|manager),
+    // plus the back-office PIN gate (a mid-signup tenant has no PINs yet, so
+    // the wizard is unaffected).
+    const auth = await requireAdminRole(request, tenantId);
     if (!auth.ok) return auth;
     return { ok: true, tenantId, user: auth.user, via: "session" };
   }
   // No tenant named: the caller's single owner|manager tenant (400 if several).
-  const auth = await requireTenantAccess(tenantId, "admin");
+  const auth = await requireAdminAccess(request, tenantId);
   if (!auth.ok) return auth;
   return { ok: true, tenantId: auth.tenantId, user: auth.user, via: "session" };
 }

@@ -15,10 +15,16 @@
  * Everything here is pure data + maps; it never reads env vars and works with no
  * configuration, so the app builds and runs offline in the Vercel preview.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
 } from "@/lib/payments/connect-status";
+import type {
+  Printer,
+  PrintJob,
+  PrintLocationSettings,
+} from "@/lib/printing/types";
 import type { PosDriver } from "./driver";
 import type {
   CreateOrderInput,
@@ -91,6 +97,8 @@ import type {
   Staff,
   PinAttempt,
   StaffSession,
+  StaffPinRecord,
+  StaffProfilePatch,
 } from "./backoffice-types";
 import type {
   Location,
@@ -131,9 +139,12 @@ import {
   users as seedUsers,
 } from "./seed-data";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
+import type { ImportChanges } from "@/lib/menu-import/apply";
+import type { MenuSnapshot } from "@/lib/menu-import/types";
 import { seedKitchenOrders } from "./kds-seed";
-import { buildSalesReport, isoDate } from "@/lib/reports";
-import { tipRefundedCents } from "@/lib/payments/refund-state";
+import { buildSalesReport, locationBusinessDate } from "@/lib/reports";
+import { buildOwnerBundle, type OwnerReportBundle } from "@/lib/owner-reports";
+import { refundableParts, tipRefundedCents } from "@/lib/payments/refund-state";
 import { coveredBaseCents, foodDueCents } from "@/lib/adjustments/math";
 import type {
   AdjustmentRecord,
@@ -181,6 +192,11 @@ const itemModifierGroups = seedItemModifierGroups.map((l) => ({ ...l }));
 const tenants: Tenant[] = seedTenants.map((t) => ({ ...t }));
 const locations: Location[] = seedLocations.map((l) => ({ ...l }));
 const storeSettings = seedStoreSettings.map((s) => ({ ...s }));
+/** `${provider}:${storeId}` -> owning location (platform-admin assigned). */
+const marketplaceStores = new Map<
+  string,
+  { provider: string; tenantId: string; locationId: string }
+>();
 const paymentSettings = seedPaymentSettings.map((s) => ({ ...s }));
 const usersById = new Map<string, User>(seedUsers.map((u) => [u.id, { ...u }]));
 const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({
@@ -284,11 +300,31 @@ const staffSessions = new Map<string, StaffSession>();
 const pinLocks = new Map<string, { attempts: number; lockedUntil: number | null }>();
 const PIN_MAX_FAILURES = 5;
 const PIN_LOCK_MS = 15 * 60_000;
+/** Per-device / per-location PIN attempt budgets (mirrors pin_attempt_limits). */
+const pinLimits = new Map<
+  string,
+  { attempts: number; windowStart: number; lockedUntil: number | null }
+>();
 /** Connect onboarding status keyed by tenant id. */
 const connectAccounts = new Map<string, ConnectAccount>();
 /** Stripe Terminal locations keyed by POS location id; readers keyed by tmr_ id. */
 const terminalLocations = new Map<string, TerminalLocation>();
 const terminalReaders = new Map<string, TerminalReader>();
+/**
+ * Network printing: printers, their job queue, per-location auto-print. Held on
+ * globalThis so the admin, kitchen and device routes (separate bundles in
+ * `next dev`) share one queue in the zero-env demo.
+ */
+const printStore = ((globalThis as { __posMockPrint?: unknown }).__posMockPrint ??= {
+  printers: new Map<string, Printer>(),
+  printJobs: new Map<string, PrintJob>(),
+  printSettings: new Map<string, PrintLocationSettings>(),
+}) as {
+  printers: Map<string, Printer>;
+  printJobs: Map<string, PrintJob>;
+  printSettings: Map<string, PrintLocationSettings>;
+};
+const { printers, printJobs, printSettings } = printStore;
 /** Online-ordering customers keyed by id. */
 const customers = new Map<string, Customer>();
 /** Magic-link tokens (stubbed, never emailed) keyed by token. */
@@ -324,6 +360,21 @@ function fireLines(order: Order, prev: OrderStatus, at: string): OrderItem[] {
   );
 }
 
+
+/** A job the printer may take now: queued, or sent but unconfirmed too long (retry). */
+function claimable(
+  j: PrintJob,
+  printerId: string,
+  nowIsoStr: string,
+  reclaimBeforeIso: string,
+): boolean {
+  return (
+    j.printer_id === printerId &&
+    j.expires_at > nowIsoStr &&
+    ((j.status === "queued" && (!j.retry_after || j.retry_after <= nowIsoStr)) ||
+      (j.status === "sent" && !!j.claimed_at && j.claimed_at <= reclaimBeforeIso))
+  );
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -1227,6 +1278,57 @@ export const mockDriver: PosDriver = {
     return { outcome: "ok", order: updated, record: structuredClone(record) };
   },
 
+  async setMarketplaceSettings(
+    tenantId,
+    locationId,
+    marketplace,
+  ): Promise<StoreSettings> {
+    const base = await this.getStoreSettings(tenantId, locationId);
+    const next: StoreSettings = { ...base, marketplace };
+    const i = storeSettings.findIndex(
+      (s) => s.tenant_id === tenantId && s.location_id === locationId,
+    );
+    if (i >= 0) storeSettings[i] = next;
+    else storeSettings.push(next);
+    return next;
+  },
+
+  async findMarketplaceLocations(provider, storeId) {
+    const row = marketplaceStores.get(`${provider}:${storeId}`);
+    return row ? [{ tenant_id: row.tenantId, location_id: row.locationId }] : [];
+  },
+
+  async assignMarketplaceStore(input) {
+    const mine = () =>
+      [...marketplaceStores].filter(
+        ([, v]) => v.provider === input.provider && v.locationId === input.locationId,
+      );
+    if (input.storeId === null) {
+      for (const [k] of mine()) marketplaceStores.delete(k);
+      return;
+    }
+    const key = `${input.provider}:${input.storeId}`;
+    const holder = marketplaceStores.get(key);
+    // A clash with another location leaves the existing assignment intact.
+    if (holder && holder.locationId !== input.locationId) throw new MarketplaceStoreTakenError();
+    for (const [k] of mine()) marketplaceStores.delete(k);
+    marketplaceStores.set(key, {
+      provider: input.provider,
+      tenantId: input.tenantId,
+      locationId: input.locationId,
+    });
+  },
+
+  async findMarketplaceOrdersByRef(provider, externalId) {
+    ensureKitchenSeed();
+    return [...orders.values()].filter(
+      (o) =>
+        o.source?.type === "marketplace" &&
+        o.source.module === provider &&
+        o.source.external_ref === externalId,
+    );
+  },
+
   async createOrder(input: CreateOrderInput): Promise<Order> {
     const existing = orders.get(input.id);
     if (existing) return existing;
@@ -1742,6 +1844,7 @@ export const mockDriver: PosDriver = {
         // passed to upsert must never roll it back.
         refunded_cents: existing.refunded_cents,
         tip_refunded_cents: existing.tip_refunded_cents,
+        refund_reserved_cents: existing.refund_reserved_cents,
         refund_ids: existing.refund_ids,
         refunds: existing.refunds,
         status:
@@ -1882,29 +1985,29 @@ export const mockDriver: PosDriver = {
     if (refundId && ids.includes(refundId)) {
       return { ok: false, reason: "duplicate", payment: p };
     }
-    const tipDone = tipRefundedCents(p);
-    const tipLeft = Math.max(0, p.tip_cents - tipDone);
-    // Explicit tip part, else the legacy rule (the refund comes off the tip first).
+    // Room left: confirmed refunds AND pending reservations count against it.
+    const left = refundableParts(p);
+    // Explicit tip part, else the legacy rule (base first, the rest off the tip).
     const tipPart =
       meta?.tipCents === undefined || meta?.tipCents === null
-        ? Math.min(amountCents, tipLeft)
+        ? Math.max(0, amountCents - left.baseCents)
         : meta.tipCents;
     const basePart = amountCents - tipPart;
-    const baseLeft = p.amount_cents - (p.refunded_cents - tipDone);
+    const reserved = p.refund_reserved_cents ?? 0;
     const total = p.amount_cents + p.tip_cents;
     if (
       amountCents <= 0 ||
       tipPart < 0 ||
       basePart < 0 ||
       (p.status !== "captured" && p.status !== "authorized") ||
-      tipPart > tipLeft ||
-      basePart > baseLeft ||
-      p.refunded_cents + amountCents > total
+      tipPart > left.tipCents ||
+      basePart > left.baseCents ||
+      p.refunded_cents + reserved + amountCents > total
     ) {
       return { ok: false, reason: "exceeds", payment: p };
     }
-    const refunded = p.refunded_cents + amountCents;
     const now = nowIso();
+    const pending = meta?.pending === true;
     const entry = {
       id: globalThis.crypto.randomUUID(),
       amount_cents: amountCents,
@@ -1913,20 +2016,36 @@ export const mockDriver: PosDriver = {
       reason: meta?.reason ?? null,
       request_id: refundId,
       tip_cents: tipPart,
-      state: meta?.pending ? ("pending" as const) : ("succeeded" as const),
+      state: pending ? ("pending" as const) : ("succeeded" as const),
       status_before: p.status,
     };
+    const refunded = pending ? p.refunded_cents : p.refunded_cents + amountCents;
     const updated: Payment = {
       ...p,
       refunded_cents: refunded,
-      tip_refunded_cents: tipDone + tipPart,
+      tip_refunded_cents: tipRefundedCents(p) + (pending ? 0 : tipPart),
+      refund_reserved_cents: reserved + (pending ? amountCents : 0),
       refund_ids: refundId ? [...ids, refundId] : ids,
       refunds: [...(p.refunds ?? []), entry],
+      // A pending refund holds its room only: the status moves at confirm.
       status: refunded >= total ? "refunded" : p.status,
       updated_at: now,
     };
     payments.set(paymentId, updated);
     return { ok: true, payment: updated, refundEntryId: entry.id };
+  },
+
+  async setRefundProcessorRef(paymentId: string, requestId: string, processorRef: string) {
+    const p = payments.get(paymentId);
+    if (!p) return false;
+    let hit = false;
+    const refunds = (p.refunds ?? []).map((r) => {
+      if (r.request_id !== requestId || r.processor_ref) return r;
+      hit = true;
+      return { ...r, processor_ref: processorRef };
+    });
+    if (hit) payments.set(paymentId, { ...p, refunds, updated_at: nowIso() });
+    return hit;
   },
 
   // Mirrors confirm_payment_refund(): synchronous, idempotent.
@@ -1936,12 +2055,28 @@ export const mockDriver: PosDriver = {
     const idx = (p.refunds ?? []).findIndex((r) => r.request_id === refundId);
     if (idx < 0) return null;
     const refunds = [...(p.refunds ?? [])];
+    const e = refunds[idx]!;
     refunds[idx] = {
-      ...refunds[idx]!,
+      ...e,
       state: "succeeded",
-      processor_ref: processorRef ?? refunds[idx]!.processor_ref,
+      processor_ref: processorRef ?? e.processor_ref,
     };
-    const updated: Payment = { ...p, refunds, updated_at: nowIso() };
+    if (e.state !== "pending") {
+      const same: Payment = { ...p, refunds, updated_at: nowIso() };
+      payments.set(paymentId, same);
+      return same;
+    }
+    const tip = typeof e.tip_cents === "number" ? e.tip_cents : 0;
+    const refunded = p.refunded_cents + e.amount_cents;
+    const updated: Payment = {
+      ...p,
+      refunds,
+      refunded_cents: refunded,
+      tip_refunded_cents: tipRefundedCents(p) + tip,
+      refund_reserved_cents: Math.max(0, (p.refund_reserved_cents ?? 0) - e.amount_cents),
+      status: refunded >= p.amount_cents + p.tip_cents ? "refunded" : p.status,
+      updated_at: nowIso(),
+    };
     payments.set(paymentId, updated);
     return updated;
   },
@@ -1958,6 +2093,20 @@ export const mockDriver: PosDriver = {
     const refunds = p.refunds ?? [];
     const dropped = refunds.find((r) => r.request_id === refundId);
     if (!dropped) return;
+    const refund_ids = opts?.tombstone
+      ? p.refund_ids
+      : (p.refund_ids ?? []).filter((x) => x !== refundId);
+    if (dropped.state === "pending") {
+      // Only held room: give it back, nothing was refunded.
+      payments.set(paymentId, {
+        ...p,
+        refund_reserved_cents: Math.max(0, (p.refund_reserved_cents ?? 0) - dropped.amount_cents),
+        refund_ids,
+        refunds: refunds.filter((r) => r !== dropped),
+        updated_at: nowIso(),
+      });
+      return;
+    }
     const tipDone = tipRefundedCents(p);
     const tipBack =
       typeof dropped.tip_cents === "number"
@@ -1971,9 +2120,7 @@ export const mockDriver: PosDriver = {
       ...p,
       refunded_cents: Math.max(0, p.refunded_cents - dropped.amount_cents),
       tip_refunded_cents: Math.max(0, tipDone - tipBack),
-      refund_ids: opts?.tombstone
-        ? p.refund_ids
-        : (p.refund_ids ?? []).filter((x) => x !== refundId),
+      refund_ids,
       refunds: refunds.filter((r) => r !== dropped),
       status: p.status === "refunded" ? before : p.status,
       updated_at: nowIso(),
@@ -2248,6 +2395,189 @@ export const mockDriver: PosDriver = {
       .slice(0, limit);
   },
 
+  // -- Network printing ------------------------------------------------------
+
+  async listPrinters(tenantId: string, locationId: string) {
+    return [...printers.values()]
+      .filter((p) => p.tenant_id === tenantId && p.location_id === locationId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .map((p) => ({ ...p }));
+  },
+
+  async getPrinter(id: string) {
+    const p = printers.get(id);
+    return p ? { ...p } : null;
+  },
+
+  async createPrinter(row: Omit<Printer, "id" | "created_at" | "last_seen_at">) {
+    const printer: Printer = {
+      ...row,
+      id: genId("prn"),
+      last_seen_at: null,
+      created_at: nowIso(),
+    };
+    printers.set(printer.id, printer);
+    return { ...printer };
+  },
+
+  async deletePrinter(tenantId: string, id: string) {
+    const p = printers.get(id);
+    if (!p || p.tenant_id !== tenantId) return false;
+    printers.delete(id);
+    for (const [jid, j] of printJobs) if (j.printer_id === id) printJobs.delete(jid);
+    return true;
+  },
+
+  async setPrinterTokenHash(tenantId: string, id: string, tokenHash: string) {
+    const p = printers.get(id);
+    if (!p || p.tenant_id !== tenantId) return null;
+    p.token_hash = tokenHash;
+    return { ...p };
+  },
+
+  async touchPrinter(id: string, at: string) {
+    const p = printers.get(id);
+    if (p) p.last_seen_at = at;
+  },
+
+  async getPrintSettings(locationId: string) {
+    const s = printSettings.get(locationId);
+    return s ? { ...s } : null;
+  },
+
+  async setPrintAutoPrint(tenantId: string, locationId: string, autoPrint: boolean) {
+    const row: PrintLocationSettings = {
+      location_id: locationId,
+      tenant_id: tenantId,
+      auto_print: autoPrint,
+      updated_at: nowIso(),
+    };
+    printSettings.set(locationId, row);
+    return { ...row };
+  },
+
+  async enqueuePrintJob(
+    job: Omit<
+      PrintJob,
+      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at" | "retry_after"
+    >,
+  ) {
+    if (job.dedupe_key) {
+      const dup = [...printJobs.values()].find(
+        (j) => j.printer_id === job.printer_id && j.dedupe_key === job.dedupe_key,
+      );
+      if (dup) return { ...dup };
+    }
+    const row: PrintJob = {
+      ...job,
+      id: genId("job"),
+      status: "queued",
+      attempts: 0,
+      error: null,
+      created_at: nowIso(),
+      claimed_at: null,
+      done_at: null,
+      retry_after: null,
+    };
+    printJobs.set(row.id, row);
+    return { ...row };
+  },
+
+  async expirePrintJobs(printerId: string, nowIsoStr: string) {
+    let n = 0;
+    for (const j of printJobs.values()) {
+      if (
+        j.printer_id === printerId &&
+        (j.status === "queued" || j.status === "sent") &&
+        j.expires_at <= nowIsoStr
+      ) {
+        j.status = "expired";
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async claimPrintJob(printerId: string, nowIsoStr: string, reclaimBeforeIso: string) {
+    const next = [...printJobs.values()]
+      .filter((j) => claimable(j, printerId, nowIsoStr, reclaimBeforeIso))
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))[0];
+    if (!next) return null;
+    next.status = "sent";
+    next.attempts += 1;
+    next.claimed_at = nowIsoStr;
+    return { ...next };
+  },
+
+  async hasPrintJobForOrder(printerId: string, orderId: string) {
+    return [...printJobs.values()].some((j) => j.printer_id === printerId && j.order_id === orderId);
+  },
+
+  async retryFailedPrintJobs(tenantId: string, locationId: string, nowIsoStr: string) {
+    let n = 0;
+    for (const j of printJobs.values()) {
+      if (
+        j.tenant_id === tenantId &&
+        j.location_id === locationId &&
+        j.status === "failed" &&
+        j.expires_at > nowIsoStr
+      ) {
+        j.status = "queued";
+        j.attempts = 0;
+        j.retry_after = null;
+        j.done_at = null;
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async pruneFinishedPrintJobs(beforeIso: string) {
+    let n = 0;
+    for (const [id, j] of printJobs) {
+      if (j.status !== "queued" && j.status !== "sent" && j.created_at < beforeIso) {
+        printJobs.delete(id);
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async getPrintJobForPrinter(printerId: string, jobId: string) {
+    const j = printJobs.get(jobId);
+    return j && j.printer_id === printerId ? { ...j } : null;
+  },
+
+  async completePrintJob(
+    printerId: string,
+    jobId: string,
+    outcome: { ok: true } | { ok: false; error: string; retryAt?: string | null },
+    nowIsoStr: string,
+  ) {
+    const j = printJobs.get(jobId);
+    if (!j || j.printer_id !== printerId) return null;
+    if (j.status === "queued" || j.status === "sent") {
+      if (!outcome.ok && outcome.retryAt) {
+        j.status = "queued";
+        j.error = outcome.error;
+        j.retry_after = outcome.retryAt;
+      } else {
+        j.status = outcome.ok ? "done" : "failed";
+        j.error = outcome.ok ? null : outcome.error;
+        j.done_at = nowIsoStr;
+      }
+    }
+    return { ...j };
+  },
+
+  async listPrintJobs(tenantId: string, locationId: string, limit: number) {
+    return [...printJobs.values()]
+      .filter((j) => j.tenant_id === tenantId && j.location_id === locationId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, limit)
+      .map((j) => ({ ...j }));
+  },
+
   // -- Customers (Phase 4) ---------------------------------------------------
 
   async getCustomerByEmail(
@@ -2518,6 +2848,209 @@ export const mockDriver: PosDriver = {
       }
       default:
         return null;
+    }
+  },
+
+  async getMenuSnapshot(tenantId: string): Promise<MenuSnapshot> {
+    const items = menuItems.filter((i) => i.tenant_id === tenantId);
+    const itemIds = new Set(items.map((i) => i.id));
+    const groups = modifierGroups.filter((g) => g.tenant_id === tenantId);
+    const groupIds = new Set(groups.map((g) => g.id));
+    return {
+      categories: menuCategories
+        .filter((c) => c.tenant_id === tenantId)
+        .map((c) => ({ id: c.id, name: c.name, sort_order: c.sort_order })),
+      items: items.map((i) => ({
+        id: i.id,
+        category_id: i.category_id,
+        name: i.name,
+        description: i.description,
+        is_half_and_half_capable: i.is_half_and_half_capable,
+        station: i.station,
+      })),
+      sizes: itemSizes.filter((s) => itemIds.has(s.item_id)).map((s) => ({ ...s })),
+      modifierGroups: groups.map((g) => ({
+        id: g.id,
+        name: g.name,
+        min_select: g.min_select,
+        max_select: g.max_select,
+        supports_half: g.supports_half,
+      })),
+      modifiers: modifiers.filter((m) => groupIds.has(m.group_id)).map((m) => ({ ...m })),
+      links: itemModifierGroups
+        .filter((l) => itemIds.has(l.item_id))
+        .map((l) => ({ item_id: l.item_id, group_id: l.group_id, sort_order: l.sort_order })),
+      inventoryLinkSourceIds: itemInventoryLinks
+        .filter((l) => l.tenant_id === tenantId)
+        .map((l) => l.source_id),
+      allergenTargetIds: (allergenRows.get(tenantId) ?? []).map((r) => r.target_id),
+    };
+  },
+
+  // Mirrors public.import_menu(): all-or-nothing. State is snapshotted up front
+  // and restored if any step throws (the SQL function gets this from its
+  // transaction). One synchronous block, so no await can interleave.
+  async applyMenuImport(tenantId: string, ch: ImportChanges): Promise<void> {
+    const saved = {
+      categories: [...menuCategories],
+      items: [...menuItems],
+      sizes: [...itemSizes],
+      groups: [...modifierGroups],
+      mods: [...modifiers],
+      links: [...itemModifierGroups],
+      overrides: new Map(overrides),
+      recipes: [...itemInventoryLinks],
+      allergens: allergenRows.get(tenantId)?.map((r) => ({ ...r })),
+    };
+    const lc = (s: string) => s.trim().toLowerCase();
+    try {
+      const mineCat = (id: string) => menuCategories.find((c) => c.id === id && c.tenant_id === tenantId);
+      const mineItem = (id: string) => menuItems.find((i) => i.id === id && i.tenant_id === tenantId);
+      const mineGroup = (id: string) => modifierGroups.find((g) => g.id === id && g.tenant_id === tenantId);
+      const ownSize = (id: string) => {
+        const s = itemSizes.find((x) => x.id === id);
+        return s && mineItem(s.item_id) ? s : undefined;
+      };
+      const ownMod = (id: string) => {
+        const m = modifiers.find((x) => x.id === id);
+        return m && mineGroup(m.group_id) ? m : undefined;
+      };
+
+      // -- deletes (+ the recipe / allergen / override rows of removed targets)
+      const dItems = new Set(ch.delete.items);
+      const dMods = new Set(ch.delete.modifiers);
+      const dSizes = new Set(ch.delete.sizes);
+      for (const id of ch.delete.categories) {
+        if (!mineCat(id)) throw new Error("Row not found.");
+        for (const i of menuItems) if (i.category_id === id) dItems.add(i.id);
+      }
+      for (const id of ch.delete.modifierGroups) {
+        if (!mineGroup(id)) throw new Error("Row not found.");
+        for (const m of modifiers) if (m.group_id === id) dMods.add(m.id);
+      }
+      for (const id of dItems) {
+        if (!mineItem(id)) throw new Error("Row not found.");
+        for (const s of itemSizes) if (s.item_id === id) dSizes.add(s.id);
+      }
+      for (const id of ch.delete.sizes) if (!ownSize(id)) throw new Error("Row not found.");
+      for (const id of ch.delete.modifiers) if (!ownMod(id)) throw new Error("Row not found.");
+      removeWhere(itemInventoryLinks, (l) =>
+        l.tenant_id === tenantId &&
+        ((l.source_type === "item" && dItems.has(l.source_id)) ||
+          (l.source_type === "modifier" && dMods.has(l.source_id))),
+      );
+      const rows = allergenRows.get(tenantId);
+      if (rows) {
+        allergenRows.set(
+          tenantId,
+          rows.filter(
+            (r) =>
+              !(
+                (r.target_type === "item" && dItems.has(r.target_id)) ||
+                (r.target_type === "size" && dSizes.has(r.target_id)) ||
+                (r.target_type === "modifier" && dMods.has(r.target_id))
+              ),
+          ),
+        );
+      }
+      for (const [k, ov] of overrides) {
+        if (
+          ov.tenant_id === tenantId &&
+          (dItems.has(ov.target_id) || dSizes.has(ov.target_id) || dMods.has(ov.target_id))
+        ) {
+          overrides.delete(k);
+        }
+      }
+      removeWhere(itemSizes, (s) => dSizes.has(s.id));
+      removeWhere(modifiers, (m) => dMods.has(m.id));
+      removeWhere(itemModifierGroups, (l) => dItems.has(l.item_id) || ch.delete.modifierGroups.includes(l.group_id));
+      for (const l of ch.delete.itemModifierGroups) {
+        if (!mineItem(l.item_id)) throw new Error("Row not found.");
+        removeWhere(itemModifierGroups, (x) => x.item_id === l.item_id && x.group_id === l.group_id);
+      }
+      removeWhere(menuItems, (i) => dItems.has(i.id));
+      removeWhere(menuCategories, (c) => ch.delete.categories.includes(c.id));
+      removeWhere(modifierGroups, (g) => ch.delete.modifierGroups.includes(g.id));
+
+      // -- updates in place (ids kept)
+      for (const u of ch.update.categories) {
+        const c = mineCat(u.id);
+        if (!c) throw new Error("Row not found.");
+        c.name = u.name;
+        c.sort_order = u.sort_order;
+      }
+      for (const u of ch.update.items) {
+        const i = mineItem(u.id);
+        if (!i || !mineCat(u.category_id)) throw new Error("Row not found.");
+        Object.assign(i, u);
+      }
+      for (const u of ch.update.sizes) {
+        const s = ownSize(u.id);
+        if (!s) throw new Error("Row not found.");
+        Object.assign(s, u);
+      }
+      for (const u of ch.update.modifierGroups) {
+        const g = mineGroup(u.id);
+        if (!g) throw new Error("Row not found.");
+        Object.assign(g, u);
+      }
+      for (const u of ch.update.modifiers) {
+        const m = ownMod(u.id);
+        if (!m) throw new Error("Row not found.");
+        Object.assign(m, u);
+      }
+      for (const u of ch.update.itemModifierGroups) {
+        const l = itemModifierGroups.find((x) => x.item_id === u.item_id && x.group_id === u.group_id);
+        if (!l || !mineItem(u.item_id)) throw new Error("Row not found.");
+        l.sort_order = u.sort_order;
+      }
+
+      // -- inserts (refuse name collisions: the menu changed under us)
+      const changed = () => new Error("The menu changed while importing. Preview again.");
+      const ins = ch.insert;
+      for (const c of ins.categories) {
+        if (c.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        if (menuCategories.some((x) => x.tenant_id === tenantId && lc(x.name) === lc(c.name))) throw changed();
+        menuCategories.push({ ...c });
+      }
+      for (const g of ins.modifierGroups) {
+        if (g.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        if (modifierGroups.some((x) => x.tenant_id === tenantId && lc(x.name) === lc(g.name))) throw changed();
+        modifierGroups.push({ ...g });
+      }
+      for (const i of ins.items) {
+        if (i.tenant_id !== tenantId) throw new Error("Row belongs to another tenant.");
+        if (!mineCat(i.category_id)) throw new Error("Unknown category_id.");
+        if (menuItems.some((x) => x.category_id === i.category_id && lc(x.name) === lc(i.name))) throw changed();
+        menuItems.push({ ...i });
+      }
+      for (const s of ins.sizes) {
+        if (!mineItem(s.item_id)) throw new Error("Unknown item_id.");
+        if (itemSizes.some((x) => x.item_id === s.item_id && lc(x.name) === lc(s.name))) throw changed();
+        itemSizes.push({ ...s });
+      }
+      for (const m of ins.modifiers) {
+        if (!mineGroup(m.group_id)) throw new Error("Unknown group_id.");
+        if (modifiers.some((x) => x.group_id === m.group_id && lc(x.name) === lc(m.name))) throw changed();
+        modifiers.push({ ...m });
+      }
+      for (const l of ins.itemModifierGroups) {
+        if (!mineItem(l.item_id) || !mineGroup(l.group_id)) throw new Error("Unknown item or group in link.");
+        if (itemModifierGroups.some((x) => x.item_id === l.item_id && x.group_id === l.group_id)) throw changed();
+        itemModifierGroups.push({ ...l });
+      }
+    } catch (err) {
+      menuCategories.splice(0, menuCategories.length, ...saved.categories);
+      menuItems.splice(0, menuItems.length, ...saved.items);
+      itemSizes.splice(0, itemSizes.length, ...saved.sizes);
+      modifierGroups.splice(0, modifierGroups.length, ...saved.groups);
+      modifiers.splice(0, modifiers.length, ...saved.mods);
+      itemModifierGroups.splice(0, itemModifierGroups.length, ...saved.links);
+      itemInventoryLinks.splice(0, itemInventoryLinks.length, ...saved.recipes);
+      if (saved.allergens) allergenRows.set(tenantId, saved.allergens);
+      overrides.clear();
+      for (const [k, v] of saved.overrides) overrides.set(k, v);
+      throw err;
     }
   },
 
@@ -2846,6 +3379,33 @@ export const mockDriver: PosDriver = {
       payments: scopedPayments,
       categoryOf: categoryOfItem,
       locationName,
+      locationClock: (id) => locations.find((l) => l.id === id),
+    });
+  },
+
+  async getOwnerReportBundle(
+    tenantId: string,
+    locationId: string | null,
+    from: string,
+    to: string,
+    topN?: number,
+  ): Promise<OwnerReportBundle> {
+    ensureKitchenSeed();
+    // Stored-value liability lives in the stored-value store (src/lib/giftcards).
+    const { mockStoredValueStore } = await import("@/lib/giftcards/store-mock");
+    const sv = await mockStoredValueStore.summary(tenantId, null, from, from);
+    return buildOwnerBundle({
+      tenantId,
+      locationId,
+      from,
+      to,
+      topN,
+      storedValueOutstandingCents: sv.outstanding_cents,
+      orders: [...orders.values()].filter((o) => o.tenant_id === tenantId),
+      payments: [...payments.values()].filter((p) => p.tenant_id === tenantId),
+      locations: locations.filter((l) => l.tenant_id === tenantId),
+      staff: [...staffById.values()].filter((s) => s.tenant_id === tenantId),
+      categoryOf: categoryOfItem,
     });
   },
 
@@ -2861,6 +3421,7 @@ export const mockDriver: PosDriver = {
     tenantId: string,
     locationId: string,
     businessDate: string,
+    opts?: { drawer?: BusinessDayClose["drawer"] },
   ): Promise<BusinessDayClose> {
     const key = `${locationId}:${businessDate}`;
     const existing = businessDayCloses.get(key);
@@ -2877,7 +3438,10 @@ export const mockDriver: PosDriver = {
         s.location_id === locationId &&
         s.status === "closed" &&
         s.closed_at != null &&
-        isoDate(s.closed_at) === businessDate,
+        locationBusinessDate(
+          s.closed_at,
+          locations.find((l) => l.id === locationId),
+        ) === businessDate,
     );
     let openingFloat = 0;
     let cashSales = 0;
@@ -2898,7 +3462,7 @@ export const mockDriver: PosDriver = {
       business_date: businessDate,
       closed_at: nowIso(),
       report,
-      drawer: {
+      drawer: opts?.drawer ?? {
         opening_float_cents: openingFloat,
         cash_sales_cents: cashSales,
         expected_cents: expected,
@@ -2919,7 +3483,12 @@ export const mockDriver: PosDriver = {
     return [...staffById.values()]
       .filter((s) => s.tenant_id === tenantId)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((s) => ({ ...s, pin_hash: undefined }));
+      .map((s) => ({
+        ...s,
+        pin_hash: undefined,
+        pin_previous_hash: undefined,
+        pin_previous_until: undefined,
+      }));
   },
 
   async getStaffById(tenantId: string, staffId: string): Promise<Staff | null> {
@@ -2971,9 +3540,37 @@ export const mockDriver: PosDriver = {
   async setStaffPinHash(tenantId, staffId, pinHash): Promise<boolean> {
     const s = staffById.get(staffId);
     if (!s || s.tenant_id !== tenantId) return false;
-    staffById.set(staffId, { ...s, pin_hash: pinHash });
+    staffById.set(staffId, {
+      ...s,
+      pin_hash: pinHash,
+      pin_previous_hash: null,
+      pin_previous_until: null,
+    });
     pinLocks.delete(staffId); // a reset PIN starts with a fresh lockout budget
     return true;
+  },
+
+  async rotateStaffPin(tenantId, staffId, pinHash, graceUntil): Promise<boolean> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return false;
+    const keep =
+      !!s.pin_previous_hash &&
+      !!s.pin_previous_until &&
+      new Date(s.pin_previous_until).getTime() > Date.now();
+    staffById.set(staffId, {
+      ...s,
+      pin_hash: pinHash,
+      pin_previous_hash: keep ? s.pin_previous_hash : (s.pin_hash ?? null),
+      pin_previous_until: keep ? s.pin_previous_until : graceUntil,
+    });
+    pinLocks.delete(staffId);
+    return true;
+  },
+
+  async clearPreviousPin(tenantId, staffId): Promise<void> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return;
+    staffById.set(staffId, { ...s, pin_previous_hash: null, pin_previous_until: null });
   },
 
   async tenantHasStaffPins(tenantId): Promise<boolean> {
@@ -2982,9 +3579,90 @@ export const mockDriver: PosDriver = {
     );
   },
 
+  async listStaffPinRecords(tenantId): Promise<StaffPinRecord[]> {
+    return [...staffById.values()]
+      .filter((s) => s.tenant_id === tenantId)
+      .map((s) => ({
+        id: s.id,
+        active: s.active,
+        location_ids: [...(s.location_ids ?? [])],
+        pin_hash: s.pin_hash ?? null,
+        pin_previous_hash: s.pin_previous_hash ?? null,
+        pin_previous_until: s.pin_previous_until ?? null,
+      }));
+  },
+
+  async updateStaffProfile(
+    tenantId: string,
+    staffId: string,
+    patch: StaffProfilePatch,
+  ): Promise<Staff | null> {
+    const cur = staffById.get(staffId);
+    if (!cur || cur.tenant_id !== tenantId) return null;
+    const next: Staff = { ...cur };
+    if (patch.name !== undefined) next.name = patch.name;
+    if (patch.role !== undefined) next.role = patch.role;
+    if (patch.active !== undefined) next.active = patch.active;
+    if (patch.contact_email !== undefined) next.contact_email = patch.contact_email;
+    if (patch.contact_phone !== undefined) next.contact_phone = patch.contact_phone;
+    if (patch.location_ids !== undefined) next.location_ids = [...patch.location_ids];
+    if (patch.module_roles !== undefined) next.module_roles = [...patch.module_roles];
+    staffById.set(staffId, next);
+    return { ...next, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
+  },
+
+  async lastStaffSignIns(tenantId): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const s of staffSessions.values()) {
+      if (s.tenant_id !== tenantId) continue;
+      const cur = out.get(s.staff_id);
+      if (!cur || s.created_at > cur) out.set(s.staff_id, s.created_at);
+    }
+    return out;
+  },
+
+  // Mirrors begin_pin_limit_attempt(): single-threaded JS makes this atomic.
+  async beginPinLimitAttempt(scope, key, limits): Promise<PinAttempt> {
+    const id = `${scope}:${key}`;
+    const now = Date.now();
+    let l = pinLimits.get(id) ?? { attempts: 0, windowStart: now, lockedUntil: null };
+    if (l.lockedUntil !== null && l.lockedUntil > now) {
+      return {
+        allowed: false,
+        justLocked: false,
+        attempts: l.attempts,
+        lockedUntil: new Date(l.lockedUntil).toISOString(),
+      };
+    }
+    if (l.lockedUntil !== null || l.windowStart + limits.windowMinutes * 60_000 <= now) {
+      l = { attempts: 0, windowStart: now, lockedUntil: null };
+    }
+    if (l.attempts >= limits.max) {
+      const lockedUntil = now + limits.lockMinutes * 60_000;
+      pinLimits.set(id, { attempts: 0, windowStart: now, lockedUntil });
+      return {
+        allowed: false,
+        justLocked: true,
+        attempts: 0,
+        lockedUntil: new Date(lockedUntil).toISOString(),
+      };
+    }
+    const attempts = l.attempts + 1;
+    pinLimits.set(id, { ...l, attempts });
+    return { allowed: true, justLocked: false, attempts, lockedUntil: null };
+  },
+
+  async releasePinLimitAttempt(scope, key): Promise<void> {
+    const id = `${scope}:${key}`;
+    const l = pinLimits.get(id);
+    if (l && l.lockedUntil === null) {
+      pinLimits.set(id, { ...l, attempts: Math.max(l.attempts - 1, 0) });
+    }
+  },
+
   async createStaffSession(session: StaffSession): Promise<StaffSession> {
-    staffSessions.set(session.id, { ...session });
-    return { ...session };
+    staffSessions.set(session.id, { kind: "till", ...session });
+    return { kind: "till", ...session };
   },
 
   async getStaffSession(id: string): Promise<StaffSession | null> {
@@ -3006,6 +3684,15 @@ export const mockDriver: PosDriver = {
     }
   },
 
+  async revokeStaffSessionsForStaff(tenantId, staffId): Promise<void> {
+    const now = nowIso();
+    for (const [id, s] of staffSessions) {
+      if (s.tenant_id === tenantId && s.staff_id === staffId && !s.revoked_at) {
+        staffSessions.set(id, { ...s, revoked_at: now });
+      }
+    }
+  },
+
   async upsertStaff(staff: Staff): Promise<Staff> {
     const existing = staffById.get(staff.id);
     const merged: Staff = {
@@ -3019,7 +3706,7 @@ export const mockDriver: PosDriver = {
       created_at: existing?.created_at ?? staff.created_at ?? nowIso(),
     };
     staffById.set(merged.id, merged);
-    return { ...merged, pin_hash: undefined };
+    return { ...merged, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async setStaffModuleRoles(tenantId, staffId, roles) {
@@ -3027,7 +3714,7 @@ export const mockDriver: PosDriver = {
     if (!cur || cur.tenant_id !== tenantId) return null;
     const next: Staff = { ...cur, module_roles: [...roles] };
     staffById.set(staffId, next);
-    return { ...next, pin_hash: undefined };
+    return { ...next, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async getShift(id: string): Promise<Shift | null> {
@@ -3138,9 +3825,22 @@ export const mockDriver: PosDriver = {
   },
 };
 
+/** Test helper: clear the per-device / per-location PIN budgets only. */
+export function resetMockPinLimits(): void {
+  pinLimits.clear();
+}
+
+/** Test helper: clear PIN budgets/locks and staff sessions. */
+export function resetMockPinState(): void {
+  pinLimits.clear();
+  pinLocks.clear();
+  staffSessions.clear();
+}
+
 /** Test helper: clear placed orders + reset the sequence + KDS seed flag. */
 export function resetMockOrders(): void {
   orders.clear();
+  marketplaceStores.clear();
   orderSeq = 0;
   kitchenSeeded = false;
 }
@@ -3154,6 +3854,9 @@ export function resetMockPayments(): void {
   connectAccounts.clear();
   terminalLocations.clear();
   terminalReaders.clear();
+  printers.clear();
+  printJobs.clear();
+  printSettings.clear();
 }
 
 /** Test helper: clear customers, magic-link tokens, and deliveries. */

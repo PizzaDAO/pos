@@ -5,15 +5,15 @@
  * GET  ?tenantId=&locationId=  -> the location's policy (defaults applied).
  * POST { tenantId, locationId, refund_approval_cents, comp_approval_cents,
  *        void_approval_cents } -> set it. OWNER only (a manager must not raise
- *        the limit a cashier may refund without them).
+ *        the limit a cashier may refund without them): the back-office PIN
+ *        gate's unlocked staff role (requireAdminAccess), not the device login.
  *
  * A cashier may refund / comp / void fired food up to the threshold alone;
  * above it an owner or manager approves by PIN at the till. 0 = always.
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
-import { sessionRoleIn } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { parsePolicy, resolvePolicy } from "@/lib/adjustments/policy";
 import { readJsonBody, recordAudit } from "@/lib/security";
 
@@ -21,7 +21,7 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId: searchParams.get("locationId"),
     requireLocation: true,
   });
@@ -34,13 +34,14 @@ export async function POST(request: Request) {
   const parsed = await readJsonBody(request);
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
   const body = (parsed.body ?? {}) as Record<string, unknown>;
-  const auth = await requireTenantAccess(
+  const auth = await requireAdminAccess(
+    request,
     typeof body.tenantId === "string" ? body.tenantId : null,
-    "admin",
     { locationId: typeof body.locationId === "string" ? body.locationId : null, requireLocation: true },
   );
   if (!auth.ok) return auth.res;
-  if (sessionRoleIn(auth.user, auth.tenantId) !== "owner") {
+  // The UNLOCKED staff member's role (PIN gate), not the device login's.
+  if (auth.actor.role !== "owner") {
     return NextResponse.json({ error: "Only the owner can change approval limits." }, { status: 403 });
   }
   const policy = parsePolicy(body);

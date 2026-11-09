@@ -69,16 +69,24 @@ begin
     raise exception 'release kept the tip part (% / %)', pay.refunded_cents, pay.tip_refunded_cents;
   end if;
 
-  -- pending card reservation -> confirm; tombstone release never frees the id
+  -- pending card reservation: holds room only; confirm makes it a refund;
+  -- a tombstone release never frees the id
   out := public.reserve_payment_refund(p1, 100, 'r-card-1', null, 'x', 0, true);
   select * into pay from public.payments where id = p1;
   if (select e ->> 'state' from jsonb_array_elements(pay.refunds) e where e ->> 'request_id' = 'r-card-1') <> 'pending' then
     raise exception 'card reservation not pending';
   end if;
+  if pay.refunded_cents <> 500 or pay.refund_reserved_cents <> 100 then
+    raise exception 'pending reservation counted as refunded (% / %)', pay.refunded_cents, pay.refund_reserved_cents;
+  end if;
+  -- the held room counts against the cap (base left 1500 - 100)
+  out := public.reserve_payment_refund(p1, 1500, 'r-over', null, null, 0);
+  if out ->> 'outcome' <> 'exceeds' then raise exception 'pending room not held: %', out; end if;
   out := public.confirm_payment_refund(p1, 'r-card-1', 're_card_1');
   if (select e ->> 'state' from jsonb_array_elements((out -> 'refunds')) e where e ->> 'request_id' = 'r-card-1') <> 'succeeded'
-     or (select e ->> 'processor_ref' from jsonb_array_elements((out -> 'refunds')) e where e ->> 'request_id' = 'r-card-1') <> 're_card_1' then
-    raise exception 'confirm did not mark succeeded: %', out;
+     or (select e ->> 'processor_ref' from jsonb_array_elements((out -> 'refunds')) e where e ->> 'request_id' = 'r-card-1') <> 're_card_1'
+     or (out ->> 'refunded_cents')::int <> 600 or (out ->> 'refund_reserved_cents')::int <> 0 then
+    raise exception 'confirm did not make it a refund: %', out;
   end if;
   perform public.release_payment_refund(p1, 100, 'r-card-1', true);
   select * into pay from public.payments where id = p1;
@@ -87,6 +95,13 @@ begin
   end if;
   out := public.reserve_payment_refund(p1, 100, 'r-card-1', null, null, 0, true);
   if out ->> 'outcome' <> 'duplicate' then raise exception 'tombstoned id reused: %', out; end if;
+  -- a pending refund released gives back only its held room
+  out := public.reserve_payment_refund(p1, 200, 'r-card-2', null, null, 0, true);
+  perform public.release_payment_refund(p1, 200, 'r-card-2', true);
+  select * into pay from public.payments where id = p1;
+  if pay.refunded_cents <> 500 or pay.refund_reserved_cents <> 0 then
+    raise exception 'pending release wrong (% / %)', pay.refunded_cents, pay.refund_reserved_cents;
+  end if;
   begin
     perform public.release_payment_refund(p1, 100, null);
     raise exception 'release without an id was accepted';
@@ -94,22 +109,27 @@ begin
     if sqlerrm not like '%refund id is required%' then raise; end if;
   end;
 
-  -- legacy (no tip part): tip first
+  -- legacy (no tip part): base first, tip last
   out := public.reserve_payment_refund(p1, 600, 'r-legacy', null, null, null);
   select * into pay from public.payments where id = p1;
-  if pay.tip_refunded_cents <> 400 or pay.refunded_cents <> 1100 then
+  if pay.tip_refunded_cents <> 0 or pay.refunded_cents <> 1100 then
     raise exception 'legacy split wrong (% / %)', pay.refunded_cents, pay.tip_refunded_cents;
+  end if;
+  out := public.reserve_payment_refund(p1, 1000, 'r-legacy-2', null, null, null);
+  select * into pay from public.payments where id = p1;
+  if pay.tip_refunded_cents <> 100 or pay.refunded_cents <> 2100 then
+    raise exception 'legacy split beyond the base wrong (% / %)', pay.refunded_cents, pay.tip_refunded_cents;
   end if;
 
   -- full refund flips to refunded; its release restores the prior status
-  out := public.reserve_payment_refund(p1, 1300, 'r-rest', null, null, 0);
+  out := public.reserve_payment_refund(p1, 300, 'r-rest', null, null, 300);
   select * into pay from public.payments where id = p1;
   if pay.status <> 'refunded' then raise exception 'not refunded after the rest: %', pay.status; end if;
-  perform public.release_payment_refund(p1, 1300, 'r-rest');
+  perform public.release_payment_refund(p1, 300, 'r-rest');
   if (select status::text from public.payments where id = p1) <> 'captured' then
     raise exception 'release did not restore captured';
   end if;
-  out := public.reserve_payment_refund(p1, 1300, 'r-rest-2', null, null, 0);
+  out := public.reserve_payment_refund(p1, 300, 'r-rest-2', null, null, 300);
 
   -- ---- item refund quantities --------------------------------------------------
   out := public.begin_order_refund(jsonb_build_object(

@@ -22,6 +22,7 @@ import type {
 import { NOT_LIVE_ORDER_STATUSES } from "@/lib/db/menu-types";
 import { memoryOutbox, type MemoryOutbox } from "./outbox";
 import { tipRefundedCents } from "@/lib/payments/refund-state";
+import { tipRefundSteps } from "./tips";
 
 /**
  * Statuses that are NOT live: an order in one of these is not on the KDS and,
@@ -263,7 +264,7 @@ function tipRow(box: MemoryOutbox, p: Payment, type: "tip.recorded" | "tip.adjus
  *   - a tip-less capture that is the FIRST settled tender of an order with an
  *     order tip -> tip.recorded `tip_online_<order>`;
  *   - a refund on a settled tipped tender -> tip.adjusted when its tip part
- *     (`tip_refunded_cents`; legacy: tip first) grows, id carries the
+ *     (`tip_refunded_cents`; legacy: tip last) grows, id carries the
  *     cumulative refunded tip;
  *   - every settled tender of an online-tip order refunded in full -> one
  *     tip.adjusted `tipadj_online_<order>_full`.
@@ -328,20 +329,13 @@ async function tipBackfill(box: MemoryOutbox, inner: PosDriver, orderId: string)
       any = true;
       tipRow(box, p, "tip.recorded", `tip_${p.id}`);
       // Refunds from before the hub saw the order: one step each, an unrecorded
-      // remainder first (same ids as tips.ts).
-      const known = (p.refunds ?? []).reduce((n, r) => n + r.amount_cents, 0);
-      const steps = [
-        ...(p.refunded_cents > known ? [p.refunded_cents - known] : []),
-        ...(p.refunds ?? []).map((r) => r.amount_cents),
-      ];
-      let run = 0;
+      // remainder first (same ids as tips.ts tipRefundSteps: an entry's own tip
+      // part, else base first / tip last; pending reservations are not refunds).
       let prev = 0;
-      for (const amt of steps) {
-        run += amt;
-        const cum = Math.min(run, p.tip_cents);
-        if (cum > prev) {
-          tipRow(box, p, "tip.adjusted", `tipadj_${p.id}_c${cum}`);
-          prev = cum;
+      for (const { cumTip } of tipRefundSteps(p)) {
+        if (cumTip > prev) {
+          tipRow(box, p, "tip.adjusted", `tipadj_${p.id}_c${cumTip}`);
+          prev = cumTip;
         }
       }
     }
@@ -516,6 +510,19 @@ export function withOutbox(
       return res;
     },
 
+    // A pending (card / stored value) refund becomes a refund when confirmed:
+    // that is when refunded_cents moves, so that is when its events go out.
+    async confirmPaymentRefund(paymentId, refundId, processorRef) {
+      const before = await inner.getPayment(paymentId);
+      const after = await inner.confirmPaymentRefund(paymentId, refundId, processorRef);
+      if (after && before) {
+        const ann = await orderAnnounced(after.order_id);
+        paymentEvents(box, ann, after, before);
+        await tipEvents(box, inner, await strictAnnounced(after.order_id), after, before);
+      }
+      return after;
+    },
+
     async releasePaymentRefund(paymentId, amountCents, refundId, opts) {
       const before = await inner.getPayment(paymentId);
       await inner.releasePaymentRefund(paymentId, amountCents, refundId, opts);
@@ -638,6 +645,23 @@ export function withOutbox(
       return result;
     },
 
+    async updateStaffProfile(tenantId, staffId, patch) {
+      const before = await inner.getStaffById(tenantId, staffId);
+      const result = await inner.updateStaffProfile(tenantId, staffId, patch);
+      if (result) {
+        box.append({
+          tenant_id: result.tenant_id,
+          location_id: null,
+          event_type:
+            before?.active && !result.active ? "staff.deactivated" : "staff.updated",
+          subject_type: "staff",
+          subject_id: result.id,
+          row_snapshot: { id: result.id },
+        });
+      }
+      return result;
+    },
+
     async setStaffModuleRoles(tenantId, staffId, roles) {
       const result = await inner.setStaffModuleRoles(tenantId, staffId, roles);
       if (result) {
@@ -683,9 +707,9 @@ export function withOutbox(
       return shift;
     },
 
-    async closeBusinessDay(tenantId, locationId, businessDate) {
+    async closeBusinessDay(tenantId, locationId, businessDate, opts) {
       const existing = await inner.getBusinessDayClose(tenantId, locationId, businessDate);
-      const close = await inner.closeBusinessDay(tenantId, locationId, businessDate);
+      const close = await inner.closeBusinessDay(tenantId, locationId, businessDate, opts);
       if (!existing) {
         box.append({
           tenant_id: tenantId,

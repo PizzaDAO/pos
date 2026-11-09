@@ -15,6 +15,7 @@ import { isCardReady } from "@/lib/payments/connect";
 import { onlineRailAvailable } from "@/lib/payments/online-rails";
 import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
 import { onlinePaymentAllowed } from "@/lib/shop/training-online";
+import { giftCardsEnabled } from "@/lib/giftcards/limits";
 
 export const runtime = "nodejs";
 
@@ -64,6 +65,8 @@ export async function GET(request: Request) {
           onlinePaymentAllowed(location.tenant_id, "crypto_coinbase"),
       },
       driver: driver.name,
+      // Gift cards / store credit can be bought and applied at checkout.
+      giftCards: giftCardsEnabled(),
       // Display only: the "payments are simulated" note shows just in training.
       demo: demoModeInfo().banner,
     },

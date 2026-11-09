@@ -189,7 +189,7 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
     .reduce((sum, p) => sum + p.amount_cents + p.tip_cents, 0);
   const refunds = live
     .flatMap((p) =>
-      (p.refunds ?? []).map((r) => ({
+      (p.refunds ?? []).filter((r) => r.state !== "pending").map((r) => ({
         tenderLabel: tenderRailLabel(p.rail),
         amountCents: r.amount_cents,
         tipCents: typeof r.tip_cents === "number" ? r.tip_cents : 0,

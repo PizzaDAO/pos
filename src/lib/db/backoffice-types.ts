@@ -190,6 +190,36 @@ export interface StaffSession {
   created_at: string;
   expires_at: string;
   revoked_at: string | null;
+  /**
+   * 'till' = a PIN switch-in at the terminal; 'admin' = a short back-office
+   * unlock by an owner/manager PIN. Each check honours only its own kind.
+   * Absent on rows written before the column existed = 'till'.
+   */
+  kind?: StaffSessionKind;
+}
+
+export type StaffSessionKind = "till" | "admin";
+
+/** Fields an owner/manager may edit on a staff member (Admin > Staff). */
+export interface StaffProfilePatch {
+  name?: string;
+  role?: MembershipRole;
+  active?: boolean;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  location_ids?: string[];
+  module_roles?: StaffModuleRole[];
+}
+
+/** A staff member's PIN material, for the server-side uniqueness check only. */
+export interface StaffPinRecord {
+  id: string;
+  active: boolean;
+  location_ids: string[];
+  pin_hash: string | null;
+  /** A replaced short PIN still honoured until `pin_previous_until`. */
+  pin_previous_hash: string | null;
+  pin_previous_until: string | null;
 }
 
 /** Per-staff PIN lockout state. */
@@ -238,12 +268,21 @@ export interface Staff {
    * `src/lib/auth/pin.ts`.
    */
   pin_hash?: string | null;
+  /**
+   * A replaced short owner/manager PIN that stays valid until the new PIN is
+   * first used or `pin_previous_until` passes (server-only, like pin_hash).
+   */
+  pin_previous_hash?: string | null;
+  pin_previous_until?: string | null;
   /** Linked login (auth user id), null until linked (POS-7). */
   user_id?: string | null;
   /** Locations this person works at; empty/absent = all (POS-7). */
   location_ids?: string[];
   /** Roles for other modules (driver, dispatcher); empty/absent = none. */
   module_roles?: StaffModuleRole[];
+  /** Optional contact details (informational; NOT an identity key). */
+  contact_email?: string | null;
+  contact_phone?: string | null;
   created_at: string;
 }
 
@@ -388,6 +427,33 @@ export interface SalesReport {
   byChannel: SalesBucket[];
   byLocation: SalesBucket[];
   paymentMix: PaymentMixSlice[];
+  /**
+   * Gift cards / store credit (src/lib/giftcards/report.ts). Gift card SALES are
+   * a liability: their orders are NOT in the figures above (nor the payment mix).
+   * Absent on reports closed before it existed.
+   */
+  stored_value?: StoredValueReport;
+}
+
+export interface StoredValueReport {
+  /** Gift card sale + reload orders with settled money, and that money (base). */
+  sold_count: number;
+  sold_cents: number;
+  /** Refunded on those orders (voided cards / reversed reloads). */
+  sold_refunded_cents: number;
+  /** The money taken for cards by tender family (drawer reconciliation). */
+  sold_by_family: { cash: number; card: number; crypto: number; other: number };
+  /** Gift card / store credit tenders on sales orders (in the payment mix too). */
+  redeemed_count: number;
+  redeemed_gift_card_cents: number;
+  redeemed_store_credit_cents: number;
+  /** Refunds of those tenders, returned to the card. */
+  returned_to_card_cents: number;
+  /** Store credit issued in the range (added by the reports route, live). */
+  store_credit_issued_count?: number;
+  store_credit_issued_cents?: number;
+  /** Current outstanding liability across the tenant (reports route, live). */
+  outstanding_cents?: number;
 }
 
 // ----------------------------------------------------------------------------
@@ -416,5 +482,11 @@ export interface BusinessDayClose {
     counted_cents: number;
     over_short_cents: number;
     shift_count: number;
+    /** Drawers still open at close (their cash is not in expected). */
+    open_drawer_count?: number;
+    /** Where expected came from: closed shifts, or the day's cash sales (no shifts). */
+    expected_source?: "shifts" | "sales";
+    /** True when the manager counted the cash at Close day. */
+    counted_at_close?: boolean;
   };
 }

@@ -6,8 +6,11 @@
  *   "warms up" between polls without waiting for the next snapshot).
  * - Shows order number, channel, status badge, live elapsed mm:ss, line items
  *   (with half-and-half), and order notes.
- * - Bump advances status; Recall re-opens a ready/completed ticket; Print opens
- *   the print-friendly ticket route.
+ * - Bump advances status; a Ready ticket's primary action is the hand-off bump
+ *   ("Picked up": ready → completed, which drops it off the board; in-house
+ *   delivery goes "Out with driver" then "Delivered"; provider-run delivery has
+ *   no hand-off button), with Recall as the secondary; Print opens the
+ *   print-friendly ticket route.
  */
 "use client";
 
@@ -16,9 +19,10 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { KdsThresholds } from "@/lib/db";
 import { ageLevelFor } from "@/lib/kds/board";
-import { statusLabel } from "@/lib/kds/status";
+import { handoffLabel, isHandoffStatus, statusLabel } from "@/lib/kds/status";
 import { channelLabel, formatElapsed } from "@/lib/kds/format";
 import type { AgeLevel, KitchenTicket, StationFilter } from "@/lib/kds/types";
+import { MarketplaceBadge } from "@/components/marketplace-badge";
 import { TicketItems } from "./ticket-items";
 
 const AGE_STYLES: Record<AgeLevel, { card: string; header: string }> = {
@@ -76,11 +80,12 @@ function TicketCardImpl({
   const { order } = ticket;
   const elapsed = useLiveElapsed(order.created_at);
   const ageLevel = ageLevelFor(elapsed, thresholds);
-  const isBumped = order.status === "ready" || order.status === "completed";
+  const isBumped = isHandoffStatus(order.status);
   // Ready/done tickets are waiting for hand-off, not aging in the kitchen, so
   // they are greyed out instead of turning amber/red.
   const styles = isBumped ? READY_STYLE : AGE_STYLES[ageLevel];
   const isRecalled = order.status === "recall";
+  const handoff = handoffLabel(order, ticket.deliveryProvider);
 
   return (
     <article
@@ -100,7 +105,14 @@ function TicketCardImpl({
           </span>
         </div>
         <div className="flex items-center justify-between text-xs font-medium">
-          <span>{channelLabel(order.channel)}</span>
+          {order.fulfillment?.marketplace ? (
+            <MarketplaceBadge
+              provider={order.fulfillment.marketplace.provider}
+              displayId={order.fulfillment.marketplace.display_id}
+            />
+          ) : (
+            <span>{channelLabel(order.channel)}</span>
+          )}
           <span
             className={cn(
               "rounded-full px-2 py-0.5",
@@ -116,6 +128,15 @@ function TicketCardImpl({
         </div>
       </header>
 
+      {order.fulfillment?.marketplace?.cancel_requested && (
+        <div
+          role="alert"
+          className="bg-red-600 px-3 py-1 text-sm font-bold text-white"
+        >
+          CANCELLED BY PROVIDER: check with the front
+        </div>
+      )}
+
       <div className="flex-1 px-3 py-2">
         <TicketItems items={order.items} stationFilter={stationFilter} />
         {order.notes && (
@@ -126,11 +147,22 @@ function TicketCardImpl({
       </div>
 
       <footer className="flex gap-2 border-t p-2">
+        {handoff && (
+          <Button
+            size="lg"
+            className="h-14 flex-1 text-lg"
+            disabled={busy}
+            aria-label={`${handoff}: hand off order ${order.order_number}`}
+            onClick={() => onBump(order.id)}
+          >
+            {handoff}
+          </Button>
+        )}
         {isBumped ? (
           <Button
             variant="outline"
             size="lg"
-            className="h-14 flex-1 text-lg"
+            className={cn("h-14 text-lg", handoff ? "px-4" : "flex-1")}
             disabled={busy}
             aria-label={`Recall order ${order.order_number}`}
             onClick={() => onRecall(order.id)}

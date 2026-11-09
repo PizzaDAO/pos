@@ -53,6 +53,7 @@ import {
   RefundPendingError,
 } from "@/lib/payments/service";
 import { deriveDrawerEventId } from "@/lib/payments/ids";
+import { scheduleVoidTicket } from "@/lib/printing/queue";
 import { isFullyRefunded, liveTenders } from "@/lib/payments/refund-state";
 import {
   AdjustmentInputError,
@@ -336,8 +337,9 @@ async function executeRefund(
         });
         if (r?.manualRefund) manual = true;
       } catch (err) {
-        // Refused at reservation (nothing sent anywhere): re-plan the rest.
-        if (err instanceof RefundExceedsError) break;
+        // Refused at reservation (nothing sent anywhere): re-plan the rest. A
+        // gift-card sale that may not be refunded yet is a hard stop.
+        if (err instanceof RefundExceedsError && err.name !== "StoredValueRefundBlockedError") break;
         hardStop(err, step.payment.id);
         break;
       }
@@ -610,6 +612,34 @@ export async function cancelRefundRequest(input: ActionInput): Promise<ActionRes
 // ---------------------------------------------------------------------------
 
 /**
+ * Paper for the kitchen: fired food that was just voided gets a VOID ticket on
+ * the location's network printers (none: the KDS STOP banner is the notice).
+ * Scheduled after the response; never fails the void.
+ */
+function kitchenVoidTicket(
+  after: Order,
+  before: Order,
+  kind: "void_line" | "void_order",
+  record: AdjustmentRecord,
+  reason: { code: string; text: string | null },
+): void {
+  const items =
+    kind === "void_order"
+      ? before.items.filter((i) => !i.voided && !!i.fired_at)
+      : after.items.filter(
+          (i) => i.voided && !!i.fired_at && !before.items.some((b) => b.id === i.id && b.voided),
+        );
+  if (items.length === 0) return;
+  scheduleVoidTicket({
+    order: after,
+    items,
+    scope: kind === "void_order" ? "order" : "lines",
+    reason: reasonSummary(kind, reason.code, reason.text),
+    dedupeKey: record.id,
+  });
+}
+
+/**
  * Orders POS must not re-price or void itself: marketplace orders (the
  * marketplace owns the price and the refund) and stored-value (gift card)
  * sales. Null when the order can be adjusted.
@@ -759,6 +789,9 @@ async function editLoop(
         `${c.audit} on order ${order.id} -- ${reasonSummary(kind, input.reason.code, input.reason.text)} [${record.id}]`,
       ),
     });
+    if (kind === "void_line" || kind === "void_order") {
+      kitchenVoidTicket(res.order, order, kind, res.record, input.reason);
+    }
     return { ok: true, body: { ...(await snapshot(order.id)), record: res.record } };
   }
   return fail(409, "The order kept changing: try again.", "order_changed");
@@ -847,7 +880,9 @@ export async function voidOrder(input: ActionInput): Promise<ActionResult> {
       (result.body.record as AdjustmentRecord | undefined)?.status === "completed" &&
       (KDS_ACTIVE_STATUSES as readonly string[]).includes(order.status)
     ) {
-      await driver.transitionOrderStatus(order.id, ["refunded"], "voided");
+      const voided = await driver.transitionOrderStatus(order.id, ["refunded"], "voided");
+      const rec = result.body.record as AdjustmentRecord | undefined;
+      if (voided && rec) kitchenVoidTicket(voided, order, "void_order", rec, input.reason);
       return { ok: true, body: { ...result.body, ...(await snapshot(order.id)) } };
     }
     return result;

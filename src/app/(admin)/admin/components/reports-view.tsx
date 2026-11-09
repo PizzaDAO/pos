@@ -166,6 +166,31 @@ export function ReportsView({ tenantId, locations }: Props) {
             <MixBars slices={report.paymentMix} />
           </section>
 
+          {report.stored_value && (
+            <section className="rounded-xl border p-4">
+              <h3 className="mb-1 text-sm font-semibold">Gift cards &amp; store credit</h3>
+              <p className="mb-3 text-xs text-muted-foreground">
+                Gift card sales are a liability, not revenue: they are not in the
+                sales, tax or payment mix above. Redemptions are (as &ldquo;Other&rdquo;).
+              </p>
+              <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
+                <MixCard label="Cards sold" cents={report.stored_value.sold_cents} />
+                <MixCard
+                  label="Redeemed"
+                  cents={
+                    report.stored_value.redeemed_gift_card_cents +
+                    report.stored_value.redeemed_store_credit_cents
+                  }
+                />
+                <MixCard label="Returned to cards" cents={report.stored_value.returned_to_card_cents} />
+                <MixCard
+                  label="Store credit issued"
+                  cents={report.stored_value.store_credit_issued_cents ?? 0}
+                />
+              </div>
+            </section>
+          )}
+
           <div className="grid gap-4 lg:grid-cols-2">
             <BucketTable title="By location" buckets={report.byLocation} />
             <BucketTable title="By channel" buckets={report.byChannel} />

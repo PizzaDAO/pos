@@ -175,14 +175,14 @@ describe.skipIf(!PGLITE)("tip events through the Supabase driver on PGlite", () 
     expect(await tipRows()).toHaveLength(1); // only the online fact (P1 is pending)
     await db.query("update public.payments set status = 'captured' where id = $1", [P1]);
     await db.query("update public.payments set status = 'captured' where id = $1", [P1]); // replay
-    // Refunds are recorded the way reservePaymentRefund does: refunded_cents and
-    // a refunds[] entry in the same UPDATE.
+    // Refunds written raw (refunded_cents + a refunds[] entry with no tip part in
+    // the same UPDATE): the legacy rule, base first, only beyond the base is tip.
     const refund = (id: string, n: number, at: string) => ({ id, amount_cents: n, at, processor_ref: null, reason: null });
-    const r1 = [refund("r1", 120, "2026-06-04T20:00:00.000Z")];
-    const r2 = [...r1, refund("r2", 280, "2026-06-04T21:00:00.000Z")];
-    await db.query("update public.payments set refunded_cents = 120, refunds = $2::jsonb where id = $1", [P1, JSON.stringify(r1)]);
-    await db.query("update public.payments set refunded_cents = 120, refunds = $2::jsonb where id = $1", [P1, JSON.stringify(r1)]); // replay
-    await db.query("update public.payments set refunded_cents = 400, status = 'refunded', refunds = $2::jsonb where id = $1", [P1, JSON.stringify(r2)]);
+    const r1 = [refund("r1", 1120, "2026-06-04T20:00:00.000Z")];
+    const r2 = [...r1, refund("r2", 180, "2026-06-04T21:00:00.000Z")];
+    await db.query("update public.payments set refunded_cents = 1120, refunds = $2::jsonb where id = $1", [P1, JSON.stringify(r1)]);
+    await db.query("update public.payments set refunded_cents = 1120, refunds = $2::jsonb where id = $1", [P1, JSON.stringify(r1)]); // replay
+    await db.query("update public.payments set refunded_cents = 1300, status = 'refunded', refunds = $2::jsonb where id = $1", [P1, JSON.stringify(r2)]);
     const rows = await tipRows();
     expect(rows.map((r) => r.row_snapshot?.fact_id)).toEqual([
       `tip_online_${ORD_ONLINE}`,

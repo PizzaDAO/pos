@@ -42,6 +42,7 @@ import {
 } from "@/lib/shop/scheduling";
 import type { ShopResponse } from "@/lib/store/use-shop";
 import { storefrontKey } from "@/lib/shop/storefront";
+import { GiftCardField, applyShopGiftCard } from "./gift-card-field";
 
 type Fulfillment = "pickup" | "delivery";
 type Step = "fulfillment" | "identity" | "payment" | "waiting" | "done";
@@ -118,6 +119,7 @@ export function CheckoutFlow({
     availableRails[0]?.key ?? "stripe_online",
   );
   const [tipCents, setTipCents] = useState(0);
+  const [giftCode, setGiftCode] = useState("");
   // Set when the server's repriced total differs from the displayed total.
   const [priceChange, setPriceChange] = useState<Order | null>(null);
   const [placedOrderId, setPlacedOrderId] = useState<string | null>(null);
@@ -234,7 +236,24 @@ export function CheckoutFlow({
       setPriceChange(placed.order);
       return;
     }
-    await payPlacedOrder(placed.order);
+    await payWithGiftCard(placed.order);
+  }
+
+  /** Apply the entered gift card (if any) first; pay whatever is left by card. */
+  async function payWithGiftCard(order: Order) {
+    if (giftCode.trim()) {
+      try {
+        const applied = await applyShopGiftCard(order.id, giftCode);
+        if (applied.orderStatus === "paid") {
+          finishPaid(order);
+          return;
+        }
+      } catch (e) {
+        checkout.setError(e instanceof Error ? e.message : "Could not apply the gift card.");
+        return;
+      }
+    }
+    await payPlacedOrder(order);
   }
 
   /**
@@ -726,6 +745,16 @@ export function CheckoutFlow({
                 </div>
               </section>
 
+              {shop.giftCards && (
+                <GiftCardField
+                  tenantSlug={tenantSlug}
+                  locationSlug={slug}
+                  currency={currency}
+                  code={giftCode}
+                  onCodeChange={setGiftCode}
+                />
+              )}
+
               {/* Totals */}
               <section className="space-y-1 rounded-md bg-muted p-3 text-sm">
                 <Row label="Subtotal" value={formatMoney(totals.subtotal_cents, currency)} />
@@ -768,7 +797,7 @@ export function CheckoutFlow({
                     <Button
                       className="flex-1"
                       disabled={checkout.loading}
-                      onClick={() => void payPlacedOrder(priceChange)}
+                      onClick={() => void payWithGiftCard(priceChange)}
                     >
                       {`Pay ${formatMoney(priceChange.totals.total_cents, currency)}`}
                     </Button>

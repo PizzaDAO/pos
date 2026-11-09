@@ -22,6 +22,7 @@
  */
 import { NextResponse } from "next/server";
 import { resolvePolicy } from "@/lib/adjustments/policy";
+import { MARKETPLACE_NOT_PAYABLE_MESSAGE } from "@/lib/marketplace/guard";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
 import { publicTender } from "@/lib/payments/public";
@@ -31,6 +32,7 @@ import {
 } from "@/lib/payments/connect";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
+  CashUnderTenderError,
   PaymentConflictError,
   takePaymentDetailed,
   deriveOnlineTender,
@@ -42,6 +44,7 @@ import {
   nextOnlineTenderId,
 } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
+import { cashTenderError } from "@/lib/payments/cash-tender";
 import { cancelOnlineCheckout, orderExpiresAt } from "@/lib/shop/lifecycle";
 import { asapAvailability } from "@/lib/shop/scheduling";
 import {
@@ -114,6 +117,15 @@ export async function POST(request: Request) {
   const order = await driver.getOrder(body.orderId);
   if (!order) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
+  }
+
+  // Paid by the marketplace: no tender of any rail, for anyone (409, before auth
+  // or any tender lookup).
+  if (order.channel === "marketplace") {
+    return NextResponse.json(
+      { error: MARKETPLACE_NOT_PAYABLE_MESSAGE, code: "marketplace_order" },
+      { status: 409 },
+    );
   }
 
   // NEVER trust the client's tenant/location: the order is the source of truth.
@@ -212,6 +224,24 @@ export async function POST(request: Request) {
     }
   } catch {
     // Fall through: takePayment repeats the idempotency check.
+  }
+
+  // Cash must be covered by the cash handed over. Checked against what the client
+  // asked for BEFORE anything is touched (superseded online tenders canceled, a
+  // live card tender closed). A short cash tender goes in as a partial:
+  // amountCents = cash handed over, no tip.
+  if (body.rail === "cash") {
+    const short = cashTenderError({
+      amountCents: body.amountCents,
+      tipCents: body.tipCents ?? 0,
+      cashTenderedCents: body.cashTenderedCents,
+    });
+    if (short) {
+      return NextResponse.json(
+        { error: short, code: "cash_under_tender" },
+        { status: 422 },
+      );
+    }
   }
 
   // ONLINE orders: the server decides what is owed. The client's amountCents /
@@ -333,6 +363,23 @@ export async function POST(request: Request) {
     }
   }
 
+  // Re-check against the FINAL amount + tip (an online order's are derived by the
+  // server above), still before a live card tender is closed below. The service
+  // checks once more.
+  if (body.rail === "cash") {
+    const short = cashTenderError({
+      amountCents,
+      tipCents,
+      cashTenderedCents: body.cashTenderedCents,
+    });
+    if (short) {
+      return NextResponse.json(
+        { error: short, code: "cash_under_tender" },
+        { status: 422 },
+      );
+    }
+  }
+
   // IN-STORE: a card tender may be live on the reader (the customer can still tap).
   // Taking cash / crypto now would double charge, so close it first, STRICTLY. If
   // the card already went through, or the customer is mid-authorization, refuse
@@ -449,6 +496,12 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
+    if (err instanceof CashUnderTenderError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: 422 },
+      );
+    }
     if (
       err instanceof CardPaymentsNotReadyError ||
       err instanceof PaymentConflictError ||

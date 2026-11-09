@@ -18,7 +18,7 @@
  * refund after a period closed lands in the open period, not in the order's.
  *   - tender tip: each refund records its own tip part (`refunds[].tip_cents`,
  *     tip refunds are separate from food refunds); a refund recorded before
- *     that came off the tip FIRST (min(running, tip) - min(prev running, tip)).
+ *     that is tip only beyond the base (tip last).
  *     The id carries the cumulative tip refunded (`tipRefundSteps`).
  *   - online tip: POS caps a tender's refunds at amount + tip and the tender
  *     tip is 0 here, so a partial refund can never reach the tip (the tip was not
@@ -32,7 +32,7 @@
  */
 import { businessDate, type TipFact } from "@openpizza/core";
 import type { Payment } from "@/lib/db";
-import { tenderMethod, toContractRefunds } from "./mappers";
+import { confirmedRefundEntries, tenderMethod, toContractRefunds } from "./mappers";
 
 /** What the builder needs about an order (POS status, not the contract axes). */
 export interface TipOrderInput {
@@ -76,25 +76,29 @@ export const onlineTipReversalId = (orderId: string) => `tipadj_online_${orderId
 
 /**
  * Each refund of a tender with the cumulative TIP refunded after it (oldest
- * first; the unrecorded legacy remainder, if any, is the first step). A refund
- * with an explicit `tip_cents` moves the tip by exactly that; an older one came
- * off the tip first. Same rule as public.core_tip_backfill_for_order.
+ * first; the unrecorded legacy remainder, if any, is the first step; pending
+ * reservations are not refunds). A refund with an explicit `tip_cents` moves
+ * the tip by exactly that; an older one is tip only beyond the base (tip last).
+ * Same rule as public.core_tip_backfill_for_order.
  */
 export function tipRefundSteps(
   p: Payment,
 ): { refund: ReturnType<typeof toContractRefunds>[number]; cumTip: number }[] {
   const contract = toContractRefunds(p);
-  const raw = p.refunds ?? [];
+  const raw = confirmedRefundEntries(p);
   const legacyOffset = contract.length - raw.length; // 1 when a remainder was prepended
   const out: { refund: (typeof contract)[number]; cumTip: number }[] = [];
   let cum = 0;
+  let run = 0;
   contract.forEach((r, i) => {
     const entry = i >= legacyOffset ? raw[i - legacyOffset] : undefined;
+    run += r.amount_cents;
     const left = Math.max(0, p.tip_cents - cum);
+    // Explicit tip part, else the legacy rule: base first, the rest is tip.
     const part =
       typeof entry?.tip_cents === "number"
         ? Math.max(0, Math.min(entry.tip_cents, left))
-        : Math.min(r.amount_cents, left);
+        : Math.min(left, Math.max(0, run - p.amount_cents - cum));
     cum += part;
     out.push({ refund: r, cumTip: cum });
   });

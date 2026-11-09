@@ -1,5 +1,7 @@
 /**
- * Refund / void endpoint.
+ * Refund / void endpoint (single tender, API / back-compat; the till uses
+ * POST /api/orders/[id]/refund, which adds item refunds, reasons, approval
+ * thresholds and the ledger).
  *
  * POST /api/payments/refund — refund a captured tender (full or partial) via its
  * rail and persist the refunded amount. When every tender on the order is fully
@@ -33,8 +35,8 @@ interface RefundBody {
   paymentId: string;
   amountCents?: number;
   reason?: string;
-  /** Client-minted id for this refund request (idempotency across retries). */
-  refundId?: string;
+  /** Client-minted id for this refund request (REQUIRED: idempotency across retries). */
+  refundId: string;
 }
 
 export async function POST(request: Request) {
@@ -65,9 +67,12 @@ export async function POST(request: Request) {
     );
   }
 
-  if (b.refundId !== undefined && !isClientId(b.refundId)) {
+  // A client refund id is REQUIRED: it is the idempotency key of the refund
+  // (the Stripe key, the reservation id). Without one a retry after a lost
+  // response could refund twice. The till uses /api/orders/[id]/refund.
+  if (!isClientId(b.refundId)) {
     return NextResponse.json(
-      { error: "refundId is invalid." },
+      { error: "refundId is required (8-128 chars, A-Z a-z 0-9 _ -)." },
       { status: 422 },
     );
   }
