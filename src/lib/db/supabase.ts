@@ -110,6 +110,7 @@ import type {
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { EMPTY_BUNDLE, type OwnerReportBundle } from "@/lib/owner-reports";
 import { fetchAllPages, safeKeyset } from "./paging";
 
 // ---------------------------------------------------------------------------
@@ -183,6 +184,7 @@ function mapLocation(r: Row): Location {
     name: r.name as string,
     slug: r.slug as string,
     timezone: r.timezone as string,
+    business_day_cutoff_minutes: (r.business_day_cutoff_minutes as number | null) ?? 0,
     address: (r.address as string | null) ?? null,
     address_line1: (r.address_line1 as string | null) ?? null,
     address_line2: (r.address_line2 as string | null) ?? null,
@@ -3950,6 +3952,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         },
         locationName: (id: string) => locNameById.get(id) ?? id,
       });
+    },
+
+    async getOwnerReportBundle(tenantId, locationId, from, to, topN) {
+      // One SQL call: every aggregate is computed in Postgres, per location
+      // timezone and business-day cutoff (see report_sales_bundle).
+      const data = unwrap(
+        await sb.rpc("report_sales_bundle", {
+          p_tenant_id: tenantId,
+          p_location_id: locationId,
+          p_from: from,
+          p_to: to,
+          p_top_n: topN ?? 50,
+        }),
+      ) as Partial<OwnerReportBundle> | null;
+      return { ...EMPTY_BUNDLE, ...(data ?? {}) };
     },
 
     async getBusinessDayClose(tenantId, locationId, businessDate) {

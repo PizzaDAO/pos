@@ -6,6 +6,7 @@
  * same interface WITHOUT touching any UI/call site. Selection happens in
  * `index.ts` via `getPosDriver()`.
  */
+import type { OwnerReportBundle } from "@/lib/owner-reports";
 import type {
   Printer,
   PrintJob,
@@ -1344,6 +1345,19 @@ export interface PosDriver {
   ): Promise<SalesReport>;
 
   /** Existing close for a (location, business day), or null. */
+  /**
+   * Owner reports for inclusive BUSINESS dates `from..to` (see
+   * `src/lib/owner-reports.ts` for the definitions). Supabase runs
+   * `report_sales_bundle` in SQL; the mock aggregates in memory. Tenant-scoped.
+   */
+  getOwnerReportBundle(
+    tenantId: string,
+    locationId: string | null,
+    from: string,
+    to: string,
+    topN?: number,
+  ): Promise<OwnerReportBundle>;
+
   getBusinessDayClose(
     tenantId: string,
     locationId: string,
