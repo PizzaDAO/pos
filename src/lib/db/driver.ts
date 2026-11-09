@@ -6,6 +6,7 @@
  * same interface WITHOUT touching any UI/call site. Selection happens in
  * `index.ts` via `getPosDriver()`.
  */
+import type { OwnerReportBundle } from "@/lib/owner-reports";
 import type {
   CreateOrderInput,
   Menu,
@@ -202,6 +203,17 @@ export interface PosDriver {
     tenantId: string,
     locationId: string,
     country: string | null,
+  ): Promise<Location | null>;
+
+  /**
+   * Set when a location's business day starts (minutes after local midnight,
+   * 0-719). One conditional update scoped to `tenantId`; null when the location
+   * is not this tenant's.
+   */
+  setLocationBusinessDayCutoff(
+    tenantId: string,
+    locationId: string,
+    minutes: number,
   ): Promise<Location | null>;
 
   /** Replace a new tenant's menu with the starter template (onboarding import). */
@@ -987,6 +999,19 @@ export interface PosDriver {
   ): Promise<SalesReport>;
 
   /** Existing close for a (location, business day), or null. */
+  /**
+   * Owner reports for inclusive BUSINESS dates `from..to` (see
+   * `src/lib/owner-reports.ts` for the definitions). Supabase runs
+   * `report_sales_bundle` in SQL; the mock aggregates in memory. Tenant-scoped.
+   */
+  getOwnerReportBundle(
+    tenantId: string,
+    locationId: string | null,
+    from: string,
+    to: string,
+    topN?: number,
+  ): Promise<OwnerReportBundle>;
+
   getBusinessDayClose(
     tenantId: string,
     locationId: string,

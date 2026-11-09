@@ -3,6 +3,7 @@
  *
  * GET  ?tenantId=  → the tenant's locations + entitlement usage (count vs cap).
  * PATCH { tenantId, locationId, country } → set an existing location's country.
+ * PATCH { tenantId, locationId, businessDayCutoffMinutes } → when the business day starts.
  * POST { tenantId, name, address?, country? } → add a location, GATED by the plan's
  *      `max_locations` entitlement. Adding beyond the cap returns 402 with the
  *      upgrade reason — this is the canonical "plan gating blocks an over-limit
@@ -67,11 +68,28 @@ export async function PATCH(request: Request) {
     locationId?: string;
     country?: string | null;
     confirmPhoneEffects?: boolean;
+    businessDayCutoffMinutes?: number;
   };
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
+  // { tenantId, locationId, businessDayCutoffMinutes } -> when the business day
+  // starts (minutes after local midnight; 0-719). Reports bucket orders by it.
+  if (body.businessDayCutoffMinutes !== undefined) {
+    const m = body.businessDayCutoffMinutes;
+    if (!body.tenantId || !body.locationId || !Number.isInteger(m) || m < 0 || m > 719) {
+      return NextResponse.json(
+        { error: "tenantId, locationId and businessDayCutoffMinutes (integer 0-719) are required." },
+        { status: 422 },
+      );
+    }
+    const cutoffAuth = await requireTenantAccess(body.tenantId, "admin");
+    if (!cutoffAuth.ok) return cutoffAuth.res;
+    const updated = await getPosDriver().setLocationBusinessDayCutoff(cutoffAuth.tenantId, body.locationId, m);
+    if (!updated) return NextResponse.json({ error: "Location not found." }, { status: 404 });
+    return NextResponse.json({ location: updated });
   }
   if (!body.tenantId || !body.locationId || body.country === undefined) {
     return NextResponse.json(

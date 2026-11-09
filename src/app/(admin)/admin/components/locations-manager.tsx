@@ -139,6 +139,21 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
     onLocationsChanged?.();
   }
 
+  async function saveCutoff(locationId: string, minutes: number) {
+    setError(null);
+    const res = await fetch("/api/admin/locations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenantId, locationId, businessDayCutoffMinutes: minutes }),
+    });
+    if (!res.ok) {
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(data.error ?? `Could not save business day start (HTTP ${res.status}).`);
+      return;
+    }
+    await load();
+  }
+
   const max = entitlements?.entitlements.max_locations ?? null;
   const maxLabel = max === null || !Number.isFinite(max) ? "∞" : String(max);
 
@@ -167,6 +182,19 @@ export function LocationsManager({ tenantId, onLocationsChanged }: Props) {
             </span>
             <span className="flex items-center gap-2 text-xs text-muted-foreground">
               {l.address ?? "no address"}
+              <select
+                aria-label={`Business day starts at, ${l.name}`}
+                title="Sales before this local time count toward the previous business day in reports."
+                className="rounded-md border bg-background px-2 py-1"
+                value={Math.floor((l.business_day_cutoff_minutes ?? 0) / 60) * 60}
+                onChange={(e) => void saveCutoff(l.id, Number(e.target.value))}
+              >
+                {Array.from({ length: 12 }, (_, h) => (
+                  <option key={h} value={h * 60}>
+                    Day starts {String(h).padStart(2, "0")}:00
+                  </option>
+                ))}
+              </select>
               <input
                 aria-label={`Country of ${l.name}`}
                 title="2-letter country code (blank = US). Phone numbers are read in this country."

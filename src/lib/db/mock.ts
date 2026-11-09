@@ -134,6 +134,7 @@ import {
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { buildOwnerBundle, type OwnerReportBundle } from "@/lib/owner-reports";
 
 /**
  * An abandoned tender attempt: unsettled (pending / requires_action), never
@@ -701,6 +702,13 @@ export const mockDriver: PosDriver = {
     const i = locations.findIndex((l) => l.id === locationId && l.tenant_id === tenantId);
     if (i < 0) return null;
     locations[i] = { ...locations[i]!, country };
+    return { ...locations[i]! };
+  },
+
+  async setLocationBusinessDayCutoff(tenantId, locationId, minutes) {
+    const i = locations.findIndex((l) => l.id === locationId && l.tenant_id === tenantId);
+    if (i < 0) return null;
+    locations[i] = { ...locations[i]!, business_day_cutoff_minutes: minutes };
     return { ...locations[i]! };
   },
 
@@ -2598,6 +2606,28 @@ export const mockDriver: PosDriver = {
       payments: scopedPayments,
       categoryOf: categoryOfItem,
       locationName,
+    });
+  },
+
+  async getOwnerReportBundle(
+    tenantId: string,
+    locationId: string | null,
+    from: string,
+    to: string,
+    topN?: number,
+  ): Promise<OwnerReportBundle> {
+    ensureKitchenSeed();
+    return buildOwnerBundle({
+      tenantId,
+      locationId,
+      from,
+      to,
+      topN,
+      orders: [...orders.values()].filter((o) => o.tenant_id === tenantId),
+      payments: [...payments.values()].filter((p) => p.tenant_id === tenantId),
+      locations: locations.filter((l) => l.tenant_id === tenantId),
+      staff: [...staffById.values()].filter((s) => s.tenant_id === tenantId),
+      categoryOf: categoryOfItem,
     });
   },
 
