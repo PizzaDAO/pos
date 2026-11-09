@@ -573,12 +573,13 @@ export async function sweepUnreleasedStoredValue(): Promise<number> {
  * refundPayment's policy for a tender, decided BEFORE any money moves:
  *  - null: not a gift-card sale/reload tender (normal rules);
  *  - "released": the value it bought already left the card (voided, reload
- *    reversed, never credited): refund normally (card rails Stripe-first with
- *    the fixed idempotency key, then record), no crash window;
+ *    reversed, never credited): refund normally (card rails: reserved pending,
+ *    Stripe under the fixed idempotency key, confirmed with the re_ id);
  *  - "excess": the order would still hold the card's value without it (a
  *    duplicate tender): reserve first, re-check (assertStoredValueRefundAllowed)
- *    after the atomic reservation, then call the rail.
+ *    after the atomic reservation, then the same reserve / Stripe / confirm.
  * Throws StoredValueRefundBlockedError while the card still holds the value.
+ * refundPayment refuses a sale tender's refund without a client refund id.
  */
 export async function storedValueSaleRefundMode(
   payment: Payment,
@@ -691,10 +692,11 @@ export async function voidStoredValue(input: {
   const sale = account.sale_order_id ? await driver.getOrder(account.sale_order_id) : null;
 
   if (account.status === "pending" && sale) {
-    const live = (await driver.listPaymentsForOrder(sale.id)).some(
-      (p) => p.status === "pending" || p.status === "authorized" || p.status === "captured",
-    );
-    if (live) {
+    // A payment still confirming, or money that already covers the sale (its
+    // settlement is about to activate the card): wait for it. A PART payment
+    // on an unsettled sale is no reason to wait: it is refunded below.
+    const payments = await driver.listPaymentsForOrder(sale.id);
+    if (payments.some((p) => p.status === "pending") || isSettled(sale, payments)) {
       throw new StoredValueError("payment_in_progress", "A payment for this card is in progress. Refresh and try again.");
     }
   }
@@ -717,9 +719,12 @@ export async function voidStoredValue(input: {
     );
     if (settled) {
       refunds = await refundOrderTenders(sale, `gcvoid_${account.id}`, `Gift card voided: ${input.reason}`);
-    } else if (sale.status === "draft" || sale.status === "awaiting_payment") {
-      await driver.transitionOrderStatus(sale.id, ["draft", "awaiting_payment"], "voided");
     }
+    // An unsettled sale (nothing paid, or part payments now given back) is
+    // voided with its card. Only reached once every refund above went through
+    // (a pending one throws; the retry finishes it and lands here). A sale that
+    // was paid in full keeps its status (refunded by maybeMarkOrderRefunded).
+    await driver.transitionOrderStatus(sale.id, ["draft", "awaiting_payment"], "voided");
   }
   if (!voided.replayed) {
     await recordAudit({

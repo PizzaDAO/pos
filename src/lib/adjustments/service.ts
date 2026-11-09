@@ -184,6 +184,8 @@ export async function refreshRefundRecord(
   orderId: string,
   recordId: string,
   meta?: Record<string, unknown>,
+  /** The caller does not own the execution claim: leave it as it is. */
+  opts: { keepClaim?: boolean } = {},
 ): Promise<AdjustmentRecord | null> {
   const driver = getPosDriver();
   const record = (await driver.listOrderAdjustments(orderId)).find((r) => r.id === recordId);
@@ -201,6 +203,7 @@ export async function refreshRefundRecord(
       return p ? { ...a, drawer_event_id: p.drawer_event_id, drawer_note: p.drawer_note } : a;
     }),
     meta,
+    ...(opts.keepClaim ? { keepClaim: true } : {}),
   });
 }
 

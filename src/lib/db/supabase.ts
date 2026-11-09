@@ -1860,6 +1860,9 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_status: patch.status,
           p_allocations: patch.allocations,
           p_meta: patch.meta ?? null,
+          // Only sent when set: callers that release the claim work against
+          // the function before and after 20261114000100.
+          ...(patch.keepClaim ? { p_keep_claim: true } : {}),
         }),
       ) as Row | null;
       return out ? mapAdjustmentRecord(out) : null;

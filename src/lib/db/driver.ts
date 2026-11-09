@@ -405,12 +405,17 @@ export interface PosDriver {
   /** Refund records still `pending` since before `beforeIso` (oldest first), any tenant. */
   listStalePendingRefunds(beforeIso: string, limit: number): Promise<AdjustmentRecord[]>;
 
-  /** Record what a refund actually moved (status, allocations, meta). */
+  /**
+   * Record what a refund actually moved (status, allocations, meta). Releases
+   * the execution claim, unless `keepClaim` (a writer that does not own it,
+   * e.g. the Stripe webhook, must not free a live claim).
+   */
   finishOrderAdjustment(
     orderId: string,
     id: string,
     patch: Pick<AdjustmentRecord, "status" | "allocations"> & {
       meta?: Record<string, unknown> | null;
+      keepClaim?: boolean;
     },
   ): Promise<AdjustmentRecord | null>;
 

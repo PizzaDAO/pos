@@ -16,7 +16,13 @@ import {
 } from "@/lib/db";
 import { resetMockOnline, resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 import { computeOrderTotals } from "@/lib/pricing";
-import { refundPayment, takePayment, getOrderBalance } from "@/lib/payments/service";
+import {
+  RefundIdRequiredError,
+  RefundNeedsResolutionError,
+  refundPayment,
+  takePayment,
+  getOrderBalance,
+} from "@/lib/payments/service";
 import { cancelOnlineCheckout } from "@/lib/shop/lifecycle";
 import { buildSalesReport } from "@/lib/reports";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
@@ -732,6 +738,145 @@ describe("card refunds on gift card sales (no crash window)", () => {
     await refundPayment({ paymentId: dup.id, refundId: "r-crash" });
     expect(railSpy).toHaveBeenCalledTimes(1);
     railSpy.mockRestore();
+  });
+});
+
+describe("follow-ups: sale refunds, partial payments, the idempotency window", () => {
+  async function cardSale(amount: number, opts: { settle?: boolean } = {}) {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: amount, channel: "in_store", currency: "USD",
+    });
+    const now = new Date().toISOString();
+    const p = await getPosDriver().upsertPayment({
+      id: randomUUID(), order_id: sale.order.id, tenant_id: TENANT, location_id: LOCATION, rail: "stripe_terminal",
+      status: "captured", amount_cents: amount, tip_cents: 0, application_fee_cents: 0, currency: "USD",
+      charge_id: `sim_pi_${randomUUID()}`, connect_account_id: "acct_sim_1", crypto_tx_hash: null, crypto_chain: null,
+      cash_tendered_cents: null, cash_change_cents: null, refunded_cents: 0, simulated: true, raw: null,
+      created_at: now, updated_at: now,
+    });
+    if (opts.settle !== false) await settleStoredValueOrder(sale.order.id);
+    return { sale, p };
+  }
+  function stubCardRail(refundId = "re_fu_1") {
+    const rail = requirePaymentRail("stripe_terminal");
+    return vi.spyOn(rail, "refund").mockImplementation(async (r) => ({
+      refundId, status: "refunded", amount: r.amount!,
+    }));
+  }
+
+  it("an EXCESS (duplicate) card tender of a live card's sale is reserved, refunded and recorded with its re_ id", async () => {
+    const { sale, p } = await cardSale(3000);
+    const driver = getPosDriver();
+    const dup = await driver.upsertPayment({ ...p, id: randomUUID() });
+    const railSpy = stubCardRail("re_excess");
+    const out = await refundPayment({ paymentId: dup.id, refundId: "dup-refund-1" });
+    expect(out?.processorRef).toBe("re_excess");
+    expect(railSpy).toHaveBeenCalledTimes(1);
+    expect(railSpy.mock.calls[0]![0].context.idempotencyKey).toBe(`refund_${dup.id}_dup-refund-1`);
+    railSpy.mockRestore();
+    expect((await driver.getPayment(dup.id))!.refunds).toEqual([
+      expect.objectContaining({ processor_ref: "re_excess", state: "succeeded", amount_cents: 3000 }),
+    ]);
+    expect((await account(sale.account.id)).status).toBe("active");
+  });
+
+  it("a sale tender is never refunded without a refund id (a retry could refund it twice)", async () => {
+    const { p } = await cardSale(3000);
+    const driver = getPosDriver();
+    const dup = await driver.upsertPayment({ ...p, id: randomUUID() });
+    const railSpy = stubCardRail();
+    await expect(refundPayment({ paymentId: dup.id })).rejects.toBeInstanceOf(RefundIdRequiredError);
+    expect(railSpy).not.toHaveBeenCalled();
+    railSpy.mockRestore();
+    const after = (await driver.getPayment(dup.id))!;
+    expect(after.refunds ?? []).toEqual([]);
+    expect(after.refund_reserved_cents ?? 0).toBe(0);
+  });
+
+  it("a part-refunded, unsettled sale never activates the card for the full amount", async () => {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: 5000, channel: "in_store", currency: "USD",
+    });
+    const a = await payCash(sale.order.id, 3000);
+    // $10 of the $30 part payment goes back before the sale settles.
+    await refundPayment({ paymentId: a.id, amountCents: 1000, refundId: "part-back-1" });
+    // The other $20: gross tenders are $50, but only $40 is still held.
+    await payCash(sale.order.id, 2000);
+    await settleStoredValueOrder(sale.order.id);
+    const acct = await account(sale.account.id);
+    expect(acct.status).toBe("pending");
+    expect(acct.balance_cents).toBe(0);
+  });
+
+  it("voiding a pending card with a part payment refunds it and voids the sale order", async () => {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: 5000, channel: "in_store", currency: "USD",
+    });
+    const part = await payCash(sale.order.id, 2000);
+    const out = await voidStoredValue({
+      tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "walked off", actor: ACTOR,
+    });
+    expect(out.account.status).toBe("voided");
+    expect(out.refunds).toEqual([{ paymentId: part.id, refundedCents: 2000, manual: false }]);
+    expect((await getPosDriver().getPayment(part.id))!.status).toBe("refunded");
+    expect((await getPosDriver().getOrder(sale.order.id))!.status).toBe("voided");
+    // A retry is a no-op.
+    const again = await voidStoredValue({
+      tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "walked off", actor: ACTOR,
+    });
+    expect(again.refunds).toEqual([]);
+  });
+
+  it("a pending card whose sale is already covered still waits for its settlement", async () => {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: 5000, channel: "in_store", currency: "USD",
+    });
+    const now = new Date().toISOString();
+    // Paid in full, settlement hook not run yet (written straight to the driver).
+    await getPosDriver().upsertPayment({
+      id: randomUUID(), order_id: sale.order.id, tenant_id: TENANT, location_id: LOCATION, rail: "cash",
+      status: "captured", amount_cents: 5000, tip_cents: 0, application_fee_cents: 0, currency: "USD",
+      charge_id: null, connect_account_id: null, crypto_tx_hash: null, crypto_chain: null,
+      cash_tendered_cents: 5000, cash_change_cents: 0, refunded_cents: 0, simulated: true, raw: null,
+      created_at: now, updated_at: now,
+    });
+    await expect(
+      voidStoredValue({ tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "x", actor: ACTOR }),
+    ).rejects.toMatchObject({ code: "payment_in_progress" });
+  });
+
+  it("past ~23h a card refund is never replayed under its (expired) Stripe key", async () => {
+    const { p } = await cardSale(3000);
+    const driver = getPosDriver();
+    const noRef = await driver.upsertPayment({ ...p, id: randomUUID() });
+    const pend = await driver.upsertPayment({ ...p, id: randomUUID() });
+    // Recorded without a Stripe id (crash), and one left pending.
+    await driver.reservePaymentRefund(noRef.id, 3000, "old-noref", { reason: null });
+    await driver.reservePaymentRefund(pend.id, 3000, "old-pending", { reason: null, pending: true });
+    const railSpy = stubCardRail("re_never");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.now() + 24 * 60 * 60_000));
+    try {
+      const out = await refundPayment({ paymentId: noRef.id, refundId: "old-noref" });
+      expect(out?.replayed).toBe(true);
+      await expect(refundPayment({ paymentId: pend.id, refundId: "old-pending" })).rejects.toBeInstanceOf(
+        RefundNeedsResolutionError,
+      );
+      expect(railSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      railSpy.mockRestore();
+    }
+    expect((await driver.getPayment(noRef.id))!.refunds?.[0]?.processor_ref).toBeNull();
+    expect((await driver.getPayment(pend.id))!.refunds?.[0]?.state).toBe("pending");
+    // Within the window the same replays do call the rail (same key).
+    const fresh = await driver.upsertPayment({ ...p, id: randomUUID() });
+    await driver.reservePaymentRefund(fresh.id, 3000, "new-pending", { reason: null, pending: true });
+    const spy2 = stubCardRail("re_now");
+    await refundPayment({ paymentId: fresh.id, refundId: "new-pending" });
+    expect(spy2).toHaveBeenCalledTimes(1);
+    spy2.mockRestore();
+    expect((await driver.getPayment(fresh.id))!.refunds?.[0]).toMatchObject({ state: "succeeded", processor_ref: "re_now" });
   });
 });
 

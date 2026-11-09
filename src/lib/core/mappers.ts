@@ -736,6 +736,12 @@ export function toContractOrder(input: {
   };
 
   const t = order.totals;
+  const lines = toContractLines(order);
+  // A gift card sale / reload stores subtotal 0 (it is no food sale), but its
+  // contract order carries one synthetic gift_card_load line: the subtotal is
+  // that line (Σ live lines, the core totals invariant), untaxed.
+  const synthetic = lines.length === 1 && lines[0]!.line_type === "gift_card_load" && order.items.length === 0;
+  const subtotalCents = synthetic ? lines[0]!.line_total_cents : t.subtotal_cents;
   // An abandoned checkout maps to fulfillment `canceled` (toPosOrderStatus), so
   // it carries a canceled_at too: its last update, the abandonment (POS keeps
   // no separate abandoned-at stamp).
@@ -761,7 +767,7 @@ export function toContractOrder(input: {
       : null,
     fire_at: order.core_ext?.fire_at ?? null,
     currency: order.currency,
-    lines: toContractLines(order),
+    lines,
     // Comps + discounts as applied (a legacy discount_cents is one discount).
     adjustments: currentAdjustments(order).map((a) => ({
       id: a.id,
@@ -773,7 +779,7 @@ export function toContractOrder(input: {
       ...(a.line_ids?.length ? { line_ids: a.line_ids } : {}),
     })),
     totals: {
-      subtotal_cents: t.subtotal_cents,
+      subtotal_cents: subtotalCents,
       discount_cents: t.discount_cents,
       service_fee_cents: 0,
       delivery_fee_cents: deliveryFee,

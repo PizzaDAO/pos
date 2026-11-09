@@ -1191,7 +1191,7 @@ export const mockDriver: PosDriver = {
       ...adjustmentRecords[idx]!,
       status: patch.status,
       allocations: structuredClone(patch.allocations),
-      claimed_until: null,
+      claimed_until: patch.keepClaim ? (adjustmentRecords[idx]!.claimed_until ?? null) : null,
       ...(patch.meta !== undefined
         ? { meta: { ...(adjustmentRecords[idx]!.meta ?? {}), ...(patch.meta ?? {}) } }
         : {}),

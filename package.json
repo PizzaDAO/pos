@@ -20,7 +20,7 @@
     "format:check": "prettier --check .",
     "db:apply": "bash supabase/apply.sh",
     "db:test:rls": "bash supabase/tests/run-rls-isolation.sh",
-    "db:test:pglite": "node scripts/pglite-migrate.mjs supabase/tests/phase2_external_and_customers.sql supabase/tests/phase3_tip_events.sql supabase/tests/phase4_fidelity.sql supabase/tests/delivery_driver_wiring.sql supabase/tests/security_client_writes.sql supabase/tests/print_network.sql supabase/tests/owner_reports.sql supabase/tests/menu_import.sql supabase/tests/marketplace_inbox.sql supabase/tests/staff_admin_gate.sql supabase/tests/stored_value.sql supabase/tests/refunds_voids_comps.sql supabase/tests/owner_reports_refunds.sql",
+    "db:test:pglite": "node scripts/pglite-migrate.mjs supabase/tests/phase2_external_and_customers.sql supabase/tests/phase3_tip_events.sql supabase/tests/phase4_fidelity.sql supabase/tests/delivery_driver_wiring.sql supabase/tests/security_client_writes.sql supabase/tests/print_network.sql supabase/tests/owner_reports.sql supabase/tests/menu_import.sql supabase/tests/marketplace_inbox.sql supabase/tests/staff_admin_gate.sql supabase/tests/stored_value.sql supabase/tests/refunds_voids_comps.sql supabase/tests/owner_reports_refunds.sql supabase/tests/money_followups.sql",
     "auth:bootstrap": "node supabase/bootstrap-auth.mjs",
     "core:vendor": "bash scripts/vendor-core.sh"
   },
