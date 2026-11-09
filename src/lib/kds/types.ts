@@ -53,8 +53,6 @@ export interface KitchenBoardResponse {
   serverTime: string;
   /** Location age-coloring thresholds, so clients can re-color as time ticks. */
   thresholds: KdsThresholds;
-  /** Default crust/sauce-style modifier ids; tickets hide them (changes only). */
-  defaultModifierIds?: string[];
 }
 
 /** Filter a line's effective station, falling back to "expo" when unknown. */

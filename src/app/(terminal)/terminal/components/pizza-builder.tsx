@@ -15,7 +15,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { soldOutSets, type SoldOut } from "@/lib/menu-availability";
 import { formatMoney, withLinePricing } from "@/lib/pricing";
-import { pickDefaultSize } from "@/lib/till/default-size";
+import { defaultSizeFor } from "@/lib/till/default-size";
 import {
   buildLine,
   placementPriceCents,
@@ -76,7 +76,7 @@ export function PizzaBuilder({
 
     const sizeId =
       editing?.size_id ??
-      pickDefaultSize(item.sizes, soldOut.sizes, defaultSizeName)?.id ??
+      defaultSizeFor(item, soldOut.sizes, defaultSizeName)?.id ??
       null;
     return {
       single,

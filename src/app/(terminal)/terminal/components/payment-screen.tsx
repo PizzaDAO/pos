@@ -191,6 +191,10 @@ export function PaymentScreen({
    * `quickTenderedCents`: a quick-cash note tap charges at once with that amount
    * (Exact = the whole balance + tip), instead of filling the field first.
    */
+  // Quick-cash charges at once, so it is disabled exactly when Charge is.
+  const quickCashDisabled =
+    checkout.loading || card.busy || balance <= 0 || cardLive;
+
   async function handleTake(quickTenderedCents?: number) {
     if (balance <= 0) return;
     let input: Parameters<typeof checkout.takeTender>[0];
@@ -492,7 +496,7 @@ export function PaymentScreen({
                         type="button"
                         variant="outline"
                         className="h-12 px-4 text-base"
-                        disabled={checkout.loading || balance <= 0}
+                        disabled={quickCashDisabled}
                         onClick={() => void handleTake(dueWithTip)}
                       >
                         Exact
@@ -503,7 +507,7 @@ export function PaymentScreen({
                           type="button"
                           variant="outline"
                           className="h-12 px-4 text-base"
-                          disabled={checkout.loading || balance <= 0}
+                          disabled={quickCashDisabled}
                           onClick={() => void handleTake(n)}
                         >
                           {formatMoney(n, currency)}

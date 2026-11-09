@@ -14,7 +14,11 @@ const norm = (s: string) => s.trim().toLowerCase();
 /** Size names often carry dimensions ('Large (16")'): match on the leading word. */
 export const leadWord = (s: string) => norm(s).split(/[^a-z0-9]+/)[0] ?? "";
 
-/** The size to preselect: preferred name, then Large, then the first in stock. */
+/**
+ * The size to preselect: the preferred name (Large when unset), else the first in
+ * stock. A preference that doesn't exist on this item (a stale saved size, a
+ * one-size side) falls back to the item's first available size.
+ */
 export function pickDefaultSize(
   sizes: ItemSize[],
   soldOutSizeIds: ReadonlySet<string>,
@@ -22,14 +26,29 @@ export function pickDefaultSize(
 ): ItemSize | null {
   const inStock = sizes.filter((s) => !soldOutSizeIds.has(s.id));
   if (inStock.length === 0) return null;
-  for (const wanted of [preferredName, FALLBACK_DEFAULT_SIZE]) {
-    if (!wanted) continue;
-    const hit =
-      inStock.find((s) => norm(s.name) === norm(wanted)) ??
-      inStock.find((s) => leadWord(s.name) === leadWord(wanted));
-    if (hit) return hit;
+  const wanted = preferredName || FALLBACK_DEFAULT_SIZE;
+  return (
+    inStock.find((s) => norm(s.name) === norm(wanted)) ??
+    inStock.find((s) => leadWord(s.name) === leadWord(wanted)) ??
+    inStock[0]!
+  );
+}
+
+/** Default size applies to pizzas (half-capable items) only; sides and drinks take their first size. */
+export function defaultSizeFor(
+  item: MenuItemDetail,
+  soldOutSizeIds: ReadonlySet<string>,
+  preferredName?: string | null,
+): ItemSize | null {
+  if (!item.is_half_and_half_capable) {
+    return item.sizes.find((s) => !soldOutSizeIds.has(s.id)) ?? null;
   }
-  return inStock[0]!;
+  return pickDefaultSize(item.sizes, soldOutSizeIds, preferredName);
+}
+
+/** Whether a saved default size name exists on any item of the menu. */
+export function isKnownSizeName(items: MenuItemDetail[], name: string): boolean {
+  return items.some((i) => i.sizes.some((s) => leadWord(s.name) === leadWord(name)));
 }
 
 /** Distinct size names across the menu items, in first-seen order. */
@@ -64,6 +83,14 @@ export function readDefaultSizeName(locationId: string): string | null {
     return window.localStorage.getItem(storageKey(locationId)) || null;
   } catch {
     return null;
+  }
+}
+
+export function clearDefaultSizeName(locationId: string): void {
+  try {
+    window.localStorage.removeItem(storageKey(locationId));
+  } catch {
+    /* ignore */
   }
 }
 

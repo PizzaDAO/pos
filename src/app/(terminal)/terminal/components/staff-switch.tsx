@@ -15,15 +15,12 @@ import { Delete } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { shouldAutoSubmitPin } from "@/lib/till/pin";
 
 interface StaffOption {
   id: string;
   tenant_id?: string;
   name: string;
   role: string;
-  /** PIN length (4-6) when the server reports it; absent today. */
-  pin_length?: number;
 }
 
 export function StaffSwitch({
@@ -74,16 +71,6 @@ export function StaffSwitch({
     setError(null);
     setPin((p) => (p.length >= 8 ? p : p + d));
   }
-
-  // Auto-submit once the PIN is complete (6 digits unless the staff member's
-  // length is known); shorter PINs use Enter / the Switch button.
-  useEffect(() => {
-    const known = staff.find((s) => s.id === selected)?.pin_length;
-    if (selected && !busyRef.current && shouldAutoSubmitPin(pin, known)) {
-      submitRef.current();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pin]);
 
   // Hardware keyboard still works (digits, Backspace).
   useEffect(() => {

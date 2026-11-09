@@ -8,6 +8,9 @@ import type { Order, OrderCoreExt } from "@/lib/db";
 export const TILL_ORDER_TYPES = ["dine_in", "pickup", "delivery"] as const;
 export type TillOrderType = (typeof TILL_ORDER_TYPES)[number];
 
+/** Offered at the till (Delivery returns when the till can capture an address). */
+export const TILL_UI_ORDER_TYPES: readonly TillOrderType[] = ["dine_in", "pickup"];
+
 export const ORDER_TYPE_LABELS: Record<TillOrderType, string> = {
   dine_in: "Dine-in",
   pickup: "Pickup",
@@ -63,15 +66,4 @@ export function orderTypeOf(order: Pick<Order, "core_ext">): TillOrderType | nul
 export function orderTypeLabel(order: Pick<Order, "core_ext">): string | null {
   const t = orderTypeOf(order);
   return t ? ORDER_TYPE_LABELS[t] : null;
-}
-
-/**
- * One display format for order numbers across the till, KDS and receipt:
- * "#406". The stored value stays as generated ("1526-406", "A-0003", "K-103");
- * this shows its trailing number so a board never mixes three styles.
- */
-export function displayOrderNumber(orderNumber: string): string {
-  const m = /(\d+)\D*$/.exec(orderNumber);
-  if (!m) return orderNumber;
-  return `#${m[1]!.replace(/^0+(?=\d)/, "")}`;
 }

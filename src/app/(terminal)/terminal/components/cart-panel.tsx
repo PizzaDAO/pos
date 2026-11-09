@@ -14,7 +14,7 @@ import { useCartStore } from "@/lib/store/cart";
 import {
   MAX_CUSTOMER_NAME,
   ORDER_TYPE_LABELS,
-  TILL_ORDER_TYPES,
+  TILL_UI_ORDER_TYPES,
   type TillOrderType,
 } from "@/lib/till/order-meta";
 
@@ -39,8 +39,8 @@ export interface CartPanelProps {
   /** Whether the active staff member may apply an order discount. */
   canDiscount?: boolean;
   /** Order type + customer name taken at the till (shown on the KDS and receipt). */
-  orderType: TillOrderType;
-  onOrderType: (t: TillOrderType) => void;
+  orderType: TillOrderType | null;
+  onOrderType: (t: TillOrderType | null) => void;
   customerName: string;
   onCustomerName: (name: string) => void;
 }
@@ -187,13 +187,13 @@ export function CartPanel({
 
       {/* Order type + name for call-out */}
       <div className="space-y-2 border-t px-4 pt-3">
-        <div role="group" aria-label="Order type" className="grid grid-cols-3 gap-2">
-          {TILL_ORDER_TYPES.map((t) => (
+        <div role="group" aria-label="Order type" className="grid grid-cols-2 gap-2">
+          {TILL_UI_ORDER_TYPES.map((t) => (
             <button
               key={t}
               type="button"
               aria-pressed={orderType === t}
-              onClick={() => onOrderType(t)}
+              onClick={() => onOrderType(orderType === t ? null : t)}
               className={cn(
                 "min-h-11 rounded-lg border px-2 text-sm font-medium touch-manipulation",
                 orderType === t

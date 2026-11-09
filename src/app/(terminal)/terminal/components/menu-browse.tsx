@@ -167,16 +167,26 @@ function MenuBrowseImpl({
             const from = startingPrice(item);
             const out = isItemSoldOut(item, soldOut);
             const item86d = isItem86d(item.id, soldOut);
+            const quick = !managing && !!onQuickAdd && canQuickAdd(item);
             return (
+              <div key={item.id} className="relative">
               <button
-                key={item.id}
                 type="button"
                 // Sold out: the tap is refused (except to un-86 in 86 mode).
                 disabled={managing ? eightySixBusy : out}
                 onPointerDown={() => !managing && startPress(item)}
                 onPointerUp={endPress}
-                onPointerLeave={endPress}
-                onPointerCancel={endPress}
+                onPointerLeave={() => {
+                  endPress();
+                  longPressed.current = false;
+                }}
+                onPointerCancel={() => {
+                  endPress();
+                  longPressed.current = false;
+                }}
+                onKeyDown={() => {
+                  longPressed.current = false;
+                }}
                 onContextMenu={(e) => onQuickAdd && canQuickAdd(item) && e.preventDefault()}
                 onClick={() => {
                   if (managing) return onSetItem86?.(item, !item86d);
@@ -193,13 +203,13 @@ function MenuBrowseImpl({
                     : out
                       ? `${item.name}, sold out.`
                       : onQuickAdd && canQuickAdd(item)
-                        ? `${item.name}, ${from !== null ? formatMoney(from, currency) : ""}. Add to order. Hold to customize.`
+                        ? `${item.name}, ${from !== null ? formatMoney(from, currency) : ""}. Add to order. Use Options to customize.`
                         : from !== null
                           ? `${item.name}, from ${formatMoney(from, currency)}. Customize and add.`
                           : `${item.name}. Customize and add.`
                 }
                 className={cn(
-                  "flex min-h-[96px] flex-col items-start rounded-xl border p-4 text-left transition-colors",
+                  "flex min-h-[96px] w-full flex-col items-start rounded-xl border p-4 text-left transition-colors",
                   out
                     ? "border-dashed bg-muted text-muted-foreground"
                     : "hover:border-primary hover:bg-accent",
@@ -244,6 +254,17 @@ function MenuBrowseImpl({
                   </span>
                 )}
               </button>
+              {quick && !out && (
+                <button
+                  type="button"
+                  aria-label={`Options for ${item.name}`}
+                  onClick={() => onSelectItem(item)}
+                  className="absolute bottom-2 right-2 min-h-11 rounded-lg border bg-background px-3 text-sm font-medium touch-manipulation hover:bg-accent"
+                >
+                  Options
+                </button>
+              )}
+              </div>
             );
           })}
         </div>

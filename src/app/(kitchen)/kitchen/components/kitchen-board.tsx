@@ -12,10 +12,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChefHat, Volume2, VolumeX } from "lucide-react";
 import {
   DEFAULT_KDS_THRESHOLDS,
-  hasKitchenWork,
   lineMatchesStation,
 } from "@/lib/kds/board";
 import {
+  isAudioRunning,
   newTickets,
   playChime,
   primeAudio,
@@ -24,14 +24,13 @@ import {
 } from "@/lib/kds/alert";
 import { DEMO_LOCATION_DOWNTOWN_ID, DEMO_TENANT_ID } from "@/lib/db";
 import { useKitchenBoard } from "@/lib/kds/use-kitchen-board";
-import { isHandoffStatus as isHandoff } from "@/lib/kds/status";
+import { isHandoffStatus as isHandoff, noPrepBumpCount } from "@/lib/kds/status";
 import type { StationFilter } from "@/lib/kds/types";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/empty-state";
 import { StationFilterBar } from "./station-filter";
 import { PrinterBanner } from "@/components/printer-banner";
 import { TicketCard } from "./ticket-card";
-import { displayOrderNumber } from "@/lib/till/order-meta";
 
 /** Columns: 4 on a laptop, 5-6 on a wall-mounted 1080p display (compact tickets). */
 const GRID =
@@ -68,15 +67,7 @@ export function KitchenBoard({
   const [station, setStation] = useState<StationFilter>("all");
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  // Orders with nothing for any station (drink-only) never need a bump.
-  const tickets = useMemo(
-    () => (board?.tickets ?? []).filter((t) => hasKitchenWork(t.order)),
-    [board?.tickets],
-  );
-  const defaultModifierIds = useMemo(
-    () => new Set(board?.defaultModifierIds ?? []),
-    [board?.defaultModifierIds],
-  );
+  const tickets = useMemo(() => board?.tickets ?? [], [board?.tickets]);
   const thresholds = board?.thresholds ?? DEFAULT_KDS_THRESHOLDS;
 
   // Per-station ticket counts for the filter badges.
@@ -122,16 +113,29 @@ export function KitchenBoard({
   const [muted, setMuted] = useState(false);
   const mutedRef = useRef(false);
   const [flash, setFlash] = useState(false);
+  // Browsers keep audio suspended until a gesture: prime on the first
+  // interaction, and until then say so instead of showing "sound on".
+  const [audioReady, setAudioReady] = useState(false);
   useEffect(() => {
     const m = readMuted();
     mutedRef.current = m;
     setMuted(m);
+    const prime = () => {
+      void primeAudio().then(setAudioReady);
+    };
+    window.addEventListener("pointerdown", prime, { once: true });
+    window.addEventListener("keydown", prime, { once: true });
+    void Promise.resolve().then(() => setAudioReady(isAudioRunning()));
+    return () => {
+      window.removeEventListener("pointerdown", prime);
+      window.removeEventListener("keydown", prime);
+    };
   }, []);
   useEffect(() => {
     const fresh = newTickets(knownIds.current, tickets);
     knownIds.current = new Set(tickets.map((t) => t.order.id));
     if (fresh.length === 1) {
-      setAnnouncement(`New order ${displayOrderNumber(fresh[0]!.order.order_number)} received.`);
+      setAnnouncement(`New order ${fresh[0]!.order.order_number} received.`);
     } else if (fresh.length > 1) {
       setAnnouncement(`${fresh.length} new orders received.`);
     }
@@ -153,8 +157,11 @@ export function KitchenBoard({
     setMuted(next);
     writeMuted(next);
     if (!next) {
-      primeAudio(); // this tap is the gesture that lets later chimes play
-      playChime();
+      // This tap is the gesture that lets later chimes play.
+      void primeAudio().then((ok) => {
+        setAudioReady(ok);
+        if (ok) playChime();
+      });
     }
   }
 
@@ -189,13 +196,21 @@ export function KitchenBoard({
     }
   }
 
+  async function handoffNoPrep(
+    ticket: (typeof tickets)[number],
+    doBump: (id: string) => Promise<void>,
+  ) {
+    const n = noPrepBumpCount(ticket.order.status, ticket.order.channel);
+    for (let i = 0; i < n; i++) await doBump(ticket.order.id);
+  }
+
   const renderTicket = (ticket: (typeof tickets)[number]) => (
     <TicketCard
       key={ticket.order.id}
       ticket={ticket}
       thresholds={thresholds}
       stationFilter={station}
-      defaultModifierIds={defaultModifierIds}
+      onNoPrepHandoff={(id) => void withBusy(id, () => handoffNoPrep(ticket, bump))}
       busy={busyId === ticket.order.id}
       onBump={(id) => void withBusy(id, () => bump(id))}
       onRecall={(id) => void withBusy(id, () => recall(id))}
@@ -246,11 +261,25 @@ export function KitchenBoard({
             <button
               type="button"
               aria-pressed={muted}
-              aria-label={muted ? "Unmute new-ticket sound" : "Mute new-ticket sound"}
-              onClick={toggleMute}
-              className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-full border border-input bg-background px-3 hover:bg-accent touch-manipulation"
+              aria-label={
+                muted
+                  ? "Unmute new-ticket sound"
+                  : audioReady
+                    ? "Mute new-ticket sound"
+                    : "Tap to enable new-ticket sound"
+              }
+              onClick={() => {
+                if (!muted && !audioReady) {
+                  void primeAudio().then(setAudioReady);
+                } else {
+                  toggleMute();
+                }
+              }}
+              className="inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-full border border-input bg-background px-3 hover:bg-accent touch-manipulation"
             >
-              {muted ? (
+              {!muted && !audioReady ? (
+                <span className="text-sm font-semibold">Tap to enable sound</span>
+              ) : muted ? (
                 <VolumeX className="h-5 w-5" aria-hidden="true" />
               ) : (
                 <Volume2 className="h-5 w-5" aria-hidden="true" />

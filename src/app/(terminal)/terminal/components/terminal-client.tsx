@@ -18,12 +18,13 @@ import { buildLine } from "@/lib/build-line";
 import { cn } from "@/lib/utils";
 import {
   buildTillCoreExt,
-  displayOrderNumber,
   type TillOrderType,
 } from "@/lib/till/order-meta";
 import {
   FALLBACK_DEFAULT_SIZE,
-  pickDefaultSize,
+  clearDefaultSizeName,
+  defaultSizeFor,
+  isKnownSizeName,
   readDefaultSizeName,
   writeDefaultSizeName,
 } from "@/lib/till/default-size";
@@ -146,16 +147,21 @@ export function TerminalClient({
   }, [canDiscount, discountCents, setDiscount]);
 
   // Order type + call-out name for the order being rung (reset after each order).
-  const [orderType, setOrderType] = useState<TillOrderType>("dine_in");
+  const [orderType, setOrderType] = useState<TillOrderType | null>(null);
   const [customerName, setCustomerName] = useState("");
   // Default pizza size (device-local, per location). Large unless changed.
   const [defaultSizeName, setDefaultSizeName] = useState(FALLBACK_DEFAULT_SIZE);
   const locationKey = data?.menu.locationId;
+  const menuData = data?.menu;
   useEffect(() => {
-    if (locationKey) {
-      setDefaultSizeName(readDefaultSizeName(locationKey) ?? FALLBACK_DEFAULT_SIZE);
-    }
-  }, [locationKey]);
+    if (!locationKey || !menuData) return;
+    const saved = readDefaultSizeName(locationKey);
+    const known =
+      saved && isKnownSizeName(menuData.categories.flatMap((c) => c.items), saved);
+    // A saved size the menu no longer has is dropped (items fall back to their first size).
+    if (saved && !known) clearDefaultSizeName(locationKey);
+    setDefaultSizeName(known && saved ? saved : FALLBACK_DEFAULT_SIZE);
+  }, [locationKey, menuData]);
   // Below `lg` the cart is a sticky bar that expands on demand.
   const [cartOpen, setCartOpen] = useState(false);
 
@@ -230,7 +236,7 @@ export function TerminalClient({
 
   /** One-tap add for items with nothing to choose (a soda). */
   function quickAddItem(item: MenuItemDetail) {
-    const size = pickDefaultSize(item.sizes, soldOut.sizes, defaultSizeName);
+    const size = defaultSizeFor(item, soldOut.sizes, defaultSizeName);
     addLine(
       buildLine({ item, size, selections: [], quantity: 1, notes: "" }),
     );
@@ -366,17 +372,17 @@ export function TerminalClient({
 
       clear();
       setCustomerName("");
-      setOrderType("dine_in");
+      setOrderType(null);
       setCartOpen(false);
       if (outcome.status === "synced") {
         // Order reached the server → go straight to taking payment.
-        toast({ title: `Order ${displayOrderNumber(orderNumber)} placed`, variant: "success" });
+        toast({ title: `Order ${orderNumber} placed`, variant: "success" });
         setPayOrderId(orderId);
       } else {
         // Offline: payment needs connectivity (beyond reader store-and-forward),
         // so confirm the queued order; the cashier pays once back online.
         toast({
-          title: `Order ${displayOrderNumber(orderNumber)} saved offline`,
+          title: `Order ${orderNumber} saved offline`,
           description: "It will sync automatically when back online.",
           variant: "info",
         });

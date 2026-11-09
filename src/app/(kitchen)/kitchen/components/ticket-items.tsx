@@ -16,10 +16,7 @@ import type { StationFilter } from "@/lib/kds/types";
 import {
   groupModifiersByPlacement,
   isHalfAndHalf,
-  withoutDefaultModifiers,
 } from "@/lib/kds/format";
-
-const NO_DEFAULTS: ReadonlySet<string> = new Set();
 
 function ModifierList({
   label,
@@ -43,17 +40,9 @@ function ModifierList({
   );
 }
 
-function LineRow({
-  line,
-  defaultIds,
-}: {
-  line: OrderItem;
-  defaultIds: ReadonlySet<string>;
-}) {
-  // Only changes from the standard pie (default crust/sauce are hidden).
-  const mods = withoutDefaultModifiers(line.modifiers, defaultIds);
-  const grouped = groupModifiersByPlacement(mods);
-  const half = isHalfAndHalf(mods);
+function LineRow({ line }: { line: OrderItem }) {
+  const grouped = groupModifiersByPlacement(line.modifiers);
+  const half = isHalfAndHalf(line.modifiers);
 
   return (
     <li className="border-b border-dashed py-2 last:border-b-0">
@@ -101,12 +90,9 @@ function LineRow({
 export function TicketItems({
   items,
   stationFilter = "all",
-  defaultModifierIds = NO_DEFAULTS,
 }: {
   items: OrderItem[];
   stationFilter?: StationFilter;
-  /** Modifier ids that are the group default; hidden from the ticket. */
-  defaultModifierIds?: ReadonlySet<string>;
 }) {
   const visible = items.filter(
     (i) => !i.voided && lineMatchesStation(i, stationFilter),
@@ -127,7 +113,7 @@ export function TicketItems({
   return (
     <ul className="divide-y-0">
       {visible.map((line) => (
-        <LineRow key={line.id} line={line} defaultIds={defaultModifierIds} />
+        <LineRow key={line.id} line={line} />
       ))}
       {stopped.map((line) => (
         <li

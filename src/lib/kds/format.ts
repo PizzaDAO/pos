@@ -38,17 +38,6 @@ export interface GroupedModifiers {
   right: OrderItemModifier[];
 }
 
-/** Drop whole-pie modifiers that are the group default (not a change from standard). */
-export function withoutDefaultModifiers(
-  modifiers: OrderItemModifier[],
-  defaultIds: ReadonlySet<string>,
-): OrderItemModifier[] {
-  if (defaultIds.size === 0) return modifiers;
-  return modifiers.filter(
-    (m) => !(m.placement === "whole" && defaultIds.has(m.modifier_id)),
-  );
-}
-
 export function groupModifiersByPlacement(
   modifiers: OrderItemModifier[],
 ): GroupedModifiers {

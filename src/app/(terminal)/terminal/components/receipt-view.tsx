@@ -10,7 +10,6 @@ import type { Order, Payment } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 import { buildReceipt } from "@/lib/payments/receipt";
-import { displayOrderNumber } from "@/lib/till/order-meta";
 
 export function ReceiptView({
   order,
@@ -36,7 +35,7 @@ export function ReceiptView({
         <div className="text-center">
           <div className="text-base font-bold">{businessName ?? "Receipt"}</div>
           <div className="text-xs text-muted-foreground">
-            Order {displayOrderNumber(r.orderNumber)}
+            Order {r.orderNumber}
           </div>
           {(r.orderType || r.customerName) && (
             <div className="text-xs text-muted-foreground">

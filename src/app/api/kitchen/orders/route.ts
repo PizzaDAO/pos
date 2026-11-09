@@ -24,12 +24,7 @@
 import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
-import {
-  buildTickets,
-  buildVoidNotices,
-  defaultModifierIds,
-  DEFAULT_KDS_THRESHOLDS,
-} from "@/lib/kds/board";
+import { buildTickets, buildVoidNotices, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import {
   isHandoffStatus,
   kitchenHandsOffDelivery,
@@ -66,11 +61,9 @@ export async function GET(request: Request) {
   const locationId = auth.locationId as string;
 
   const driver = getPosDriver();
-  const [orders, settings, menu] = await Promise.all([
+  const [orders, settings] = await Promise.all([
     driver.listOrders(tenantId, locationId),
     driver.getStoreSettings(tenantId, locationId),
-    // Only to learn each group's default option; a menu failure just shows all.
-    driver.getMenu(tenantId, locationId, { includeUnavailable: true }).catch(() => null),
   ]);
 
   const now = new Date();
@@ -92,7 +85,6 @@ export async function GET(request: Request) {
     driver: driver.name,
     serverTime: now.toISOString(),
     thresholds,
-    ...(menu ? { defaultModifierIds: defaultModifierIds(menu) } : {}),
   };
   // No caching — the board must reflect the latest status on every poll.
   return NextResponse.json(body, {

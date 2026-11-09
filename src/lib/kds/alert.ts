@@ -33,25 +33,33 @@ export function writeMuted(muted: boolean): void {
 
 let ctx: AudioContext | null = null;
 
-/** Call from a user gesture (the mute toggle) so browsers allow later chimes. */
-export function primeAudio(): void {
+/** Whether chimes can play right now (context created and running). */
+export function isAudioRunning(): boolean {
+  return ctx?.state === "running";
+}
+
+/**
+ * Create / resume the audio context. Call from a user gesture (browsers keep it
+ * suspended until then); resolves true once chimes can play.
+ */
+export async function primeAudio(): Promise<boolean> {
   try {
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!Ctor) return;
+    if (!Ctor) return false;
     ctx ??= new Ctor();
-    if (ctx.state === "suspended") void ctx.resume();
+    if (ctx.state === "suspended") await ctx.resume();
+    return ctx.state === "running";
   } catch {
-    /* no audio available */
+    return false;
   }
 }
 
 /** A short two-tone chime. Silent (never throws) when audio is unavailable. */
 export function playChime(): void {
   try {
-    primeAudio();
-    if (!ctx) return;
+    if (!ctx || ctx.state !== "running") return;
     const t0 = ctx.currentTime;
     [880, 1175].forEach((freq, i) => {
       const osc = ctx!.createOscillator();

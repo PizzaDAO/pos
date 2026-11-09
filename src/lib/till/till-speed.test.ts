@@ -1,12 +1,10 @@
 import { describe, it, expect } from "vitest";
 import type { ItemSize, MenuItemDetail, Order } from "@/lib/db";
 import { quickCashNotes } from "./quick-cash";
-import { canQuickAdd, pickDefaultSize, sizeNamesOf } from "./default-size";
-import { shouldAutoSubmitPin } from "./pin";
+import { canQuickAdd, defaultSizeFor, isKnownSizeName, pickDefaultSize, sizeNamesOf } from "./default-size";
 import {
   buildTillCoreExt,
   cleanCustomerName,
-  displayOrderNumber,
   orderTypeLabel,
   sanitizeTillCoreExt,
 } from "./order-meta";
@@ -42,7 +40,8 @@ describe("pickDefaultSize", () => {
   it("uses the preferred size, else Large, else the first in stock", () => {
     expect(pickDefaultSize(sizes, new Set(), "Medium")?.id).toBe("m");
     expect(pickDefaultSize(sizes, new Set())?.id).toBe("l");
-    expect(pickDefaultSize(sizes, new Set(), "XL")?.id).toBe("l");
+    // A preference this item doesn't have (stale / one-size side): first available.
+    expect(pickDefaultSize(sizes, new Set(), "XL")?.id).toBe("s");
     expect(pickDefaultSize([size("s", "Small")], new Set())?.id).toBe("s");
   });
   it("skips sold-out sizes and matches case-insensitively", () => {
@@ -55,6 +54,15 @@ describe("pickDefaultSize", () => {
     const dim = [size("s", 'Small (10")'), size("l", 'Large (16")')];
     expect(pickDefaultSize(dim, new Set())?.id).toBe("l");
     expect(pickDefaultSize(dim, new Set(), "Small")?.id).toBe("s");
+  });
+  it("applies to pizzas only and detects stale saved sizes", () => {
+    const pizza = { sizes, is_half_and_half_capable: true } as MenuItemDetail;
+    const drink = { sizes, is_half_and_half_capable: false } as MenuItemDetail;
+    expect(defaultSizeFor(pizza, new Set(), "Medium")?.id).toBe("m");
+    expect(defaultSizeFor(drink, new Set(), "Medium")?.id).toBe("s");
+    expect(defaultSizeFor(drink, new Set(["s"]))?.id).toBe("m");
+    expect(isKnownSizeName([pizza], "large")).toBe(true);
+    expect(isKnownSizeName([pizza], "Party")).toBe(false);
   });
   it("lists distinct size names", () => {
     const items = [{ sizes }, { sizes: [size("x", "large")] }] as MenuItemDetail[];
@@ -86,25 +94,7 @@ describe("canQuickAdd", () => {
   });
 });
 
-describe("shouldAutoSubmitPin", () => {
-  it("submits at 6 digits when the length is unknown", () => {
-    expect(shouldAutoSubmitPin("1234")).toBe(false);
-    expect(shouldAutoSubmitPin("12345")).toBe(false);
-    expect(shouldAutoSubmitPin("123456")).toBe(true);
-  });
-  it("submits at the known 4-6 length", () => {
-    expect(shouldAutoSubmitPin("1234", 4)).toBe(true);
-    expect(shouldAutoSubmitPin("123", 4)).toBe(false);
-    expect(shouldAutoSubmitPin("12345", 5)).toBe(true);
-  });
-  it("ignores an out-of-range known length and non-digits", () => {
-    expect(shouldAutoSubmitPin("1234", 9)).toBe(false);
-    expect(shouldAutoSubmitPin("", 4)).toBe(false);
-    expect(shouldAutoSubmitPin("12a4", 4)).toBe(false);
-  });
-});
-
-describe("order type, name and number display", () => {
+describe("order type and name", () => {
   it("round-trips through core_ext and the server sanitizer", () => {
     const ext = buildTillCoreExt("pickup", "  Maria   G ");
     expect(ext).toEqual({ callout_name: "Maria G", metadata: { order_type: "pickup" } });
@@ -123,12 +113,5 @@ describe("order type, name and number display", () => {
     expect(sanitizeTillCoreExt(null)).toBeNull();
     expect(buildTillCoreExt(null, "  ")).toBeNull();
     expect(cleanCustomerName("x".repeat(100))).toHaveLength(40);
-  });
-  it("shows one order-number format", () => {
-    expect(displayOrderNumber("1526-406")).toBe("#406");
-    expect(displayOrderNumber("A-0003")).toBe("#3");
-    expect(displayOrderNumber("K-103")).toBe("#103");
-    expect(displayOrderNumber("0000")).toBe("#0");
-    expect(displayOrderNumber("walk-in")).toBe("walk-in");
   });
 });
