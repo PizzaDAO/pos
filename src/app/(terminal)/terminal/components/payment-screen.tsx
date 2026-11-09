@@ -4,7 +4,10 @@
  * Pick a rail → set a tip → take payment. Supports SPLIT PAYMENT: each tender
  * applies to the remaining balance and the screen stays open until the balance
  * reaches zero, at which point the order is `paid` and the full receipt shows.
- * Cash captures a tendered amount and shows change due; crypto tenders show a
+ * Cash captures a tendered amount and shows change due; cash SHORT of the
+ * balance is taken as a partial tender for what was handed over (no tip: the tip
+ * rides on the tender that finishes the order, see lib/payments/cash-tender),
+ * and the rest stays due for more cash or a card. Crypto tenders show a
  * pay-to address/QR placeholder and poll until confirmed. Card tenders go to the
  * selected card reader (server-driven Stripe Terminal; a virtual reader when no
  * Stripe key): the card panel shows present card / approved / declined with
@@ -26,6 +29,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/pricing";
 import { isFullyRefunded } from "@/lib/payments/refund-state";
+import { planCashTender } from "@/lib/payments/cash-tender";
 import {
   PAYMENT_RAIL_KEYS,
   tenderRailLabel,
@@ -89,6 +93,8 @@ export function PaymentScreen({
   const [cashTendered, setCashTendered] = useState("");
 
   const [confirmRefundId, setConfirmRefundId] = useState<string | null>(null);
+  /** The last partial cash tender taken (shown until the order is finished). */
+  const [partialCashCents, setPartialCashCents] = useState<number | null>(null);
 
   const balance = checkout.balanceCents;
   // Fully refunded: the order is closed out, so never re-offer "Charge".
@@ -132,23 +138,44 @@ export function PaymentScreen({
     return Number.isFinite(v) ? Math.round(v * 100) : 0;
   }, [cashTendered]);
   const dueWithTip = balance + effectiveTipCents;
-  const changeDue = Math.max(0, cashTenderedCents - dueWithTip);
+  // What the typed cash means: exact (nothing typed), full with change, a
+  // partial tender (short of the balance), or short of the tip (refused).
+  const cashPlan = planCashTender({
+    balanceCents: balance,
+    tipCents: effectiveTipCents,
+    tenderedCents: cashTenderedCents,
+  });
+  const changeDue = cashPlan.kind === "full" ? cashPlan.changeCents : 0;
+  const cashPartial = rail === "cash" && cashPlan.kind === "partial";
+  const cashShortOfTip = rail === "cash" && cashPlan.kind === "short_of_tip";
+  /** What this tender puts through (base + tip). */
+  const thisTenderCents = cashPartial ? cashPlan.amountCents : dueWithTip;
 
   async function handleTake() {
     if (balance <= 0) return;
-    const recorded = await checkout.takeTender({
-      rail,
-      amountCents: balance,
-      tipCents: effectiveTipCents,
-      cashTenderedCents:
-        rail === "cash" ? cashTenderedCents || dueWithTip : undefined,
-    });
+    let input: Parameters<typeof checkout.takeTender>[0];
+    if (rail === "cash") {
+      if (cashPlan.kind !== "full" && cashPlan.kind !== "partial") return;
+      input = {
+        rail,
+        amountCents: cashPlan.amountCents,
+        tipCents: cashPlan.tipCents,
+        cashTenderedCents: cashPlan.cashTenderedCents,
+      };
+    } else {
+      input = { rail, amountCents: balance, tipCents: effectiveTipCents };
+    }
+    const recorded = await checkout.takeTender(input);
     // Only a tender that was actually recorded (or a card tender now on the
     // reader) consumes the entered tip / cash amount; a failed or lost request
     // keeps them so the cashier can simply press Charge again.
     if (!recorded) return;
     if (rail !== "stripe_terminal") card.clearError();
-    setTipCents(0);
+    setPartialCashCents(
+      rail === "cash" && cashPlan.kind === "partial" ? cashPlan.amountCents : null,
+    );
+    // A partial cash tender keeps the tip for the tender that finishes the order.
+    if (!(rail === "cash" && cashPlan.kind === "partial")) setTipCents(0);
     setCashTendered("");
   }
 
@@ -219,6 +246,17 @@ export function PaymentScreen({
                     {msg}
                   </div>
                 ),
+            )}
+
+            {!finished && partialCashCents !== null && (
+              <div
+                role="status"
+                data-testid="partial-cash"
+                className="rounded-md border border-amber-500/60 bg-amber-500/10 p-3 text-base font-semibold"
+              >
+                Cash {formatMoney(partialCashCents, currency)} taken,{" "}
+                {formatMoney(balance, currency)} still due
+              </div>
             )}
 
             {!finished && (
@@ -430,14 +468,35 @@ export function PaymentScreen({
                         </Button>
                       ))}
                     </div>
-                    <div className="flex items-baseline justify-between">
-                      <span className="text-sm text-muted-foreground">
-                        Change due
-                      </span>
-                      <span className="text-2xl font-bold">
-                        {formatMoney(changeDue, currency)}
-                      </span>
-                    </div>
+                    {cashPartial && cashPlan.kind === "partial" ? (
+                      <p
+                        role="status"
+                        data-testid="cash-short"
+                        className="rounded-md bg-amber-500/10 p-2 text-sm font-medium"
+                      >
+                        Short {formatMoney(cashPlan.remainingCents, currency)}:
+                        this takes {formatMoney(cashPlan.amountCents, currency)}{" "}
+                        as a partial payment and the rest stays due
+                        {effectiveTipCents > 0 ? " (the tip goes on the last payment)" : ""}.
+                      </p>
+                    ) : cashShortOfTip && cashPlan.kind === "short_of_tip" ? (
+                      <p
+                        role="alert"
+                        className="rounded-md bg-destructive/10 p-2 text-sm font-medium text-destructive"
+                      >
+                        Short {formatMoney(cashPlan.shortCents, currency)} for
+                        the tip: lower the tip or take more cash.
+                      </p>
+                    ) : (
+                      <div className="flex items-baseline justify-between">
+                        <span className="text-sm text-muted-foreground">
+                          Change due
+                        </span>
+                        <span className="text-2xl font-bold">
+                          {formatMoney(changeDue, currency)}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -463,7 +522,7 @@ export function PaymentScreen({
                 <div className="flex items-center justify-between rounded-md bg-muted p-3 text-sm">
                   <span className="text-muted-foreground">This tender</span>
                   <span className="font-bold">
-                    {formatMoney(balance + effectiveTipCents, currency)}
+                    {formatMoney(thisTenderCents, currency)}
                   </span>
                 </div>
 
@@ -475,6 +534,7 @@ export function PaymentScreen({
                     balance <= 0 ||
                     // A card tender is on the reader: finish or cancel it first.
                     cardLive ||
+                    cashShortOfTip ||
                     (cardRail && (!!cardBlocked || !card.selectedReaderId))
                   }
                   onClick={handleTake}
@@ -485,7 +545,9 @@ export function PaymentScreen({
                       Processing…
                     </>
                   ) : (
-                    `Charge ${formatMoney(balance + effectiveTipCents, currency)}`
+                    cashPartial
+                      ? `Take ${formatMoney(thisTenderCents, currency)} cash (partial)`
+                      : `Charge ${formatMoney(thisTenderCents, currency)}`
                   )}
                 </Button>
               </>

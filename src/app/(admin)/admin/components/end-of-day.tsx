@@ -3,9 +3,12 @@
  *
  * Per-location business-day close: gross/net, tax, tips, fees, payment mix,
  * voids/refunds, order counts by channel, and a drawer summary. CLOSE is
- * idempotent (re-closing the same day returns the frozen snapshot). Includes a
- * print-friendly layout (browser print CSS hides the chrome). Talks to
- * /api/admin/eod. No env vars.
+ * idempotent (re-closing the same day returns the frozen snapshot). Close day
+ * asks first: a confirm dialog with the day's orders, expected cash vs the cash
+ * counted now (over/short live) and a warning for drawers still open. The
+ * default business date is TODAY AT THE LOCATION (its time zone and cutoff,
+ * `locationBusinessDate`), not UTC, and the report buckets by the same rule. Includes a print-friendly layout (browser print CSS
+ * hides the chrome). Talks to /api/admin/eod. No env vars.
  */
 "use client";
 
@@ -13,30 +16,78 @@ import { useCallback, useEffect, useState } from "react";
 import { Lock, Printer, Receipt } from "lucide-react";
 import type { BusinessDayClose, SalesReport } from "@/lib/db";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { formatMoney } from "@/lib/pricing";
-import { railFamily } from "@/lib/reports";
+import { locationBusinessDate, railFamily } from "@/lib/reports";
 
 interface Props {
   tenantId: string;
   locationId: string;
   /** Display name for the active location (Phase 6 — locations are dynamic). */
   locationName?: string;
+  /** Tenant (business) name for the report title. */
+  tenantName?: string;
+  /** IANA time zone of the location (the business date is local to it). */
+  timezone?: string;
+  /** Minutes after local midnight the business day starts (default 0). */
+  cutoffMinutes?: number;
 }
 
-function todayIso(): string {
-  return new Date().toISOString().slice(0, 10);
+/**
+ * Today's business date at the location: local date in its zone, less its
+ * cutoff (the same rule the Z-report and owner reports bucket by).
+ */
+export function todayInZone(
+  timezone: string | undefined,
+  now = new Date(),
+  cutoffMinutes = 0,
+): string {
+  return locationBusinessDate(now.toISOString(), {
+    timezone,
+    business_day_cutoff_minutes: cutoffMinutes,
+  });
+}
+
+/** "Mon, Nov 9" for a yyyy-mm-dd business date. */
+function prettyDate(iso: string): string {
+  const d = new Date(`${iso}T12:00:00Z`);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
 }
 
 interface EodData {
   close: BusinessDayClose | null;
   closed: boolean;
   report?: SalesReport;
+  /** Live drawer preview (not yet closed). */
+  drawer?: BusinessDayClose["drawer"];
 }
 
-export function EndOfDay({ tenantId, locationId, locationName: locName }: Props) {
-  const [date, setDate] = useState(todayIso());
+export function EndOfDay({
+  tenantId,
+  locationId,
+  locationName: locName,
+  tenantName,
+  timezone,
+  cutoffMinutes = 0,
+}: Props) {
+  const [date, setDate] = useState(() =>
+    todayInZone(timezone, new Date(), cutoffMinutes),
+  );
+  // Until the manager picks a date, follow the location's (late-loading) zone.
+  const [dateTouched, setDateTouched] = useState(false);
+  useEffect(() => {
+    if (!dateTouched) setDate(todayInZone(timezone, new Date(), cutoffMinutes));
+  }, [timezone, cutoffMinutes, dateTouched]);
   const [data, setData] = useState<EodData | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [counted, setCounted] = useState("");
 
   const load = useCallback(async () => {
     const res = await fetch(
@@ -50,14 +101,28 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
     void load();
   }, [load]);
 
+  const countedCents = (() => {
+    const v = parseFloat(counted);
+    return counted.trim() !== "" && Number.isFinite(v) && v >= 0
+      ? Math.round(v * 100)
+      : null;
+  })();
+
   async function close() {
+    setConfirming(false);
     setBusy(true);
     try {
       await fetch("/api/admin/eod", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tenantId, locationId, date }),
+        body: JSON.stringify({
+          tenantId,
+          locationId,
+          date,
+          ...(countedCents !== null ? { countedCents } : {}),
+        }),
       });
+      setCounted("");
       await load();
     } finally {
       setBusy(false);
@@ -65,9 +130,13 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
   }
 
   const report = data?.close?.report ?? data?.report ?? null;
-  const drawer = data?.close?.drawer ?? null;
+  const drawer = data?.close?.drawer ?? data?.drawer ?? null;
   const closed = data?.closed ?? false;
   const locationName = locName ?? locationId;
+  const businessName = tenantName?.trim() || locationName;
+  const expectedCents = drawer?.expected_cents ?? 0;
+  const overShort = countedCents !== null ? countedCents - expectedCents : null;
+  const openDrawers = drawer?.open_drawer_count ?? 0;
 
   const family = { cash: 0, card: 0, crypto: 0, other: 0 };
   for (const s of report?.paymentMix ?? []) {
@@ -89,11 +158,18 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
               type="date"
               className="rounded-md border bg-background px-2 py-1.5"
               value={date}
-              onChange={(e) => setDate(e.target.value)}
+              onChange={(e) => {
+                setDateTouched(true);
+                setDate(e.target.value);
+              }}
             />
           </label>
           {!closed && (
-            <Button size="sm" disabled={busy} onClick={close}>
+            <Button
+              size="sm"
+              disabled={busy || !report}
+              onClick={() => setConfirming(true)}
+            >
               <Lock className="h-4 w-4" /> Close day
             </Button>
           )}
@@ -103,14 +179,87 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
         </div>
       </div>
 
+      {confirming && report && (
+        <ConfirmDialog
+          title={`Close ${prettyDate(date)}?`}
+          destructive={false}
+          confirmLabel="Close day"
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void close()}
+          description={
+            <span className="block space-y-3 text-foreground">
+              <span className="block">
+                {report.order_count} order{report.order_count === 1 ? "" : "s"} ·
+                net {formatMoney(report.net_cents)}. This freezes the Z-report
+                for {locationName}; it can&apos;t be reopened.
+              </span>
+              {openDrawers > 0 && (
+                <span
+                  role="alert"
+                  className="block rounded-md bg-amber-500/15 p-2 font-medium text-amber-800 dark:text-amber-300"
+                >
+                  {openDrawers} drawer{openDrawers === 1 ? " is" : "s are"} still
+                  open: close {openDrawers === 1 ? "it" : "them"} in Staff &amp;
+                  drawer first, or {openDrawers === 1 ? "its" : "their"} cash is
+                  not in Expected.
+                </span>
+              )}
+              <span className="flex justify-between">
+                <span className="text-muted-foreground">
+                  Expected cash
+                  {drawer?.expected_source === "sales" ? " (cash sales)" : ""}
+                </span>
+                <span className="font-semibold tabular-nums">
+                  {formatMoney(expectedCents)}
+                </span>
+              </span>
+              <label className="flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Counted cash</span>
+                <span className="flex items-center gap-1">
+                  $
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    min={0}
+                    step="0.01"
+                    aria-label="Counted cash"
+                    value={counted}
+                    onChange={(e) => setCounted(e.target.value)}
+                    placeholder={(expectedCents / 100).toFixed(2)}
+                    className="h-11 w-28 rounded-md border bg-background px-2 text-right"
+                  />
+                </span>
+              </label>
+              <span className="flex justify-between">
+                <span className="text-muted-foreground">Over / short</span>
+                <span
+                  data-testid="eod-over-short"
+                  className={
+                    overShort === null
+                      ? "text-muted-foreground"
+                      : overShort < 0
+                        ? "font-bold text-destructive"
+                        : "font-bold"
+                  }
+                >
+                  {overShort === null
+                    ? "Count the drawer"
+                    : `${overShort > 0 ? "+" : ""}${formatMoney(overShort)}`}
+                </span>
+              </span>
+            </span>
+          }
+        />
+      )}
+
       {!report ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : (
         <div className="rounded-xl border p-6 print:border-0 print:p-0">
           <div className="mb-4 text-center">
-            <h1 className="text-xl font-bold">Tony&apos;s Pizza — Z-Report</h1>
+            <h1 className="text-xl font-bold">{businessName} — Z-Report</h1>
             <p className="text-sm text-muted-foreground">
-              {locationName} · {date}
+              {locationName} · {prettyDate(date)} ({date})
             </p>
             <p className="mt-1 text-xs">
               {closed ? (
@@ -175,6 +324,12 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
           {drawer && (
             <Section title="Drawer summary">
               <Row label="Shifts closed" value={String(drawer.shift_count)} />
+              {(drawer.open_drawer_count ?? 0) > 0 && (
+                <Row
+                  label="Drawers still open"
+                  value={String(drawer.open_drawer_count)}
+                />
+              )}
               <Row
                 label="Opening float"
                 value={formatMoney(drawer.opening_float_cents)}
@@ -187,7 +342,10 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
                 label="Expected drawer"
                 value={formatMoney(drawer.expected_cents)}
               />
-              <Row label="Counted" value={formatMoney(drawer.counted_cents)} />
+              <Row
+                label={drawer.counted_at_close ? "Counted at close" : "Counted"}
+                value={formatMoney(drawer.counted_cents)}
+              />
               <Row
                 label="Over / short"
                 value={`${drawer.over_short_cents > 0 ? "+" : ""}${formatMoney(
@@ -199,7 +357,7 @@ export function EndOfDay({ tenantId, locationId, locationName: locName }: Props)
           )}
 
           <p className="mt-6 text-center text-xs text-muted-foreground">
-            Generated by Tony&apos;s Pizza POS — back office
+            Generated by {businessName} POS — back office
           </p>
         </div>
       )}

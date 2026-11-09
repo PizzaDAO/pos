@@ -31,6 +31,7 @@ import {
 } from "@/lib/payments/connect";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
+  CashUnderTenderError,
   PaymentConflictError,
   takePaymentDetailed,
   deriveOnlineTender,
@@ -42,6 +43,7 @@ import {
   nextOnlineTenderId,
 } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
+import { cashTenderError } from "@/lib/payments/cash-tender";
 import { cancelOnlineCheckout, orderExpiresAt } from "@/lib/shop/lifecycle";
 import { asapAvailability } from "@/lib/shop/scheduling";
 import {
@@ -223,6 +225,24 @@ export async function POST(request: Request) {
     // Fall through: takePayment repeats the idempotency check.
   }
 
+  // Cash must be covered by the cash handed over. Checked against what the client
+  // asked for BEFORE anything is touched (superseded online tenders canceled, a
+  // live card tender closed). A short cash tender goes in as a partial:
+  // amountCents = cash handed over, no tip.
+  if (body.rail === "cash") {
+    const short = cashTenderError({
+      amountCents: body.amountCents,
+      tipCents: body.tipCents ?? 0,
+      cashTenderedCents: body.cashTenderedCents,
+    });
+    if (short) {
+      return NextResponse.json(
+        { error: short, code: "cash_under_tender" },
+        { status: 422 },
+      );
+    }
+  }
+
   // ONLINE orders: the server decides what is owed. The client's amountCents /
   // tipCents are ignored (the order total already includes the customer's tip,
   // which rides on the tender's tip, so trusting the body double-charges it).
@@ -338,6 +358,23 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { error: "This order has nothing left to pay." },
         { status: 409 },
+      );
+    }
+  }
+
+  // Re-check against the FINAL amount + tip (an online order's are derived by the
+  // server above), still before a live card tender is closed below. The service
+  // checks once more.
+  if (body.rail === "cash") {
+    const short = cashTenderError({
+      amountCents,
+      tipCents,
+      cashTenderedCents: body.cashTenderedCents,
+    });
+    if (short) {
+      return NextResponse.json(
+        { error: short, code: "cash_under_tender" },
+        { status: 422 },
       );
     }
   }
@@ -458,6 +495,12 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
+    if (err instanceof CashUnderTenderError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: 422 },
+      );
+    }
     if (
       err instanceof CardPaymentsNotReadyError ||
       err instanceof PaymentConflictError ||

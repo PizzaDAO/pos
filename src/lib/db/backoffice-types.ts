@@ -443,5 +443,11 @@ export interface BusinessDayClose {
     counted_cents: number;
     over_short_cents: number;
     shift_count: number;
+    /** Drawers still open at close (their cash is not in expected). */
+    open_drawer_count?: number;
+    /** Where expected came from: closed shifts, or the day's cash sales (no shifts). */
+    expected_source?: "shifts" | "sales";
+    /** True when the manager counted the cash at Close day. */
+    counted_at_close?: boolean;
   };
 }

@@ -22,6 +22,8 @@ export interface KitchenTicket {
   ageLevel: AgeLevel;
   /** Distinct stations this order's (non-voided) items route to. */
   stations: Station[];
+  /** Delivery orders: the delivery record's provider (decides the hand-off). */
+  deliveryProvider?: string | null;
 }
 
 /** Response shape for the KDS orders API (what the polling fetcher returns). */

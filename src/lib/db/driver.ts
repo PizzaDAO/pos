@@ -1429,12 +1429,15 @@ export interface PosDriver {
 
   /**
    * Idempotently close a business day for a location (the Z-report). Re-closing
-   * the same day returns the already-frozen snapshot.
+   * the same day returns the already-frozen snapshot. `opts.drawer` (computed
+   * by the caller with lib/eod-drawer, incl. a count taken at close) replaces
+   * the driver's own shift-based drawer summary.
    */
   closeBusinessDay(
     tenantId: string,
     locationId: string,
     businessDate: string,
+    opts?: { drawer?: BusinessDayClose["drawer"] },
   ): Promise<BusinessDayClose>;
 
   // --------------------------------------------------------------------------
