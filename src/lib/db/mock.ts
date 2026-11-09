@@ -1099,14 +1099,19 @@ export const mockDriver: PosDriver = {
   },
 
   async assignMarketplaceStore(input) {
-    for (const [k, v] of marketplaceStores) {
-      if (v.provider === input.provider && v.locationId === input.locationId) {
-        marketplaceStores.delete(k);
-      }
+    const mine = () =>
+      [...marketplaceStores].filter(
+        ([, v]) => v.provider === input.provider && v.locationId === input.locationId,
+      );
+    if (input.storeId === null) {
+      for (const [k] of mine()) marketplaceStores.delete(k);
+      return;
     }
-    if (input.storeId === null) return;
     const key = `${input.provider}:${input.storeId}`;
-    if (marketplaceStores.has(key)) throw new MarketplaceStoreTakenError();
+    const holder = marketplaceStores.get(key);
+    // A clash with another location leaves the existing assignment intact.
+    if (holder && holder.locationId !== input.locationId) throw new MarketplaceStoreTakenError();
+    for (const [k] of mine()) marketplaceStores.delete(k);
     marketplaceStores.set(key, {
       provider: input.provider,
       tenantId: input.tenantId,

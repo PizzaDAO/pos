@@ -1743,23 +1743,30 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async assignMarketplaceStore(input) {
-      // One store per (location, provider): clear the old one, then insert. The
-      // primary key (provider, store_id) is the cross-location uniqueness guard.
-      unwrap(
-        await sb
-          .from("marketplace_stores")
-          .delete()
-          .eq("provider", input.provider)
-          .eq("location_id", input.locationId),
+      if (input.storeId === null) {
+        unwrap(
+          await sb
+            .from("marketplace_stores")
+            .delete()
+            .eq("provider", input.provider)
+            .eq("location_id", input.locationId),
+        );
+        return;
+      }
+      // ONE upsert on (location_id, provider): it replaces this location's store,
+      // and a clash with another location's store id (primary key) fails the whole
+      // statement, leaving the old assignment intact.
+      const { error } = await sb.from("marketplace_stores").upsert(
+        {
+          provider: input.provider,
+          store_id: input.storeId,
+          tenant_id: input.tenantId,
+          location_id: input.locationId,
+          assigned_by: input.assignedBy ?? null,
+          assigned_at: new Date().toISOString(),
+        },
+        { onConflict: "location_id,provider" },
       );
-      if (input.storeId === null) return;
-      const { error } = await sb.from("marketplace_stores").insert({
-        provider: input.provider,
-        store_id: input.storeId,
-        tenant_id: input.tenantId,
-        location_id: input.locationId,
-        assigned_by: input.assignedBy ?? null,
-      });
       if (error) {
         if (error.code === "23505") throw new MarketplaceStoreTakenError();
         throw new Error(error.message);

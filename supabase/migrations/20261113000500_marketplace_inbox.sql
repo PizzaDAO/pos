@@ -33,6 +33,11 @@ create unique index if not exists orders_marketplace_ref_uq
   on public.orders (location_id, (source->>'module'), (source->>'external_ref'))
   where source->>'type' = 'marketplace';
 
+-- Serves findMarketplaceOrdersByRef (cancel with no store id: provider + order id).
+create index if not exists orders_marketplace_lookup_idx
+  on public.orders ((source->>'module'), (source->>'external_ref'))
+  where source->>'type' = 'marketplace';
+
 -- marketplace_stores: which provider store belongs to which location. ASSIGNED BY
 -- A PLATFORM ADMIN ONLY (tenants cannot write it: a tenant that could claim a
 -- store id could receive another restaurant's orders). The primary key is the
