@@ -20,6 +20,8 @@ export function channelLabel(channel: OrderChannel): string {
       return "Pickup";
     case "online_delivery":
       return "Delivery";
+    case "marketplace":
+      return "Marketplace";
     default:
       return channel;
   }

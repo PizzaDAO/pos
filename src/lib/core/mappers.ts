@@ -519,6 +519,10 @@ export function derivePaymentStatus(
   order: Order,
   payments: Payment[],
 ): { payment_status: CoreOrder["payment_status"]; amount_due_cents: number } {
+  // Marketplace orders are paid by the marketplace; they carry no tender.
+  if (order.channel === "marketplace") {
+    return { payment_status: "paid", amount_due_cents: 0 };
+  }
   const live = payments.filter(
     (p) => p.status === "captured" || p.status === "refunded",
   );
@@ -551,10 +555,18 @@ export function derivePaymentStatus(
   return { payment_status: status, amount_due_cents: due };
 }
 
+/**
+ * `fromPosChannel` for a POS channel. A marketplace order is delivered or picked
+ * up by the marketplace; it has no coarser core mapping, so it reads as online.
+ */
+function corePosChannel(channel: Order["channel"]) {
+  return fromPosChannel(channel === "marketplace" ? "online_pickup" : channel);
+}
+
 function contractChannel(order: Order): string {
   const explicit = order.source?.channel;
   if (explicit) return explicit;
-  return fromPosChannel(order.channel).channel;
+  return corePosChannel(order.channel).channel;
 }
 
 function sourceOf(order: Order): CoreOrder["source"] {
@@ -641,7 +653,7 @@ export function toContractOrder(input: {
 
   const addr = f?.address;
   const fulfillment: CoreOrder["fulfillment"] = {
-    type: f?.type ?? fromPosChannel(order.channel).fulfillment_type,
+    type: f?.type ?? corePosChannel(order.channel).fulfillment_type,
     scheduled_for:
       f && f.scheduled_for !== "asap" ? ts(f.scheduled_for) : null,
     promised_at: f?.promised_at ? ts(f.promised_at) : null,

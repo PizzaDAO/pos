@@ -1,0 +1,6 @@
+Clover ID,Name,Alternate Name,Price,Price Type,Price Unit,Tax Rates,Cost,Product Code,SKU,Modifier Groups,Quantity,Printer Labels,Hidden,Non-revenue item,Category
+CL1,Cheese Slice,,3.50,Fixed,,Sales Tax,,,,"Toppings, Crust",0,,No,No,Slices
+CL2,Pepperoni Slice,,"$4.25",Fixed,,Sales Tax,,,,,0,,No,No,Slices
+CL3,Soda,,2.00,Fixed,,Sales Tax,,,,,0,,No,No,Drinks
+CL4,Market Item,,,Variable,,Sales Tax,,,,,0,,No,No,Drinks
+CL5,Retired Dish,,9.00,Fixed,,Sales Tax,,,,,0,,Yes,No,Slices

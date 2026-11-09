@@ -200,6 +200,9 @@ export type AuditAction =
   | "location_country_change"
   // A manager overrode a stuck driver conflict and dispatched in-house instead.
   | "delivery_manual_override"
+  // A menu was bulk-imported (add or replace) from a Square/Toast/Clover/CSV file.
+  | "menu_import"
+
   // Stored value: a gift card voided (its sale refunded) / store credit issued.
   | "gift_card_void"
   | "store_credit_issue";

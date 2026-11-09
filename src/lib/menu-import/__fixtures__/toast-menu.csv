@@ -1,0 +1,6 @@
+Menu,Menu Group,Item Name,Item ID,Description,Size,Price,Visibility,Tax Rate
+Dinner,Pizzas,Margherita,i-1,Fresh basil,Small,12.00,Visible,
+Dinner,Pizzas,Margherita,i-2,,Large,18.00,Visible,
+Dinner,Wings,Buffalo Wings,i-3,"Six, tossed",,10.50,Visible,
+Dinner,Beverages,Lemonade,i-4,,,3.00,Visible,
+Dinner,Pizzas,Mystery Pie,i-5,,,abc,Visible,

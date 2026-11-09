@@ -8,6 +8,7 @@
  */
 import type { Order, OrderChannel, Payment } from "@/lib/db";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
+import { providerLabel } from "@/lib/marketplace/types";
 import type {
   DateRange,
   PaymentMixSlice,
@@ -25,9 +26,26 @@ export function channelLabel(channel: OrderChannel): string {
       return "Online pickup";
     case "online_delivery":
       return "Online delivery";
+    case "marketplace":
+      return "Marketplace";
     default:
       return channel;
   }
+}
+
+/**
+ * Report bucket for an order's channel. Marketplace orders split by provider
+ * (`marketplace:doordash` ...) so the owner sees DoorDash vs Uber Eats vs Grubhub.
+ */
+export function channelBucket(order: Order): { key: string; label: string } {
+  const provider = order.fulfillment?.marketplace?.provider;
+  if (order.channel === "marketplace" && provider) {
+    return {
+      key: `marketplace:${provider}`,
+      label: `${providerLabel(provider)} (marketplace)`,
+    };
+  }
+  return { key: order.channel, label: channelLabel(order.channel) };
 }
 
 /** Human label for a payment rail (incl. cash). */
@@ -204,10 +222,11 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     tipCents += order.totals.tip_cents;
 
     pushBucket(byDay, isoDate(order.created_at), isoDate(order.created_at), gross, 1);
+    const bucket = channelBucket(order);
     pushBucket(
       byChannel,
-      order.channel,
-      channelLabel(order.channel),
+      bucket.key,
+      bucket.label,
       gross,
       1,
       order.totals.fees_cents ?? 0,
