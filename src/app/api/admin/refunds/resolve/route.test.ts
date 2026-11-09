@@ -44,7 +44,7 @@ vi.mock("@/lib/security", async (orig) => ({
   recordAudit: (...a: unknown[]) => recordAudit(...a),
 }));
 
-import { POST } from "./route";
+import { GET, POST } from "./route";
 
 function post(body: Record<string, unknown>) {
   return POST(
@@ -129,6 +129,25 @@ describe("POST /api/admin/refunds/resolve", () => {
     expect(recordAudit).toHaveBeenCalledTimes(1);
     expect(recordAudit.mock.calls[0]![0]).toMatchObject({ action: "payment_refund", tenantId: TENANT });
     expect(recordAudit.mock.calls[0]![0].detail).toContain("re_route");
+  });
+
+  it("lists stuck card refunds for the back office, and a dry run changes nothing", async () => {
+    const { payment, refundId } = await stuckCardRefund();
+    const list = await GET(new Request(`http://localhost/api/admin/refunds/resolve?tenantId=${TENANT}&locationId=${LOCATION}`));
+    expect(list.status).toBe(200);
+    expect((await list.json()).refunds).toEqual([
+      expect.objectContaining({ paymentId: payment.id, refundId, amountCents: 400, kind: "pending", pastWindow: false }),
+    ]);
+    stripeGet.mockResolvedValue({ data: [], has_more: false });
+    const dry = await post({ tenantId: TENANT, paymentId: payment.id, refundId, dryRun: true });
+    expect(await dry.json()).toMatchObject({ dryRun: true, outcome: "released", stripeRefund: null });
+    expect((await getPosDriver().getPayment(payment.id))!.refunds![0]!.state).toBe("pending");
+    expect(recordAudit).not.toHaveBeenCalled();
+    expect((await post({ tenantId: TENANT, paymentId: payment.id, refundId, expect: "nope" })).status).toBe(422);
+    const wrong = await post({ tenantId: TENANT, paymentId: payment.id, refundId, expect: "confirmed" });
+    expect(wrong.status).toBe(409);
+    gate.role = "cashier";
+    expect((await GET(new Request(`http://localhost/api/admin/refunds/resolve?tenantId=${TENANT}`))).status).toBe(403);
   });
 
   it("a Stripe outage changes nothing (502)", async () => {

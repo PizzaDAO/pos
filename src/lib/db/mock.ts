@@ -279,6 +279,8 @@ const orders = new Map<string, Order>();
 const tenantSettings = new Map<string, TenantSettings>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
+/** Per-tender refund locks (payments.refund_lock_until / _owner). */
+const refundLocks = new Map<string, { owner: string; until: string }>();
 /** The order_adjustments ledger (refunds, voids, comps), append-only. */
 const adjustmentRecords: AdjustmentRecord[] = [];
 /** Statuses an order can be voided / comped / discounted in (same as apply_order_edit). */
@@ -2102,6 +2104,43 @@ export const mockDriver: PosDriver = {
     return updated;
   },
 
+  // Mirrors release_pending_payment_refund(): synchronous check + release.
+  async releasePendingPaymentRefund(paymentId, refundId, opts) {
+    const p = payments.get(paymentId);
+    const e = (p?.refunds ?? []).find((r) => r.request_id === refundId);
+    if (!p || !e || e.state !== "pending") return false;
+    await this.releasePaymentRefund(paymentId, e.amount_cents, refundId, opts);
+    return true;
+  },
+
+  async listCardTendersWithOpenRefunds(tenantId, locationId, limit) {
+    return [...payments.values()]
+      .filter(
+        (p) =>
+          p.tenant_id === tenantId &&
+          (!locationId || p.location_id === locationId) &&
+          (p.rail === "stripe_terminal" || p.rail === "stripe_online") &&
+          !p.simulated &&
+          ((p.refund_reserved_cents ?? 0) > 0 || (p.refunds ?? []).some((r) => !r.processor_ref)),
+      )
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+      .slice(0, limit)
+      .map((p) => structuredClone(p));
+  },
+
+  // Mirrors take_payment_refund_lock() / release_payment_refund_lock().
+  async takePaymentRefundLock(paymentId, owner, untilIso) {
+    if (!payments.has(paymentId)) return false;
+    const cur = refundLocks.get(paymentId);
+    if (cur && cur.owner !== owner && cur.until > nowIso()) return false;
+    refundLocks.set(paymentId, { owner, until: untilIso });
+    return true;
+  },
+
+  async releasePaymentRefundLock(paymentId, owner) {
+    if (refundLocks.get(paymentId)?.owner === owner) refundLocks.delete(paymentId);
+  },
+
   // Mirrors release_payment_refund(): the entry reserved under refundId only.
   async releasePaymentRefund(
     paymentId: string,
@@ -3869,6 +3908,7 @@ export function resetMockOrders(): void {
 /** Test helper: clear payments + connect state. */
 export function resetMockPayments(): void {
   payments.clear();
+  refundLocks.clear();
   adjustmentRecords.length = 0;
   paymentSessions.clear();
   storedQuotes.clear();

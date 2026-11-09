@@ -47,6 +47,7 @@ import {
   mapIntentStatus,
   StripeError,
   StripeTimeoutError,
+  STRIPE_TIMEOUT_MS,
   stripeGet,
   stripeRequest,
 } from "./providers/stripe-client";
@@ -1075,6 +1076,9 @@ export class RefundNeedsResolutionError extends RefundPendingError {
   }
 }
 
+/** How long a card refund replay holds the tender's refund lock (one Stripe call + margin). */
+const REPLAY_LOCK_MS = STRIPE_TIMEOUT_MS + 20_000;
+
 /** A gift card sale / reload tender is refunded only under a client refund id (retry-safe). */
 export class RefundIdRequiredError extends Error {
   constructor() {
@@ -1236,7 +1240,30 @@ export async function refundPayment(input: {
         throw new RefundNeedsResolutionError();
       }
       const tip = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
-      const ref = await settle(entry);
+      if (!card) {
+        const ref = await settle(entry);
+        return finish(entry.amount_cents, tip, ref);
+      }
+      // A card replay holds the tender's refund lock while it talks to Stripe,
+      // so the stuck-refund resolver (refund-resolve.ts) never looks it up and
+      // releases it at the same moment.
+      const owner = `replay:${globalThis.crypto.randomUUID()}`;
+      const until = new Date(Date.now() + REPLAY_LOCK_MS).toISOString();
+      if (!(await driver.takePaymentRefundLock(payment.id, owner, until))) {
+        throw new RefundPendingError("A manager is resolving this card refund right now: try again in a moment.");
+      }
+      let ref: string | null;
+      try {
+        // Re-read under the lock: the resolver may have just finished it.
+        const now = ((await driver.getPayment(payment.id))?.refunds ?? []).find((r) => r.request_id === refundId);
+        if (now?.state !== "pending") {
+          const fresh = (await driver.getPayment(payment.id)) ?? payment;
+          return { ...fresh, replayed: true, refundedNowCents: 0, tipRefundedNowCents: 0 };
+        }
+        ref = await settle(entry);
+      } finally {
+        await driver.releasePaymentRefundLock(payment.id, owner).catch(() => undefined);
+      }
       return finish(entry.amount_cents, tip, ref);
     }
     const repaired = await repairReplayedCardRefund(payment, refundId, rail);
@@ -1300,8 +1327,10 @@ export async function refundPayment(input: {
   };
   const tipNow = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
 
-  if (saleMode === "excess") {
-    // Re-checked after the atomic reservation (it sees every concurrent one).
+  if (saleMode !== null) {
+    // Re-checked after the atomic reservation (it sees every concurrent one):
+    // "excess" against racing refunds, "released" against a settlement that
+    // credited the card between the decision and the reservation.
     try {
       await giftcards.assertStoredValueRefundAllowed(recorded.payment);
     } catch (err) {

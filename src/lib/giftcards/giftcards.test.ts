@@ -845,6 +845,87 @@ describe("follow-ups: sale refunds, partial payments, the idempotency window", (
     ).rejects.toMatchObject({ code: "payment_in_progress" });
   });
 
+  it("a void retried after Stripe FAILED a sale refund refunds it under a new id (never skipped)", async () => {
+    const { sale, p } = await cardSale(3000);
+    const driver = getPosDriver();
+    const rail = requirePaymentRail("stripe_terminal");
+    const { RefundRefusedError } = await import("@/lib/payments/PaymentRail");
+    const failing = vi.spyOn(rail, "refund").mockRejectedValueOnce(new RefundRefusedError("card expired"));
+    const args = { tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "x", actor: ACTOR };
+    await expect(voidStoredValue(args)).rejects.toBeTruthy();
+    failing.mockRestore();
+    const afterFail = (await driver.getPayment(p.id))!;
+    expect(afterFail.status).toBe("captured");
+    expect(afterFail.refund_ids).toEqual([`gcvoid_${sale.account.id}_0`]); // tombstone
+    const ok = stubCardRail("re_retry");
+    const out = await voidStoredValue(args);
+    expect(ok).toHaveBeenCalledTimes(1);
+    expect(ok.mock.calls[0]![0].context.idempotencyKey).toBe(`refund_${p.id}_gcvoid_${sale.account.id}_1`);
+    ok.mockRestore();
+    expect(out.refunds).toEqual([{ paymentId: p.id, refundedCents: 3000, manual: false }]);
+    expect((await driver.getPayment(p.id))!.status).toBe("refunded");
+  });
+
+  it("a void whose sale refund is still pending at Stripe throws, leaves the sale open, and resumes the SAME id", async () => {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: 5000, channel: "in_store", currency: "USD",
+    });
+    const now = new Date().toISOString();
+    const driver = getPosDriver();
+    // A part payment by card on a pending card.
+    const p = await driver.upsertPayment({
+      id: randomUUID(), order_id: sale.order.id, tenant_id: TENANT, location_id: LOCATION, rail: "stripe_terminal",
+      status: "captured", amount_cents: 2000, tip_cents: 0, application_fee_cents: 0, currency: "USD",
+      charge_id: `sim_pi_${randomUUID()}`, connect_account_id: "acct_sim_1", crypto_tx_hash: null, crypto_chain: null,
+      cash_tendered_cents: null, cash_change_cents: null, refunded_cents: 0, simulated: true, raw: null,
+      created_at: now, updated_at: now,
+    });
+    const rail = requirePaymentRail("stripe_terminal");
+    const hang = vi.spyOn(rail, "refund").mockRejectedValueOnce(new Error("socket hang up"));
+    const args = { tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "x", actor: ACTOR };
+    await expect(voidStoredValue(args)).rejects.toBeTruthy();
+    hang.mockRestore();
+    expect((await driver.getOrder(sale.order.id))!.status).toBe("draft"); // still open: money is held
+    const ok = stubCardRail("re_resumed");
+    await voidStoredValue(args);
+    expect(ok.mock.calls.map((c) => c[0].context.idempotencyKey)).toEqual([
+      `refund_${p.id}_gcvoid_${sale.account.id}_0`,
+    ]);
+    ok.mockRestore();
+    expect((await driver.getPayment(p.id))!.status).toBe("refunded");
+    expect((await driver.getOrder(sale.order.id))!.status).toBe("voided");
+  });
+
+  it("released mode is re-checked after the reservation: a settlement racing in blocks the refund", async () => {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: 2000, channel: "in_store", currency: "USD",
+    });
+    const now = new Date().toISOString();
+    const driver = getPosDriver();
+    // Paid in full, settlement hook not run yet: the value is not on the card ("released").
+    const cash = await driver.upsertPayment({
+      id: randomUUID(), order_id: sale.order.id, tenant_id: TENANT, location_id: LOCATION, rail: "cash",
+      status: "captured", amount_cents: 2000, tip_cents: 0, application_fee_cents: 0, currency: "USD",
+      charge_id: null, connect_account_id: null, crypto_tx_hash: null, crypto_chain: null,
+      cash_tendered_cents: 2000, cash_change_cents: 0, refunded_cents: 0, simulated: true, raw: null,
+      created_at: now, updated_at: now,
+    });
+    const real = driver.reservePaymentRefund.bind(driver);
+    const spy = vi.spyOn(driver, "reservePaymentRefund").mockImplementation(async (...a) => {
+      // The settlement lands between the decision and the reservation.
+      await settleStoredValueOrder(sale.order.id);
+      return real(...a);
+    });
+    await expect(refundPayment({ paymentId: cash.id, refundId: "race-released-1" })).rejects.toBeInstanceOf(
+      StoredValueRefundBlockedError,
+    );
+    spy.mockRestore();
+    expect((await account(sale.account.id)).balance_cents).toBe(2000);
+    const after = (await driver.getPayment(cash.id))!;
+    expect(after.refunded_cents).toBe(0);
+    expect(after.status).toBe("captured");
+  });
+
   it("past ~23h a card refund is never replayed under its (expired) Stripe key", async () => {
     const { p } = await cardSale(3000);
     const driver = getPosDriver();

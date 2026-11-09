@@ -1861,7 +1861,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_allocations: patch.allocations,
           p_meta: patch.meta ?? null,
           // Only sent when set: callers that release the claim work against
-          // the function before and after 20261114000100.
+          // the function before and after 20261114000500.
           ...(patch.keepClaim ? { p_keep_claim: true } : {}),
         }),
       ) as Row | null;
@@ -2662,6 +2662,65 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         }),
       ) as Row | null;
       return out ? mapPayment(out) : null;
+    },
+
+    async listCardTendersWithOpenRefunds(tenantId, locationId, limit) {
+      const cap = Math.min(Math.max(limit, 1), 200);
+      const base = () => {
+        let q = sb
+          .from("payments")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .in("rail", ["stripe_terminal", "stripe_online"])
+          .eq("simulated", false);
+        if (locationId) q = q.eq("location_id", locationId);
+        return q;
+      };
+      const [pending, noRef] = await Promise.all([
+        base().gt("refund_reserved_cents", 0).order("updated_at", { ascending: false }).limit(cap),
+        base()
+          .contains("refunds", '[{"processor_ref":null}]')
+          .order("updated_at", { ascending: false })
+          .limit(cap),
+      ]);
+      const byId = new Map<string, Payment>();
+      for (const r of [...(unwrap(pending) as Row[]), ...(unwrap(noRef) as Row[])]) {
+        const p = mapPayment(r);
+        byId.set(p.id, p);
+      }
+      return [...byId.values()]
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+        .slice(0, cap);
+    },
+
+    async releasePendingPaymentRefund(paymentId, refundId, opts) {
+      return (
+        unwrap(
+          await sb.rpc("release_pending_payment_refund", {
+            p_payment_id: paymentId,
+            p_refund_id: refundId,
+            p_tombstone: opts?.tombstone ?? false,
+          }),
+        ) === true
+      );
+    },
+
+    async takePaymentRefundLock(paymentId, owner, untilIso) {
+      return (
+        unwrap(
+          await sb.rpc("take_payment_refund_lock", {
+            p_payment_id: paymentId,
+            p_owner: owner,
+            p_until: untilIso,
+          }),
+        ) === true
+      );
+    },
+
+    async releasePaymentRefundLock(paymentId, owner) {
+      unwrap(
+        await sb.rpc("release_payment_refund_lock", { p_payment_id: paymentId, p_owner: owner }),
+      );
     },
 
     async setRefundProcessorRef(paymentId, requestId, processorRef) {

@@ -1,5 +1,5 @@
 -- ============================================================================
--- Checks for 20261114000100_money_followups (run by scripts/pglite-migrate.mjs
+-- Checks for 20261114000500_money_followups (run by scripts/pglite-migrate.mjs
 -- after the migrations + seed): a part-refunded sale never activates its card
 -- for the full amount, and finish_order_adjustment can keep a live claim.
 -- Raises on the first failed expectation; rolled back at the end.
@@ -18,6 +18,8 @@ declare
   r jsonb;
   v_until timestamptz := now() + interval '2 minutes';
   v_claim timestamptz;
+  pc uuid := gen_random_uuid();
+  ok boolean;
 begin
   select id into loc from public.locations where tenant_id = t limit 1;
 
@@ -83,6 +85,53 @@ begin
   r := public.finish_order_adjustment(o1, 'mf-req-0001', 'failed', '[]'::jsonb, null);
   select claimed_until into v_claim from public.order_adjustments where order_id = o1 and id = 'mf-req-0001';
   if v_claim is not null then raise exception 'claim not released'; end if;
+
+  -- ---- compare-and-set release + the per-tender refund lock ------------------
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated)
+  values (pc, o1, t, loc, 'stripe_terminal', 'captured', 1000, 0, 'USD', false);
+  r := public.reserve_payment_refund(pc, 400, 'mf-card-0001', null, null, 0, true, true);
+  if (r ->> 'outcome') <> 'ok' then raise exception 'pending reserve: %', r; end if;
+  -- confirmed meanwhile: the CAS release refuses and changes nothing
+  perform public.confirm_payment_refund(pc, 'mf-card-0001', 're_mf');
+  ok := public.release_pending_payment_refund(pc, 'mf-card-0001', true);
+  if ok then raise exception 'released a confirmed refund'; end if;
+  if (select refunded_cents from public.payments where id = pc) <> 400 then
+    raise exception 'confirmed refund undone';
+  end if;
+  -- still pending: released (tombstoned)
+  r := public.reserve_payment_refund(pc, 300, 'mf-card-0002', null, null, 0, true, true);
+  ok := public.release_pending_payment_refund(pc, 'mf-card-0002', true);
+  if not ok then raise exception 'pending refund not released'; end if;
+  if (select refund_reserved_cents from public.payments where id = pc) <> 0
+     or not ('mf-card-0002' = any (select unnest(refund_ids) from public.payments where id = pc)) then
+    raise exception 'release did not give the room back / tombstone';
+  end if;
+  if public.release_pending_payment_refund(pc, 'mf-card-0002', true) then
+    raise exception 'released twice';
+  end if;
+  -- lock: exclusive between owners, re-entrant, released by its owner only
+  if not public.take_payment_refund_lock(pc, 'resolver', now() + interval '1 minute') then
+    raise exception 'lock refused';
+  end if;
+  if public.take_payment_refund_lock(pc, 'replay', now() + interval '1 minute') then
+    raise exception 'lock taken twice';
+  end if;
+  if not public.take_payment_refund_lock(pc, 'resolver', now() + interval '1 minute') then
+    raise exception 'lock not re-entrant';
+  end if;
+  perform public.release_payment_refund_lock(pc, 'replay');
+  if public.take_payment_refund_lock(pc, 'replay', now() + interval '1 minute') then
+    raise exception 'lock released by a non-owner';
+  end if;
+  perform public.release_payment_refund_lock(pc, 'resolver');
+  if not public.take_payment_refund_lock(pc, 'replay', now() + interval '1 minute') then
+    raise exception 'lock not released';
+  end if;
+  -- an expired lock is free
+  update public.payments set refund_lock_until = now() - interval '1 second' where id = pc;
+  if not public.take_payment_refund_lock(pc, 'resolver', now() + interval '1 minute') then
+    raise exception 'expired lock still held';
+  end if;
 end
 $$;
 

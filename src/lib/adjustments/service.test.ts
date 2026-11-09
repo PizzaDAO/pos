@@ -1599,13 +1599,24 @@ describe("follow-ups: resolving a refund stuck pending at Stripe", () => {
 
   it("a re_ id from the dashboard (no metadata) for the same amount confirms it", async () => {
     const { card, refundId } = await stuck("rs5");
-    stripeGet.mockResolvedValue({ id: "re_dash", status: "succeeded", amount: 500, payment_intent: "pi_rs5", metadata: {} });
+    const nowSec = Math.floor(Date.now() / 1000);
+    // Older than the refund it would confirm: refused.
+    stripeGet.mockResolvedValueOnce({
+      id: "re_old", status: "succeeded", amount: 500, payment_intent: "pi_rs5", metadata: {}, created: nowSec - 3600,
+    });
+    const { resolveStuckCardRefund: r0 } = await import("@/lib/payments/refund-resolve");
+    await expect(
+      r0({ tenantId: TENANT, paymentId: card.id, refundId, stripeRefundId: "re_old", now: later() }),
+    ).rejects.toMatchObject({ code: "mismatch" });
+    stripeGet.mockResolvedValue({
+      id: "re_dash", status: "succeeded", amount: 500, payment_intent: "pi_rs5", metadata: {}, created: nowSec,
+    });
     const { resolveStuckCardRefund } = await import("@/lib/payments/refund-resolve");
     const out = await resolveStuckCardRefund({
       tenantId: TENANT, paymentId: card.id, refundId, stripeRefundId: "re_dash", now: later(),
     });
     expect(out.outcome).toBe("confirmed");
-    expect(stripeGet.mock.calls[0]![0]).toBe("/refunds/re_dash");
+    expect(stripeGet.mock.calls.at(-1)![0]).toBe("/refunds/re_dash");
     expect((await getPosDriver().getPayment(card.id))!.refunds![0]!.processor_ref).toBe("re_dash");
   });
 
@@ -1617,6 +1628,62 @@ describe("follow-ups: resolving a refund stuck pending at Stripe", () => {
     ).rejects.toMatchObject({ code: "not_found" });
   });
 
+  it("a dry run only reports; the outcome pressed must still match what Stripe says", async () => {
+    const { card, refundId } = await stuck("rs8");
+    stripeGet.mockResolvedValue({ data: [], has_more: false });
+    const { resolveStuckCardRefund } = await import("@/lib/payments/refund-resolve");
+    const dry = await resolveStuckCardRefund({ tenantId: TENANT, paymentId: card.id, refundId, dryRun: true, now: later() });
+    expect(dry).toMatchObject({ dryRun: true, outcome: "released", stripeRefund: null });
+    expect((await getPosDriver().getPayment(card.id))!.refunds![0]!.state).toBe("pending");
+    await expect(
+      resolveStuckCardRefund({ tenantId: TENANT, paymentId: card.id, refundId, expect: "confirmed", now: later() }),
+    ).rejects.toMatchObject({ code: "mismatch" });
+    expect((await getPosDriver().getPayment(card.id))!.refunds![0]!.state).toBe("pending");
+    const out = await resolveStuckCardRefund({ tenantId: TENANT, paymentId: card.id, refundId, expect: "released", now: later() });
+    expect(out.outcome).toBe("released");
+  });
+
+  it("RACE: a till retry confirms the refund while the resolver looks it up: the release fails, nothing is undone", async () => {
+    const { card, refundId } = await stuck("rs9");
+    const driver = getPosDriver();
+    stripeGet.mockImplementation(async () => {
+      // The till's retry lands meanwhile (as if it had got past the lock just
+      // before the resolver took it): Stripe refunded, POS confirmed.
+      await driver.confirmPaymentRefund(card.id, refundId, "re_till");
+      return { data: [], has_more: false };
+    });
+    const { resolveStuckCardRefund } = await import("@/lib/payments/refund-resolve");
+    await expect(
+      resolveStuckCardRefund({ tenantId: TENANT, paymentId: card.id, refundId, now: later() }),
+    ).rejects.toMatchObject({ code: "in_progress" });
+    const p = (await driver.getPayment(card.id))!;
+    expect(p.refunds![0]).toMatchObject({ state: "succeeded", processor_ref: "re_till" });
+    expect(p.refunded_cents).toBe(500);
+  });
+
+  it("RACE: while the resolver holds the tender's lock, a till retry never calls Stripe", async () => {
+    const { order, card, requestId, refundId } = await stuck("rs10");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    stripeGet.mockImplementation(async () => {
+      await gate;
+      return { data: [], has_more: false };
+    });
+    const { resolveStuckCardRefund } = await import("@/lib/payments/refund-resolve");
+    // A legacy-route style refund id is not a till request: only the lock guards it.
+    const resolving = resolveStuckCardRefund({ tenantId: TENANT, paymentId: card.id, refundId, now: later() });
+    await new Promise((r) => setTimeout(r, 10));
+    stripeRequest.mockResolvedValue({ id: "re_should_not", status: "succeeded" });
+    await expect(refundPayment({ paymentId: card.id, refundId })).rejects.toThrow(/resolving/);
+    expect(stripeRequest).not.toHaveBeenCalled();
+    release();
+    expect((await resolving).outcome).toBe("released");
+    // The lock is gone afterwards.
+    expect(await getPosDriver().takePaymentRefundLock(card.id, "probe", new Date(Date.now() + 1000).toISOString())).toBe(true);
+    void order;
+    void requestId;
+  });
+
   it("while a till runs the same request, it is refused (one execution at a time)", async () => {
     const { order, card, requestId, refundId } = await stuck("rs7");
     await getPosDriver().claimOrderAdjustment(order.id, requestId, new Date(Date.now() + 60_000).toISOString());
@@ -1625,5 +1692,42 @@ describe("follow-ups: resolving a refund stuck pending at Stripe", () => {
       resolveStuckCardRefund({ tenantId: TENANT, paymentId: card.id, refundId, now: later() }),
     ).rejects.toMatchObject({ code: "in_progress" });
     expect(stripeGet).not.toHaveBeenCalled();
+  });
+});
+
+describe("follow-ups: the sweeper alerts once a day and never resends an expired key", () => {
+  it("dedupes the stuck alert and skips card refunds past the idempotency window", async () => {
+    goLiveStripe();
+    const obs = await import("@/lib/observability");
+    const order = await seedOrder([item("l-swd", 1000, 1)], { status: "paid" });
+    await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_swd", connect_account_id: ACCT, simulated: false });
+    stripeRequest.mockRejectedValue(new Error("socket hang up"));
+    const requestId = rid("swd");
+    await refund(order.id, { amountCents: 400, requestId });
+    stripeRequest.mockClear();
+    const spy = vi.spyOn(obs, "captureError");
+    const { sweepPendingRefunds } = await import("./service");
+    const stuckAlerts = () => spy.mock.calls.filter((c) => (c[1] as { scope?: string })?.scope === "refund-stuck").length;
+    try {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const t0 = Date.now();
+      vi.setSystemTime(new Date(t0 + 20 * 60_000));
+      await sweepPendingRefunds(new Date());
+      vi.setSystemTime(new Date(t0 + 40 * 60_000));
+      await sweepPendingRefunds(new Date());
+      expect(stuckAlerts()).toBe(1);
+      expect(stripeRequest).toHaveBeenCalledTimes(2); // still within the window: resumed (same key)
+      // A day later: alerted again, but the expired key is never resent.
+      stripeRequest.mockClear();
+      vi.setSystemTime(new Date(t0 + 25 * 60 * 60_000));
+      await sweepPendingRefunds(new Date());
+      expect(stuckAlerts()).toBe(2);
+      expect(stripeRequest).not.toHaveBeenCalled();
+      const record = (await getPosDriver().listOrderAdjustments(order.id)).find((r) => r.id === requestId)!;
+      expect(record.meta).toMatchObject({ needs_resolution: true });
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+    }
   });
 });

@@ -32,7 +32,7 @@ import type { TerminalTipMode } from "@/lib/db/payment-types";
 import { captureError } from "@/lib/observability";
 import { resolveCardConnectAccountId } from "../connect";
 import { cardReaderMode, isStripeLiveKey, terminalSimAutoApproveMs } from "../env";
-import { mapIntentStatus, StripeError } from "../providers/stripe-client";
+import { mapIntentStatus, StripeError, StripeTimeoutError } from "../providers/stripe-client";
 import {
   cancelReaderAction,
   cancelReaderActionForIntent,
@@ -355,6 +355,16 @@ async function beginReaderAttempt(
 
 /** Map a Stripe reader error to a flow error, recording it on the tender. */
 async function explainReaderError(payment: Payment, err: unknown): Promise<unknown> {
+  if (err instanceof StripeTimeoutError) {
+    // Stripe did not answer: the reader action may or may not have started.
+    // Not marked failed (the sync reads the truth); the till retries.
+    const msg = "The card processor didn't answer in time. Check the reader, then try again.";
+    await applyRailStatus(payment.id, "requires_action", {
+      raw: { last_error: { code: "stripe_timeout", declineCode: null, message: msg } satisfies CardLastError },
+    }).catch(() => null);
+    const fresh = (await getPosDriver().getPayment(payment.id)) ?? payment;
+    return new TerminalFlowError("reader_timeout", msg, 504, fresh);
+  }
   if (!(err instanceof StripeError)) return err;
   const record = async (message: string, markFailed: boolean) => {
     await applyRailStatus(payment.id, "requires_action", {

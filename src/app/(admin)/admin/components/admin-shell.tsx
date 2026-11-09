@@ -81,6 +81,10 @@ const LatePayments = dynamic(
   () => import("./late-payments").then((m) => m.LatePayments),
   { loading: PanelFallback },
 );
+const StuckRefunds = dynamic(
+  () => import("./stuck-refunds").then((m) => m.StuckRefunds),
+  { loading: PanelFallback },
+);
 const GiftCardsManager = dynamic(
   () => import("./gift-cards-manager").then((m) => m.GiftCardsManager),
   { loading: PanelFallback },
@@ -328,7 +332,10 @@ export function AdminShell({
           />
         )}
         {tab === "late" && locationId && (
-          <LatePayments tenantId={tenantId} locationId={locationId} />
+          <div className="space-y-10">
+            <LatePayments tenantId={tenantId} locationId={locationId} />
+            <StuckRefunds tenantId={tenantId} locationId={locationId} />
+          </div>
         )}
         {tab === "giftcards" && <GiftCardsManager tenantId={tenantId} />}
         {tab === "locations" && (

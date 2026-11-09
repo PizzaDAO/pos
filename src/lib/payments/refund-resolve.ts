@@ -19,14 +19,18 @@
  * old replay we may no longer repeat) gets its id the same way.
  *
  * Never runs on an entry younger than RESOLVE_MIN_AGE_MS (its Stripe call may
- * still be in flight), and holds the refund request's execution claim while it
- * works, so a till resuming the same request cannot race it.
+ * still be in flight). It holds the tender's refund lock (also taken by every
+ * replay of a pending card refund) and, for a till refund request, its
+ * execution claim; the release is a compare-and-set on the entry still being
+ * pending, so a refund confirmed meanwhile is never undone. A dry run only
+ * reports what Stripe shows (the back office then asks for that outcome).
  */
 import { getPosDriver, type Payment, type PaymentRefund } from "@/lib/db";
+import type { AdjustmentRecord } from "@/lib/db/adjustment-types";
 import { captureError } from "@/lib/observability";
 import { refreshRefundRecord } from "@/lib/adjustments/service";
 import { stripeGet } from "./providers/stripe-client";
-import { maybeMarkOrderRefunded } from "./service";
+import { isPastIdempotencyWindow, maybeMarkOrderRefunded } from "./service";
 
 /** An entry younger than this may still have its Stripe call in flight. */
 export const RESOLVE_MIN_AGE_MS = 5 * 60_000;
@@ -58,11 +62,18 @@ interface StripeRefund {
   status: string;
   amount: number;
   payment_intent?: string | null;
+  /** Unix seconds. */
+  created?: number;
   metadata?: Record<string, string> | null;
 }
 
+export type ResolveOutcome = "confirmed" | "released" | "ref_recorded";
+
 export interface ResolveResult {
-  outcome: "confirmed" | "released" | "ref_recorded";
+  /** What was done (or, for a dry run, what would be done). */
+  outcome: ResolveOutcome;
+  /** True for a dry run: Stripe was asked, nothing was changed. */
+  dryRun?: boolean;
   /** The Stripe refund found (null: Stripe has none for this refund id). */
   stripeRefund: { id: string; status: string; amount: number } | null;
   payment: Payment;
@@ -129,31 +140,14 @@ async function findStripeRefund(
   );
 }
 
-/**
- * Look a stuck card refund up at Stripe and confirm or release it (see the file
- * header). Throws RefundResolveError for every refusal; Stripe / network errors
- * propagate (nothing was changed).
- */
-export async function resolveStuckCardRefund(input: {
-  tenantId: string;
-  paymentId: string;
-  refundId: string;
-  stripeRefundId?: string;
-  now?: number;
-}): Promise<ResolveResult> {
-  const driver = getPosDriver();
-  const now = input.now ?? Date.now();
-  const payment = await driver.getPayment(input.paymentId);
-  if (!payment || payment.tenant_id !== input.tenantId) {
-    throw new RefundResolveError("not_found", "Payment not found.", 404);
-  }
-  if (!isLiveCardTender(payment)) {
-    throw new RefundResolveError("not_card", "Only live card refunds are resolved at Stripe.", 422);
-  }
-  const entry = (payment.refunds ?? []).find((r) => r.request_id === input.refundId);
+/** The entry's Stripe refund must not predate the refund it confirms (clock skew allowed). */
+const CREATED_SKEW_MS = 60_000;
+
+/** A refund entry the resolver may act on (throws a RefundResolveError otherwise). */
+function resolvableEntry(payment: Payment, refundId: string, now: number): PaymentRefund {
+  const entry = (payment.refunds ?? []).find((r) => r.request_id === refundId);
   if (!entry) throw new RefundResolveError("not_found", "No such refund on this payment.", 404);
-  const pending = entry.state === "pending";
-  if (!pending && entry.processor_ref) {
+  if (entry.state !== "pending" && entry.processor_ref) {
     throw new RefundResolveError("already_resolved", "This refund is already recorded with its Stripe id.", 409);
   }
   const at = Date.parse(entry.at);
@@ -164,20 +158,70 @@ export async function resolveStuckCardRefund(input: {
       409,
     );
   }
+  return entry;
+}
 
-  const requestId = requestIdOf(input.refundId);
-  const record = requestId
-    ? ((await driver.listOrderAdjustments(payment.order_id)).find((r) => r.id === requestId) ?? null)
-    : null;
-  if (record) {
-    const until = new Date(now + CLAIM_MS).toISOString();
-    if (!(await driver.claimOrderAdjustment(payment.order_id, record.id, until))) {
-      throw new RefundResolveError("in_progress", "This refund is being processed right now: try again in a moment.", 409);
-    }
+/** Someone confirmed or released the refund while we were looking it up. */
+function changedMeanwhile(): RefundResolveError {
+  return new RefundResolveError(
+    "in_progress",
+    "This refund changed while it was being looked up (a till finished it): refresh and check again.",
+    409,
+  );
+}
+
+/**
+ * Look a stuck card refund up at Stripe and confirm or release it (see the file
+ * header). Throws RefundResolveError for every refusal; Stripe / network errors
+ * propagate (nothing was changed).
+ *
+ * Races: the per-tender refund lock (also taken by every replay of a pending
+ * card refund in refundPayment) keeps a till retry from calling Stripe while
+ * this runs; on top of that the release is a compare-and-set (only while the
+ * entry is STILL pending), so a refund confirmed meanwhile is never undone.
+ */
+export async function resolveStuckCardRefund(input: {
+  tenantId: string;
+  paymentId: string;
+  refundId: string;
+  stripeRefundId?: string;
+  /** Only look it up and say what would happen (the UI's "Check Stripe"). */
+  dryRun?: boolean;
+  /** The outcome the manager confirmed in the UI: refused if Stripe now says otherwise. */
+  expect?: ResolveOutcome;
+  now?: number;
+}): Promise<ResolveResult> {
+  const driver = getPosDriver();
+  const now = input.now ?? Date.now();
+  const first = await driver.getPayment(input.paymentId);
+  if (!first || first.tenant_id !== input.tenantId) {
+    throw new RefundResolveError("not_found", "Payment not found.", 404);
   }
+  if (!isLiveCardTender(first)) {
+    throw new RefundResolveError("not_card", "Only live card refunds are resolved at Stripe.", 422);
+  }
+  resolvableEntry(first, input.refundId, now);
 
+  const owner = `resolve:${globalThis.crypto.randomUUID()}`;
+  if (!(await driver.takePaymentRefundLock(first.id, owner, new Date(Date.now() + CLAIM_MS).toISOString()))) {
+    throw new RefundResolveError("in_progress", "This payment's refund is being processed right now: try again in a moment.", 409);
+  }
+  let record: AdjustmentRecord | null = null;
   let result: ResolveResult | null = null;
   try {
+    const requestId = requestIdOf(input.refundId);
+    record = requestId
+      ? ((await driver.listOrderAdjustments(first.order_id)).find((r) => r.id === requestId) ?? null)
+      : null;
+    if (record && !(await driver.claimOrderAdjustment(first.order_id, record.id, new Date(Date.now() + CLAIM_MS).toISOString()))) {
+      record = null; // not ours to refresh
+      throw new RefundResolveError("in_progress", "This refund is being processed right now: try again in a moment.", 409);
+    }
+    // Under the lock: the entry as it is NOW.
+    const payment = (await driver.getPayment(first.id)) ?? first;
+    const entry = resolvableEntry(payment, input.refundId, now);
+    const pending = entry.state === "pending";
+
     const found = await findStripeRefund(payment, entry, input.refundId, input.stripeRefundId);
     const view = found ? { id: found.id, status: found.status, amount: found.amount } : null;
     const live = !!found && ["succeeded", "pending", "requires_action"].includes(found.status);
@@ -194,47 +238,116 @@ export async function resolveStuckCardRefund(input: {
         409,
       );
     }
-    if (pending) {
+    if (found && input.stripeRefundId) {
+      // A re_ id given by hand must be a refund made AFTER this one was asked for
+      // (never an older refund of the same charge).
+      const at = Date.parse(entry.at);
+      if (typeof found.created !== "number" || !Number.isFinite(at) || found.created * 1000 < at - CREATED_SKEW_MS) {
+        throw new RefundResolveError("mismatch", "That Stripe refund was made before this refund was asked for.", 409);
+      }
+    }
+    const proposed: ResolveOutcome = pending ? (live ? "confirmed" : "released") : "ref_recorded";
+    if (!pending && !live) {
+      captureError(new Error("refund recorded as done but Stripe has no live refund"), {
+        scope: "refund-resolve",
+        paymentId: payment.id,
+        refundId: input.refundId,
+        stripeStatus: found?.status ?? null,
+      });
+      throw new RefundResolveError(
+        "not_at_stripe",
+        found
+          ? `Stripe shows this refund ${found.status}: the money was NOT returned. Refund it another way.`
+          : "Stripe has no refund for this: the money was NOT returned. Refund it another way.",
+        409,
+      );
+    }
+    if (input.dryRun) {
+      result = { outcome: proposed, dryRun: true, stripeRefund: view, payment };
+    } else if (input.expect && input.expect !== proposed) {
+      throw new RefundResolveError(
+        "mismatch",
+        `Stripe now says this refund should be ${proposed}, not ${input.expect}: check it again.`,
+        409,
+      );
+    } else if (pending) {
       if (live) {
-        await driver.confirmPaymentRefund(payment.id, input.refundId, found!.id);
+        const confirmed = await driver.confirmPaymentRefund(payment.id, input.refundId, found!.id);
+        if (!confirmed) throw changedMeanwhile();
         await maybeMarkOrderRefunded(payment.order_id);
         result = { outcome: "confirmed", stripeRefund: view, payment };
       } else {
         // Failed / canceled at Stripe, or never made: nothing was returned.
-        await driver.releasePaymentRefund(payment.id, entry.amount_cents, input.refundId, {
-          tombstone: true,
-        });
+        // Compare-and-set: only while it is STILL pending.
+        if (!(await driver.releasePendingPaymentRefund(payment.id, input.refundId, { tombstone: true }))) {
+          throw changedMeanwhile();
+        }
         result = { outcome: "released", stripeRefund: view, payment };
       }
     } else {
       // Confirmed earlier without a Stripe id.
-      if (!live) {
-        captureError(new Error("refund recorded as done but Stripe has no live refund"), {
-          scope: "refund-resolve",
-          paymentId: payment.id,
-          refundId: input.refundId,
-          stripeStatus: found?.status ?? null,
-        });
-        throw new RefundResolveError(
-          "not_at_stripe",
-          found
-            ? `Stripe shows this refund ${found.status}: the money was NOT returned. Refund it another way.`
-            : "Stripe has no refund for this: the money was NOT returned. Refund it another way.",
-          409,
-        );
-      }
       await driver.setRefundProcessorRef?.(payment.id, input.refundId, found!.id);
       result = { outcome: "ref_recorded", stripeRefund: view, payment };
     }
   } finally {
-    // Re-derive the request from the tenders (and release the claim).
+    // Re-derive the request from the tenders (and release its claim).
     if (record) {
+      const rec = record;
       await refreshRefundRecord(
-        payment.order_id,
-        record.id,
-        result ? { resolved_at: new Date(now).toISOString(), resolved: result.outcome } : undefined,
-      ).catch((err) => captureError(err, { scope: "refund-resolve", requestId: record.id }));
+        first.order_id,
+        rec.id,
+        result && !result.dryRun ? { resolved_at: new Date(now).toISOString(), resolved: result.outcome } : undefined,
+      ).catch((err) => captureError(err, { scope: "refund-resolve", requestId: rec.id }));
+    }
+    await driver
+      .releasePaymentRefundLock(first.id, owner)
+      .catch((err) => captureError(err, { scope: "refund-resolve-unlock", paymentId: first.id }));
+  }
+  return { ...result!, payment: (await driver.getPayment(first.id)) ?? first };
+}
+
+export interface StuckCardRefund {
+  paymentId: string;
+  orderId: string;
+  locationId: string;
+  refundId: string;
+  amountCents: number;
+  currency: string;
+  at: string;
+  /** pending: the outcome at Stripe is unknown; no_ref: recorded without a Stripe id. */
+  kind: "pending" | "no_ref";
+  /** Older than Stripe's idempotency window: POS will no longer retry it by itself. */
+  pastWindow: boolean;
+}
+
+/** Card refunds the back office should resolve (older than RESOLVE_MIN_AGE_MS). */
+export async function listStuckCardRefunds(
+  tenantId: string,
+  locationId: string | null,
+  now = Date.now(),
+): Promise<StuckCardRefund[]> {
+  const tenders = await getPosDriver().listCardTendersWithOpenRefunds(tenantId, locationId, 100);
+  const out: StuckCardRefund[] = [];
+  for (const p of tenders) {
+    if (!isLiveCardTender(p)) continue;
+    for (const e of p.refunds ?? []) {
+      if (!e.request_id) continue;
+      const kind = e.state === "pending" ? "pending" : !e.processor_ref ? "no_ref" : null;
+      if (!kind) continue;
+      const at = Date.parse(e.at);
+      if (Number.isFinite(at) && now - at < RESOLVE_MIN_AGE_MS) continue;
+      out.push({
+        paymentId: p.id,
+        orderId: p.order_id,
+        locationId: p.location_id,
+        refundId: e.request_id,
+        amountCents: e.amount_cents,
+        currency: p.currency,
+        at: e.at,
+        kind,
+        pastWindow: isPastIdempotencyWindow(e, now),
+      });
     }
   }
-  return { ...result!, payment: (await driver.getPayment(payment.id)) ?? payment };
+  return out.sort((a, b) => a.at.localeCompare(b.at));
 }

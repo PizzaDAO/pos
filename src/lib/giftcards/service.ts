@@ -651,20 +651,58 @@ export interface Actor {
   label: string;
 }
 
-async function refundOrderTenders(order: Order, refundId: string, reason: string) {
-  const payments = await getPosDriver().listPaymentsForOrder(order.id);
+/** This operation's refund ids on a tender: `<base>` (older) or `<base>_<n>`. */
+function isOpRefundId(id: string | null | undefined, base: string): id is string {
+  return typeof id === "string" && (id === base || (id.startsWith(`${base}_`) && /^\d+$/.test(id.slice(base.length + 1))));
+}
+
+/** Money a tender still holds (settled, not refunded, or held by a pending refund). */
+function stillHeld(p: Payment): boolean {
+  if (p.status === "pending") return true;
+  if (p.status !== "captured" && p.status !== "authorized") return false;
+  return p.refunded_cents < p.amount_cents + p.tip_cents || (p.refund_reserved_cents ?? 0) > 0;
+}
+
+/**
+ * Refund everything the order's tenders still hold, for one void / reversal
+ * (`base` = `gcvoid_<card>` / `gcreverse_<order>`). Retry-safe per tender:
+ *  - a refund of this operation still PENDING (unknown outcome at Stripe) is
+ *    resumed under its own id (same idempotency key);
+ *  - otherwise a NEW id `<base>_<n>`, n counting every id of this operation the
+ *    tender ever used (tombstones included), so a refund Stripe failed and
+ *    released is retried under a fresh key, never "replayed" as done.
+ * Afterwards the tenders are re-read: throws `refund_incomplete` while any
+ * money is still held (the caller leaves the sale open; a retry finishes it).
+ */
+async function refundOrderTenders(order: Order, base: string, reason: string) {
+  const driver = getPosDriver();
   const out: { paymentId: string; refundedCents: number; manual: boolean }[] = [];
-  for (const p of payments) {
+  for (const p of await driver.listPaymentsForOrder(order.id)) {
     if (p.status !== "captured" && p.status !== "authorized") continue;
-    if (p.refunded_cents >= p.amount_cents + p.tip_cents) continue;
+    const pendingEntry = (p.refunds ?? []).find((e) => e.state === "pending" && isOpRefundId(e.request_id, base));
+    let refundId: string;
+    if (pendingEntry) {
+      refundId = pendingEntry.request_id!;
+    } else {
+      if (p.refunded_cents + (p.refund_reserved_cents ?? 0) >= p.amount_cents + p.tip_cents) continue;
+      const used = (p.refund_ids ?? []).filter((id) => isOpRefundId(id, base)).length;
+      refundId = `${base}_${used}`;
+    }
     const r = await refundPayment({ paymentId: p.id, refundId, reason });
-    if (r) {
+    if (r && (r.refundedNowCents ?? 0) > 0) {
       out.push({
         paymentId: p.id,
         refundedCents: r.refundedNowCents ?? 0,
         manual: r.manualRefund === true,
       });
     }
+  }
+  if ((await driver.listPaymentsForOrder(order.id)).some(stillHeld)) {
+    throw new StoredValueError(
+      "refund_incomplete",
+      "Not all of this sale's money could be returned yet (a refund is still in progress). Try again.",
+      409,
+    );
   }
   return out;
 }

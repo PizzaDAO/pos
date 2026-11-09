@@ -1,7 +1,12 @@
 /**
  * Resolve a stuck card refund -- POST /api/admin/refunds/resolve
  *
- * { tenantId, paymentId, refundId, stripeRefundId? }
+ * GET  ?tenantId=&locationId=   card refunds needing a manager (pending at
+ *                               Stripe, or recorded without a Stripe id).
+ * POST { tenantId, paymentId, refundId, stripeRefundId?, dryRun?, expect? }
+ *   dryRun: only look it up and say what would happen ("Check Stripe").
+ *   expect: "confirmed" | "released" | "ref_recorded", the outcome the manager
+ *           pressed; refused (409) if Stripe now says otherwise.
  *
  * For a card refund left `pending` (Stripe kept answering an idempotency error,
  * never answered, or it is older than Stripe's 24 h idempotency window, so POS
@@ -17,11 +22,29 @@
 import { NextResponse } from "next/server";
 import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { publicTender } from "@/lib/payments/public";
-import { RefundResolveError, resolveStuckCardRefund } from "@/lib/payments/refund-resolve";
+import {
+  listStuckCardRefunds,
+  RefundResolveError,
+  resolveStuckCardRefund,
+  type ResolveOutcome,
+} from "@/lib/payments/refund-resolve";
 import { enforceRateLimit, isClientId, isUuid, readJsonBody, recordAudit } from "@/lib/security";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+const OUTCOMES: readonly ResolveOutcome[] = ["confirmed", "released", "ref_recorded"];
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const locationId = searchParams.get("locationId");
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), { locationId });
+  if (!auth.ok) return auth.res;
+  if (auth.actor.role !== "owner" && auth.actor.role !== "manager") {
+    return NextResponse.json({ error: "Only an owner or manager can resolve a refund." }, { status: 403 });
+  }
+  return NextResponse.json({ refunds: await listStuckCardRefunds(auth.tenantId, locationId) });
+}
 
 export async function POST(request: Request) {
   const limited = enforceRateLimit(request, "payments");
@@ -43,13 +66,24 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "stripeRefundId must be a Stripe refund id (re_...)." }, { status: 422 });
   }
 
+  const expect = body.expect;
+  if (expect !== undefined && !OUTCOMES.includes(expect as ResolveOutcome)) {
+    return NextResponse.json({ error: "expect must be confirmed, released or ref_recorded." }, { status: 422 });
+  }
+  const dryRun = body.dryRun === true;
+
   try {
     const out = await resolveStuckCardRefund({
       tenantId: auth.tenantId,
       paymentId: body.paymentId,
       refundId: body.refundId,
       stripeRefundId: stripeRefundId as string | undefined,
+      dryRun,
+      expect: expect as ResolveOutcome | undefined,
     });
+    if (out.dryRun) {
+      return NextResponse.json({ dryRun: true, outcome: out.outcome, stripeRefund: out.stripeRefund });
+    }
     const who = auth.actor.staff ? `${auth.actor.staff.name} (${auth.actor.staff.id})` : auth.user.email;
     const stripe = out.stripeRefund
       ? `Stripe refund ${out.stripeRefund.id} is ${out.stripeRefund.status} (${out.stripeRefund.amount}c)`

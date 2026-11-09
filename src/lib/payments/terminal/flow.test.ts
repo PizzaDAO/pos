@@ -24,7 +24,7 @@ vi.mock("@/lib/payments/providers/stripe-client", async (orig) => ({
   stripeDelete: (...a: unknown[]) => stripeDelete(...a),
 }));
 
-import { StripeError } from "@/lib/payments/providers/stripe-client";
+import { StripeError, StripeTimeoutError } from "@/lib/payments/providers/stripe-client";
 import {
   TerminalFlowError,
   cancelCardTender,
@@ -980,6 +980,24 @@ describe("stripe_test mode (stubbed Stripe)", () => {
     const keys = callsTo("/process_payment_intent").map((c) => (c[2] as { idempotencyKey: string }).idempotencyKey);
     expect(keys).toHaveLength(2);
     expect(keys[0]).toBe(keys[1]);
+  });
+
+  it("a Stripe timeout on the reader call -> reader_timeout (504), not marked failed", async () => {
+    stripeRequest.mockImplementation(async (path: string) => {
+      if (path === "/payment_intents") return { id: "pi_to", status: "requires_payment_method" };
+      if (path.endsWith("/process_payment_intent")) throw new StripeTimeoutError(path, 25_000);
+      throw new Error(`unexpected ${path}`);
+    });
+    const err = await startCardTender({
+      paymentId: uuid(),
+      orderId: await seedOrder(),
+      readerId: "tmr_1",
+      amountCents: 2000,
+    }).catch((e) => e);
+    expect(err).toMatchObject({ code: "reader_timeout", status: 504 });
+    expect(err.payment.status).toBe("requires_action");
+    expect(err.payment.raw.reader_action_status).not.toBe("failed");
+    expect(err.payment.raw.last_error.code).toBe("stripe_timeout");
   });
 
   it("an unregistered reader, or another location's reader, is refused before any Stripe call", async () => {

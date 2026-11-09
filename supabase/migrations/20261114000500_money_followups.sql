@@ -9,17 +9,32 @@
 --      for the full amount. What an order still OWES (sv_redeem's remaining,
 --      sv_order_sum) is unchanged. Mirrors isSettled / heldBaseCents in
 --      src/lib/giftcards/order-math.ts.
+--      sv_credit also LOCKS the sale's payment rows before it sums them, so a
+--      refund reservation racing the settlement is serialized with it.
 --   2. finish_order_adjustment(..., p_keep_claim): a writer that does not own
 --      the request's execution claim (the Stripe refund.failed webhook)
 --      re-derives the record WITHOUT clearing a live claim, so a concurrent
 --      execution of the same request stays exclusive. Default false: every
 --      existing caller (the claim owner) still releases it.
+--   3. Stuck card refund resolution (POST /api/admin/refunds/resolve):
+--      - payments.refund_lock_until / refund_lock_owner: a short per-tender
+--        lock (take_payment_refund_lock / release_payment_refund_lock) held by
+--        the resolver AND by any replay of a pending card refund, so the two
+--        never talk to Stripe about the same tender at once.
+--      - release_pending_payment_refund: compare-and-set release, true only
+--        when the entry was STILL pending (a refund confirmed meanwhile is
+--        never undone).
 --
--- No new tables. Functions are service_role only.
+-- No new tables (two nullable columns on payments). Functions are
+-- service_role only.
 -- ============================================================================
 
 begin;
 set local lock_timeout = '3s';
+
+alter table public.payments
+  add column if not exists refund_lock_until timestamptz,
+  add column if not exists refund_lock_owner text;
 
 create or replace function public.sv_order_settled_cents(p_order public.orders)
 returns bigint
@@ -94,7 +109,10 @@ begin
   if p_require_settled_order is not null then
     select * into v_order from public.orders
      where id = p_require_settled_order and tenant_id = p_tenant_id;
-    if not found
+    -- Serialize with refund reservations on the sale's tenders (they lock the
+    -- payment row): the sum below sees every refund reserved before it.
+    perform 1 from public.payments where order_id = p_require_settled_order for update;
+    if v_order.id is null
        or v_order.status::text in ('voided', 'abandoned', 'refunded')
        or public.sv_order_settled_cents(v_order) < public.sv_order_due(v_order) then
       return jsonb_build_object('outcome', 'not_settled', 'account', to_jsonb(v_acct));
@@ -176,6 +194,62 @@ begin
 end;
 $$;
 
+-- ---- per-tender refund lock (resolver vs. replay) ----------------------------
+create or replace function public.take_payment_refund_lock(
+  p_payment_id uuid,
+  p_owner text,
+  p_until timestamptz
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  update public.payments
+     set refund_lock_until = p_until, refund_lock_owner = p_owner
+   where id = p_payment_id
+     and (refund_lock_until is null or refund_lock_until < now() or refund_lock_owner = p_owner);
+  return found;
+end;
+$$;
+
+create or replace function public.release_payment_refund_lock(p_payment_id uuid, p_owner text)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  update public.payments
+     set refund_lock_until = null, refund_lock_owner = null
+   where id = p_payment_id and refund_lock_owner = p_owner;
+end;
+$$;
+
+-- ---- compare-and-set release of a PENDING refund ------------------------------
+-- True when the entry reserved under p_refund_id was still pending and is now
+-- released; false when it is gone or was confirmed meanwhile (nothing changes).
+create or replace function public.release_pending_payment_refund(
+  p_payment_id uuid,
+  p_refund_id text,
+  p_tombstone boolean default false
+) returns boolean
+language plpgsql
+as $$
+declare
+  r public.payments;
+begin
+  select * into r from public.payments where id = p_payment_id for update;
+  if not found or not exists (
+       select 1 from jsonb_array_elements(r.refunds) e
+        where e ->> 'request_id' = p_refund_id and e ->> 'state' = 'pending') then
+    return false;
+  end if;
+  perform public.release_payment_refund(p_payment_id, 0, p_refund_id, p_tombstone);
+  return true;
+end;
+$$;
+
 do $$
 declare
   f text;
@@ -183,7 +257,10 @@ begin
   foreach f in array array[
     'public.sv_order_settled_cents(public.orders)',
     'public.sv_credit(uuid, uuid, uuid, text, integer, text, uuid, uuid, text, text, text, boolean, uuid, integer)',
-    'public.finish_order_adjustment(uuid, text, text, jsonb, jsonb, boolean)'
+    'public.finish_order_adjustment(uuid, text, text, jsonb, jsonb, boolean)',
+    'public.take_payment_refund_lock(uuid, text, timestamptz)',
+    'public.release_payment_refund_lock(uuid, text)',
+    'public.release_pending_payment_refund(uuid, text, boolean)'
   ] loop
     execute format('revoke all on function %s from public', f);
     if exists (select 1 from pg_roles where rolname = 'anon') then
