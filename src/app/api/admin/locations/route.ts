@@ -125,8 +125,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "country must be a 2-letter ISO code." }, { status: 422 });
   }
   // Stored canonical; null/missing keeps the default zone. Abbreviations (EST) are refused.
-  const timezone = body.timezone ? canonicalTimezone(body.timezone) : null;
-  if (body.timezone && !timezone) {
+  const timezone = typeof body.timezone === "string" && body.timezone ? canonicalTimezone(body.timezone) : null;
+  if (body.timezone != null && body.timezone !== "" && !timezone) {
     return NextResponse.json({ error: "timezone must be an IANA zone like America/New_York (or UTC)." }, { status: 422 });
   }
   // Only an owner|manager of this tenant may add a location.

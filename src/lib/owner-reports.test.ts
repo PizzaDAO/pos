@@ -214,6 +214,29 @@ describe("buildOwnerBundle money math", () => {
       total: 1130, tip: 50, tax: 80, fees: 0, sales: 1000,
     });
   });
+  it("tip-last is per tender: a fully refunded tipped card leaves the cash tender alone", () => {
+    // cash $10.00 no tip + card $11.65 with $4.00 tip (card fully refunded = $15.65); order tax 1.65 on 20.00 sales
+    const tenders = [
+      { amount_cents: 1000, tip_cents: 0, refunded_cents: 0 },
+      { amount_cents: 1165, tip_cents: 400, refunded_cents: 1565 },
+    ];
+    const r = splitRefund(tenders, { sales: 2000, tax: 165, fees: 0 }, 400);
+    expect(r.tip).toBe(400);
+    // the card's non-tip $11.65 split pro-rata: tax 165/2165 of 1165 = 89, sales 1076
+    expect(r).toMatchObject({ total: 1565, tax: 89, fees: 0, sales: 1076 });
+    expect(r.tip + r.tax + r.fees + r.sales).toBe(r.total);
+  });
+  it("caps refunded sales at gross - discount; overflow goes to the tip part", () => {
+    // order tip $2 but tender tip $3; fully refunded $24.65 on $20.00 sales + $1.65 tax + $2.00 order tip
+    const r = splitRefund([{ amount_cents: 2165, tip_cents: 300, refunded_cents: 2465 }], { sales: 2000, tax: 165, fees: 0 }, 200);
+    expect(r.sales).toBe(2000);
+    expect(r.tip + r.tax + r.fees + r.sales).toBe(2465);
+    const o = order({ price: 2000, totals: { subtotal_cents: 2000, discount_cents: 0, taxable_cents: 2000, tax_cents: 165, tip_cents: 200, total_cents: 2365 } });
+    const p = pay(o, { amount_cents: 2165, tip_cents: 300, refunded_cents: 2465, status: "refunded" });
+    const sum = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [p] }).daily);
+    expect(sum.net_cents).toBe(0);
+    expect(sum.tax_cents).toBe(0);
+  });
   describe("delivery fees", () => {
     const delivery = () =>
       order({ price: 2000, channel: "online_delivery", totals: { subtotal_cents: 2000, discount_cents: 0, taxable_cents: 2000, tax_cents: 0, tip_cents: 0, total_cents: 2500, fees_cents: 500 } });
@@ -238,7 +261,7 @@ describe("buildOwnerBundle money math", () => {
     const cases: [number, number, number, number, number][] = [
       // amount, tip, refunded, tax, fees
       [1080, 100, 0, 80, 0], [1080, 100, 320, 80, 0], [1080, 100, 1080, 80, 0], [1080, 100, 1180, 80, 0],
-      [2500, 0, 777, 0, 500], [2900, 400, 2901, 160, 340], [540, 50, 590, 40, 0], [333, 0, 111, 33, 33], [100, 0, 100, 0, 0],
+      [2500, 0, 777, 0, 500], [2165, 300, 2465, 165, 0], [1165, 400, 1565, 165, 0], [2900, 400, 2901, 160, 340], [540, 50, 590, 40, 0], [333, 0, 111, 33, 33], [100, 0, 100, 0, 0],
     ];
     for (const [amount, tip, refunded, tax, fees] of cases) {
       const r = splitRefund([{ amount_cents: amount, tip_cents: tip, refunded_cents: refunded }], { sales: amount - tax - fees, tax, fees }, tip);

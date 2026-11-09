@@ -21,8 +21,10 @@
 --   fees     = order total - tip - tax - (gross - discount), floored at 0
 --              (delivery / custom fee lines; they are in the tender amount)
 --   refunds  = sum(payments.refunded_cents) on the order's tenders (cash back to
---              the customer), split per order, TIP LAST:
---                tip   = only what exceeds the order's paid non-tip amount
+--              the customer), split per order, TIP LAST (per tender):
+--                tip   = Σ over tenders of max(refunded - amount, 0), capped at
+--                        the order's tip; plus any sales overflow (sales are
+--                        capped at gross - discount)
 --                rest  = refunded - tip part, split pro-rata across sales, tax
 --                        and fees (tax and fees capped at their own amount;
 --                        sales takes the remainder)
@@ -148,6 +150,7 @@ f0 as (
     coalesce(li.voided_lines, 0) as voided_lines,
     coalesce(pay.refunded, 0) as refunded,
     coalesce(pay.amt, 0) as amt,
+    coalesce(pay.tip_ref_raw, 0) as tip_ref_raw,
     case when ob.order_tip > 0 then ob.order_tip else coalesce(pay.tip, 0) end as tip,
     coalesce(pay.cash, 0) as t_cash,
     coalesce(pay.card, 0) as t_card,
@@ -165,6 +168,8 @@ f0 as (
     select
       sum(p.refunded_cents) as refunded,
       sum(p.amount_cents) as amt,
+      -- per tender: only the part of a refund beyond that tender's own non-tip amount is tip
+      sum(greatest(p.refunded_cents - p.amount_cents, 0)) as tip_ref_raw,
       sum(p.tip_cents) as tip,
       sum(p.amount_cents) filter (where p.rail::text = 'cash' or (p.rail::text = 'external' and p.method = 'cash')) as cash,
       sum(p.amount_cents) filter (where p.rail::text in ('stripe_terminal', 'stripe_online') or (p.rail::text = 'external' and p.method = 'card')) as card,
@@ -178,15 +183,17 @@ f0 as (
       and p.status::text in ('captured', 'refunded')
   ) pay on true
 ),
--- Split each order's refunds, tip last (see header). Invariant:
--- refunded = ref_sales + ref_tax + ref_fees + ref_tip.
+-- Split each order's refunds, tip last PER TENDER (see header). Refunded sales
+-- are capped at gross - discount; any overflow goes to the tip part, so
+-- refunded = ref_sales + ref_tax + ref_fees + ref_tip always holds.
 f as (
-  select f0.*, r1.ref_tip as ref_tip_c, r3.ref_tax as ref_tax_c, r3.ref_fees as ref_fees_c,
-         (r1.rest - r3.ref_tax - r3.ref_fees) as ref_sales_c
+  select f0.*,
+         (r1.ref_tip + r4.overflow)::bigint as ref_tip_c,
+         r3.ref_tax as ref_tax_c, r3.ref_fees as ref_fees_c, r4.sales as ref_sales_c
   from f0
   cross join lateral (
-    select least(greatest(f0.refunded - f0.amt, 0), f0.tip)::bigint as ref_tip,
-           (f0.refunded - least(greatest(f0.refunded - f0.amt, 0), f0.tip))::bigint as rest
+    select least(f0.tip_ref_raw, f0.tip)::bigint as ref_tip,
+           (f0.refunded - least(f0.tip_ref_raw, f0.tip))::bigint as rest
   ) r1
   cross join lateral (
     select greatest(f0.gross - f0.discount, 0) + f0.tax + f0.fees as base
@@ -195,6 +202,11 @@ f as (
     select least(f0.tax, coalesce(round(r1.rest * f0.tax::numeric / nullif(r2.base, 0)), 0))::bigint as ref_tax,
            least(f0.fees, coalesce(round(r1.rest * f0.fees::numeric / nullif(r2.base, 0)), 0))::bigint as ref_fees
   ) r3
+  cross join lateral (
+    select least(r1.rest - r3.ref_tax - r3.ref_fees, greatest(f0.gross - f0.discount, 0))::bigint as sales,
+           (r1.rest - r3.ref_tax - r3.ref_fees
+             - least(r1.rest - r3.ref_tax - r3.ref_fees, greatest(f0.gross - f0.discount, 0)))::bigint as overflow
+  ) r4
 ),
 sales as (select * from f where is_sale),
 daily as (

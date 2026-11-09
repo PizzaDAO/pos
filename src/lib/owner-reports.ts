@@ -11,8 +11,9 @@
  *   discount = order totals.discount_cents
  *   fees     = order total − tip − tax − (gross − discount), floored at 0
  *              (delivery / custom fee lines; they are part of the tender amount)
- *   refunds  = Σ tender refunded_cents (cash back), split per order, TIP LAST:
- *              tip = only what exceeds the order's paid non-tip amount; the rest
+ *   refunds  = Σ tender refunded_cents (cash back), split per order, TIP LAST
+ *              per tender: tip = Σ max(refunded − amount, 0) capped at the order's
+ *              tip (plus any overflow of sales beyond gross − discount); the rest
  *              is split pro-rata across sales, tax and fees (tax and fees capped
  *              at their own amount, sales takes the remainder). Each part comes
  *              off its own column, so a fully refunded order contributes 0 net,
@@ -344,7 +345,7 @@ export function tenderKey(p: Pick<Payment, "rail" | "method" | "processor">): st
 }
 
 /**
- * Split an order's refunds, tip last (mirrors the SQL). `tenders` are the order's
+ * Split an order's refunds, tip last per tender (mirrors the SQL). `tenders` are the order's
  * counted tenders; `sales` = gross − discount, `tax`, `fees` the order's amounts
  * and `tip` the tip counted for it. Invariant: total = tip + tax + fees + sales.
  */
@@ -354,14 +355,18 @@ export function splitRefund(
   tip: number,
 ): { total: number; tip: number; tax: number; fees: number; sales: number } {
   const total = tenders.reduce((s, p) => s + p.refunded_cents, 0);
-  const paid = tenders.reduce((s, p) => s + p.amount_cents, 0);
-  const refTip = Math.min(Math.max(total - paid, 0), tip);
+  // Tip last, PER TENDER: only the part beyond a tender's own non-tip amount is tip.
+  const tipRaw = tenders.reduce((s, p) => s + Math.max(p.refunded_cents - p.amount_cents, 0), 0);
+  const refTip = Math.min(tipRaw, tip);
   const rest = total - refTip;
   const base = Math.max(amounts.sales, 0) + amounts.tax + amounts.fees;
   const share = (v: number) => (base > 0 ? Math.min(v, Math.round((rest * v) / base)) : 0);
   const refTax = share(amounts.tax);
   const refFees = share(amounts.fees);
-  return { total, tip: refTip, tax: refTax, fees: refFees, sales: rest - refTax - refFees };
+  // Refunded sales never exceed what was sold; any overflow is tip.
+  const sales = Math.min(rest - refTax - refFees, Math.max(amounts.sales, 0));
+  const overflow = rest - refTax - refFees - sales;
+  return { total, tip: refTip + overflow, tax: refTax, fees: refFees, sales };
 }
 
 export interface BuildBundleInput {

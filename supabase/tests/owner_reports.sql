@@ -127,6 +127,34 @@ begin
        or (rp -> 'daily' -> 0 ->> 'fees_cents')::int <> 0 or (rp -> 'daily' -> 0 ->> 'refund_cents')::int <> 2500 then
       raise exception 'fee refund %', rp -> 'daily' -> 0;
     end if;
+    -- per-tender tip-last: cash 1000 + card 1165 (tip 400, fully refunded 1565), 2000 sales + 165 tax
+    declare
+      oe uuid := gen_random_uuid();
+      re jsonb;
+    begin
+      insert into public.orders (id, tenant_id, location_id, status, channel, currency, totals, order_number, created_at) values
+       (oe, t, loc, 'completed', 'in_store', 'USD', '{"discount_cents":0,"tax_cents":165,"tip_cents":0,"total_cents":2165}', 'R9', '2026-04-12T16:00:00Z');
+      insert into public.order_items (id, order_id, item_id, item_name, quantity, unit_price_cents, line_total_cents) values
+       (gen_random_uuid(), oe, item, 'Margherita', 1, 2000, 2000);
+      insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
+       (gen_random_uuid(), oe, t, loc, 'cash', 'captured', 1000, 0, 0, false),
+       (gen_random_uuid(), oe, t, loc, 'stripe_terminal', 'captured', 1165, 400, 1565, false);
+      re := public.report_sales_bundle(t, loc, '2026-04-12', '2026-04-12', 50);
+      if (re -> 'daily' -> 0 ->> 'refund_tip_cents')::int <> 400 or (re -> 'daily' -> 0 ->> 'refund_tax_cents')::int <> 89
+         or (re -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 1076 then
+        raise exception 'per-tender tip-last %', re -> 'daily' -> 0;
+      end if;
+      -- sales cap: order tip 200, tender tip 300, refunded 2465 -> net 0 (overflow goes to tip)
+      update public.orders set totals = '{"discount_cents":0,"tax_cents":165,"tip_cents":200,"total_cents":2365}' where id = oe;
+      delete from public.payments where order_id = oe;
+      insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
+       (gen_random_uuid(), oe, t, loc, 'stripe_terminal', 'refunded', 2165, 300, 2465, false);
+      re := public.report_sales_bundle(t, loc, '2026-04-12', '2026-04-12', 50);
+      if (re -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 2000 or (re -> 'daily' -> 0 ->> 'refund_cents')::int <> 2465
+         or (re -> 'daily' -> 0 ->> 'refund_tip_cents')::int + (re -> 'daily' -> 0 ->> 'refund_tax_cents')::int + 2000 <> 2465 then
+        raise exception 'sales cap %', re -> 'daily' -> 0;
+      end if;
+    end;
     -- invariant: parts sum to the refund total
     if exists (select 1 from jsonb_array_elements(r -> 'daily') d
                where (d ->> 'refund_cents')::int <> (d ->> 'refund_sales_cents')::int + (d ->> 'refund_tax_cents')::int

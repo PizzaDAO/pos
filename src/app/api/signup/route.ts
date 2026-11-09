@@ -202,8 +202,8 @@ export async function POST(request: Request) {
             { status: 402 },
           );
         }
-        const timezone = body.timezone ? canonicalTimezone(body.timezone) : null;
-        if (body.timezone && !timezone) {
+        const timezone = typeof body.timezone === "string" && body.timezone ? canonicalTimezone(body.timezone) : null;
+        if (body.timezone != null && body.timezone !== "" && !timezone) {
           return NextResponse.json(
             { error: "timezone must be an IANA zone like America/New_York (or UTC)." },
             { status: 422 },
