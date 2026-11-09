@@ -17,7 +17,7 @@ import { getPosDriver } from "@/lib/db";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
 import { recordAudit } from "@/lib/security";
-import { isValidTimezone } from "@/lib/owner-reports";
+import { canonicalTimezone } from "@/lib/owner-reports";
 
 /** What changing a location's country does to phone numbers (shown before saving). */
 const COUNTRY_CHANGE_WARNING =
@@ -124,8 +124,10 @@ export async function POST(request: Request) {
   if (country && !/^[A-Z]{2}$/.test(country)) {
     return NextResponse.json({ error: "country must be a 2-letter ISO code." }, { status: 422 });
   }
-  if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
-    return NextResponse.json({ error: "timezone must be a valid IANA zone, e.g. America/New_York." }, { status: 422 });
+  // Stored canonical; null/missing keeps the default zone. Abbreviations (EST) are refused.
+  const timezone = body.timezone ? canonicalTimezone(body.timezone) : null;
+  if (body.timezone && !timezone) {
+    return NextResponse.json({ error: "timezone must be an IANA zone like America/New_York (or UTC)." }, { status: 422 });
   }
   // Only an owner|manager of this tenant may add a location.
   const auth = await requireTenantAccess(body.tenantId, "admin");
@@ -151,7 +153,7 @@ export async function POST(request: Request) {
     tenant_id: body.tenantId,
     name: body.name.trim(),
     address: body.address ?? null,
-    timezone: body.timezone,
+    timezone: timezone ?? undefined,
     ...(country ? { country } : {}),
   });
   return NextResponse.json({ location }, { status: 201 });

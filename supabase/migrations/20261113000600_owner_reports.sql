@@ -18,13 +18,17 @@
 --   sale     = order status not in (draft, awaiting_payment, abandoned, voided)
 --   gross    = sum(unit_price_cents * quantity) of non-voided lines
 --   discount = orders.totals.discount_cents
+--   fees     = order total - tip - tax - (gross - discount), floored at 0
+--              (delivery / custom fee lines; they are in the tender amount)
 --   refunds  = sum(payments.refunded_cents) on the order's tenders (cash back to
---              the customer: sales + tax + tip), split per order into
---                tip   = per tender, refunded up to the tender's tip first
---                tax   = the rest, pro-rata to the order's tax share of paid amount
---                sales = whatever remains
---              and each part comes off its own column: a fully refunded order
---              contributes 0 net, 0 tax and 0 tip. refund_cents stays the total.
+--              the customer), split per order, TIP LAST:
+--                tip   = only what exceeds the order's paid non-tip amount
+--                rest  = refunded - tip part, split pro-rata across sales, tax
+--                        and fees (tax and fees capped at their own amount;
+--                        sales takes the remainder)
+--              Each part comes off its own column, so a fully refunded order
+--              contributes 0 net, 0 tax, 0 fees and 0 tip, and
+--              refund_cents = sales + tax + fees + tip parts, always.
 --              TODO(refunds-voids-comps): refunds are dated to the ORIGINAL
 --              order's business day because no refund timestamp exists yet; use
 --              the refund row's timestamp once that branch adds it.
@@ -86,8 +90,8 @@ params as (
 -- Locations of this tenant; an unknown timezone reads as UTC.
 locs as (
   select l.id, l.name, l.business_day_cutoff_minutes as cutoff,
-         case when exists (select 1 from pg_timezone_names z where z.name = l.timezone)
-              then l.timezone else 'UTC' end as tz
+         coalesce((select z.name from pg_timezone_names z
+                    where lower(z.name) = lower(l.timezone) limit 1), 'UTC') as tz
   from public.locations l
   where l.tenant_id = p_tenant_id
 ),
@@ -140,9 +144,9 @@ f0 as (
   select
     ob.*,
     coalesce(li.gross, 0) as gross,
+    greatest(0, ob.total - ob.order_tip - ob.tax - (coalesce(li.gross, 0) - ob.discount)) as fees,
     coalesce(li.voided_lines, 0) as voided_lines,
     coalesce(pay.refunded, 0) as refunded,
-    coalesce(pay.tip_ref_raw, 0) as tip_ref_raw,
     coalesce(pay.amt, 0) as amt,
     case when ob.order_tip > 0 then ob.order_tip else coalesce(pay.tip, 0) end as tip,
     coalesce(pay.cash, 0) as t_cash,
@@ -160,7 +164,6 @@ f0 as (
   left join lateral (
     select
       sum(p.refunded_cents) as refunded,
-      sum(least(p.refunded_cents, p.tip_cents)) as tip_ref_raw,
       sum(p.amount_cents) as amt,
       sum(p.tip_cents) as tip,
       sum(p.amount_cents) filter (where p.rail::text = 'cash' or (p.rail::text = 'external' and p.method = 'cash')) as cash,
@@ -175,17 +178,23 @@ f0 as (
       and p.status::text in ('captured', 'refunded')
   ) pay on true
 ),
--- Split each order's refunds into tip / tax / sales parts (see header).
+-- Split each order's refunds, tip last (see header). Invariant:
+-- refunded = ref_sales + ref_tax + ref_fees + ref_tip.
 f as (
-  select f0.*,
-         least(f0.tip_ref_raw, f0.tip) as ref_tip_c,
-         r2.ref_tax as ref_tax_c,
-         (r1.rest - r2.ref_tax) as ref_sales_c
+  select f0.*, r1.ref_tip as ref_tip_c, r3.ref_tax as ref_tax_c, r3.ref_fees as ref_fees_c,
+         (r1.rest - r3.ref_tax - r3.ref_fees) as ref_sales_c
   from f0
-  cross join lateral (select f0.refunded - f0.tip_ref_raw as rest) r1
   cross join lateral (
-    select least(f0.tax, coalesce(round(r1.rest * f0.tax::numeric / nullif(f0.amt, 0)), 0))::bigint as ref_tax
+    select least(greatest(f0.refunded - f0.amt, 0), f0.tip)::bigint as ref_tip,
+           (f0.refunded - least(greatest(f0.refunded - f0.amt, 0), f0.tip))::bigint as rest
+  ) r1
+  cross join lateral (
+    select greatest(f0.gross - f0.discount, 0) + f0.tax + f0.fees as base
   ) r2
+  cross join lateral (
+    select least(f0.tax, coalesce(round(r1.rest * f0.tax::numeric / nullif(r2.base, 0)), 0))::bigint as ref_tax,
+           least(f0.fees, coalesce(round(r1.rest * f0.fees::numeric / nullif(r2.base, 0)), 0))::bigint as ref_fees
+  ) r3
 ),
 sales as (select * from f where is_sale),
 daily as (
@@ -197,6 +206,8 @@ daily as (
     coalesce(sum(refunded) filter (where is_sale), 0) as refund_cents,
     coalesce(sum(ref_sales_c) filter (where is_sale), 0) as refund_sales_cents,
     coalesce(sum(ref_tax_c) filter (where is_sale), 0) as refund_tax_cents,
+    coalesce(sum(ref_fees_c) filter (where is_sale), 0) as refund_fees_cents,
+    coalesce(sum(fees - ref_fees_c) filter (where is_sale), 0) as fees_cents,
     coalesce(sum(ref_tip_c) filter (where is_sale), 0) as refund_tip_cents,
     coalesce(sum(tax - ref_tax_c) filter (where is_sale), 0) as tax_cents,
     coalesce(sum(tip - ref_tip_c) filter (where is_sale), 0) as tip_cents,
@@ -212,7 +223,8 @@ daily as (
 channels as (
   select channel, count(*) as orders,
          sum(gross) as gross_cents, sum(discount) as discount_cents, sum(refunded) as refund_cents,
-         sum(ref_sales_c) as refund_sales_cents
+         sum(ref_sales_c) as refund_sales_cents, sum(ref_fees_c) as refund_fees_cents,
+         sum(fees - ref_fees_c) as fees_cents
   from sales group by channel
 ),
 tenders as (

@@ -5,6 +5,7 @@ import {
   buildOwnerBundle,
   bundleToCsv,
   businessDay,
+  canonicalTimezone,
   compareSummaries,
   csvCell,
   heatmapGrid,
@@ -105,6 +106,13 @@ describe("businessDay (timezone + cutoff)", () => {
     expect(sat0130).toEqual({ date: "2026-03-06", dow: 5, hour: 1 });
     expect(businessDay("2026-03-07T09:00:00Z", "America/New_York", 240).date).toBe("2026-03-07"); // 04:00 EST
   });
+  it("canonicalTimezone accepts Area/City and UTC, rejects abbreviations", () => {
+    expect(canonicalTimezone("America/New_York")).toBe("America/New_York");
+    expect(canonicalTimezone("utc")).toBe("UTC");
+    expect(canonicalTimezone("EST")).toBeNull();
+    expect(canonicalTimezone("Nope/Zone")).toBeNull();
+    expect(canonicalTimezone("")).toBeNull();
+  });
   it("rejects unknown zones in isValidTimezone and reads them as UTC", () => {
     expect(isValidTimezone("America/Chicago")).toBe(true);
     expect(isValidTimezone("Nope/Zone")).toBe(false);
@@ -191,15 +199,52 @@ describe("buildOwnerBundle money math", () => {
     const r = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [p] }).daily);
     expect(r).toMatchObject({ net_cents: 0, tax_cents: 0, tip_cents: 0, refund_cents: 590 });
   });
-  it("splits a partial refund pro-rata (tip first, then tax share, rest sales)", () => {
-    // paid $10.80 (sales 10.00 + tax 0.80) + tip 1.00; refund $3.20: 1.00 tip, then 2.20 -> tax 0.16, sales 2.04
-    expect(splitRefund([{ amount_cents: 1080, tip_cents: 100, refunded_cents: 320 }], 80, 100)).toEqual({
-      total: 320, tip: 100, tax: 16, sales: 204,
+  it("splits a partial refund tip-last: pro-rata over sales and tax, tip untouched", () => {
+    // paid $10.80 (sales 10.00 + tax 0.80) + tip 1.00; refund $3.20 of items
+    expect(splitRefund([{ amount_cents: 1080, tip_cents: 100, refunded_cents: 320 }], { sales: 1000, tax: 80, fees: 0 }, 100)).toEqual({
+      total: 320, tip: 0, tax: 24, fees: 0, sales: 296,
     });
     const o = order({ price: 1000, totals: { subtotal_cents: 1000, discount_cents: 0, taxable_cents: 1000, tax_cents: 80, tip_cents: 0, total_cents: 1080 } });
     const p = pay(o, { amount_cents: 1080, tip_cents: 100, refunded_cents: 320 });
     const r = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [p] }).daily);
-    expect(r).toMatchObject({ net_cents: 1000 - 204, tax_cents: 80 - 16, tip_cents: 0, refund_cents: 320 });
+    expect(r).toMatchObject({ net_cents: 1000 - 296, tax_cents: 80 - 24, tip_cents: 100, refund_cents: 320 });
+  });
+  it("only the part beyond the non-tip amount comes off the tip", () => {
+    expect(splitRefund([{ amount_cents: 1080, tip_cents: 100, refunded_cents: 1130 }], { sales: 1000, tax: 80, fees: 0 }, 100)).toEqual({
+      total: 1130, tip: 50, tax: 80, fees: 0, sales: 1000,
+    });
+  });
+  describe("delivery fees", () => {
+    const delivery = () =>
+      order({ price: 2000, channel: "online_delivery", totals: { subtotal_cents: 2000, discount_cents: 0, taxable_cents: 2000, tax_cents: 0, tip_cents: 0, total_cents: 2500, fees_cents: 500 } });
+    it("reports fees separately from sales", () => {
+      const o = delivery();
+      const r = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [pay(o)] }).daily);
+      expect(r).toMatchObject({ gross_cents: 2000, fees_cents: 500, net_cents: 2000 });
+    });
+    it("a full refund zeroes net, fees, tax and tip (no negative net)", () => {
+      const o = delivery();
+      const b = buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [pay(o, { refunded_cents: 2500, status: "refunded" })] });
+      expect(summarize(b.daily)).toMatchObject({ net_cents: 0, fees_cents: 0, refund_fees_cents: 500, refund_sales_cents: 2000, refund_cents: 2500 });
+      expect(b.channels[0]).toMatchObject({ refund_fees_cents: 500, fees_cents: 0 });
+    });
+    it("a partial refund takes fees pro-rata", () => {
+      const o = delivery();
+      const r = summarize(buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [pay(o, { refunded_cents: 1250 })] }).daily);
+      expect(r).toMatchObject({ refund_fees_cents: 250, refund_sales_cents: 1000, fees_cents: 250, net_cents: 1000 });
+    });
+  });
+  it("invariant: refund parts always sum to the refund total", () => {
+    const cases: [number, number, number, number, number][] = [
+      // amount, tip, refunded, tax, fees
+      [1080, 100, 0, 80, 0], [1080, 100, 320, 80, 0], [1080, 100, 1080, 80, 0], [1080, 100, 1180, 80, 0],
+      [2500, 0, 777, 0, 500], [2900, 400, 2901, 160, 340], [540, 50, 590, 40, 0], [333, 0, 111, 33, 33], [100, 0, 100, 0, 0],
+    ];
+    for (const [amount, tip, refunded, tax, fees] of cases) {
+      const r = splitRefund([{ amount_cents: amount, tip_cents: tip, refunded_cents: refunded }], { sales: amount - tax - fees, tax, fees }, tip);
+      expect(r.tip + r.tax + r.fees + r.sales).toBe(r.total);
+      expect(r.tip).toBeGreaterThanOrEqual(0);
+    }
   });
   it("excludes voided lines from gross and counts them against staff", () => {
     const o = order({ staff_id: "s1" });
@@ -276,7 +321,7 @@ describe("comparison + csv", () => {
     const bundle = buildOwnerBundle({ ...base, from: "2026-03-10", to: "2026-03-10", orders: [o], payments: [pay(o)] });
     const lines = bundleToCsv("accountant", bundle, (k) => k).trim().split("\r\n");
     expect(lines).toHaveLength(3);
-    expect(lines[1]).toBe("2026-03-10,NY,1,10.00,0.00,0.00,10.00,0.80,0.00,0,0.00,10.80,0.00,0.00,0.00");
+    expect(lines[1]).toBe("2026-03-10,NY,1,10.00,0.00,0.00,10.00,0.80,0.00,0.00,0,0.00,10.80,0.00,0.00,0.00");
     expect(lines[2]).toMatch(/^# Refunds are dated to the original order's business day/);
   });
 });
@@ -284,7 +329,7 @@ describe("comparison + csv", () => {
 function emptyDay() {
   return {
     location_id: "x", location_name: "x", business_date: "2026-03-10", orders: 0, gross_cents: 0, discount_cents: 0,
-    refund_cents: 0, refund_sales_cents: 0, refund_tax_cents: 0, refund_tip_cents: 0, tax_cents: 0, tip_cents: 0, void_count: 0, void_cents: 0, cash_cents: 0, card_cents: 0,
+    refund_cents: 0, refund_sales_cents: 0, refund_tax_cents: 0, refund_fees_cents: 0, fees_cents: 0, refund_tip_cents: 0, tax_cents: 0, tip_cents: 0, void_count: 0, void_cents: 0, cash_cents: 0, card_cents: 0,
     crypto_cents: 0, other_cents: 0,
   };
 }

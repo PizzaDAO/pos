@@ -22,7 +22,7 @@
  * be used to bypass plan gating (extra locations) or to re-activate a tenant
  * the platform suspended.
  */
-import { isValidTimezone } from "@/lib/owner-reports";
+import { canonicalTimezone } from "@/lib/owner-reports";
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { effectiveConnectAccount } from "@/lib/payments/connect";
@@ -202,9 +202,10 @@ export async function POST(request: Request) {
             { status: 402 },
           );
         }
-        if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+        const timezone = body.timezone ? canonicalTimezone(body.timezone) : null;
+        if (body.timezone && !timezone) {
           return NextResponse.json(
-            { error: "timezone must be a valid IANA zone, e.g. America/New_York." },
+            { error: "timezone must be an IANA zone like America/New_York (or UTC)." },
             { status: 422 },
           );
         }
@@ -212,7 +213,7 @@ export async function POST(request: Request) {
           tenant_id: tenantId,
           name: body.name.trim().slice(0, 120),
           address: body.address ?? null,
-          timezone: body.timezone,
+          timezone: timezone ?? undefined,
         });
         const onboarding = await driver.completeOnboardingStep(
           tenantId,

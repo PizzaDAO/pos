@@ -90,6 +90,7 @@ begin
   declare
     op uuid := gen_random_uuid();
     ot uuid := gen_random_uuid();
+    od uuid := gen_random_uuid();
     rp jsonb;
   begin
     insert into public.orders (id, tenant_id, location_id, status, channel, currency, totals, order_number, created_at) values
@@ -104,16 +105,40 @@ begin
     insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
      (gen_random_uuid(), ot, t, loc, 'external', 'captured', 300, 0, 0, false);
     rp := public.report_sales_bundle(t, loc, '2026-04-10', '2026-04-10', 50);
-    if (rp -> 'daily' -> 0 ->> 'refund_tip_cents')::int <> 100 or (rp -> 'daily' -> 0 ->> 'refund_tax_cents')::int <> 16
-       or (rp -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 204 then
+    -- refund 320 of 1080 non-tip: tip untouched, tax 24, sales 296
+    if (rp -> 'daily' -> 0 ->> 'refund_tip_cents')::int <> 0 or (rp -> 'daily' -> 0 ->> 'refund_tax_cents')::int <> 24
+       or (rp -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 296 then
       raise exception 'partial refund split %', rp -> 'daily' -> 0;
     end if;
-    if (rp -> 'daily' -> 0 ->> 'tax_cents')::int <> 64 or (rp -> 'daily' -> 0 ->> 'tip_cents')::int <> 0 then
+    if (rp -> 'daily' -> 0 ->> 'tax_cents')::int <> 56 or (rp -> 'daily' -> 0 ->> 'tip_cents')::int <> 100 then
       raise exception 'partial refund columns %', rp -> 'daily' -> 0;
     end if;
     if (rp -> 'daily' -> 0 ->> 'other_cents')::int <> 300 then raise exception 'null-method external %', rp -> 'daily' -> 0; end if;
 
+    -- delivery fee order: $20 pizza + $5 fee, fully refunded -> net/fees 0, invariant holds
+    insert into public.orders (id, tenant_id, location_id, status, channel, currency, totals, order_number, created_at) values
+     (od, t, loc, 'refunded', 'online_delivery', 'USD', '{"discount_cents":0,"tax_cents":0,"tip_cents":0,"total_cents":2500,"fees_cents":500}', 'R8', '2026-04-11T16:00:00Z');
+    insert into public.order_items (id, order_id, item_id, item_name, quantity, unit_price_cents, line_total_cents) values
+     (gen_random_uuid(), od, item, 'Margherita', 1, 2000, 2000);
+    insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, refunded_cents, simulated) values
+     (gen_random_uuid(), od, t, loc, 'stripe_online', 'refunded', 2500, 0, 2500, false);
+    rp := public.report_sales_bundle(t, loc, '2026-04-11', '2026-04-11', 50);
+    if (rp -> 'daily' -> 0 ->> 'refund_fees_cents')::int <> 500 or (rp -> 'daily' -> 0 ->> 'refund_sales_cents')::int <> 2000
+       or (rp -> 'daily' -> 0 ->> 'fees_cents')::int <> 0 or (rp -> 'daily' -> 0 ->> 'refund_cents')::int <> 2500 then
+      raise exception 'fee refund %', rp -> 'daily' -> 0;
+    end if;
+    -- invariant: parts sum to the refund total
+    if exists (select 1 from jsonb_array_elements(r -> 'daily') d
+               where (d ->> 'refund_cents')::int <> (d ->> 'refund_sales_cents')::int + (d ->> 'refund_tax_cents')::int
+                     + (d ->> 'refund_fees_cents')::int + (d ->> 'refund_tip_cents')::int)
+       or (rp -> 'daily' -> 0 ->> 'refund_cents')::int <> 2500 then
+      raise exception 'refund parts do not sum %', r -> 'daily';
+    end if;
+
     -- unknown timezone reads as UTC instead of failing the report
+    update public.locations set timezone = 'america/new_york' where id = loc;
+    rp := public.report_sales_bundle(t, null, '2026-04-10', '2026-04-10', 50);
+    if (rp -> 'daily' -> 0 ->> 'orders')::int <> 2 then raise exception 'case-insensitive tz %', rp -> 'daily'; end if;
     update public.locations set timezone = 'Nope/Zone', business_day_cutoff_minutes = 0 where id = loc;
     rp := public.report_sales_bundle(t, null, '2026-04-10', '2026-04-10', 50);
     if (rp -> 'daily' -> 0 ->> 'orders')::int <> 2 then raise exception 'bad tz report %', rp -> 'daily'; end if;

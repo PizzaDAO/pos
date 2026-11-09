@@ -9,12 +9,15 @@
  *   sale     = order status not in draft / awaiting_payment / abandoned / voided
  *   gross    = Σ unit_price × quantity of non-voided lines
  *   discount = order totals.discount_cents
- *   refunds  = Σ tender refunded_cents (cash back: sales + tax + tip), split per
- *              order into tip (per tender, up to its tip first), tax (the rest,
- *              pro-rata to the order's tax share of the paid amount) and sales
- *              (remainder). Each part comes off its own column, so a fully
- *              refunded order contributes 0 net, 0 tax, 0 tip; `refund_cents`
- *              stays the total. See {@link splitRefund}.
+ *   fees     = order total − tip − tax − (gross − discount), floored at 0
+ *              (delivery / custom fee lines; they are part of the tender amount)
+ *   refunds  = Σ tender refunded_cents (cash back), split per order, TIP LAST:
+ *              tip = only what exceeds the order's paid non-tip amount; the rest
+ *              is split pro-rata across sales, tax and fees (tax and fees capped
+ *              at their own amount, sales takes the remainder). Each part comes
+ *              off its own column, so a fully refunded order contributes 0 net,
+ *              0 tax, 0 fees, 0 tip, and refund_cents = sales + tax + fees + tip
+ *              always. See {@link splitRefund}.
  *              TODO(refunds-voids-comps): refunds are dated to the ORIGINAL
  *              order's business day (no refund timestamp exists yet); switch to
  *              the refund row's timestamp when that branch adds it.
@@ -53,7 +56,10 @@ export interface OwnerDailyRow {
   refund_cents: number;
   refund_sales_cents: number;
   refund_tax_cents: number;
+  refund_fees_cents: number;
   refund_tip_cents: number;
+  /** Delivery / custom fees, net of refunded fees. */
+  fees_cents: number;
   /** Net of refunded tax. */
   tax_cents: number;
   /** Net of refunded tips. */
@@ -73,6 +79,8 @@ export interface OwnerChannelRow {
   discount_cents: number;
   refund_cents: number;
   refund_sales_cents: number;
+  refund_fees_cents: number;
+  fees_cents: number;
 }
 
 export interface OwnerTenderRow {
@@ -140,6 +148,10 @@ export interface OwnerSummary {
   /** Total cash refunded. */
   refund_cents: number;
   refund_sales_cents: number;
+  refund_tax_cents: number;
+  refund_fees_cents: number;
+  refund_tip_cents: number;
+  fees_cents: number;
   net_cents: number;
   tax_cents: number;
   tip_cents: number;
@@ -186,6 +198,21 @@ export function isValidTimezone(tz: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Canonical IANA zone for storage, or null when `tz` is not an "Area/City" zone
+ * (or UTC). Abbreviations such as "EST" are rejected: they do not follow DST.
+ */
+export function canonicalTimezone(tz: string): string | null {
+  const t = tz.trim();
+  if (t.toUpperCase() === "UTC") return "UTC";
+  if (!/^[A-Za-z]+(\/[A-Za-z0-9_+-]+)+$/.test(t)) return null;
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: t }).resolvedOptions().timeZone;
+  } catch {
+    return null;
   }
 }
 
@@ -317,21 +344,24 @@ export function tenderKey(p: Pick<Payment, "rail" | "method" | "processor">): st
 }
 
 /**
- * Split an order's refunds into tip / tax / sales parts (mirrors the SQL).
- * `tenders` are the order's counted tenders; `tip` is the tip counted for the
- * order, `tax` its tax.
+ * Split an order's refunds, tip last (mirrors the SQL). `tenders` are the order's
+ * counted tenders; `sales` = gross − discount, `tax`, `fees` the order's amounts
+ * and `tip` the tip counted for it. Invariant: total = tip + tax + fees + sales.
  */
 export function splitRefund(
   tenders: Pick<Payment, "amount_cents" | "tip_cents" | "refunded_cents">[],
-  tax: number,
+  amounts: { sales: number; tax: number; fees: number },
   tip: number,
-): { total: number; tip: number; tax: number; sales: number } {
+): { total: number; tip: number; tax: number; fees: number; sales: number } {
   const total = tenders.reduce((s, p) => s + p.refunded_cents, 0);
-  const tipRaw = tenders.reduce((s, p) => s + Math.min(p.refunded_cents, p.tip_cents), 0);
   const paid = tenders.reduce((s, p) => s + p.amount_cents, 0);
-  const rest = total - tipRaw;
-  const taxPart = paid > 0 ? Math.min(tax, Math.round((rest * tax) / paid)) : 0;
-  return { total, tip: Math.min(tipRaw, tip), tax: taxPart, sales: rest - taxPart };
+  const refTip = Math.min(Math.max(total - paid, 0), tip);
+  const rest = total - refTip;
+  const base = Math.max(amounts.sales, 0) + amounts.tax + amounts.fees;
+  const share = (v: number) => (base > 0 ? Math.min(v, Math.round((rest * v) / base)) : 0);
+  const refTax = share(amounts.tax);
+  const refFees = share(amounts.fees);
+  return { total, tip: refTip, tax: refTax, fees: refFees, sales: rest - refTax - refFees };
 }
 
 export interface BuildBundleInput {
@@ -395,7 +425,9 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
         refund_cents: 0,
         refund_sales_cents: 0,
         refund_tax_cents: 0,
+        refund_fees_cents: 0,
         refund_tip_cents: 0,
+        fees_cents: 0,
         tax_cents: 0,
         tip_cents: 0,
         void_count: 0,
@@ -435,7 +467,8 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     const orderTip = cents(o.totals?.tip_cents);
     const tip = orderTip > 0 ? orderTip : counted.reduce((s, p) => s + p.tip_cents, 0);
     const tax = cents(o.totals?.tax_cents);
-    const ref = splitRefund(counted, tax, tip);
+    const fees = Math.max(0, cents(o.totals?.total_cents) - cents(o.totals?.tip_cents) - tax - (gross - discount));
+    const ref = splitRefund(counted, { sales: gross - discount, tax, fees }, tip);
     const refunded = ref.total;
 
     d.orders += 1;
@@ -444,6 +477,8 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     d.refund_cents += refunded;
     d.refund_sales_cents += ref.sales;
     d.refund_tax_cents += ref.tax;
+    d.refund_fees_cents += ref.fees;
+    d.fees_cents += fees - ref.fees;
     d.refund_tip_cents += ref.tip;
     d.tax_cents += tax - ref.tax;
     d.tip_cents += tip - ref.tip;
@@ -461,12 +496,14 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     const ch = reportChannel(o);
     const c =
       channels.get(ch) ??
-      { channel: ch, orders: 0, gross_cents: 0, discount_cents: 0, refund_cents: 0, refund_sales_cents: 0 };
+      { channel: ch, orders: 0, gross_cents: 0, discount_cents: 0, refund_cents: 0, refund_sales_cents: 0, refund_fees_cents: 0, fees_cents: 0 };
     c.orders += 1;
     c.gross_cents += gross;
     c.discount_cents += discount;
     c.refund_cents += refunded;
     c.refund_sales_cents += ref.sales;
+    c.refund_fees_cents += ref.fees;
+    c.fees_cents += fees - ref.fees;
     channels.set(ch, c);
 
     const hk = `${when.dow}|${when.hour}`;
@@ -527,6 +564,10 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     comp_cents: 0,
     refund_cents: 0,
     refund_sales_cents: 0,
+    refund_tax_cents: 0,
+    refund_fees_cents: 0,
+    refund_tip_cents: 0,
+    fees_cents: 0,
     net_cents: 0,
     tax_cents: 0,
     tip_cents: 0,
@@ -544,6 +585,10 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     s.discount_cents += d.discount_cents;
     s.refund_cents += d.refund_cents;
     s.refund_sales_cents += d.refund_sales_cents;
+    s.refund_tax_cents += d.refund_tax_cents;
+    s.refund_fees_cents += d.refund_fees_cents;
+    s.refund_tip_cents += d.refund_tip_cents;
+    s.fees_cents += d.fees_cents;
     s.tax_cents += d.tax_cents;
     s.tip_cents += d.tip_cents;
     s.void_count += d.void_count;
@@ -632,7 +677,7 @@ export function toCsv(header: string[], rows: (string | number | null | undefine
 
 /** Printed under every CSV that carries refunds. */
 export const REFUND_NOTE =
-  "# Refunds are dated to the original order's business day (refund timestamps are not recorded yet). Refunded tax and tips are removed from tax and tips; net_sales = gross - discounts - refunded sales.";
+  "# Refunds are dated to the original order's business day (refund timestamps are not recorded yet). A refund comes off sales, tax and fees pro-rata and off tips only beyond the non-tip amount; net_sales = gross - discounts - refunded sales.";
 
 const dollars = (c: number): string => (c / 100).toFixed(2);
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -672,12 +717,12 @@ function bundleToCsvBody(kind: OwnerReportKind, b: OwnerReportBundle, tenderLabe
       return toCsv(
         [
           "business_date", "location", "orders", "gross_sales", "discounts", "refunds_total", "net_sales", "tax_net_of_refunds",
-          "tips_net_of_refunds", "voids", "void_amount", "cash", "card", "crypto", "other_tenders",
+          "fees_net_of_refunds", "tips_net_of_refunds", "voids", "void_amount", "cash", "card", "crypto", "other_tenders",
         ],
         b.daily.map((d) => [
           d.business_date, d.location_name, d.orders, dollars(d.gross_cents), dollars(d.discount_cents),
           dollars(d.refund_cents), dollars(d.gross_cents - d.discount_cents - d.refund_sales_cents), dollars(d.tax_cents),
-          dollars(d.tip_cents), d.void_count, dollars(d.void_cents), dollars(d.cash_cents), dollars(d.card_cents),
+          dollars(d.fees_cents), dollars(d.tip_cents), d.void_count, dollars(d.void_cents), dollars(d.cash_cents), dollars(d.card_cents),
           dollars(d.crypto_cents), dollars(d.other_cents),
         ]),
       );
