@@ -7,6 +7,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "loadtest:serve": "next build && RATE_LIMIT_DISABLED=1 next start -p ${PORT:-3405}",
+    "loadtest": "node loadtest/run.mjs",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest",
