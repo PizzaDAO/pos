@@ -4425,7 +4425,9 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       const rows = unwrap(
         await sb
           .from("staff")
-          .select("id, active, location_ids, pin_hash")
+          .select(
+            "id, active, location_ids, pin_hash, pin_previous_hash, pin_previous_until",
+          )
           .eq("tenant_id", tenantId),
       ) as Row[];
       return rows.map((r) => ({
@@ -4433,6 +4435,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         active: r.active as boolean,
         location_ids: (r.location_ids as string[] | null) ?? [],
         pin_hash: (r.pin_hash as string | null) ?? null,
+        pin_previous_hash: (r.pin_previous_hash as string | null) ?? null,
+        pin_previous_until: (r.pin_previous_until as string | null) ?? null,
       }));
     },
 

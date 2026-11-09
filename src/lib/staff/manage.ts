@@ -174,9 +174,20 @@ export async function issueStaffPin(
   opts: { keepOldForMs?: number } = {},
 ): Promise<string | null> {
   const driver = getPosDriver();
-  const others = (await driver.listStaffPinRecords(tenantId)).filter(
-    (r) => r.id !== staffId && r.pin_hash,
-  );
+  // Every other member's PIN hashes: the current one, and a replaced short
+  // PIN still in its grace window (it still unlocks, so it must not repeat).
+  const now = Date.now();
+  const others = (await driver.listStaffPinRecords(tenantId))
+    .filter((r) => r.id !== staffId)
+    .flatMap((r) => [
+      r.pin_hash,
+      r.pin_previous_hash &&
+      r.pin_previous_until &&
+      new Date(r.pin_previous_until).getTime() > now
+        ? r.pin_previous_hash
+        : null,
+    ])
+    .filter((h): h is string => !!h);
   for (let tries = 0; tries < 25; tries++) {
     const pin = String(random(10 ** ISSUED_PIN_LENGTH)).padStart(
       ISSUED_PIN_LENGTH,
@@ -184,7 +195,7 @@ export async function issueStaffPin(
     );
     if (isWeakPin(pin)) continue;
     const clashes = await Promise.all(
-      others.map((r) => matchesHash(pin, r.pin_hash as string)),
+      others.map((h) => matchesHash(pin, h)),
     );
     if (clashes.some(Boolean)) continue;
     const ok = opts.keepOldForMs

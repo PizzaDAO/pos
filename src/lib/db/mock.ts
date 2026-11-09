@@ -3285,6 +3285,8 @@ export const mockDriver: PosDriver = {
         active: s.active,
         location_ids: [...(s.location_ids ?? [])],
         pin_hash: s.pin_hash ?? null,
+        pin_previous_hash: s.pin_previous_hash ?? null,
+        pin_previous_until: s.pin_previous_until ?? null,
       }));
   },
 

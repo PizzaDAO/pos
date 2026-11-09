@@ -217,6 +217,9 @@ export interface StaffPinRecord {
   active: boolean;
   location_ids: string[];
   pin_hash: string | null;
+  /** A replaced short PIN still honoured until `pin_previous_until`. */
+  pin_previous_hash: string | null;
+  pin_previous_until: string | null;
 }
 
 /** Per-staff PIN lockout state. */

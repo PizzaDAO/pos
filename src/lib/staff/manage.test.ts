@@ -181,6 +181,30 @@ describe("issueStaffPin", () => {
     expect(pin).toBe("482915");
   });
 
+  it("never issues another member's replaced PIN while it is still in grace", async () => {
+    const d = getPosDriver();
+    // Chris's old PIN 615283 was replaced by 482915 but still works for 10 min.
+    await d.setStaffPinHash(T, CHRIS, hashPin("615283"));
+    await d.rotateStaffPin(
+      T,
+      CHRIS,
+      hashPin("482915"),
+      new Date(Date.now() + 600_000).toISOString(),
+    );
+    const seq = [615283, 482915, 739204];
+    expect(await issueStaffPin(T, FURIO, () => seq.shift()!)).toBe("739204");
+
+    // Once the grace has passed, that old PIN is free again.
+    await d.setStaffPinHash(T, CHRIS, hashPin("615283"));
+    await d.rotateStaffPin(
+      T,
+      CHRIS,
+      hashPin("482915"),
+      new Date(Date.now() - 1).toISOString(),
+    );
+    expect(await issueStaffPin(T, FURIO, () => 615283)).toBe("615283");
+  });
+
   it("pads to 6 digits", async () => {
     expect(await issueStaffPin(T, FURIO, () => 4071)).toBe("004071");
   });
