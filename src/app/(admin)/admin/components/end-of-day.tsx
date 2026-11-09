@@ -296,6 +296,28 @@ export function EndOfDay({
             {family.other > 0 && <Row label="Other" value={formatMoney(family.other)} />}
           </Section>
 
+          {report.stored_value &&
+            (report.stored_value.sold_cents > 0 || report.stored_value.redeemed_count > 0) && (
+              <Section title="Gift cards (liability, not sales)">
+                <Row
+                  label="Sold"
+                  value={`${report.stored_value.sold_count} · ${formatMoney(report.stored_value.sold_cents)}`}
+                />
+                <Row label="  paid in cash" value={formatMoney(report.stored_value.sold_by_family.cash)} />
+                <Row label="  paid by card" value={formatMoney(report.stored_value.sold_by_family.card)} />
+                {report.stored_value.sold_refunded_cents > 0 && (
+                  <Row label="Sales refunded (voided)" value={formatMoney(report.stored_value.sold_refunded_cents)} />
+                )}
+                <Row
+                  label="Redeemed (gift card / store credit)"
+                  value={`${formatMoney(report.stored_value.redeemed_gift_card_cents)} / ${formatMoney(report.stored_value.redeemed_store_credit_cents)}`}
+                />
+                {report.stored_value.returned_to_card_cents > 0 && (
+                  <Row label="Returned to cards" value={formatMoney(report.stored_value.returned_to_card_cents)} />
+                )}
+              </Section>
+            )}
+
           <Section title="Orders by channel">
             {report.byChannel.length === 0 ? (
               <Row label="—" value="" />

@@ -662,6 +662,17 @@ export interface PosDriver {
   ): Promise<RefundReservation>;
 
   /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */
+  /**
+   * Fill in the provider refund id on the refunds[] entry recorded under
+   * `requestId` that has none yet (a replayed card refund). Atomic; returns
+   * whether an entry was updated. Optional so test doubles need not implement it.
+   */
+  setRefundProcessorRef?(
+    paymentId: string,
+    requestId: string,
+    processorRef: string,
+  ): Promise<boolean>;
+
   releasePaymentRefund(
     paymentId: string,
     amountCents: number,

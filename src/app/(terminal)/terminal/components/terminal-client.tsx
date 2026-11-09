@@ -38,6 +38,7 @@ import {
 } from "./order-confirmation";
 import { OpenOrdersPanel, useOpenOrders } from "./open-orders";
 import { PaymentScreen } from "./payment-screen";
+import { GiftCardsDialog } from "./gift-cards-dialog";
 
 function newUuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -69,6 +70,7 @@ export function TerminalClient({
   deviceRole,
   requireActiveStaff = false,
   locationName = "Register",
+  giftCards = false,
 }: {
   /** Display name of the active location (server-resolved). */
   locationName?: string;
@@ -83,6 +85,8 @@ export function TerminalClient({
    * active staff member only (the server enforces this; the UI mirrors it).
    */
   requireActiveStaff?: boolean;
+  /** Server-computed: gift cards / store credit are enabled (see giftCardsEnabled). */
+  giftCards?: boolean;
 } = {}) {
   const { data, isLoading, isError, refetch } = useMenu(
     initialTenantId,
@@ -93,6 +97,7 @@ export function TerminalClient({
   const [showStaffSwitch, setShowStaffSwitch] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [showOpenOrders, setShowOpenOrders] = useState(false);
+  const [showGiftCards, setShowGiftCards] = useState(false);
   const toast = useToast();
   const queuedStaff: QueuedStaff | null = activeStaff
     ? {
@@ -354,6 +359,7 @@ export function TerminalClient({
         activeStaffName={activeStaff?.name ?? null}
         onSwitchStaff={() => setShowStaffSwitch(true)}
         readerScope={{ tenantId: menu.tenantId, locationId: location }}
+        onGiftCards={giftCards && sync.online ? () => setShowGiftCards(true) : undefined}
       />
 
       <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1.2fr)] lg:grid-cols-[1fr_400px] lg:grid-rows-1">
@@ -407,6 +413,7 @@ export function TerminalClient({
           locationId={location}
           paymentSettings={paymentSettings}
           cardReady={cardReady}
+          giftCards={giftCards}
           locationName={locationName}
           onClose={() => {
             setPayOrderId(null);
@@ -416,6 +423,19 @@ export function TerminalClient({
             setPayOrderId(null);
             void openOrders.refresh();
           }}
+        />
+      )}
+
+      {showGiftCards && (
+        <GiftCardsDialog
+          tenantId={menu.tenantId}
+          locationId={location}
+          currency={settings.currency}
+          onTakePayment={(id) => {
+            setShowGiftCards(false);
+            setPayOrderId(id);
+          }}
+          onClose={() => setShowGiftCards(false)}
         />
       )}
 

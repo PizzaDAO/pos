@@ -208,7 +208,11 @@ export type AuditAction =
   | "staff_deactivate"
   | "staff_reactivate"
   | "staff_pin_reset"
-  | "admin_unlock";
+  | "admin_unlock"
+
+  // Stored value: a gift card voided (its sale refunded) / store credit issued.
+  | "gift_card_void"
+  | "store_credit_issue";
 
 /**
  * An append-only audit entry written when a platform operator takes a

@@ -1,0 +1,805 @@
+-- ============================================================================
+-- Migration: stored_value  (gift cards + store credit, part 2 of 2)
+--
+-- Storage and the atomic writers behind src/lib/giftcards (store-supabase.ts).
+--
+--   * stored_value_accounts: one row per gift card / store-credit account. The
+--     code is NEVER stored: `code_hash` is HMAC-SHA256(server pepper, tenant +
+--     normalized code), unique per tenant, plus `code_last4` for display.
+--     `balance_cents` is a CACHE of the ledger (always = the last ledger row's
+--     balance_after_cents), maintained only by the writers below.
+--   * stored_value_ledger: APPEND-ONLY. Signed amounts (credits issue/load/refund
+--     > 0, debits redeem/reverse/void < 0), the balance each row produced, and a
+--     per-account idempotency key (a replay writes nothing). A trigger refuses
+--     every UPDATE and DELETE.
+--   * Writers (SECURITY DEFINER, service_role only), each ONE transaction:
+--       sv_credit   issue / load (activating a paid sale) / refund-to-card
+--       sv_debit    reverse a refunded reload
+--       sv_void     close an UNREDEEMED card (its sale is then refunded)
+--       sv_redeem   debit the card AND insert the gift_card / store_credit tender
+--     Each locks the account row FOR UPDATE, so two tills redeeming one card
+--     serialize and can never overspend it. sv_redeem locks the ORDER first and
+--     then the account (no writer locks them in the other order: no deadlock),
+--     and re-checks what the order still owes under that lock, so stored value
+--     can never overpay an order either.
+--
+-- No client access: RLS on with no policies, and every grant revoked from anon
+-- and authenticated. The app reads and writes with the service role only.
+--
+-- Additive and live-safe: three new tables, new functions only. Needs
+-- 20261113000900 (the enum values) applied first.
+-- ============================================================================
+
+begin;
+set local lock_timeout = '3s';
+
+create table if not exists public.stored_value_accounts (
+  id uuid primary key,
+  tenant_id uuid not null references public.tenants (id) on delete restrict,
+  kind text not null check (kind in ('gift_card', 'store_credit')),
+  status text not null check (status in ('pending', 'active', 'voided')),
+  currency text not null default 'USD',
+  balance_cents integer not null default 0 check (balance_cents >= 0),
+  code_hash text not null,
+  code_last4 text not null,
+  physical boolean not null default false,
+  customer_id uuid references public.customers (id) on delete set null,
+  recipient_name text,
+  recipient_email text,
+  sale_order_id uuid references public.orders (id) on delete set null,
+  source text not null check (source in ('till', 'online', 'issued')),
+  created_by text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  activated_at timestamptz,
+  voided_at timestamptz,
+  -- Online purchases: when the buyer's one-time code reveal was used.
+  code_revealed_at timestamptz,
+  constraint stored_value_accounts_code_uq unique (tenant_id, code_hash)
+);
+create index if not exists stored_value_accounts_tenant_idx
+  on public.stored_value_accounts (tenant_id, created_at desc);
+create index if not exists stored_value_accounts_customer_idx
+  on public.stored_value_accounts (customer_id) where customer_id is not null;
+
+create table if not exists public.stored_value_ledger (
+  id uuid primary key default gen_random_uuid(),
+  account_id uuid not null references public.stored_value_accounts (id) on delete restrict,
+  tenant_id uuid not null references public.tenants (id) on delete restrict,
+  location_id uuid,
+  kind text not null check (kind in ('issue', 'load', 'refund', 'redeem', 'reverse', 'void')),
+  amount_cents integer not null,
+  balance_after_cents integer not null check (balance_after_cents >= 0),
+  order_id uuid,
+  payment_id uuid,
+  idempotency_key text not null,
+  reason text,
+  actor_id text,
+  approved_by text,
+  created_at timestamptz not null default now(),
+  constraint stored_value_ledger_sign_ck check (
+    (kind in ('issue', 'load', 'refund') and amount_cents > 0)
+    or (kind in ('redeem', 'reverse', 'void') and amount_cents < 0)
+  ),
+  constraint stored_value_ledger_key_uq unique (account_id, idempotency_key)
+);
+create index if not exists stored_value_ledger_account_idx
+  on public.stored_value_ledger (account_id, created_at);
+create index if not exists stored_value_ledger_tenant_idx
+  on public.stored_value_ledger (tenant_id, created_at);
+create index if not exists stored_value_ledger_payment_idx
+  on public.stored_value_ledger (payment_id) where payment_id is not null;
+
+-- ---- append-only ------------------------------------------------------------
+create or replace function public.sv_ledger_append_only()
+returns trigger
+language plpgsql
+as $$
+begin
+  raise exception 'stored_value_ledger is append-only (% refused)', tg_op;
+end;
+$$;
+
+drop trigger if exists stored_value_ledger_append_only on public.stored_value_ledger;
+create trigger stored_value_ledger_append_only
+  before update or delete on public.stored_value_ledger
+  for each row execute function public.sv_ledger_append_only();
+
+-- ---- code-guess limiter (shared across app instances) ----------------------------
+-- One row per limiter key (e.g. `shop:ip:<ip>:<tenant>`): failures inside the
+-- current window, and a lockout once over the limit. Written only by
+-- sv_guard_fail; read by sv_guard_check.
+create table if not exists public.stored_value_guard (
+  key text primary key,
+  window_start timestamptz not null default now(),
+  failures integer not null default 0,
+  locked_until timestamptz
+);
+create index if not exists stored_value_guard_window_idx
+  on public.stored_value_guard (window_start);
+alter table public.stored_value_guard enable row level security;
+
+-- ---- no client access ---------------------------------------------------------
+alter table public.stored_value_accounts enable row level security;
+alter table public.stored_value_ledger enable row level security;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke all on table public.stored_value_accounts, public.stored_value_ledger, public.stored_value_guard from anon;
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    revoke all on table public.stored_value_accounts, public.stored_value_ledger, public.stored_value_guard from authenticated;
+  end if;
+  -- The service role only READS; every write goes through the SECURITY DEFINER
+  -- functions below (owned by the migration owner).
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    revoke insert, update, delete, truncate on table
+      public.stored_value_accounts, public.stored_value_ledger, public.stored_value_guard
+      from service_role;
+    grant select on table public.stored_value_accounts, public.stored_value_ledger to service_role;
+  end if;
+end
+$$;
+
+-- ---- helpers ------------------------------------------------------------------
+
+-- What the order still owes / whether settled money covers it. Same rules as
+-- src/lib/giftcards/order-math.ts (and orderDueCents in the payment service):
+-- due = total - order-level tip; covering = pending/authorized/captured base
+-- amounts, settled = captured/authorized, both in the order's currency.
+create or replace function public.sv_order_due(p_order public.orders)
+returns bigint
+language sql
+immutable
+as $$
+  select greatest(
+    0,
+    coalesce((p_order.totals ->> 'total_cents')::bigint, 0)
+      - coalesce((p_order.totals ->> 'tip_cents')::bigint, 0)
+  );
+$$;
+
+create or replace function public.sv_order_sum(p_order public.orders, p_statuses text[])
+returns bigint
+language sql
+stable
+set search_path = public, pg_temp
+as $$
+  select coalesce(sum(p.amount_cents), 0)::bigint
+    from public.payments p
+   where p.order_id = p_order.id
+     and upper(p.currency) = upper(p_order.currency)
+     and p.status::text = any (p_statuses);
+$$;
+
+-- ---- sv_credit ----------------------------------------------------------------
+-- Outcomes: ok (replayed true|false) | not_found | inactive | not_settled |
+--           bad_amount | exceeds_max
+create or replace function public.sv_credit(
+  p_tenant_id uuid,
+  p_account_id uuid,
+  p_location_id uuid,
+  p_kind text,
+  p_amount integer,
+  p_key text,
+  p_order_id uuid default null,
+  p_payment_id uuid default null,
+  p_reason text default null,
+  p_actor_id text default null,
+  p_approved_by text default null,
+  p_activate boolean default false,
+  p_require_settled_order uuid default null,
+  p_max_balance integer default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+  v_prior public.stored_value_ledger;
+  v_order public.orders;
+  v_entry public.stored_value_ledger;
+  v_after bigint;
+begin
+  if p_kind not in ('issue', 'load', 'refund') then
+    raise exception 'sv_credit: bad kind %', p_kind;
+  end if;
+
+  select * into v_acct from public.stored_value_accounts
+   where id = p_account_id and tenant_id = p_tenant_id
+   for update;
+  if not found then
+    return jsonb_build_object('outcome', 'not_found');
+  end if;
+
+  select * into v_prior from public.stored_value_ledger
+   where account_id = p_account_id and idempotency_key = p_key;
+  if found then
+    return jsonb_build_object('outcome', 'ok', 'replayed', true,
+      'account', to_jsonb(v_acct), 'entry', to_jsonb(v_prior));
+  end if;
+
+  if v_acct.status = 'voided' or (v_acct.status = 'pending' and not p_activate) then
+    return jsonb_build_object('outcome', 'inactive', 'account', to_jsonb(v_acct));
+  end if;
+
+  if p_require_settled_order is not null then
+    select * into v_order from public.orders
+     where id = p_require_settled_order and tenant_id = p_tenant_id;
+    if not found
+       or v_order.status::text in ('voided', 'abandoned', 'refunded')
+       or public.sv_order_sum(v_order, array['captured', 'authorized'])
+          < public.sv_order_due(v_order) then
+      return jsonb_build_object('outcome', 'not_settled', 'account', to_jsonb(v_acct));
+    end if;
+  end if;
+
+  if p_amount is null or p_amount <= 0 then
+    return jsonb_build_object('outcome', 'bad_amount', 'account', to_jsonb(v_acct));
+  end if;
+  -- A refund back to the card never exceeds what that tender redeemed (the
+  -- credit runs BEFORE the refund is recorded, so it must cap itself).
+  if p_kind = 'refund' then
+    if p_payment_id is null or coalesce((
+         select -sum(amount_cents) from public.stored_value_ledger
+          where account_id = p_account_id and payment_id = p_payment_id and kind = 'redeem'
+       ), 0) < coalesce((
+         select sum(amount_cents) from public.stored_value_ledger
+          where account_id = p_account_id and payment_id = p_payment_id and kind = 'refund'
+       ), 0) + p_amount then
+      return jsonb_build_object('outcome', 'exceeds_max', 'account', to_jsonb(v_acct));
+    end if;
+  end if;
+  v_after := v_acct.balance_cents::bigint + p_amount;
+  if p_max_balance is not null and v_after > p_max_balance then
+    return jsonb_build_object('outcome', 'exceeds_max', 'account', to_jsonb(v_acct));
+  end if;
+
+  update public.stored_value_accounts
+     set balance_cents = v_after,
+         status = case when p_activate and status = 'pending' then 'active' else status end,
+         activated_at = case when p_activate and status = 'pending' then now() else activated_at end,
+         updated_at = now()
+   where id = p_account_id
+  returning * into v_acct;
+
+  insert into public.stored_value_ledger (
+    account_id, tenant_id, location_id, kind, amount_cents, balance_after_cents,
+    order_id, payment_id, idempotency_key, reason, actor_id, approved_by
+  ) values (
+    p_account_id, p_tenant_id, p_location_id, p_kind, p_amount, v_after,
+    p_order_id, p_payment_id, p_key, p_reason, p_actor_id, p_approved_by
+  ) returning * into v_entry;
+
+  return jsonb_build_object('outcome', 'ok', 'replayed', false,
+    'account', to_jsonb(v_acct), 'entry', to_jsonb(v_entry));
+end;
+$$;
+
+-- ---- sv_debit (reverse a refunded reload) --------------------------------------
+-- Outcomes: ok | not_found | inactive | bad_amount | insufficient
+create or replace function public.sv_debit(
+  p_tenant_id uuid,
+  p_account_id uuid,
+  p_location_id uuid,
+  p_kind text,
+  p_amount integer,
+  p_key text,
+  p_order_id uuid default null,
+  p_reason text default null,
+  p_actor_id text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+  v_prior public.stored_value_ledger;
+  v_entry public.stored_value_ledger;
+begin
+  if p_kind <> 'reverse' then
+    raise exception 'sv_debit: bad kind %', p_kind;
+  end if;
+
+  select * into v_acct from public.stored_value_accounts
+   where id = p_account_id and tenant_id = p_tenant_id
+   for update;
+  if not found then
+    return jsonb_build_object('outcome', 'not_found');
+  end if;
+
+  select * into v_prior from public.stored_value_ledger
+   where account_id = p_account_id and idempotency_key = p_key;
+  if found then
+    return jsonb_build_object('outcome', 'ok', 'replayed', true,
+      'account', to_jsonb(v_acct), 'entry', to_jsonb(v_prior));
+  end if;
+
+  if v_acct.status <> 'active' then
+    return jsonb_build_object('outcome', 'inactive', 'account', to_jsonb(v_acct));
+  end if;
+  if p_amount is null or p_amount <= 0 then
+    return jsonb_build_object('outcome', 'bad_amount', 'account', to_jsonb(v_acct));
+  end if;
+  if v_acct.balance_cents < p_amount then
+    return jsonb_build_object('outcome', 'insufficient', 'account', to_jsonb(v_acct));
+  end if;
+
+  update public.stored_value_accounts
+     set balance_cents = balance_cents - p_amount, updated_at = now()
+   where id = p_account_id
+  returning * into v_acct;
+
+  insert into public.stored_value_ledger (
+    account_id, tenant_id, location_id, kind, amount_cents, balance_after_cents,
+    order_id, idempotency_key, reason, actor_id
+  ) values (
+    p_account_id, p_tenant_id, p_location_id, p_kind, -p_amount, v_acct.balance_cents,
+    p_order_id, p_key, p_reason, p_actor_id
+  ) returning * into v_entry;
+
+  return jsonb_build_object('outcome', 'ok', 'replayed', false,
+    'account', to_jsonb(v_acct), 'entry', to_jsonb(v_entry));
+end;
+$$;
+
+-- ---- sv_void (only an UNREDEEMED card) -------------------------------------------
+-- Outcomes: ok (replayed) | not_found | has_activity
+create or replace function public.sv_void(
+  p_tenant_id uuid,
+  p_account_id uuid,
+  p_location_id uuid,
+  p_key text,
+  p_reason text default null,
+  p_actor_id text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+  v_entry public.stored_value_ledger;
+begin
+  select * into v_acct from public.stored_value_accounts
+   where id = p_account_id and tenant_id = p_tenant_id
+   for update;
+  if not found then
+    return jsonb_build_object('outcome', 'not_found');
+  end if;
+
+  if v_acct.status = 'voided' then
+    select * into v_entry from public.stored_value_ledger
+     where account_id = p_account_id and idempotency_key = p_key;
+    return jsonb_build_object('outcome', 'ok', 'replayed', true,
+      'account', to_jsonb(v_acct),
+      'entry', case when v_entry.id is null then null else to_jsonb(v_entry) end);
+  end if;
+
+  -- Unredeemed: nothing but issue/load credits ever touched it.
+  if exists (
+    select 1 from public.stored_value_ledger
+     where account_id = p_account_id and kind not in ('issue', 'load')
+  ) then
+    return jsonb_build_object('outcome', 'has_activity', 'account', to_jsonb(v_acct));
+  end if;
+
+  if v_acct.balance_cents > 0 then
+    insert into public.stored_value_ledger (
+      account_id, tenant_id, location_id, kind, amount_cents, balance_after_cents,
+      idempotency_key, reason, actor_id
+    ) values (
+      p_account_id, p_tenant_id, p_location_id, 'void', -v_acct.balance_cents, 0,
+      p_key, p_reason, p_actor_id
+    ) returning * into v_entry;
+  end if;
+
+  update public.stored_value_accounts
+     set balance_cents = 0, status = 'voided', voided_at = now(), updated_at = now()
+   where id = p_account_id
+  returning * into v_acct;
+
+  return jsonb_build_object('outcome', 'ok', 'replayed', false,
+    'account', to_jsonb(v_acct),
+    'entry', case when v_entry.id is null then null else to_jsonb(v_entry) end);
+end;
+$$;
+
+-- ---- sv_redeem (debit + tender, one transaction) ---------------------------------
+-- Outcomes: ok (replayed) | bad_amount | order_not_found | conflict | not_found |
+--           inactive | order_not_payable | currency | exceeds_due | insufficient
+create or replace function public.sv_redeem(
+  p_tenant_id uuid,
+  p_account_id uuid,
+  p_order_id uuid,
+  p_payment_id uuid,
+  p_amount integer,
+  p_actor_id text default null,
+  p_staff_id uuid default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_order public.orders;
+  v_acct public.stored_value_accounts;
+  v_pay public.payments;
+  v_entry public.stored_value_ledger;
+  v_remaining bigint;
+begin
+  if p_amount is null or p_amount <= 0 then
+    return jsonb_build_object('outcome', 'bad_amount');
+  end if;
+
+  -- Lock order: ORDER first, then the account (every writer agrees).
+  select * into v_order from public.orders
+   where id = p_order_id and tenant_id = p_tenant_id
+   for update;
+  if not found then
+    return jsonb_build_object('outcome', 'order_not_found');
+  end if;
+
+  -- Replay on the tender id.
+  select * into v_pay from public.payments where id = p_payment_id;
+  if found then
+    select * into v_entry from public.stored_value_ledger
+     where payment_id = p_payment_id and kind = 'redeem'
+     limit 1;
+    if v_entry.id is not null and v_entry.account_id = p_account_id
+       and v_pay.order_id = p_order_id then
+      select * into v_acct from public.stored_value_accounts where id = p_account_id;
+      return jsonb_build_object('outcome', 'ok', 'replayed', true,
+        'account', to_jsonb(v_acct), 'entry', to_jsonb(v_entry),
+        'payment_id', p_payment_id);
+    end if;
+    return jsonb_build_object('outcome', 'conflict');
+  end if;
+
+  select * into v_acct from public.stored_value_accounts
+   where id = p_account_id and tenant_id = p_tenant_id
+   for update;
+  if not found then
+    return jsonb_build_object('outcome', 'not_found');
+  end if;
+  if v_acct.status <> 'active' then
+    return jsonb_build_object('outcome', 'inactive', 'account', to_jsonb(v_acct));
+  end if;
+  if v_order.status::text in ('voided', 'abandoned', 'refunded')
+     or (v_order.core_ext ? 'stored_value') then
+    return jsonb_build_object('outcome', 'order_not_payable');
+  end if;
+  if upper(v_order.currency) <> upper(v_acct.currency) then
+    return jsonb_build_object('outcome', 'currency');
+  end if;
+
+  v_remaining := public.sv_order_due(v_order)
+    - public.sv_order_sum(v_order, array['pending', 'authorized', 'captured']);
+  if p_amount > v_remaining then
+    return jsonb_build_object('outcome', 'exceeds_due');
+  end if;
+  if v_acct.balance_cents < p_amount then
+    return jsonb_build_object('outcome', 'insufficient', 'account', to_jsonb(v_acct));
+  end if;
+
+  update public.stored_value_accounts
+     set balance_cents = balance_cents - p_amount, updated_at = now()
+   where id = p_account_id
+  returning * into v_acct;
+
+  insert into public.stored_value_ledger (
+    account_id, tenant_id, location_id, kind, amount_cents, balance_after_cents,
+    order_id, payment_id, idempotency_key, actor_id
+  ) values (
+    p_account_id, p_tenant_id, v_order.location_id, 'redeem', -p_amount,
+    v_acct.balance_cents, p_order_id, p_payment_id, 'redeem:' || p_payment_id::text,
+    p_actor_id
+  ) returning * into v_entry;
+
+  insert into public.payments (
+    id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents,
+    application_fee_cents, currency, charge_id, simulated, raw, staff_id
+  ) values (
+    p_payment_id, p_order_id, p_tenant_id, v_order.location_id,
+    v_acct.kind::public.payment_rail, 'captured', p_amount, 0,
+    0, v_order.currency, v_entry.id::text, false,
+    jsonb_build_object('stored_value_account_id', v_acct.id,
+                       'code_last4', v_acct.code_last4,
+                       'kind', v_acct.kind),
+    p_staff_id
+  );
+
+  return jsonb_build_object('outcome', 'ok', 'replayed', false,
+    'account', to_jsonb(v_acct), 'entry', to_jsonb(v_entry),
+    'payment_id', p_payment_id);
+end;
+$$;
+
+-- ---- sv_create_account ---------------------------------------------------------
+-- Outcomes: ok | code_taken. `p_row` carries the NewAccount fields.
+create or replace function public.sv_create_account(p_row jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+begin
+  begin
+    insert into public.stored_value_accounts (
+      id, tenant_id, kind, status, currency, code_hash, code_last4, physical,
+      customer_id, recipient_name, recipient_email, sale_order_id, source, created_by,
+      activated_at
+    ) values (
+      (p_row ->> 'id')::uuid, (p_row ->> 'tenant_id')::uuid, p_row ->> 'kind',
+      p_row ->> 'status', coalesce(p_row ->> 'currency', 'USD'), p_row ->> 'code_hash',
+      p_row ->> 'code_last4', coalesce((p_row ->> 'physical')::boolean, false),
+      (p_row ->> 'customer_id')::uuid, p_row ->> 'recipient_name', p_row ->> 'recipient_email',
+      (p_row ->> 'sale_order_id')::uuid, p_row ->> 'source', p_row ->> 'created_by',
+      case when p_row ->> 'status' = 'active' then now() end
+    ) returning * into v_acct;
+  exception when unique_violation then
+    return jsonb_build_object('outcome', 'code_taken');
+  end;
+  return jsonb_build_object('outcome', 'ok', 'account', to_jsonb(v_acct));
+end;
+$$;
+
+-- ---- sv_issue_store_credit (create + credit, one transaction) -------------------
+-- Outcomes: ok | replayed | approval_required | code_taken | bad_amount
+-- A non-manager may not take their own store credit issued since p_day_start
+-- (the start of the location's business day, computed by the app) above
+-- p_daily_cap; serialized per (tenant, actor) by an advisory lock. The actor is
+-- the PIN-switched staff member (else the device login).
+create or replace function public.sv_issue_store_credit(
+  p_tenant_id uuid,
+  p_account_id uuid,
+  p_location_id uuid,
+  p_currency text,
+  p_code_hash text,
+  p_code_last4 text,
+  p_customer_id uuid,
+  p_amount integer,
+  p_reason text,
+  p_actor_id text,
+  p_is_manager boolean,
+  p_daily_cap integer,
+  p_day_start timestamptz default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_acct public.stored_value_accounts;
+  v_entry public.stored_value_ledger;
+  v_today bigint;
+begin
+  if p_amount is null or p_amount <= 0 then
+    return jsonb_build_object('outcome', 'bad_amount');
+  end if;
+  perform pg_advisory_xact_lock(hashtext('sv_issue:' || p_tenant_id::text || ':' || coalesce(p_actor_id, '')));
+
+  select * into v_acct from public.stored_value_accounts
+   where id = p_account_id and tenant_id = p_tenant_id;
+  if found then
+    return jsonb_build_object('outcome', 'replayed', 'account', to_jsonb(v_acct));
+  end if;
+
+  if not p_is_manager and p_daily_cap is not null then
+    select coalesce(sum(l.amount_cents), 0) into v_today
+      from public.stored_value_ledger l
+      join public.stored_value_accounts a on a.id = l.account_id
+     where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
+       and l.actor_id = p_actor_id
+       and l.created_at >= coalesce(p_day_start, date_trunc('day', now() at time zone 'UTC') at time zone 'UTC');
+    if v_today + p_amount > p_daily_cap then
+      return jsonb_build_object('outcome', 'approval_required');
+    end if;
+  end if;
+
+  begin
+    insert into public.stored_value_accounts (
+      id, tenant_id, kind, status, currency, balance_cents, code_hash, code_last4,
+      customer_id, source, created_by, activated_at
+    ) values (
+      p_account_id, p_tenant_id, 'store_credit', 'active', coalesce(p_currency, 'USD'), p_amount,
+      p_code_hash, p_code_last4, p_customer_id, 'issued', p_actor_id, now()
+    ) returning * into v_acct;
+  exception when unique_violation then
+    return jsonb_build_object('outcome', 'code_taken');
+  end;
+
+  insert into public.stored_value_ledger (
+    account_id, tenant_id, location_id, kind, amount_cents, balance_after_cents,
+    idempotency_key, reason, actor_id, approved_by
+  ) values (
+    p_account_id, p_tenant_id, p_location_id, 'issue', p_amount, p_amount,
+    'issue:' || p_account_id::text, p_reason, p_actor_id,
+    case when p_is_manager then p_actor_id end
+  ) returning * into v_entry;
+
+  return jsonb_build_object('outcome', 'ok', 'account', to_jsonb(v_acct), 'entry', to_jsonb(v_entry));
+end;
+$$;
+
+-- ---- sv_mark_revealed (the buyer's one-time code reveal) ------------------------
+create or replace function public.sv_mark_revealed(p_tenant_id uuid, p_account_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  update public.stored_value_accounts
+     set code_revealed_at = now()
+   where id = p_account_id and tenant_id = p_tenant_id
+     and source = 'online' and status = 'active' and code_revealed_at is null;
+  return found;
+end;
+$$;
+
+-- ---- guess limiter ---------------------------------------------------------------
+-- Seconds the most-locked of `p_keys` is still locked out (0 = free).
+create or replace function public.sv_guard_check(p_keys text[])
+returns integer
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select coalesce(max(ceil(extract(epoch from (locked_until - now()))))::integer, 0)
+    from public.stored_value_guard
+   where key = any (p_keys) and locked_until > now();
+$$;
+
+-- Count one failed lookup on every key; lock a key out for the rest of its
+-- window once it is over `p_limit`. Returns seconds locked (0 = not locked).
+create or replace function public.sv_guard_fail(p_keys text[], p_limit integer, p_window_seconds integer)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  k text;
+  v_wait integer := 0;
+  v_row public.stored_value_guard;
+begin
+  foreach k in array p_keys loop
+    insert into public.stored_value_guard as g (key, window_start, failures)
+    values (k, now(), 1)
+    on conflict (key) do update
+      set window_start = case when g.window_start + make_interval(secs => p_window_seconds) <= now()
+                              then now() else g.window_start end,
+          failures = case when g.window_start + make_interval(secs => p_window_seconds) <= now()
+                          then 1 else g.failures + 1 end
+    returning * into v_row;
+    if v_row.failures > p_limit then
+      update public.stored_value_guard
+         set locked_until = v_row.window_start + make_interval(secs => p_window_seconds)
+       where key = k;
+      v_wait := greatest(v_wait, ceil(extract(epoch from
+        (v_row.window_start + make_interval(secs => p_window_seconds) - now())))::integer);
+    end if;
+  end loop;
+  -- Opportunistic prune of stale keys.
+  if random() < 0.01 then
+    delete from public.stored_value_guard
+     where window_start < now() - interval '1 day'
+       and (locked_until is null or locked_until < now());
+  end if;
+  return v_wait;
+end;
+$$;
+
+-- ---- sv_summary (report aggregates, in SQL) --------------------------------------
+create or replace function public.sv_summary(
+  p_tenant_id uuid,
+  p_location_id uuid,
+  p_from timestamptz,
+  p_to timestamptz
+)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select jsonb_build_object(
+    'outstanding_cents', coalesce((
+      select sum(balance_cents) from public.stored_value_accounts
+       where tenant_id = p_tenant_id and status = 'active'), 0),
+    'store_credit_issued_count', coalesce((
+      select count(*) from public.stored_value_ledger l
+        join public.stored_value_accounts a on a.id = l.account_id
+       where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
+         and l.created_at >= p_from and l.created_at < p_to
+         and (p_location_id is null or l.location_id is null or l.location_id = p_location_id)), 0),
+    'store_credit_issued_cents', coalesce((
+      select sum(l.amount_cents) from public.stored_value_ledger l
+        join public.stored_value_accounts a on a.id = l.account_id
+       where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
+         and l.created_at >= p_from and l.created_at < p_to
+         and (p_location_id is null or l.location_id is null or l.location_id = p_location_id)), 0)
+  );
+$$;
+
+-- ---- sv_unreleased_orders (the release sweep's target set) -----------------------
+-- Abandoned orders that still hold a captured, not fully refunded gift_card /
+-- store_credit tender: newest first, keyset-paged on (created_at, id).
+create index if not exists payments_stored_value_open_idx
+  on public.payments (order_id)
+  where rail in ('gift_card', 'store_credit') and status = 'captured';
+
+create or replace function public.sv_unreleased_orders(
+  p_limit integer,
+  p_before_created_at timestamptz default null,
+  p_before_id uuid default null
+)
+returns table (order_id uuid, created_at timestamptz)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select o.id, o.created_at
+    from public.orders o
+   where o.status = 'abandoned'
+     and exists (
+       select 1 from public.payments p
+        where p.order_id = o.id
+          and p.rail in ('gift_card', 'store_credit')
+          and p.status = 'captured'
+          and p.refunded_cents < p.amount_cents + p.tip_cents)
+     and (p_before_created_at is null
+          or (o.created_at, o.id) < (p_before_created_at, p_before_id))
+   order by o.created_at desc, o.id desc
+   limit least(greatest(coalesce(p_limit, 100), 1), 500);
+$$;
+
+-- ---- grants: service_role only ---------------------------------------------------
+do $$
+declare
+  f text;
+begin
+  foreach f in array array[
+    'public.sv_credit(uuid, uuid, uuid, text, integer, text, uuid, uuid, text, text, text, boolean, uuid, integer)',
+    'public.sv_debit(uuid, uuid, uuid, text, integer, text, uuid, text, text)',
+    'public.sv_void(uuid, uuid, uuid, text, text, text)',
+    'public.sv_redeem(uuid, uuid, uuid, uuid, integer, text, uuid)',
+    'public.sv_create_account(jsonb)',
+    'public.sv_issue_store_credit(uuid, uuid, uuid, text, text, text, uuid, integer, text, text, boolean, integer, timestamptz)',
+    'public.sv_mark_revealed(uuid, uuid)',
+    'public.sv_guard_check(text[])',
+    'public.sv_guard_fail(text[], integer, integer)',
+    'public.sv_summary(uuid, uuid, timestamptz, timestamptz)',
+    'public.sv_unreleased_orders(integer, timestamptz, uuid)',
+    'public.sv_order_due(public.orders)',
+    'public.sv_order_sum(public.orders, text[])'
+  ] loop
+    execute format('revoke all on function %s from public', f);
+    if exists (select 1 from pg_roles where rolname = 'anon') then
+      execute format('revoke all on function %s from anon', f);
+    end if;
+    if exists (select 1 from pg_roles where rolname = 'authenticated') then
+      execute format('revoke all on function %s from authenticated', f);
+    end if;
+    if exists (select 1 from pg_roles where rolname = 'service_role') then
+      execute format('grant execute on function %s to service_role', f);
+    end if;
+  end loop;
+end
+$$;
+
+commit;
+
+notify pgrst, 'reload schema';

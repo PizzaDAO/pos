@@ -25,6 +25,8 @@ export const PAYMENT_RAIL_LABELS: Record<PaymentRailKey, string> = {
   stripe_online: "Card — Stripe (online)",
   crypto_onchain_usdc: "Crypto — Onchain USDC (Base)",
   crypto_coinbase: "Crypto — Coinbase Commerce",
+  gift_card: "Gift card",
+  store_credit: "Store credit",
 };
 
 /**

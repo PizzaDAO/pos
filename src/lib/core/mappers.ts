@@ -393,8 +393,11 @@ export function toContractMenu(input: {
 // Payments + orders
 // ---------------------------------------------------------------------------
 
-export function railToMethod(rail: string): "card" | "cash" | "crypto" | "other" {
+export function railToMethod(rail: string): "card" | "cash" | "crypto" | "gift_card" | "other" {
   if (rail === "cash") return "cash";
+  // Stored value (src/lib/giftcards): the contract's `gift_card` method; store
+  // credit is told apart by its processor (`store_credit`, see railToProcessor).
+  if (rail === "gift_card" || rail === "store_credit") return "gift_card";
   if (rail.startsWith("stripe")) return "card";
   if (rail.startsWith("crypto")) return "crypto";
   return "other";
@@ -402,6 +405,8 @@ export function railToMethod(rail: string): "card" | "cash" | "crypto" | "other"
 
 export function railToProcessor(rail: string): string {
   if (rail.startsWith("stripe")) return "stripe";
+  if (rail === "gift_card") return "pos";
+  if (rail === "store_credit") return "store_credit";
   if (rail === "crypto_coinbase") return "coinbase";
   return rail;
 }
@@ -587,6 +592,36 @@ function sourceOf(order: Order): CoreOrder["source"] {
 }
 
 function toContractLines(order: Order): CoreOrderLine[] {
+  // A gift card sale / reload has no menu lines: one synthetic `gift_card_load`
+  // line (kind gift_card, tax exempt) so hub consumers see what was sold.
+  const sv = order.core_ext?.stored_value;
+  if (sv && order.items.length === 0) {
+    return [
+      {
+        id: `gift_card_${sv.account_id}`,
+        line_type: "gift_card_load",
+        item_id: sv.account_id,
+        item_name: sv.op === "sell" ? `Gift card ••••${sv.code_last4}` : `Gift card reload ••••${sv.code_last4}`,
+        kind: "gift_card",
+        station: null,
+        size_id: null,
+        size_name: null,
+        quantity: 1,
+        base_price_cents: sv.amount_cents,
+        modifiers: [],
+        unit_price_cents: sv.amount_cents,
+        line_total_cents: sv.amount_cents,
+        discount_cents: 0,
+        net_cents: sv.amount_cents,
+        tax_exempt: true,
+        notes: null,
+        voided: false,
+        fired_at: null,
+        voided_at: null,
+        status_at_void: null,
+      } as CoreOrderLine,
+    ];
+  }
   const live = order.items.filter((i) => !i.voided);
   const discounts = allocate(
     Math.min(order.totals.discount_cents, order.totals.subtotal_cents),
@@ -741,7 +776,14 @@ export function toContractOrder(input: {
     quote_id: null,
     tax_exempt: order.core_ext?.tax_exempt ?? false,
     business_date: businessDate(order.created_at, timezone),
-    metadata: order.core_ext?.metadata ?? {},
+    // A gift card sale / reload is flagged so hub consumers never treat it as
+    // food revenue: "gift_card_sale" | "gift_card_reload".
+    metadata: order.core_ext?.stored_value
+      ? {
+          ...(order.core_ext?.metadata ?? {}),
+          stored_value: order.core_ext.stored_value.op === "sell" ? "gift_card_sale" : "gift_card_reload",
+        }
+      : (order.core_ext?.metadata ?? {}),
     callout_name:
       order.core_ext?.callout_name ??
       calloutName({ name: contact.name }) ??

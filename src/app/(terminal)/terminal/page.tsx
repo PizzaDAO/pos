@@ -4,6 +4,7 @@ import { TerminalClient } from "./components/terminal-client";
 import { requireLocationSurface } from "@/lib/auth/guard";
 import { roleInTenant } from "@/lib/auth/session";
 import { requiresPinStaff } from "@/lib/auth/active-staff";
+import { giftCardsEnabled } from "@/lib/giftcards/limits";
 
 export const metadata: Metadata = {
   title: "Terminal",
@@ -39,6 +40,7 @@ export default async function TerminalPage({
       cardReady={await isInStoreCardReady(ctx.tenantId, ctx.locationId)}
       deviceRole={roleInTenant(ctx.user, ctx.tenantId) ?? undefined}
       requireActiveStaff={await requiresPinStaff(ctx.tenantId)}
+      giftCards={giftCardsEnabled()}
       locationName={
         ctx.locations.find((l) => l.id === ctx.locationId)?.name ?? undefined
       }

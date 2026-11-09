@@ -21,6 +21,7 @@ import {
   ClipboardList,
   CreditCard,
   Eye,
+  Gift,
   LayoutGrid,
   MapPin,
   Printer,
@@ -80,6 +81,10 @@ const LatePayments = dynamic(
   () => import("./late-payments").then((m) => m.LatePayments),
   { loading: PanelFallback },
 );
+const GiftCardsManager = dynamic(
+  () => import("./gift-cards-manager").then((m) => m.GiftCardsManager),
+  { loading: PanelFallback },
+);
 const PlanBilling = dynamic(
   () => import("./plan-billing").then((m) => m.PlanBilling),
   { loading: PanelFallback },
@@ -111,6 +116,7 @@ type Tab =
   | "payments"
   | "late"
   | "printers"
+  | "giftcards"
   | "delivery";
 
 function readTenantParam(fallbackTenantId: string): {
@@ -193,6 +199,7 @@ export function AdminShell({
       { id: "payments", label: "Payments", icon: CreditCard },
       { id: "late", label: "Late payments", icon: AlertTriangle },
       { id: "printers", label: "Printers", icon: Printer },
+      { id: "giftcards", label: "Gift cards", icon: Gift },
       { id: "delivery", label: "Delivery", icon: Truck },
     ];
     return base;
@@ -323,6 +330,7 @@ export function AdminShell({
         {tab === "late" && locationId && (
           <LatePayments tenantId={tenantId} locationId={locationId} />
         )}
+        {tab === "giftcards" && <GiftCardsManager tenantId={tenantId} />}
         {tab === "locations" && (
           <LocationsManager
             tenantId={tenantId}

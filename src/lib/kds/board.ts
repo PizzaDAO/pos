@@ -64,7 +64,8 @@ export function buildTickets(
   const nowMs = now.getTime();
 
   return orders
-    .filter((o) => active.has(o.status))
+    // A gift card sale/reload order has nothing to cook.
+    .filter((o) => active.has(o.status) && !o.core_ext?.stored_value)
     // A marketplace order the cashier has not accepted yet is not for the kitchen.
     .filter((o) => o.fulfillment?.marketplace?.acceptance !== "pending")
     .map((order) => {

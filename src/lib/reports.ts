@@ -17,6 +17,7 @@ import type {
   SalesBucket,
   SalesReport,
 } from "@/lib/db/backoffice-types";
+import { buildStoredValueReport, isStoredValueOrder } from "@/lib/giftcards/report";
 
 /** Human label for an order channel. */
 export function channelLabel(channel: OrderChannel): string {
@@ -64,6 +65,10 @@ export function railLabel(rail: string): string {
       return "Crypto (onchain USDC)";
     case "crypto_coinbase":
       return "Crypto (Coinbase)";
+    case "gift_card":
+      return "Gift card";
+    case "store_credit":
+      return "Store credit";
     default:
       return rail;
   }
@@ -101,6 +106,7 @@ export function railFamily(rail: string): "cash" | "card" | "crypto" | "other" {
   }
   if (rail === "cash") return "cash";
   if (rail.startsWith("crypto")) return "crypto";
+  if (rail === "gift_card" || rail === "store_credit") return "other";
   return "card";
 }
 
@@ -221,7 +227,14 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
   const inRange = (o: Order, r: DateRange) => inRangeBy(o, r, dayOf);
   const range = input.range;
   // Unpaid online checkouts (awaiting_payment / abandoned) are not sales.
-  const orders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
+  const allOrders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
+  // Gift card sales are a liability, not revenue (no tax): summarized apart.
+  const orders = allOrders.filter((o) => !isStoredValueOrder(o));
+  const storedValue = buildStoredValueReport(
+    allOrders.filter((o) => inRange(o, range)),
+    payments,
+    (p) => railFamily(mixKey(p)),
+  );
 
   const byDay = new Map<string, SalesBucket>();
   const byItem = new Map<string, SalesBucket>();
@@ -361,5 +374,6 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     paymentMix: [...mixMap.values()].sort(
       (a, b) => b.amount_cents - a.amount_cents,
     ),
+    stored_value: storedValue,
   };
 }

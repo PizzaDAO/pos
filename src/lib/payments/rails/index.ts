@@ -12,6 +12,7 @@ import { stripeTerminalRail } from "./stripe-terminal";
 import { stripeOnlineRail } from "./stripe-online";
 import { cryptoOnchainUsdcRail } from "./crypto-onchain-usdc";
 import { cryptoCoinbaseRail } from "./crypto-coinbase";
+import { giftCardRail, storeCreditRail } from "./stored-value";
 
 let registered = false;
 
@@ -23,6 +24,8 @@ export function registerAllRails(): void {
   registerPaymentRail(stripeOnlineRail);
   registerPaymentRail(cryptoOnchainUsdcRail);
   registerPaymentRail(cryptoCoinbaseRail);
+  registerPaymentRail(giftCardRail);
+  registerPaymentRail(storeCreditRail);
   registered = true;
 }
 
@@ -35,4 +38,6 @@ export {
   stripeOnlineRail,
   cryptoOnchainUsdcRail,
   cryptoCoinbaseRail,
+  giftCardRail,
+  storeCreditRail,
 };

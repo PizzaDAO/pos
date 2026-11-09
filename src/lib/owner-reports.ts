@@ -25,6 +25,11 @@
  *   net      = gross − discount − refund sales part
  *   tips     = order-level tip, else the tenders' tips (never both), less tip refunds
  *   tenders  = payments in status captured | refunded
+ *   stored value (20261113000920): gift card SALE / RELOAD orders
+ *              (core_ext.stored_value) are a liability, never a sale: they are
+ *              in no column above and only in `stored_value` (sold / refunded,
+ *              plus redemptions on sales and the current outstanding liability).
+ *              gift_card / store_credit tenders have their own daily columns.
  *
  * Time: every order is bucketed in ITS OWN location's timezone, and the business
  * day starts `business_day_cutoff_minutes` after local midnight (so 01:30 on a
@@ -70,6 +75,9 @@ export interface OwnerDailyRow {
   cash_cents: number;
   card_cents: number;
   crypto_cents: number;
+  /** Gift card / store credit tenders (stored value redeemed on sales). */
+  gift_card_cents: number;
+  store_credit_cents: number;
   other_cents: number;
 }
 
@@ -138,7 +146,30 @@ export interface OwnerReportBundle {
   /** Σ revenue over ALL items (the denominator for "% of sales"). */
   item_total_cents: number;
   staff: OwnerStaffRow[];
+  /** Gift cards / store credit: a liability, kept out of every sales figure. */
+  stored_value: OwnerStoredValue;
 }
+
+export interface OwnerStoredValue {
+  /** Gift card sale + reload orders in range with counted tenders, and that money. */
+  sold_count: number;
+  sold_cents: number;
+  sold_refunded_cents: number;
+  /** Redeemed on sales in range, net of value refunded back to the cards. */
+  redeemed_gift_card_cents: number;
+  redeemed_store_credit_cents: number;
+  /** Current outstanding balance on active cards (not range-bound). */
+  outstanding_cents: number;
+}
+
+export const EMPTY_STORED_VALUE: OwnerStoredValue = {
+  sold_count: 0,
+  sold_cents: 0,
+  sold_refunded_cents: 0,
+  redeemed_gift_card_cents: 0,
+  redeemed_store_credit_cents: 0,
+  outstanding_cents: 0,
+};
 
 export interface OwnerSummary {
   orders: number;
@@ -161,6 +192,8 @@ export interface OwnerSummary {
   cash_cents: number;
   card_cents: number;
   crypto_cents: number;
+  gift_card_cents: number;
+  store_credit_cents: number;
   other_cents: number;
   avg_ticket_cents: number;
 }
@@ -173,6 +206,7 @@ export const EMPTY_BUNDLE: OwnerReportBundle = {
   items: [],
   categories: [],
   item_total_cents: 0,
+  stored_value: EMPTY_STORED_VALUE,
   staff: [],
 };
 
@@ -325,7 +359,7 @@ function cents(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? Math.round(v) : 0;
 }
 
-type TenderFamily = "cash" | "card" | "crypto" | "other";
+type TenderFamily = "cash" | "card" | "crypto" | "gift_card" | "store_credit" | "other";
 
 function tenderFamily(p: Pick<Payment, "rail" | "method">): TenderFamily {
   if (p.rail === "external") {
@@ -334,6 +368,7 @@ function tenderFamily(p: Pick<Payment, "rail" | "method">): TenderFamily {
   if (p.rail === "cash") return "cash";
   if (p.rail === "stripe_terminal" || p.rail === "stripe_online") return "card";
   if (String(p.rail).startsWith("crypto")) return "crypto";
+  if (p.rail === "gift_card" || p.rail === "store_credit") return p.rail;
   return "other";
 }
 
@@ -381,6 +416,8 @@ export interface BuildBundleInput {
   locations: Location[];
   staff: Pick<Staff, "id" | "name">[];
   categoryOf: (itemId: string) => { id: string; name: string } | null;
+  /** Current outstanding stored-value balance (the SQL reads the accounts). */
+  storedValueOutstandingCents?: number;
 }
 
 /** Hard cap on item rows (matches the SQL). */
@@ -405,6 +442,10 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
   const cats = new Map<string, OwnerCategoryRow>();
   const staff = new Map<string, OwnerStaffRow>();
   let itemTotal = 0;
+  const sv: OwnerStoredValue = {
+    ...EMPTY_STORED_VALUE,
+    outstanding_cents: input.storedValueOutstandingCents ?? 0,
+  };
 
   for (const o of input.orders) {
     if (o.tenant_id !== input.tenantId) continue;
@@ -416,6 +457,17 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     if (!isSale && !isVoid) continue;
     const when = businessDay(o.created_at, loc.timezone, loc.business_day_cutoff_minutes ?? 0);
     if (when.date < input.from || when.date > input.to) continue;
+    if (o.core_ext?.stored_value) {
+      // A liability, never a sale (no day row, staff row, channel or tender line).
+      if (!isSale) continue;
+      const counted = (paysByOrder.get(o.id) ?? []).filter((p) => COUNTED_TENDER.has(p.status));
+      if (counted.length > 0) sv.sold_count += 1;
+      for (const p of counted) {
+        sv.sold_cents += p.amount_cents;
+        sv.sold_refunded_cents += Math.min(p.refunded_cents, p.amount_cents + p.tip_cents);
+      }
+      continue;
+    }
 
     const key = `${o.location_id}|${when.date}`;
     const d =
@@ -440,6 +492,8 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
         cash_cents: 0,
         card_cents: 0,
         crypto_cents: 0,
+        gift_card_cents: 0,
+        store_credit_cents: 0,
         other_cents: 0,
       } satisfies OwnerDailyRow);
     daily.set(key, d);
@@ -489,6 +543,10 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     d.tip_cents += tip - ref.tip;
     for (const p of counted) {
       d[`${tenderFamily(p)}_cents`] += p.amount_cents;
+      // Net of value returned to the card (a refund of that tender).
+      const kept = p.amount_cents - Math.min(p.refunded_cents, p.amount_cents);
+      if (p.rail === "gift_card") sv.redeemed_gift_card_cents += kept;
+      if (p.rail === "store_credit") sv.redeemed_store_credit_cents += kept;
       const tk = tenderKey(p);
       const t = tenders.get(tk) ?? { key: tk, count: 0, amount_cents: 0, tip_cents: 0, refunded_cents: 0 };
       t.count += 1;
@@ -554,6 +612,7 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     categories: [...cats.values()].sort((a, b) => b.revenue_cents - a.revenue_cents).slice(0, 200),
     item_total_cents: itemTotal,
     staff: [...staff.values()].sort((a, b) => b.sales_cents - a.sales_cents).slice(0, 200),
+    stored_value: sv,
   };
 }
 
@@ -581,6 +640,8 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     cash_cents: 0,
     card_cents: 0,
     crypto_cents: 0,
+    gift_card_cents: 0,
+    store_credit_cents: 0,
     other_cents: 0,
     avg_ticket_cents: 0,
   };
@@ -601,6 +662,8 @@ export function summarize(daily: OwnerDailyRow[]): OwnerSummary {
     s.cash_cents += d.cash_cents;
     s.card_cents += d.card_cents;
     s.crypto_cents += d.crypto_cents;
+    s.gift_card_cents += d.gift_card_cents ?? 0;
+    s.store_credit_cents += d.store_credit_cents ?? 0;
     s.other_cents += d.other_cents;
   }
   s.net_cents = s.gross_cents - s.discount_cents - s.refund_sales_cents;
@@ -722,13 +785,15 @@ function bundleToCsvBody(kind: OwnerReportKind, b: OwnerReportBundle, tenderLabe
       return toCsv(
         [
           "business_date", "location", "orders", "gross_sales", "discounts", "refunds_total", "net_sales", "tax_net_of_refunds",
-          "fees_net_of_refunds", "tips_net_of_refunds", "voids", "void_amount", "cash", "card", "crypto", "other_tenders",
+          "fees_net_of_refunds", "tips_net_of_refunds", "voids", "void_amount", "cash", "card", "crypto", "gift_card",
+          "store_credit", "other_tenders",
         ],
         b.daily.map((d) => [
           d.business_date, d.location_name, d.orders, dollars(d.gross_cents), dollars(d.discount_cents),
           dollars(d.refund_cents), dollars(d.gross_cents - d.discount_cents - d.refund_sales_cents), dollars(d.tax_cents),
           dollars(d.fees_cents), dollars(d.tip_cents), d.void_count, dollars(d.void_cents), dollars(d.cash_cents), dollars(d.card_cents),
-          dollars(d.crypto_cents), dollars(d.other_cents),
+          dollars(d.crypto_cents), dollars(d.gift_card_cents ?? 0), dollars(d.store_credit_cents ?? 0),
+          dollars(d.other_cents),
         ]),
       );
     }

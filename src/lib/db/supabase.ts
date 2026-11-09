@@ -2460,6 +2460,18 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { ok: false, reason, payment };
     },
 
+    async setRefundProcessorRef(paymentId, requestId, processorRef) {
+      return (
+        unwrap(
+          await sb.rpc("set_payment_refund_ref", {
+            p_payment_id: paymentId,
+            p_request_id: requestId,
+            p_processor_ref: processorRef,
+          }),
+        ) === true
+      );
+    },
+
     async releasePaymentRefund(paymentId, amountCents, refundId) {
       unwrap(
         await sb.rpc("release_payment_refund", {

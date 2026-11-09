@@ -1815,6 +1815,19 @@ export const mockDriver: PosDriver = {
     return { ok: true, payment: updated, refundEntryId: entry.id };
   },
 
+  async setRefundProcessorRef(paymentId: string, requestId: string, processorRef: string) {
+    const p = payments.get(paymentId);
+    if (!p) return false;
+    let hit = false;
+    const refunds = (p.refunds ?? []).map((r) => {
+      if (r.request_id !== requestId || r.processor_ref) return r;
+      hit = true;
+      return { ...r, processor_ref: processorRef };
+    });
+    if (hit) payments.set(paymentId, { ...p, refunds, updated_at: nowIso() });
+    return hit;
+  },
+
   async releasePaymentRefund(
     paymentId: string,
     amountCents: number,
@@ -3098,12 +3111,16 @@ export const mockDriver: PosDriver = {
     topN?: number,
   ): Promise<OwnerReportBundle> {
     ensureKitchenSeed();
+    // Stored-value liability lives in the stored-value store (src/lib/giftcards).
+    const { mockStoredValueStore } = await import("@/lib/giftcards/store-mock");
+    const sv = await mockStoredValueStore.summary(tenantId, null, from, from);
     return buildOwnerBundle({
       tenantId,
       locationId,
       from,
       to,
       topN,
+      storedValueOutstandingCents: sv.outstanding_cents,
       orders: [...orders.values()].filter((o) => o.tenant_id === tenantId),
       payments: [...payments.values()].filter((p) => p.tenant_id === tenantId),
       locations: locations.filter((l) => l.tenant_id === tenantId),

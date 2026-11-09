@@ -336,6 +336,19 @@ function SummaryTab({ d, csv }: TabProps) {
         Refunded tax and tips come off tax and tips. Refunds ({formatMoney(s.refund_cents)} total) are dated to the
         original order&apos;s day, not the day the refund was issued.
       </p>
+      {d.bundle.stored_value &&
+        (d.bundle.stored_value.sold_cents > 0 ||
+          d.bundle.stored_value.outstanding_cents > 0 ||
+          s.gift_card_cents + s.store_credit_cents > 0) && (
+          <p className="text-xs text-muted-foreground" data-testid="stored-value-summary">
+            Gift cards (a liability, not in sales): sold {formatMoney(d.bundle.stored_value.sold_cents)}
+            {d.bundle.stored_value.sold_refunded_cents > 0 &&
+              ` (${formatMoney(d.bundle.stored_value.sold_refunded_cents)} refunded)`}
+            , redeemed {formatMoney(d.bundle.stored_value.redeemed_gift_card_cents)} gift card +{" "}
+            {formatMoney(d.bundle.stored_value.redeemed_store_credit_cents)} store credit, outstanding now{" "}
+            {formatMoney(d.bundle.stored_value.outstanding_cents)}.
+          </p>
+        )}
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel title="By tender" action={<CsvLink href={csv("tenders")} label="CSV" />}>
           <Bars

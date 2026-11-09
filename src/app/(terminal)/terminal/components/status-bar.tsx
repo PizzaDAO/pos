@@ -79,6 +79,8 @@ export interface StatusBarProps {
   onOpenOrders?: () => void;
   /** Show the card-reader chip for this tenant + location. */
   readerScope?: { tenantId: string; locationId: string };
+  /** Open the gift cards dialog (sell / reload / balance / store credit). */
+  onGiftCards?: () => void;
 }
 
 export function StatusBar({
@@ -94,6 +96,7 @@ export function StatusBar({
   readerScope,
   openOrdersCount = 0,
   onOpenOrders,
+  onGiftCards,
 }: StatusBarProps) {
   return (
     <>
@@ -128,6 +131,15 @@ export function StatusBar({
             )}
           >
             Open orders ({openOrdersCount})
+          </button>
+        )}
+        {onGiftCards && (
+          <button
+            type="button"
+            onClick={onGiftCards}
+            className="h-11 rounded-full border px-4 text-sm font-medium touch-manipulation hover:bg-secondary"
+          >
+            Gift cards
           </button>
         )}
         {readerScope && <ReaderChip {...readerScope} />}
