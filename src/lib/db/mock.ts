@@ -134,6 +134,14 @@ import {
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { seedKitchenOrders } from "./kds-seed";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { tipRefundedCents } from "@/lib/payments/refund-state";
+import { coveredBaseCents, foodDueCents } from "@/lib/adjustments/math";
+import type {
+  AdjustmentRecord,
+  BeginRefundResult,
+  OrderEditResult,
+  OrderEditWrite,
+} from "./adjustment-types";
 
 /**
  * An abandoned tender attempt: unsettled (pending / requires_action), never
@@ -256,6 +264,19 @@ const orders = new Map<string, Order>();
 const tenantSettings = new Map<string, TenantSettings>();
 /** Payment tenders keyed by client UUID (idempotency key). */
 const payments = new Map<string, Payment>();
+/** The order_adjustments ledger (refunds, voids, comps), append-only. */
+const adjustmentRecords: AdjustmentRecord[] = [];
+/** Statuses an order can be voided / comped / discounted in (same as apply_order_edit). */
+const EDITABLE_ORDER_STATUSES: OrderStatus[] = [
+  "draft",
+  "placed",
+  "paid",
+  "in_kitchen",
+  "ready",
+  "recall",
+  "out_for_delivery",
+  "completed",
+];
 const paymentSessions = new Map<string, PaymentSessionRow>();
 const storedQuotes = new Map<string, StoredQuote>();
 /** Terminal PIN switch-in sessions keyed by id (server-side revocation). */
@@ -1037,6 +1058,156 @@ export const mockDriver: PosDriver = {
     };
   },
 
+  async setAdjustmentPolicy(tenantId, locationId, policy): Promise<StoreSettings> {
+    const current = await this.getStoreSettings(tenantId, locationId);
+    const next: StoreSettings = { ...current, adjustment_policy: { ...policy } };
+    const idx = storeSettings.findIndex(
+      (s) => s.tenant_id === tenantId && s.location_id === locationId,
+    );
+    if (idx >= 0) storeSettings[idx] = next;
+    else storeSettings.push(next);
+    return { ...next };
+  },
+
+  async listOrderAdjustments(orderId: string): Promise<AdjustmentRecord[]> {
+    return adjustmentRecords
+      .filter((r) => r.order_id === orderId)
+      .map((r) => structuredClone(r));
+  },
+
+  // Mirrors begin_order_refund(): one synchronous block (no awaits), so it is
+  // atomic in the single-threaded mock exactly as the SQL is under its lock.
+  async beginOrderRefund(record: AdjustmentRecord): Promise<BeginRefundResult> {
+    const order = orders.get(record.order_id);
+    if (!order || order.tenant_id !== record.tenant_id) return { outcome: "not_found" };
+    const prior = adjustmentRecords.find(
+      (r) => r.order_id === record.order_id && r.id === record.id,
+    );
+    if (prior) return { outcome: "duplicate", record: structuredClone(prior) };
+    for (const sel of record.lines) {
+      const line = order.items.find((i) => i.id === sel.line_id);
+      const used = adjustmentRecords
+        .filter((r) => r.order_id === order.id && r.kind === "refund" && r.status !== "failed")
+        .flatMap((r) => r.lines)
+        .filter((l) => l.line_id === sel.line_id)
+        .reduce((n, l) => n + l.quantity, 0);
+      const available = line && !line.voided ? Math.max(0, line.quantity - used) : 0;
+      if (sel.quantity <= 0 || sel.quantity > available) {
+        return { outcome: "exceeds", line_id: sel.line_id, available };
+      }
+    }
+    const now = nowIso();
+    const stored: AdjustmentRecord = {
+      ...structuredClone(record),
+      status: "pending",
+      created_at: now,
+      updated_at: now,
+    };
+    adjustmentRecords.push(stored);
+    return { outcome: "ok", record: structuredClone(stored) };
+  },
+
+  async finishOrderAdjustment(orderId, id, patch): Promise<AdjustmentRecord | null> {
+    const idx = adjustmentRecords.findIndex((r) => r.order_id === orderId && r.id === id);
+    if (idx < 0) return null;
+    const next: AdjustmentRecord = {
+      ...adjustmentRecords[idx]!,
+      status: patch.status,
+      allocations: structuredClone(patch.allocations),
+      ...(patch.meta !== undefined
+        ? { meta: { ...(adjustmentRecords[idx]!.meta ?? {}), ...(patch.meta ?? {}) } }
+        : {}),
+      updated_at: nowIso(),
+    };
+    adjustmentRecords[idx] = next;
+    return structuredClone(next);
+  },
+
+  // Mirrors apply_order_edit(): compare-and-set on the version + the money
+  // checks + the ledger insert, in one synchronous block (atomic in the mock).
+  async applyOrderEdit(write: OrderEditWrite): Promise<OrderEditResult> {
+    const order = orders.get(write.orderId);
+    if (!order || order.tenant_id !== write.tenantId) return { outcome: "not_found" };
+    const prior = adjustmentRecords.find(
+      (r) => r.order_id === write.orderId && r.id === write.record.id,
+    );
+    if (prior) return { outcome: "duplicate", record: structuredClone(prior) };
+    if ((order.version ?? 1) !== write.expectVersion) return { outcome: "stale" };
+    if (!EDITABLE_ORDER_STATUSES.includes(order.status)) {
+      return { outcome: "invalid_state", reason: `order is ${order.status}` };
+    }
+    const mine = [...payments.values()].filter((p) => p.order_id === order.id);
+    if (write.voidOrder) {
+      const inFlight = mine.some(
+        (p) =>
+          ["pending", "authorized", "requires_action"].includes(p.status) &&
+          !(p.rail === "external" && p.status === "pending"),
+      );
+      if (inFlight) return { outcome: "invalid_state", reason: "in_flight" };
+      const held = mine.some(
+        (p) => p.status === "captured" && p.amount_cents + p.tip_cents > p.refunded_cents,
+      );
+      if (held) return { outcome: "invalid_state", reason: "captured" };
+    } else {
+      const due = foodDueCents({ totals: write.totals });
+      if (coveredBaseCents(mine, order.currency) > due) {
+        return { outcome: "invalid_state", reason: "paid_exceeds" };
+      }
+    }
+    const at = nowIso();
+    const voidIds = new Set(write.voidLineIds);
+    const items: OrderItem[] = [];
+    for (const line of order.items) {
+      if (voidIds.has(line.id)) {
+        items.push({
+          ...line,
+          voided: true,
+          line_total_cents: 0,
+          voided_at: at,
+          status_at_void: order.status,
+        });
+        continue;
+      }
+      const split = write.splits.find((x) => x.line_id === line.id);
+      if (!split) {
+        items.push(line);
+        continue;
+      }
+      items.push({
+        ...line,
+        quantity: split.keep_quantity,
+        line_total_cents: line.unit_price_cents * split.keep_quantity,
+      });
+      items.push({
+        ...line,
+        id: split.new_line_id,
+        quantity: split.void_quantity,
+        voided: true,
+        line_total_cents: 0,
+        voided_at: at,
+        status_at_void: order.status,
+      });
+    }
+    const updated: Order = {
+      ...order,
+      items,
+      totals: write.totals,
+      discount_cents: write.discountCents,
+      adjustments: structuredClone(write.adjustments),
+      status: write.voidOrder ? "voided" : order.status,
+      version: (order.version ?? 1) + 1,
+      updated_at: at,
+    };
+    orders.set(order.id, updated);
+    const record: AdjustmentRecord = {
+      ...structuredClone(write.record),
+      created_at: at,
+      updated_at: at,
+    };
+    adjustmentRecords.push(record);
+    return { outcome: "ok", order: updated, record: structuredClone(record) };
+  },
+
   async createOrder(input: CreateOrderInput): Promise<Order> {
     const existing = orders.get(input.id);
     if (existing) return existing;
@@ -1060,6 +1231,7 @@ export const mockDriver: PosDriver = {
       source: input.source,
       hold: input.hold ?? null,
       core_ext: input.core_ext ?? null,
+      adjustments: input.adjustments?.length ? structuredClone(input.adjustments) : null,
       version: 1,
       created_at: now,
       updated_at: now,
@@ -1550,6 +1722,7 @@ export const mockDriver: PosDriver = {
         // Refund bookkeeping is owned by reservePaymentRefund; a stale snapshot
         // passed to upsert must never roll it back.
         refunded_cents: existing.refunded_cents,
+        tip_refunded_cents: existing.tip_refunded_cents,
         refund_ids: existing.refund_ids,
         refunds: existing.refunds,
         status:
@@ -1675,18 +1848,33 @@ export const mockDriver: PosDriver = {
     paymentId: string,
     amountCents: number,
     refundId: string | null,
-    meta?: { processorRef?: string | null; reason?: string | null },
+    meta?: { processorRef?: string | null; reason?: string | null; tipCents?: number | null },
   ): Promise<RefundReservation> {
+    // One synchronous block (no awaits): atomic in the single-threaded mock,
+    // exactly as reserve_payment_refund() is under its row lock.
     const p = payments.get(paymentId);
     if (!p) return { ok: false, reason: "not_found", payment: null };
     const ids = p.refund_ids ?? [];
     if (refundId && ids.includes(refundId)) {
       return { ok: false, reason: "duplicate", payment: p };
     }
+    const tipDone = tipRefundedCents(p);
+    const tipLeft = Math.max(0, p.tip_cents - tipDone);
+    // Explicit tip part, else the legacy rule (the refund comes off the tip first).
+    const tipPart =
+      meta?.tipCents === undefined || meta?.tipCents === null
+        ? Math.min(amountCents, tipLeft)
+        : meta.tipCents;
+    const basePart = amountCents - tipPart;
+    const baseLeft = p.amount_cents - (p.refunded_cents - tipDone);
     const total = p.amount_cents + p.tip_cents;
     if (
       amountCents <= 0 ||
+      tipPart < 0 ||
+      basePart < 0 ||
       (p.status !== "captured" && p.status !== "authorized") ||
+      tipPart > tipLeft ||
+      basePart > baseLeft ||
       p.refunded_cents + amountCents > total
     ) {
       return { ok: false, reason: "exceeds", payment: p };
@@ -1700,10 +1888,12 @@ export const mockDriver: PosDriver = {
       processor_ref: meta?.processorRef ?? null,
       reason: meta?.reason ?? null,
       request_id: refundId,
+      tip_cents: tipPart,
     };
     const updated: Payment = {
       ...p,
       refunded_cents: refunded,
+      tip_refunded_cents: tipDone + tipPart,
       refund_ids: refundId ? [...ids, refundId] : ids,
       refunds: [...(p.refunds ?? []), entry],
       status: refunded >= total ? "refunded" : p.status,
@@ -1720,13 +1910,22 @@ export const mockDriver: PosDriver = {
   ): Promise<void> {
     const p = payments.get(paymentId);
     if (!p) return;
+    const refunds = p.refunds ?? [];
+    const kept = dropReleasedRefund(refunds, amountCents, refundId);
+    const dropped = refunds.find((r) => !kept.includes(r));
+    const tipDone = tipRefundedCents(p);
+    const tipBack =
+      typeof dropped?.tip_cents === "number"
+        ? dropped.tip_cents
+        : Math.min(amountCents, tipDone);
     payments.set(paymentId, {
       ...p,
       refunded_cents: Math.max(0, p.refunded_cents - amountCents),
+      tip_refunded_cents: Math.max(0, tipDone - tipBack),
       refund_ids: refundId
         ? (p.refund_ids ?? []).filter((x) => x !== refundId)
         : p.refund_ids,
-      refunds: dropReleasedRefund(p.refunds ?? [], amountCents, refundId),
+      refunds: kept,
       status: p.status === "refunded" ? "captured" : p.status,
       updated_at: nowIso(),
     });
@@ -2897,6 +3096,7 @@ export function resetMockOrders(): void {
 /** Test helper: clear payments + connect state. */
 export function resetMockPayments(): void {
   payments.clear();
+  adjustmentRecords.length = 0;
   paymentSessions.clear();
   storedQuotes.clear();
   connectAccounts.clear();

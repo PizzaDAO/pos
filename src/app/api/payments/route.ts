@@ -21,6 +21,7 @@
  * No env vars are required; with none, rails settle via the simulated path.
  */
 import { NextResponse } from "next/server";
+import { resolvePolicy } from "@/lib/adjustments/policy";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
 import { publicTender } from "@/lib/payments/public";
@@ -481,10 +482,17 @@ export async function GET(request: Request) {
   if (!auth.ok) return auth.res;
   const payments = await driver.listPaymentsForOrder(orderId);
   const balance = await getOrderBalance(order);
+  const [adjustments, settings] = await Promise.all([
+    driver.listOrderAdjustments(orderId),
+    driver.getStoreSettings(order.tenant_id, order.location_id),
+  ]);
   return NextResponse.json({
     order,
     payments: payments.map(publicTender),
     balanceCents: balance,
     orderStatus: order.status,
+    // Refund / void / comp history + the approval thresholds the till previews.
+    adjustments,
+    policy: resolvePolicy(settings.adjustment_policy),
   });
 }

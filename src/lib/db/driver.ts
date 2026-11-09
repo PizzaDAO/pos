@@ -7,6 +7,13 @@
  * `index.ts` via `getPosDriver()`.
  */
 import type {
+  AdjustmentPolicy,
+  AdjustmentRecord,
+  BeginRefundResult,
+  OrderEditResult,
+  OrderEditWrite,
+} from "./adjustment-types";
+import type {
   CreateOrderInput,
   Menu,
   LatePaymentMarker,
@@ -343,6 +350,48 @@ export interface PosDriver {
     locationId: string,
   ): Promise<StoreSettings>;
 
+  /** Set a location's refund / comp / void approval thresholds. */
+  setAdjustmentPolicy(
+    tenantId: string,
+    locationId: string,
+    policy: AdjustmentPolicy,
+  ): Promise<StoreSettings>;
+
+  // -- Refunds / voids / comps (order_adjustments ledger) --------------------
+
+  /** Every adjustment record of an order, oldest first. */
+  listOrderAdjustments(orderId: string): Promise<AdjustmentRecord[]>;
+
+  /**
+   * ATOMICALLY open a refund record (status `pending`): under the order row
+   * lock, refuse when any selected line is voided/unknown or would be refunded
+   * past its quantity (Σ units of the line's non-failed refund records + the new
+   * ones), else insert. Idempotent on (order, record id): a retry returns the
+   * stored record as `duplicate`. Two tills refunding the same pizza at once:
+   * exactly one gets it.
+   */
+  beginOrderRefund(record: AdjustmentRecord): Promise<BeginRefundResult>;
+
+  /** Record what a refund actually moved (status, allocations, meta). */
+  finishOrderAdjustment(
+    orderId: string,
+    id: string,
+    patch: Pick<AdjustmentRecord, "status" | "allocations"> & {
+      meta?: Record<string, unknown> | null;
+    },
+  ): Promise<AdjustmentRecord | null>;
+
+  /**
+   * ATOMICALLY apply a void / comp / discount computed from the order at
+   * `expectVersion` (compare-and-set: a concurrent change makes it `stale`, the
+   * caller re-reads and recomputes). Under the order row lock it also re-checks
+   * the money: the tenders must still fit the new amount due (else
+   * `invalid_state`, the caller refunds instead), and a whole-order void is
+   * refused while a tender is in flight or money is still captured. The ledger
+   * row is inserted in the same transaction.
+   */
+  applyOrderEdit(write: OrderEditWrite): Promise<OrderEditResult>;
+
   /**
    * Idempotent upsert-by-UUID. Creating with an id that already exists returns
    * the existing order unchanged (so offline retries never duplicate). Assigns
@@ -605,9 +654,15 @@ export interface PosDriver {
     /**
      * Recorded on the new `payment.refunds[]` entry (which gets a server-minted
      * stable id, returned as `refundEntryId`): the rail's refund id and the
-     * staff-given reason.
+     * staff-given reason. `tipCents` is the GRATUITY part of `amountCents`
+     * (capped separately: base part <= base left, tip part <= tip left); when
+     * omitted the refund comes off the tip first (legacy rule).
      */
-    meta?: { processorRef?: string | null; reason?: string | null },
+    meta?: {
+      processorRef?: string | null;
+      reason?: string | null;
+      tipCents?: number | null;
+    },
   ): Promise<RefundReservation>;
 
   /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */

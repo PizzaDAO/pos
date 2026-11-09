@@ -1,5 +1,8 @@
 /**
- * GET /api/orders/open?tenantId=&locationId=
+ * GET /api/orders/open?tenantId=&locationId=[&view=recent]
+ *
+ * `view=recent`: the till's order history instead (last 50 in-store orders with
+ * paid / partially refunded / refunded / voided), to find an order to refund.
  *
  * The till's unpaid in-store orders (balance > 0, live tenders only), computed
  * server-side in two queries (orders, then all their tenders). Tenant member +
@@ -9,7 +12,7 @@ import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantMember } from "@/lib/auth/api";
 import { requireLocationInTenant } from "@/lib/auth/tenant-guard";
-import { selectOpenOrders } from "@/lib/payments/open-orders";
+import { selectOpenOrders, selectRecentOrders } from "@/lib/payments/open-orders";
 
 export const runtime = "nodejs";
 
@@ -32,5 +35,8 @@ export async function GET(request: Request) {
   const orders = (await driver.listOrders(tenantId, locationId, { limit: 300 }))
     .filter((o) => o.channel === "in_store");
   const payments = await driver.listPaymentsForOrders(orders.map((o) => o.id));
+  if (searchParams.get("view") === "recent") {
+    return NextResponse.json({ orders: selectRecentOrders(orders, payments) });
+  }
   return NextResponse.json({ orders: selectOpenOrders(orders, payments) });
 }

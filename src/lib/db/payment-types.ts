@@ -35,6 +35,12 @@ export interface PaymentRefund {
   reason: string | null;
   /** Internal: the client refund-request id this entry was reserved under. */
   request_id?: string | null;
+  /**
+   * The GRATUITY part of `amount_cents` (the rest is base). Recorded on every
+   * refund since tip refunds are tracked separately; absent on older entries,
+   * which came off the tip first (see `tipRefundedCents`).
+   */
+  tip_cents?: number | null;
 }
 
 /**
@@ -67,8 +73,14 @@ export interface Payment {
   /** Cash-only: amount tendered + change due, in cents. */
   cash_tendered_cents: number | null;
   cash_change_cents: number | null;
-  /** Amount refunded so far against this tender, in cents. */
+  /** Amount refunded so far against this tender, in cents (base + tip). */
   refunded_cents: number;
+  /**
+   * The gratuity part of `refunded_cents`. Written ONLY by the refund
+   * reservation (never `upsertPayment`). Absent on rows read from a database
+   * that predates it: then refunds came off the tip first (`tipRefundedCents`).
+   */
+  tip_refunded_cents?: number;
   /** Whether this payment was taken on a simulated rail (no live keys). */
   simulated: boolean;
   /**

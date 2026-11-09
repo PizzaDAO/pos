@@ -114,6 +114,8 @@ export interface RefundRequest {
   /** Optional partial refund amount; defaults to a full refund. */
   amount?: Money;
   reason?: string;
+  /** Correlation ids carried to the provider (Stripe refund metadata). */
+  metadata?: Record<string, string>;
 }
 
 export interface RefundResult {

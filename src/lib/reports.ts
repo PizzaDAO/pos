@@ -8,6 +8,7 @@
  */
 import type { Order, OrderChannel, Payment } from "@/lib/db";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
+import { liveTenders, tipRefundedCents } from "@/lib/payments/refund-state";
 import type {
   DateRange,
   PaymentMixSlice,
@@ -141,9 +142,12 @@ export interface BuildReportInput {
 }
 
 /**
- * Build a full sales report from orders + payments. Voided/refunded orders are
- * excluded from the sales slices but counted in the void/refund tallies. The
- * payment mix sums tenders that aren't failed/canceled.
+ * Build a full sales report from orders + payments. Voided orders are excluded
+ * from the sales slices but counted in the void tallies; refunds (full or
+ * partial, base and tip) come from the tenders' refunded amounts. Comps are
+ * part of the discount and also tallied on their own; items voided on a live
+ * order are tallied as line voids. The payment mix sums tenders that aren't
+ * failed/canceled.
  */
 export function buildSalesReport(input: BuildReportInput): SalesReport {
   const { payments, range } = input;
@@ -166,6 +170,18 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
   let voidCents = 0;
   let refundCount = 0;
   let refundCents = 0;
+  let tipRefundCents = 0;
+  let compCount = 0;
+  let compCents = 0;
+  let lineVoidCount = 0;
+  let lineVoidCents = 0;
+
+  const tendersByOrder = new Map<string, Payment[]>();
+  for (const p of payments) {
+    const list = tendersByOrder.get(p.order_id) ?? [];
+    list.push(p);
+    tendersByOrder.set(p.order_id, list);
+  }
 
   for (const order of orders) {
     if (!inRange(order, range)) continue;
@@ -175,11 +191,25 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
       voidCents += order.totals.total_cents;
       continue;
     }
-    if (order.status === "refunded") {
+    // Refunds: what the tenders actually gave back (partial refunds included).
+    // Refunded orders still represent rung sales; they stay in the tallies
+    // below so the period gross matches the register.
+    const live = liveTenders(tendersByOrder.get(order.id) ?? []);
+    const refunded = live.reduce((n, p) => n + p.refunded_cents, 0);
+    if (refunded > 0 || order.status === "refunded") {
       refundCount += 1;
-      refundCents += order.totals.total_cents;
-      // refunded orders still represent rung sales; keep them in the tallies
-      // below so the period gross matches the register, but they're flagged.
+      refundCents += refunded;
+      tipRefundCents += live.reduce((n, p) => n + tipRefundedCents(p), 0);
+    }
+    for (const a of order.adjustments ?? []) {
+      if (a.type !== "comp") continue;
+      compCount += 1;
+      compCents += a.amount_cents;
+    }
+    for (const line of order.items) {
+      if (!line.voided) continue;
+      lineVoidCount += line.quantity;
+      lineVoidCents += line.unit_price_cents * line.quantity;
     }
 
     const gross = orderGrossCents(order);
@@ -251,8 +281,10 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
       amount_cents: 0,
       tip_cents: 0,
       application_fee_cents: 0,
+      refunded_cents: 0,
     };
     slice.count += 1;
+    slice.refunded_cents = (slice.refunded_cents ?? 0) + p.refunded_cents;
     slice.amount_cents += p.amount_cents;
     slice.tip_cents += p.tip_cents;
     slice.application_fee_cents += p.application_fee_cents;
@@ -279,6 +311,11 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     void_cents: voidCents,
     refund_count: refundCount,
     refund_cents: refundCents,
+    tip_refund_cents: tipRefundCents,
+    comp_count: compCount,
+    comp_cents: compCents,
+    line_void_count: lineVoidCount,
+    line_void_cents: lineVoidCents,
     byDay: [...byDay.values()].sort((a, b) => a.key.localeCompare(b.key)),
     byItem: sortBuckets(byItem),
     byCategory: sortBuckets(byCategory),

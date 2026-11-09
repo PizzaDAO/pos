@@ -199,7 +199,14 @@ export type AuditAction =
   // A location's country (how phone numbers are read) was changed.
   | "location_country_change"
   // A manager overrode a stuck driver conflict and dispatched in-house instead.
-  | "delivery_manual_override";
+  | "delivery_manual_override"
+  // Before-payment order edits at the till (refunds keep payment_refund/void).
+  | "order_line_void"
+  | "order_void"
+  | "order_comp"
+  | "order_discount"
+  // A location's refund / comp / void approval thresholds changed.
+  | "adjustment_policy_change";
 
 /**
  * An append-only audit entry written when a platform operator takes a

@@ -308,6 +308,7 @@ export const stripeOnlineRail: PaymentRail = {
         chargeId: req.chargeId,
         amountCents: req.amount?.amount,
         reason: req.reason,
+        metadata: req.metadata,
       }),
       {
         stripeAccount: req.context.connectAccountId ?? undefined,

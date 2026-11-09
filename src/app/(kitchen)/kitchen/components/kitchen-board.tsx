@@ -168,6 +168,31 @@ export function KitchenBoard({
         </div>
       </header>
 
+      {(board?.voided?.length ?? 0) > 0 && (
+        <section
+          aria-label="Voided orders"
+          role="alert"
+          data-testid="void-notices"
+          className="space-y-2 border-b bg-destructive/10 px-4 py-3"
+        >
+          {board!.voided!.map((v) => (
+            <div
+              key={`${v.orderId}-${v.at}`}
+              className="flex flex-wrap items-baseline gap-2 text-destructive"
+            >
+              <span className="rounded bg-destructive px-2 py-0.5 text-sm font-bold uppercase text-destructive-foreground">
+                {v.scope === "order" ? "Stop: order voided" : "Stop: item voided"}
+              </span>
+              <span className="font-semibold">#{v.orderNumber}</span>
+              <span className="text-sm">{v.items.join(", ")}</span>
+              <span className="text-xs text-muted-foreground">
+                {new Date(v.at).toLocaleTimeString()}
+              </span>
+            </div>
+          ))}
+        </section>
+      )}
+
       <section className="flex-1 p-4" aria-busy={loading && !board}>
         {loading && !board ? (
           <div

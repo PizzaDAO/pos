@@ -22,7 +22,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
+import { buildTickets, buildVoidNotices, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
 import {
@@ -56,6 +56,7 @@ export async function GET(request: Request) {
 
   const body: KitchenBoardResponse = {
     tickets,
+    voided: buildVoidNotices(orders, now),
     driver: driver.name,
     serverTime: now.toISOString(),
     thresholds,

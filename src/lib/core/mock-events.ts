@@ -21,6 +21,7 @@ import type {
 // Direct module (not the barrel): @/lib/db/client imports this file.
 import { NOT_LIVE_ORDER_STATUSES } from "@/lib/db/menu-types";
 import { memoryOutbox, type MemoryOutbox } from "./outbox";
+import { tipRefundedCents } from "@/lib/payments/refund-state";
 
 /**
  * Statuses that are NOT live: an order in one of these is not on the KDS and,
@@ -261,8 +262,9 @@ function tipRow(box: MemoryOutbox, p: Payment, type: "tip.recorded" | "tip.adjus
  *   - a tender becoming captured with a tip -> tip.recorded `tip_<payment>`;
  *   - a tip-less capture that is the FIRST settled tender of an order with an
  *     order tip -> tip.recorded `tip_online_<order>`;
- *   - a refund on a settled tipped tender -> tip.adjusted for the part that lands
- *     on the tip (tip first), id carries the cumulative refunded tip;
+ *   - a refund on a settled tipped tender -> tip.adjusted when its tip part
+ *     (`tip_refunded_cents`; legacy: tip first) grows, id carries the
+ *     cumulative refunded tip;
  *   - every settled tender of an online-tip order refunded in full -> one
  *     tip.adjusted `tipadj_online_<order>_full`.
  * Pure transitions: a replayed upsert changes neither status nor refunded_cents.
@@ -291,8 +293,8 @@ async function tipEvents(
   }
   if (before && after.refunded_cents > before.refunded_cents && SETTLED.includes(after.status)) {
     if (after.tip_cents > 0) {
-      const cumNew = Math.min(after.refunded_cents, after.tip_cents);
-      const cumOld = Math.min(before.refunded_cents, after.tip_cents);
+      const cumNew = tipRefundedCents(after);
+      const cumOld = tipRefundedCents({ ...before, tip_cents: after.tip_cents });
       if (cumNew > cumOld) tipRow(box, after, "tip.adjusted", `tipadj_${after.id}_c${cumNew}`);
     } else {
       const order = await inner.getOrder(after.order_id);
@@ -490,6 +492,15 @@ export function withOutbox(
       const order = await inner.mergeOrderFulfillment(id, patch);
       if (order && before) await orderEventsT(order, before);
       return order;
+    },
+
+    // Voids / comps / discounts: totals change (order.updated) or the order is
+    // voided (order.status_changed + order.canceled), like core_trg_orders.
+    async applyOrderEdit(write) {
+      const before = await inner.getOrder(write.orderId);
+      const res = await inner.applyOrderEdit(write);
+      if (res.outcome === "ok" && before) await orderEventsT(res.order, before);
+      return res;
     },
 
     // Refunds move refunded_cents / status through the atomic reservation

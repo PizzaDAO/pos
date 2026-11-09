@@ -202,6 +202,28 @@ export async function POST(request: Request) {
       order_number: body.order_number,
       status: "placed",
       staff_id: staffId,
+      // The till's order-level discount, as a recorded adjustment (core
+      // `adjustments`); comps/discounts added later append to it.
+      ...(priced.totals.discount_cents > 0
+        ? {
+            adjustments: [
+              {
+                id: `disc_${body.id}`.slice(0, 64),
+                type: "discount" as const,
+                source: "pos.manual",
+                label: "Discount",
+                percent_bps: null,
+                amount_cents: priced.totals.discount_cents,
+                line_ids: null,
+                reason_code: "manager_discretion",
+                reason_text: null,
+                staff_id: staffId,
+                approved_by: null,
+                created_at: new Date().toISOString(),
+              },
+            ],
+          }
+        : {}),
     };
     // createOrder is an idempotent upsert-by-UUID — retries return the existing
     // order, so this log line may report the same order id more than once.

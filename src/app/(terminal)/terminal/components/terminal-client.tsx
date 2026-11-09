@@ -355,6 +355,8 @@ export function TerminalClient({
         <OpenOrdersPanel
           orders={openOrders.open}
           currency={settings.currency}
+          tenantId={data?.menu.tenantId}
+          locationId={data?.menu.locationId}
           onPay={(id) => {
             setShowOpenOrders(false);
             setPayOrderId(id);

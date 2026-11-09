@@ -29,6 +29,12 @@ import { recordAudit } from "@/lib/security/audit";
 import { cancelCoinbaseCharge } from "./providers/coinbase-client";
 import { finalizeOnlinePayment } from "@/lib/shop/finalize";
 import { deriveTenderId } from "./ids";
+import {
+  baseRefundedCents,
+  isFullyRefunded,
+  refundableParts,
+  tipRefundedCents,
+} from "./refund-state";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
 import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
@@ -101,18 +107,23 @@ export function orderDueCents(order: Order): number {
 }
 
 /**
- * Tenders that cover the balance: pending, authorized or captured — INCLUDING
- * pending crypto, so the cashier isn't asked to collect twice while it confirms.
- * `requires_action` (an intent nobody has paid yet), failed, canceled and
- * refunded tenders do NOT cover. (The order is only marked `paid` once tenders
- * SETTLE — see `settledCents`.)
+ * Tenders that cover the balance: pending, authorized, captured or REFUNDED —
+ * INCLUDING pending crypto, so the cashier isn't asked to collect twice while it
+ * confirms. A refund (full or partial) is money given back AFTER the sale: it
+ * never re-opens the balance, or a fully refunded tender next to a live one (or
+ * a refunded order with an earlier declined card) would show "Balance due" and
+ * invite a second charge. To collect again, staff ring a new order.
+ * `requires_action` (an intent nobody has paid yet), failed and canceled tenders
+ * do NOT cover. (The order is only marked `paid` once tenders SETTLE — see
+ * `settledCents`.)
  */
 function coveredTenders(payments: Payment[]): Payment[] {
   return payments.filter(
     (p) =>
       p.status === "pending" ||
       p.status === "authorized" ||
-      p.status === "captured",
+      p.status === "captured" ||
+      p.status === "refunded",
   );
 }
 
@@ -944,10 +955,22 @@ export async function refundPayment(input: {
    * new id is a new refund, so repeated partial refunds work.
    */
   refundId?: string;
+  /**
+   * The GRATUITY part of the refund (tip refunds are tracked separately and
+   * flagged; base part = amount - tip). Omitted: the legacy rule, the refund
+   * comes off the tip first.
+   */
+  tipCents?: number;
+  /** Provider correlation (Stripe refund metadata). */
+  metadata?: Record<string, string>;
 }): Promise<
   | (Payment & {
       replayed?: boolean;
       refundedNowCents?: number;
+      /** The tip part of what was refunded now. */
+      tipRefundedNowCents?: number;
+      /** Provider refund id (Stripe re_...) of this refund, when there is one. */
+      processorRef?: string | null;
       /**
        * True when the rail only RECORDS the refund (crypto): no money moved, staff
        * must send it back themselves. Callers must say so, never "refunded".
@@ -968,13 +991,28 @@ export async function refundPayment(input: {
   const total = payment.amount_cents + payment.tip_cents;
   const refundId = input.refundId ?? null;
   if (refundId && (payment.refund_ids ?? []).includes(refundId)) {
-    return { ...payment, replayed: true, refundedNowCents: 0 };
+    return { ...payment, replayed: true, refundedNowCents: 0, tipRefundedNowCents: 0 };
   }
 
   const rail = requirePaymentRail(payment.rail);
   const refundAmount = input.amountCents ?? total - payment.refunded_cents;
   if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
     throw new RefundExceedsError();
+  }
+  const tipPart = input.tipCents;
+  if (tipPart !== undefined) {
+    // Explicit split: base and tip are capped separately (a food refund never
+    // eats into the tip, a tip refund never into the food).
+    const left = refundableParts(payment);
+    if (
+      !Number.isSafeInteger(tipPart) ||
+      tipPart < 0 ||
+      tipPart > refundAmount ||
+      tipPart > left.tipCents ||
+      refundAmount - tipPart > left.baseCents
+    ) {
+      throw new RefundExceedsError();
+    }
   }
 
   const callRail = () =>
@@ -993,23 +1031,62 @@ export async function refundPayment(input: {
       chargeId: payment.charge_id ?? payment.id,
       amount: { amount: refundAmount, currency: payment.currency },
       reason: input.reason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        order_id: payment.order_id,
+        payment_id: payment.id,
+        ...(tipPart ? { tip_cents: String(tipPart) } : {}),
+      },
     });
 
   let recorded: RefundReservation;
+  let processorRef: string | null = null;
   if (isCardRail(payment.rail)) {
     const railRefund = await callRail();
-    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
+    processorRef = railRefund?.refundId ?? null;
+    const meta = {
       // Stripe's refund id (re_...) rides on the payment's refunds[] entry.
-      processorRef: railRefund?.refundId ?? null,
+      processorRef,
       reason: input.reason ?? null,
-    });
+      tipCents: tipPart ?? null,
+    };
+    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, meta);
+    if (!recorded.ok && recorded.reason === "exceeds" && tipPart !== undefined) {
+      // Stripe already moved this money (it caps refunds at the charge, the
+      // same amount + tip cap as ours), but a concurrent refund on this tender
+      // took the base/tip room we split it into. The money MUST be recorded:
+      // record it with the legacy split (bounded by the same total cap) and alert.
+      captureError(new Error("card refund recorded with an adjusted tip/base split"), {
+        scope: "refund-split-adjusted",
+        paymentId: payment.id,
+        refundId,
+        amountCents: refundAmount,
+        tipCents: tipPart,
+      });
+      recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
+        ...meta,
+        tipCents: null,
+      });
+    }
+    if (!recorded.ok && recorded.reason === "exceeds") {
+      // Money left Stripe but no room to record it: never silent.
+      captureError(new Error("card refund succeeded at the provider but could not be recorded"), {
+        scope: "refund-unrecorded",
+        paymentId: payment.id,
+        refundId,
+        amountCents: refundAmount,
+        processorRef,
+      });
+    }
   } else {
     recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
       reason: input.reason ?? null,
+      tipCents: tipPart ?? null,
     });
     if (recorded.ok) {
       try {
-        await callRail();
+        const r = await callRail();
+        processorRef = r?.refundId ?? null;
       } catch (err) {
         await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
         throw err;
@@ -1019,41 +1096,58 @@ export async function refundPayment(input: {
 
   if (!recorded.ok) {
     if (recorded.reason === "duplicate" && recorded.payment) {
-      return { ...recorded.payment, replayed: true, refundedNowCents: 0 };
+      return {
+        ...recorded.payment,
+        replayed: true,
+        refundedNowCents: 0,
+        tipRefundedNowCents: 0,
+      };
     }
     if (recorded.reason === "not_found") return null;
     throw new RefundExceedsError();
   }
   const updated = recorded.payment;
+  const entry = (updated.refunds ?? []).find((r) => r.id === recorded.refundEntryId);
 
-  // If all tenders on the order are fully refunded, mark the order refunded.
-  const all = await driver.listPaymentsForOrder(payment.order_id);
-  const allRefunded =
-    all.length > 0 && all.every((p) => p.status === "refunded");
-  // Compare-and-set from a "real" order status only: an abandoned/voided/awaiting
-  // order (a refunded LATE payment) must keep its status, not turn `refunded`.
-  if (allRefunded) {
-    await driver.transitionOrderStatus(
-      payment.order_id,
-      [
-        "draft",
-        "placed",
-        "paid",
-        "in_kitchen",
-        "ready",
-        "recall",
-        "out_for_delivery",
-        "completed",
-      ],
-      "refunded",
-    );
-  }
+  await maybeMarkOrderRefunded(payment.order_id);
 
   return {
     ...updated,
     refundedNowCents: refundAmount,
+    tipRefundedNowCents:
+      typeof entry?.tip_cents === "number"
+        ? entry.tip_cents
+        : tipRefundedCents(updated) - tipRefundedCents(payment),
+    processorRef,
     manualRefund: isManualRefundRail(payment.rail),
   };
+}
+
+/**
+ * Every LIVE tender of the order is fully refunded: mark the order `refunded`.
+ * Declined / canceled attempts never took money, so they are ignored (an order
+ * with an earlier declined card is still fully refunded once its real tender is).
+ * Compare-and-set from a "real" order status only: an abandoned/voided/awaiting
+ * order (a refunded LATE payment) keeps its status, it does not turn `refunded`.
+ */
+export async function maybeMarkOrderRefunded(orderId: string): Promise<void> {
+  const driver = getPosDriver();
+  const all = await driver.listPaymentsForOrder(orderId);
+  if (!isFullyRefunded(null, all)) return;
+  await driver.transitionOrderStatus(
+    orderId,
+    [
+      "draft",
+      "placed",
+      "paid",
+      "in_kitchen",
+      "ready",
+      "recall",
+      "out_for_delivery",
+      "completed",
+    ],
+    "refunded",
+  );
 }
 
 /**
@@ -1291,15 +1385,11 @@ async function flagDuplicatePayment(order: Order, payments: Payment[]): Promise<
   // the tender, not the amount due, and may be added by the payer (an agent-channel
   // order paid by session with a tip the order did not carry). Comparing money
   // including tips to the order total would flag that tip as a duplicate payment,
-  // and the admin refund of the "duplicate" would refund the tip. Refunds are
-  // taken off the tip first, so a tip-only refund can't hide a duplicate of the base.
+  // and the admin refund of the "duplicate" would refund the tip. Only the BASE
+  // part of refunds counts, so a tip-only refund can't hide a duplicate of the base.
   const held = payments
     .filter((p) => p.status === "captured" || p.status === "authorized")
-    .reduce(
-      (n, p) =>
-        n + Math.max(0, p.amount_cents - Math.max(0, p.refunded_cents - p.tip_cents)),
-      0,
-    );
+    .reduce((n, p) => n + Math.max(0, p.amount_cents - baseRefundedCents(p)), 0);
   const baseExcess = held - orderDueCents(order);
   if (baseExcess <= 0) return;
   // The admin refund returns exactly the marker amount. A payer-added tip is never

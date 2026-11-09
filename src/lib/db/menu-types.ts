@@ -8,6 +8,7 @@
  *
  * Money is always stored as integer cents to avoid floating-point drift.
  */
+import type { AdjustmentPolicy, OrderAdjustment } from "./adjustment-types";
 
 export interface MenuCategory {
   id: string;
@@ -179,6 +180,8 @@ export interface StoreSettings {
   kds_thresholds?: KdsThresholds;
   /** Online-ordering / fulfillment config (Phase 4). Optional; a default applies. */
   fulfillment?: FulfillmentSettings;
+  /** Refund / comp / void approval thresholds. Optional; DEFAULT_ADJUSTMENT_POLICY applies. */
+  adjustment_policy?: AdjustmentPolicy;
 }
 
 // ----------------------------------------------------------------------------
@@ -513,6 +516,12 @@ export interface Order {
   hold?: OrderHold | null;
   /** /v1 extras (fees, tax_exempt, callout_name, metadata, fire_at). */
   core_ext?: OrderCoreExt | null;
+  /**
+   * Comps + discounts currently applied (Σ amount_cents = discount_cents).
+   * Absent/empty on orders that predate it: a non-zero `discount_cents` is then
+   * one manual discount (the mappers synthesize it).
+   */
+  adjustments?: OrderAdjustment[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -544,4 +553,6 @@ export interface CreateOrderInput {
   hold?: OrderHold | null;
   /** /v1 extras (fees, tax_exempt, callout_name, metadata, fire_at). */
   core_ext?: OrderCoreExt | null;
+  /** Comps + discounts applied at creation (Σ = discount_cents). */
+  adjustments?: OrderAdjustment[] | null;
 }
