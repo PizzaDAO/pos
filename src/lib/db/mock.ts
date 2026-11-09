@@ -43,7 +43,6 @@ import type {
   OrderItem,
   OrderStatus,
   StoreSettings,
-  MarketplaceProviderKey,
 } from "./menu-types";
 import type {
   ConnectAccount,
