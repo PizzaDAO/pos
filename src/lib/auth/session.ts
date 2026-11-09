@@ -58,8 +58,33 @@ export interface SessionUser {
 }
 
 /**
- * The newest `amr[].timestamp` (seconds) of a JWT payload, in ms; null when
- * absent. Pure; exported for tests. Only call on a token getUser() verified.
+ * Supabase `amr` methods that mean the person actually authenticated (typed a
+ * password, followed a magic link / OTP, completed OAuth/SSO or MFA). Anything
+ * else — notably `token_refresh`, which only proves the browser held a refresh
+ * token — never counts as a sign-in.
+ */
+const SIGN_IN_AMR_METHODS = new Set([
+  "password",
+  "otp",
+  "magiclink",
+  "oauth",
+  "sso/saml",
+  "totp",
+  "mfa/totp",
+  "mfa/phone",
+  "mfa/webauthn",
+  "recovery",
+  "invite",
+  "email/signup",
+  "email_change",
+  "web3",
+]);
+
+/**
+ * The newest SIGN-IN `amr[].timestamp` (seconds) of a JWT payload, in ms; null
+ * when absent. Entries whose method isn't a sign-in (e.g. `token_refresh`) are
+ * ignored, so a refreshed token can't pass for a recent sign-in. Pure; exported
+ * for tests. Only call on a token getUser() verified.
  */
 export function authTimeFromAccessToken(token: string | null | undefined): number | null {
   if (!token) return null;
@@ -67,10 +92,11 @@ export function authTimeFromAccessToken(token: string | null | undefined): numbe
   if (!part) return null;
   try {
     const payload = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as {
-      amr?: { timestamp?: unknown }[];
+      amr?: { method?: unknown; timestamp?: unknown }[];
     };
-    const ts = (payload.amr ?? [])
-      .map((a) => (typeof a?.timestamp === "number" ? a.timestamp : NaN))
+    const ts = (Array.isArray(payload.amr) ? payload.amr : [])
+      .filter((a) => typeof a?.method === "string" && SIGN_IN_AMR_METHODS.has(a.method))
+      .map((a) => (typeof a.timestamp === "number" ? a.timestamp : NaN))
       .filter((n) => Number.isFinite(n));
     return ts.length ? Math.max(...ts) * 1000 : null;
   } catch {

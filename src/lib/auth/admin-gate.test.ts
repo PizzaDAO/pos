@@ -571,6 +571,56 @@ describe("short owner/manager PINs", () => {
     }
   });
 
+  it("the old PIN keeps working until the new one is used (a lost response can't lock out the owner)", async () => {
+    const driver = getPosDriver();
+    await driver.setStaffPinHash(T, TONY, hashPin("1357"));
+    try {
+      const first = await unlock(TONY, "1357");
+      expect(first.res.status).toBe(200);
+      const lost = ((await first.res.json()) as { newPin: string }).newPin;
+      // The response never reached anyone: the old PIN still unlocks (and
+      // hands out another new PIN), the first new PIN is simply replaced.
+      const retry = await unlock(TONY, "1357");
+      expect(retry.res.status).toBe(200);
+      const newPin = ((await retry.res.json()) as { newPin: string }).newPin;
+      expect(newPin).toMatch(/^\d{6}$/);
+      expect((await unlock(TONY, lost)).res.status).toBe(401);
+      // Using the new PIN ends the old one's grace.
+      expect((await unlock(TONY, newPin)).res.status).toBe(200);
+      expect((await unlock(TONY, "1357")).res.status).toBe(401);
+    } finally {
+      await driver.setStaffPinHash(T, TONY, hashPin(TONY_PIN));
+      resetMockPinState();
+    }
+  });
+
+  it("the old PIN stops working after 10 minutes even if the new one is never used", async () => {
+    const driver = getPosDriver();
+    await driver.setStaffPinHash(T, TONY, hashPin("1357"));
+    try {
+      expect((await unlock(TONY, "1357")).res.status).toBe(200);
+      const spy = vi
+        .spyOn(Date, "now")
+        .mockReturnValue(Date.now() + 11 * 60_000);
+      try {
+        expect((await unlock(TONY, "1357")).res.status).toBe(401);
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      await driver.setStaffPinHash(T, TONY, hashPin(TONY_PIN));
+      resetMockPinState();
+    }
+  });
+
+  it("a reset from the back office ends any grace at once", async () => {
+    const driver = getPosDriver();
+    await driver.setStaffPinHash(T, TONY, hashPin("1357"));
+    expect((await unlock(TONY, "1357")).res.status).toBe(200);
+    await driver.setStaffPinHash(T, TONY, hashPin(TONY_PIN));
+    expect((await unlock(TONY, "1357")).res.status).toBe(401);
+  });
+
   it("a 6-digit PIN is left alone", async () => {
     const { res } = await unlock(CARMELA, CARMELA_PIN);
     expect(((await res.json()) as { newPin?: string }).newPin).toBeUndefined();

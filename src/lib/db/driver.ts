@@ -1486,6 +1486,21 @@ export interface PosDriver {
     staffId: string,
     pinHash: string | null,
   ): Promise<boolean>;
+  /**
+   * Replace a PIN but keep the OLD one valid until `graceUntil` (or until the
+   * new one is first used, see clearPreviousPin). If an earlier replacement's
+   * old PIN is still in grace it is kept (with its own deadline), so a retry
+   * after a lost response still accepts the PIN the person actually knows.
+   * Resets the lockout. False when the staff member is not in the tenant.
+   */
+  rotateStaffPin(
+    tenantId: string,
+    staffId: string,
+    pinHash: string,
+    graceUntil: string,
+  ): Promise<boolean>;
+  /** Drop a replaced PIN's grace (the new PIN was used). */
+  clearPreviousPin(tenantId: string, staffId: string): Promise<void>;
   /** Does the tenant have any ACTIVE staff member with a PIN set? */
   tenantHasStaffPins(tenantId: string): Promise<boolean>;
   /**

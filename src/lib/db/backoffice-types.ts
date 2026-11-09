@@ -265,6 +265,12 @@ export interface Staff {
    * `src/lib/auth/pin.ts`.
    */
   pin_hash?: string | null;
+  /**
+   * A replaced short owner/manager PIN that stays valid until the new PIN is
+   * first used or `pin_previous_until` passes (server-only, like pin_hash).
+   */
+  pin_previous_hash?: string | null;
+  pin_previous_until?: string | null;
   /** Linked login (auth user id), null until linked (POS-7). */
   user_id?: string | null;
   /** Locations this person works at; empty/absent = all (POS-7). */

@@ -127,7 +127,7 @@ import type {
   OrderCoreExt,
   OrderFeeLine,
 } from "@/lib/db";
-import { hashPin, verifyPin } from "@/lib/auth/pin";
+import { hashPin, matchStaffPin, verifyPin } from "@/lib/auth/pin";
 import { tenderFingerprint } from "@/lib/db/payment-types";
 import { netSettledBaseCents } from "./money";
 import {
@@ -1282,16 +1282,28 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     }
     // A member with no PIN set costs the same scrypt as a wrong PIN (and can
     // never match: the dummy is a random secret, and the result is ANDed).
-    const ok =
+    const current =
       verifyPin(pin, staff.pin_hash ?? dummyPinHash()) && Boolean(staff.pin_hash);
-    if (!ok) throw mismatch();
+    // A replaced short PIN stays valid for a short grace (see rotateStaffPin).
+    const previous =
+      !current && matchStaffPin(pin, { ...staff, pin_hash: null }) === "previous";
+    if (!current && !previous) throw mismatch();
     await ctx.driver.clearPinAttempts(tenantId, staff.id);
+    if (current && staff.pin_previous_hash) {
+      await ctx.driver.clearPreviousPin(tenantId, staff.id);
+    }
 
     const email = staff.user_id
       ? ((await ctx.driver.getUserEmails([staff.user_id])).get(staff.user_id) ?? null)
       : null;
     return {
-      body: { staff: toContractStaff({ ...staff, pin_hash: undefined }, true, email) },
+      body: {
+        staff: toContractStaff(
+          { ...staff, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined },
+          true,
+          email,
+        ),
+      },
     };
   },
 

@@ -4,7 +4,7 @@
  * shown once and unique, last sign-in, owner/manager rules, last-owner rule,
  * and the audit trail.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionUser } from "@/lib/auth/session";
 
 const session = vi.hoisted(() => ({ user: null as SessionUser | null }));
@@ -549,5 +549,141 @@ describe("concurrent staff changes", () => {
       expect(r.body.error).toMatch(/Try again/);
       spy.mockRestore();
     }
+  });
+});
+
+describe("promotion / reactivation turns an existing PIN into a gate PIN", () => {
+  const FURIO = "80000000-0000-0000-0000-000000000004";
+  const role = async (id: string) =>
+    (await getPosDriver().getStaffById(T, id))?.role;
+  const restore = async () => {
+    const d = getPosDriver();
+    await d.updateStaffProfile(T, CHRIS, { role: "cashier", active: true });
+    await d.updateStaffProfile(T, FURIO, { role: "kitchen", active: true });
+    await d.updateStaffProfile(T, CARMELA, { role: "manager", active: true });
+  };
+
+  describe("gate off (no owner/manager PIN yet)", () => {
+    beforeEach(async () => {
+      cookie = "";
+      await getPosDriver().setStaffPinHash(T, TONY, null);
+      await getPosDriver().setStaffPinHash(T, CARMELA, null);
+      await restore();
+    });
+
+    it("a cashier with a PIN at an owner-signed-in till can't promote themselves", async () => {
+      // The till's owner login signed in long ago; Chris (cashier, PIN 3333) acts.
+      session.user = { ...device, authAt: Date.now() - 60 * 60_000 };
+      const toOwner = await post({
+        action: "update",
+        staffId: CHRIS,
+        role: "owner",
+      });
+      expect(toOwner.status).toBe(401);
+      expect(toOwner.body.code).toBe("reauth_required");
+      const toManager = await post({
+        action: "update",
+        staffId: CHRIS,
+        role: "manager",
+      });
+      expect(toManager.status).toBe(409);
+      expect(await role(CHRIS)).toBe("cashier");
+    });
+
+    it("promoting someone else with a PIN to owner needs a recent sign-in", async () => {
+      session.user = device;
+      expect(
+        (await post({ action: "update", staffId: FURIO, role: "owner" }))
+          .status,
+      ).toBe(401);
+      expect(await role(FURIO)).toBe("kitchen");
+      session.user = { ...device, authAt: Date.now() };
+      expect(
+        (await post({ action: "update", staffId: FURIO, role: "owner" }))
+          .status,
+      ).toBe(200);
+      expect(await role(FURIO)).toBe("owner");
+      // That PIN now gates the back office.
+      expect(
+        (await post({ action: "update", staffId: CHRIS, name: "Chris" })).body
+          .code,
+      ).toBe("admin_pin_required");
+      await getPosDriver().updateStaffProfile(T, FURIO, { role: "kitchen" });
+      await getPosDriver().updateStaffProfile(T, CHRIS, {
+        name: "Christopher M.",
+      });
+    });
+
+    it("promoting someone WITHOUT a PIN is not a gate PIN", async () => {
+      session.user = device;
+      const r = await post({
+        action: "create",
+        name: "No Pin",
+        role: "cashier",
+      });
+      const id = (r.body.staff as { id: string }).id;
+      expect(
+        (await post({ action: "update", staffId: id, role: "owner" })).status,
+      ).toBe(200);
+      await getPosDriver().updateStaffProfile(T, id, { active: false });
+    });
+
+    it("reactivating a manager who has a PIN follows the same rules", async () => {
+      const d = getPosDriver();
+      await d.setStaffPinHash(T, CARMELA, hashPin(CARMELA_PIN));
+      await d.updateStaffProfile(T, CARMELA, { active: false });
+      session.user = { ...device, authAt: Date.now() };
+      // No owner has a PIN: reactivating a PIN'd manager would make theirs the first.
+      expect(
+        (await post({ action: "reactivate", staffId: CARMELA })).status,
+      ).toBe(409);
+      expect((await d.getStaffById(T, CARMELA))?.active).toBe(false);
+      await d.updateStaffProfile(T, CARMELA, { active: true });
+    });
+
+    it("reactivating an owner who has a PIN needs a recent sign-in", async () => {
+      const d = getPosDriver();
+      const r = await post({
+        action: "create",
+        name: "Old Owner",
+        role: "owner",
+      });
+      const id = (r.body.staff as { id: string }).id;
+      await d.setStaffPinHash(T, id, hashPin("615283"));
+      await d.updateStaffProfile(T, id, { active: false });
+      session.user = device;
+      expect(
+        (await post({ action: "reactivate", staffId: id })).body.code,
+      ).toBe("reauth_required");
+      session.user = { ...device, authAt: Date.now() };
+      expect((await post({ action: "reactivate", staffId: id })).status).toBe(
+        200,
+      );
+      await d.updateStaffProfile(T, id, { active: false });
+    });
+  });
+
+  describe("gate on (unlocked by the owner)", () => {
+    afterEach(restore);
+
+    it("an unlocked owner may promote and reactivate (owner PIN exists)", async () => {
+      expect(
+        (await post({ action: "update", staffId: CHRIS, role: "manager" }))
+          .status,
+      ).toBe(200);
+      await getPosDriver().updateStaffProfile(T, FURIO, { active: false });
+      await getPosDriver().updateStaffProfile(T, FURIO, { role: "manager" });
+      expect(
+        (await post({ action: "reactivate", staffId: FURIO })).status,
+      ).toBe(200);
+    });
+
+    it("an unlocked manager still can't promote to owner", async () => {
+      await unlockAs(CARMELA, CARMELA_PIN);
+      expect(
+        (await post({ action: "update", staffId: CHRIS, role: "owner" }))
+          .status,
+      ).toBe(403);
+    });
   });
 });

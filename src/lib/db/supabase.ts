@@ -364,6 +364,12 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
     pin_hash: opts?.includePin
       ? ((r.pin_hash as string | null) ?? null)
       : undefined,
+    pin_previous_hash: opts?.includePin
+      ? ((r.pin_previous_hash as string | null) ?? null)
+      : undefined,
+    pin_previous_until: opts?.includePin
+      ? ((r.pin_previous_until as string | null) ?? null)
+      : undefined,
     user_id: (r.user_id as string | null) ?? null,
     location_ids: (r.location_ids as string[] | null) ?? [],
     module_roles: normalizeModuleRoles(r.module_roles),
@@ -4348,12 +4354,58 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             pin_hash: pinHash,
             pin_failed_attempts: 0,
             pin_locked_until: null,
+            pin_previous_hash: null,
+            pin_previous_until: null,
           })
           .eq("id", staffId)
           .eq("tenant_id", tenantId)
           .select("id"),
       ) as Row[];
       return rows.length > 0;
+    },
+
+    async rotateStaffPin(tenantId, staffId, pinHash, graceUntil) {
+      const cur = unwrap(
+        await sb
+          .from("staff")
+          .select("pin_hash, pin_previous_hash, pin_previous_until")
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .maybeSingle(),
+      ) as Row | null;
+      if (!cur) return false;
+      const prevUntil = cur.pin_previous_until as string | null;
+      const keep =
+        !!cur.pin_previous_hash &&
+        !!prevUntil &&
+        new Date(prevUntil).getTime() > Date.now();
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .update({
+            pin_hash: pinHash,
+            pin_failed_attempts: 0,
+            pin_locked_until: null,
+            pin_previous_hash: keep ? cur.pin_previous_hash : cur.pin_hash,
+            pin_previous_until: keep ? prevUntil : graceUntil,
+          })
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .select("id"),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async clearPreviousPin(tenantId, staffId) {
+      unwrap(
+        await sb
+          .from("staff")
+          .update({ pin_previous_hash: null, pin_previous_until: null })
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .not("pin_previous_hash", "is", null)
+          .select("id"),
+      );
     },
 
     async tenantHasStaffPins(tenantId) {

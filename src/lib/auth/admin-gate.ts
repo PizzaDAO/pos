@@ -128,7 +128,12 @@ export async function resolveAdminUnlock(
     return null;
   }
   return {
-    staff: { ...staff, pin_hash: undefined },
+    staff: {
+      ...staff,
+      pin_hash: undefined,
+      pin_previous_hash: undefined,
+      pin_previous_until: undefined,
+    },
     expiresAt: session.expires_at,
     sessionId: session.id,
   };

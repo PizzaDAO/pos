@@ -7,12 +7,15 @@
  *   1. the per-STAFF lockout (begin_pin_attempt: 5 → 15-minute lock) — the main
  *      limit: a PIN is guessed for one person, and that person locks;
  *   2. per-DEVICE budget: this browser (a random, signed, httpOnly `pos_device`
- *      id) under this device login. Every till of a shop is usually signed in
- *      as the owner, so the login alone can't be the key: one till's bad
- *      guesses would lock PIN entry on every till. A browser without a valid
- *      id shares ONE bucket per login ("unidentified"), and an id is only
- *      handed out on a SUCCESSFUL PIN, so clearing the cookie doesn't buy an
- *      attacker a fresh budget;
+ *      id, handed out on the first SUCCESSFUL PIN) under this device login.
+ *      Every till of a shop is usually signed in as the owner, so the login
+ *      alone can't be the key: one till's bad guesses would lock PIN entry on
+ *      every till. A browser with no valid id gets its own SMALL budget keyed
+ *      on its IP + the login, so guesses elsewhere never block a fresh till.
+ *      This budget only slows one browser down: someone who clears the cookie
+ *      and then enters a PIN they know (their own) does get a fresh device
+ *      budget. The real limits are the per-staff lockout (layer 1) and the
+ *      per-location budget (layer 3);
  *   3. per-LOCATION budget: the till's location (validated to belong to the
  *      staff member's tenant), or the tenant as a whole when none is named. Set
  *      high: it is a backstop against spraying guesses over many staff, not a
@@ -33,14 +36,20 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { getPosDriver, type MembershipRole, type Staff } from "@/lib/db";
-import { recordAudit } from "@/lib/security";
+import { clientIp, recordAudit } from "@/lib/security";
 import { readCookie } from "./active-staff";
-import { verifyPin } from "./pin";
+import { matchStaffPin } from "./pin";
 import type { SessionUser } from "./session";
 import { signingSecret } from "./signing-secret";
 
 /** Unproven attempts per browser (per device login) per window before a lock. */
 export const PIN_DEVICE_LIMIT = { max: 10, windowMinutes: 15, lockMinutes: 15 };
+/** The smaller budget of a browser with no device id yet (per IP + login). */
+export const PIN_UNIDENTIFIED_LIMIT = {
+  max: 5,
+  windowMinutes: 15,
+  lockMinutes: 15,
+};
 /** Unproven attempts per location (all its tills) per window before a lock. */
 export const PIN_LOCATION_LIMIT = {
   max: 100,
@@ -91,9 +100,16 @@ export function deviceCookieOptions() {
   };
 }
 
-/** The device budget key: this browser under this login. */
-export function deviceKey(userId: string, deviceId: string | null): string {
-  return `${userId}:${deviceId ?? "unidentified"}`;
+/**
+ * The device budget key: this browser under this login, or — for a browser
+ * with no device id yet — its IP under this login.
+ */
+export function deviceKey(
+  userId: string,
+  deviceId: string | null,
+  ip: string,
+): string {
+  return deviceId ? `${userId}:${deviceId}` : `${userId}:ip:${ip}`;
 }
 
 /** The location budget key: the till's location, or the whole tenant. */
@@ -109,6 +125,8 @@ export type PinAttemptResult =
       ok: true;
       staff: Staff;
       locationId: string | null;
+      /** The PIN matched was a replaced short PIN still in its grace window. */
+      usedPreviousPin: boolean;
       /** Set this `pos_device` cookie value (the browser had no valid id). */
       newDeviceCookie: string | null;
     }
@@ -149,13 +167,13 @@ export async function attemptStaffPin(input: {
   const driver = getPosDriver();
   const { user } = input;
   const deviceId = readDeviceId(input.request);
-  const devKey = deviceKey(user.id, deviceId);
+  const devKey = deviceKey(user.id, deviceId, clientIp(input.request.headers));
 
   // Device budget first, so guesses at unknown staff ids are counted too.
   const device = await driver.beginPinLimitAttempt(
     "device",
     devKey,
-    PIN_DEVICE_LIMIT,
+    deviceId ? PIN_DEVICE_LIMIT : PIN_UNIDENTIFIED_LIMIT,
   );
 
   // getStaffById carries pin_hash; it never goes to the client.
@@ -230,7 +248,8 @@ export async function attemptStaffPin(input: {
     return locked(attemptState.lockedUntil);
   }
 
-  if (!verifyPin(input.pin, staff.pin_hash)) return incorrect();
+  const matched = matchStaffPin(input.pin, staff);
+  if (!matched) return incorrect();
 
   // Proven: un-count this attempt from the device/location budgets (a no-op
   // on a locked bucket), and reset the staff counter (unless a concurrent
@@ -239,10 +258,15 @@ export async function attemptStaffPin(input: {
     driver.releasePinLimitAttempt("device", devKey),
     driver.releasePinLimitAttempt("location", locKey),
     driver.clearPinAttempts(staff.tenant_id, staff.id),
+    // The new PIN works: a replaced short PIN's grace ends now.
+    matched === "current" && staff.pin_previous_hash
+      ? driver.clearPreviousPin(staff.tenant_id, staff.id)
+      : Promise.resolve(),
   ]);
   return {
     ok: true,
     staff,
+    usedPreviousPin: matched === "previous",
     locationId,
     // First proven PIN on this browser: give it its own device budget.
     newDeviceCookie: deviceId ? null : mintDeviceCookie(),

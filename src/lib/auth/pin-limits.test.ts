@@ -24,6 +24,7 @@ import {
   DEVICE_COOKIE,
   PIN_DEVICE_LIMIT,
   PIN_LOCATION_LIMIT,
+  PIN_UNIDENTIFIED_LIMIT,
   locationKey,
   mintDeviceCookie,
 } from "./pin-attempt";
@@ -54,29 +55,39 @@ function device(id: string): SessionUser {
   };
 }
 
+/** This test's browser: a till that already has a device id. */
+let currentDevice: string | null = null;
+
+const headersFor = (deviceCookie: string | null, ip?: string) => ({
+  ...(deviceCookie ? { cookie: `${DEVICE_COOKIE}=${deviceCookie}` } : {}),
+  ...(ip ? { "x-forwarded-for": ip } : {}),
+});
+
+/** `deviceCookie` null = a browser with no device id yet. */
 const till = (
   staffId: string,
   pin: string,
   locationId?: string,
-  deviceCookie?: string,
+  deviceCookie: string | null | undefined = currentDevice,
+  ip?: string,
 ) =>
   pinPOST(
     new Request("http://localhost/api/terminal/pin", {
       method: "POST",
-      headers: deviceCookie
-        ? { cookie: `${DEVICE_COOKIE}=${deviceCookie}` }
-        : {},
+      headers: headersFor(deviceCookie ?? null, ip),
       body: JSON.stringify({ staffId, pin, locationId }),
     }),
   );
 
-const unlock = (staffId: string, pin: string, deviceCookie?: string) =>
+const unlock = (
+  staffId: string,
+  pin: string,
+  deviceCookie: string | null | undefined = currentDevice,
+) =>
   unlockPOST(
     new Request("http://localhost/api/admin/unlock", {
       method: "POST",
-      headers: deviceCookie
-        ? { cookie: `${DEVICE_COOKIE}=${deviceCookie}` }
-        : {},
+      headers: headersFor(deviceCookie ?? null),
       body: JSON.stringify({ tenantId: T, staffId, pin }),
     }),
   );
@@ -89,6 +100,7 @@ const deviceCookieOf = (res: Response) =>
 beforeEach(() => {
   resetMockPinState();
   session.user = device("limits-device");
+  currentDevice = mintDeviceCookie();
 });
 
 describe("per-device budget", () => {
@@ -151,13 +163,7 @@ describe("per-device budget", () => {
     for (let i = 0; i < PIN_DEVICE_LIMIT.max; i++) {
       await till(STAFF[i % STAFF.length]!, "9999");
     }
-    const res = await unlockPOST(
-      new Request("http://localhost/api/admin/unlock", {
-        method: "POST",
-        body: JSON.stringify({ tenantId: T, staffId: CARMELA, pin: "2222" }),
-      }),
-    );
-    expect(res.status).toBe(423);
+    expect((await unlock(CARMELA, "2222")).status).toBe(423);
   });
 });
 
@@ -267,29 +273,56 @@ describe("per-browser device budget (tills share the owner login)", () => {
     expect((await till(CHRIS, "3333", undefined, tillB)).status).toBe(200);
   });
 
-  it("a device id is handed out only on a successful PIN; browsers without one share a bucket", async () => {
-    const bad = await till(CHRIS, "9999");
+  it("a device id is handed out only on a successful PIN", async () => {
+    const bad = await till(CHRIS, "9999", undefined, null);
     expect(bad.status).toBe(401);
     expect(deviceCookieOf(bad)).toBeUndefined();
-    const good = await till(CHRIS, "3333");
+    const good = await till(CHRIS, "3333", undefined, null);
     expect(good.status).toBe(200);
-    const issued = deviceCookieOf(good);
-    expect(issued).toBeTruthy();
+    expect(deviceCookieOf(good)).toBeTruthy();
     expect(good.headers.get("set-cookie")).toMatch(
       /pos_device=[^;]+;.*HttpOnly/i,
     );
+    // A browser that already has an id isn't given another.
+    expect(deviceCookieOf(await till(CHRIS, "3333"))).toBeUndefined();
+  });
 
-    // Clearing the cookie doesn't buy a fresh budget: no-cookie requests share one.
-    await exhaust(undefined);
-    expect((await till(CHRIS, "3333")).status).toBe(423);
-    // A forged id counts as no id.
+  it(`a browser with no id gets its own small budget (${PIN_UNIDENTIFIED_LIMIT.max}) keyed on IP + login`, async () => {
+    for (let i = 0; i < PIN_UNIDENTIFIED_LIMIT.max; i++) {
+      expect(
+        (
+          await till(
+            STAFF[i % STAFF.length]!,
+            "9999",
+            undefined,
+            null,
+            "10.0.0.1",
+          )
+        ).status,
+      ).toBe(401);
+    }
     expect(
-      (await till(CHRIS, "3333", undefined, "a".repeat(32) + ".beef")).status,
+      (await till(CHRIS, "3333", undefined, null, "10.0.0.1")).status,
     ).toBe(423);
-    // The browser that earned an id keeps its own budget.
+    // A forged id counts as no id (same IP → same small bucket).
     expect(
-      (await till(CHRIS, "3333", undefined, decodeURIComponent(issued!)))
-        .status,
+      (
+        await till(
+          CHRIS,
+          "3333",
+          undefined,
+          "a".repeat(32) + ".beef",
+          "10.0.0.1",
+        )
+      ).status,
+    ).toBe(423);
+    // A fresh till elsewhere (another IP) is not blocked by those guesses…
+    expect(
+      (await till(CHRIS, "3333", undefined, null, "10.0.0.2")).status,
+    ).toBe(200);
+    // …nor is a till that already has its device id.
+    expect(
+      (await till(CHRIS, "3333", undefined, currentDevice, "10.0.0.1")).status,
     ).toBe(200);
   });
 });

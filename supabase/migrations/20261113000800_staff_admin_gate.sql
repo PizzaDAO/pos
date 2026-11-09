@@ -1,6 +1,8 @@
 -- ============================================================================
 -- Migration: staff_admin_gate (security audit M1 + staff management)
 --
+--   * staff.pin_previous_hash / pin_previous_until: a replaced short PIN stays
+--     valid briefly (see below).
 --   * staff.contact_email / contact_phone: optional contact details an owner or
 --     manager records in Admin > Staff. Informational ONLY: they are not an
 --     identity key (the login link stays staff.user_id), they never reach the
@@ -33,6 +35,15 @@ set local lock_timeout = '3s';
 -- ---- staff contact details ---------------------------------------------------
 alter table public.staff add column if not exists contact_email text;
 alter table public.staff add column if not exists contact_phone text;
+
+-- ---- short-PIN replacement grace ------------------------------------------------
+-- When an owner/manager unlocks the back office with a PIN shorter than 6
+-- digits, the server replaces it with an issued 6-digit PIN. If that response
+-- is lost, a sole owner would be locked out, so the OLD hash stays valid until
+-- the new PIN is first used successfully or pin_previous_until passes (10 min).
+-- Server-only like pin_hash: NOT in the `authenticated` column grant.
+alter table public.staff add column if not exists pin_previous_hash text;
+alter table public.staff add column if not exists pin_previous_until timestamptz;
 
 do $$
 begin

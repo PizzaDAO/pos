@@ -88,7 +88,8 @@ begin
     raise exception 'a client role can call the PIN limit functions';
   end if;
   if has_column_privilege('authenticated', 'public.staff', 'contact_email', 'SELECT')
-     or has_column_privilege('authenticated', 'public.staff', 'contact_phone', 'SELECT') then
+     or has_column_privilege('authenticated', 'public.staff', 'contact_phone', 'SELECT')
+     or has_column_privilege('authenticated', 'public.staff', 'pin_previous_hash', 'SELECT') then
     raise exception 'staff contact details are readable with a user JWT';
   end if;
   if has_table_privilege('authenticated', 'public.staff', 'UPDATE') then

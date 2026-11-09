@@ -158,6 +158,9 @@ async function matchesHash(pin: string, stored: string): Promise<boolean> {
   }
 }
 
+/** How long a replaced short PIN keeps working (until the new one is used). */
+export const SHORT_PIN_GRACE_MS = 10 * 60 * 1000;
+
 /**
  * Generate a PIN no OTHER staff member of the tenant uses, hash it, and store
  * it on `staffId` (targeted update; also resets the lockout). Returns the
@@ -168,6 +171,7 @@ export async function issueStaffPin(
   tenantId: string,
   staffId: string,
   random: (max: number) => number = (max) => randomInt(0, max),
+  opts: { keepOldForMs?: number } = {},
 ): Promise<string | null> {
   const driver = getPosDriver();
   const others = (await driver.listStaffPinRecords(tenantId)).filter(
@@ -183,7 +187,16 @@ export async function issueStaffPin(
       others.map((r) => matchesHash(pin, r.pin_hash as string)),
     );
     if (clashes.some(Boolean)) continue;
-    const ok = await driver.setStaffPinHash(tenantId, staffId, hashPin(pin));
+    const ok = opts.keepOldForMs
+      ? // Replacing a short PIN: the old one stays valid until the new one is
+        // first used or the grace passes (a lost response can't lock anyone out).
+        await driver.rotateStaffPin(
+          tenantId,
+          staffId,
+          hashPin(pin),
+          new Date(Date.now() + opts.keepOldForMs).toISOString(),
+        )
+      : await driver.setStaffPinHash(tenantId, staffId, hashPin(pin));
     return ok ? pin : null;
   }
   throw new Error("Could not issue a unique PIN. Try again.");

@@ -3181,7 +3181,12 @@ export const mockDriver: PosDriver = {
     return [...staffById.values()]
       .filter((s) => s.tenant_id === tenantId)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((s) => ({ ...s, pin_hash: undefined }));
+      .map((s) => ({
+        ...s,
+        pin_hash: undefined,
+        pin_previous_hash: undefined,
+        pin_previous_until: undefined,
+      }));
   },
 
   async getStaffById(tenantId: string, staffId: string): Promise<Staff | null> {
@@ -3233,9 +3238,37 @@ export const mockDriver: PosDriver = {
   async setStaffPinHash(tenantId, staffId, pinHash): Promise<boolean> {
     const s = staffById.get(staffId);
     if (!s || s.tenant_id !== tenantId) return false;
-    staffById.set(staffId, { ...s, pin_hash: pinHash });
+    staffById.set(staffId, {
+      ...s,
+      pin_hash: pinHash,
+      pin_previous_hash: null,
+      pin_previous_until: null,
+    });
     pinLocks.delete(staffId); // a reset PIN starts with a fresh lockout budget
     return true;
+  },
+
+  async rotateStaffPin(tenantId, staffId, pinHash, graceUntil): Promise<boolean> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return false;
+    const keep =
+      !!s.pin_previous_hash &&
+      !!s.pin_previous_until &&
+      new Date(s.pin_previous_until).getTime() > Date.now();
+    staffById.set(staffId, {
+      ...s,
+      pin_hash: pinHash,
+      pin_previous_hash: keep ? s.pin_previous_hash : (s.pin_hash ?? null),
+      pin_previous_until: keep ? s.pin_previous_until : graceUntil,
+    });
+    pinLocks.delete(staffId);
+    return true;
+  },
+
+  async clearPreviousPin(tenantId, staffId): Promise<void> {
+    const s = staffById.get(staffId);
+    if (!s || s.tenant_id !== tenantId) return;
+    staffById.set(staffId, { ...s, pin_previous_hash: null, pin_previous_until: null });
   },
 
   async tenantHasStaffPins(tenantId): Promise<boolean> {
@@ -3271,7 +3304,7 @@ export const mockDriver: PosDriver = {
     if (patch.location_ids !== undefined) next.location_ids = [...patch.location_ids];
     if (patch.module_roles !== undefined) next.module_roles = [...patch.module_roles];
     staffById.set(staffId, next);
-    return { ...next, pin_hash: undefined };
+    return { ...next, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async lastStaffSignIns(tenantId): Promise<Map<string, string>> {
@@ -3369,7 +3402,7 @@ export const mockDriver: PosDriver = {
       created_at: existing?.created_at ?? staff.created_at ?? nowIso(),
     };
     staffById.set(merged.id, merged);
-    return { ...merged, pin_hash: undefined };
+    return { ...merged, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async setStaffModuleRoles(tenantId, staffId, roles) {
@@ -3377,7 +3410,7 @@ export const mockDriver: PosDriver = {
     if (!cur || cur.tenant_id !== tenantId) return null;
     const next: Staff = { ...cur, module_roles: [...roles] };
     staffById.set(staffId, next);
-    return { ...next, pin_hash: undefined };
+    return { ...next, pin_hash: undefined, pin_previous_hash: undefined, pin_previous_until: undefined };
   },
 
   async getShift(id: string): Promise<Shift | null> {

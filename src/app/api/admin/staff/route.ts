@@ -171,6 +171,28 @@ async function cleanLocationIds(
     : false;
 }
 
+/** A staff row without any PIN material, for a response. */
+function publicStaff(s: Staff): Staff {
+  return {
+    ...s,
+    pin_hash: undefined,
+    pin_previous_hash: undefined,
+    pin_previous_until: undefined,
+  };
+}
+
+/** Will this change leave `target` an ACTIVE owner/manager holding a PIN? */
+function holdsGatePin(
+  target: Staff,
+  next: { role?: MembershipRole; active?: boolean },
+): MembershipRole | null {
+  const role = next.role ?? target.role;
+  const active = next.active ?? target.active;
+  return target.pin_hash && active && (role === "owner" || role === "manager")
+    ? role
+    : null;
+}
+
 /** A deadlock / serialization failure (Postgres 40P01 / 40001): retryable → 409. */
 function isRetryableDbError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -558,7 +580,7 @@ async function manage(body: StaffBody, auth: ManageAuth): Promise<NextResponse> 
   if (body.action === "deactivate" || body.action === "reactivate") {
     const active = body.action === "reactivate";
     if (target.active === active) {
-      return NextResponse.json({ staff: { ...target, pin_hash: undefined } });
+      return NextResponse.json({ staff: publicStaff(target) });
     }
     const refused = await refuse(auth.actor, tenantId, {
       kind: "update",
@@ -566,6 +588,13 @@ async function manage(body: StaffBody, auth: ManageAuth): Promise<NextResponse> 
       next: { active },
     });
     if (refused) return refused;
+    // Reactivating an owner/manager who has a PIN hands out a gate PIN again:
+    // the same bootstrap rules as issuing one.
+    const gateRole = active ? holdsGatePin(target, { active }) : null;
+    if (gateRole) {
+      const pinRefused = await pinIssueRefusal(auth, gateRole);
+      if (pinRefused) return pinRefused;
+    }
     const saved = await driver.updateStaffProfile(tenantId, target.id, { active });
     if (!saved) return deny(404, "Staff not found.");
     if (!active) await driver.revokeStaffSessionsForStaff(tenantId, target.id);
@@ -643,8 +672,19 @@ async function manage(body: StaffBody, auth: ManageAuth): Promise<NextResponse> 
     next: { role: patch.role },
   });
   if (refused) return refused;
+  // Promoting someone who already has a PIN to owner/manager makes that PIN a
+  // back-office PIN: the same bootstrap rules as issuing one (else a cashier at
+  // a till signed in as the owner could promote themselves, gate off, and hold
+  // a gate PIN without any re-auth).
+  if (patch.role && patch.role !== target.role) {
+    const gateRole = holdsGatePin(target, { role: patch.role });
+    if (gateRole) {
+      const pinRefused = await pinIssueRefusal(auth, gateRole);
+      if (pinRefused) return pinRefused;
+    }
+  }
   if (changes.length === 0) {
-    return NextResponse.json({ staff: { ...target, pin_hash: undefined } });
+    return NextResponse.json({ staff: publicStaff(target) });
   }
   const saved: Staff | null = await driver.updateStaffProfile(tenantId, target.id, patch);
   if (!saved) return deny(404, "Staff not found.");

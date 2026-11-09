@@ -13,7 +13,9 @@
  *        403 not an owner/manager, 423 locked. An OWNER is never kept out by
  *        the device/location budgets, only by their own per-staff lockout.
  *        An owner/manager PIN shorter than 6 digits is replaced first: the
- *        server issues a new 6-digit PIN, returned ONCE as `newPin`.
+ *        server issues a new 6-digit PIN, returned ONCE as `newPin`. The old
+ *        PIN keeps working until the new one is first used or for 10 minutes,
+ *        so a lost response can't lock out a sole owner.
  * DELETE ?tenantId= → Lock: revoke the unlock and clear the cookie.
  *
  * See src/lib/auth/admin-gate.ts. No env vars required (mock driver).
@@ -27,7 +29,11 @@ import {
   deviceCookieOptions,
 } from "@/lib/auth/pin-attempt";
 import { getPosDriver } from "@/lib/db";
-import { ISSUED_PIN_LENGTH, issueStaffPin } from "@/lib/staff/manage";
+import {
+  ISSUED_PIN_LENGTH,
+  SHORT_PIN_GRACE_MS,
+  issueStaffPin,
+} from "@/lib/staff/manage";
 import { readCookie } from "@/lib/auth/active-staff";
 import {
   ADMIN_PIN_ROLES,
@@ -112,7 +118,9 @@ export async function POST(request: Request) {
   // server-issued 6-digit one before unlocking (shown once, below).
   let newPin: string | null = null;
   if (b.pin.length < ISSUED_PIN_LENGTH) {
-    newPin = await issueStaffPin(auth.tenantId, staff.id);
+    newPin = await issueStaffPin(auth.tenantId, staff.id, undefined, {
+      keepOldForMs: SHORT_PIN_GRACE_MS,
+    });
     if (!newPin) {
       return NextResponse.json({ error: "Staff not found." }, { status: 404 });
     }
