@@ -36,12 +36,15 @@ test("reports tab renders KPIs and payment mix", async ({ page }) => {
   await expect(page.getByText("Orders").first()).toBeVisible({
     timeout: 30_000,
   });
-  await expect(page.getByText("Gross")).toBeVisible();
+  await expect(page.getByText("Gross sales", { exact: true })).toBeVisible();
+  // Summary: payment mix by tender, plus the channel rollup.
+  await expect(page.getByRole("heading", { name: "By tender" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "By channel" })).toBeVisible();
+  // The classic view keeps the payment-mix and top-items rollups.
+  await page.getByRole("tab", { name: "Classic" }).click();
   await expect(
     page.getByText("Payment mix (cash / card / crypto)"),
-  ).toBeVisible();
-  // By-channel / by-item rollups render.
-  await expect(page.getByText("By channel")).toBeVisible();
+  ).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("Top items")).toBeVisible();
 });
 
