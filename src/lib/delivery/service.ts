@@ -864,6 +864,13 @@ export async function dispatchManuallyInstead(
       message: "The delivery changed; reload and try again.",
     };
   }
+  // The order's quoted provider follows the switch, so everything that reads
+  // fulfillment (the KDS hand-off, the tracker) treats it as in-house now.
+  await driver
+    .mergeOrderFulfillment(rec.order_id, { delivery_provider: "in_house_manual" })
+    .catch((err) =>
+      captureError(err, { scope: "delivery-switch-fulfillment", orderId: rec.order_id }),
+    );
   if (overrideConflict) {
     const who = opts.actor?.label ?? opts.actor?.id ?? "unknown";
     console.error(

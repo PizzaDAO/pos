@@ -12,7 +12,7 @@
  */
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import type { CreateOrderInput, MenuItemDetail, OrderItem } from "@/lib/db";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import { useToast } from "@/components/ui/toast";
 import { computeOrderTotals } from "@/lib/pricing";
 import { useCartStore } from "@/lib/store/cart";
 import { useMenu } from "@/lib/store/use-menu";
+import { isItemSoldOut, soldOutSets } from "@/lib/menu-availability";
 import { useActiveStaff } from "@/lib/store/use-active-staff";
 import { useOfflineSync } from "@/lib/offline/use-offline-sync";
 import type { QueuedStaff } from "@/lib/offline/queue";
@@ -120,6 +121,12 @@ export function TerminalClient({
   const effectiveRole =
     activeStaff?.role ?? (requireActiveStaff ? null : (deviceRole ?? null));
   const canDiscount = effectiveRole === "owner" || effectiveRole === "manager";
+  // 86 from the till: the person at the till must be a manager+, and so must the
+  // device login (the overrides API authorizes the signed-in session).
+  const canEightySix =
+    canDiscount && (deviceRole === "owner" || deviceRole === "manager");
+  const [eightySixBusy, setEightySixBusy] = useState(false);
+  const soldOut = useMemo(() => soldOutSets(data?.unavailable), [data?.unavailable]);
   useEffect(() => {
     if (!canDiscount && discountCents > 0) setDiscount(0);
   }, [canDiscount, discountCents, setDiscount]);
@@ -193,6 +200,42 @@ export function TerminalClient({
     setBuilderItem(item);
   }
 
+  async function setItem86(item: MenuItemDetail, eightySix: boolean) {
+    setEightySixBusy(true);
+    try {
+      const res = eightySix
+        ? await fetch("/api/admin/overrides", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tenant_id: menu.tenantId,
+              location_id: location,
+              target_type: "item",
+              target_id: item.id,
+              available: false,
+            }),
+          })
+        : await fetch(
+            `/api/admin/overrides?tenantId=${encodeURIComponent(menu.tenantId)}&locationId=${encodeURIComponent(location)}&targetType=item&targetId=${encodeURIComponent(item.id)}`,
+            { method: "DELETE" },
+          );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      toast({
+        title: eightySix ? `${item.name} 86'd` : `${item.name} is back on`,
+        variant: "success",
+      });
+    } catch {
+      toast({
+        title: eightySix ? `Couldn't 86 ${item.name}` : `Couldn't un-86 ${item.name}`,
+        description: "Only a manager signed in on this device can change this. Try Admin → Menu.",
+        variant: "error",
+      });
+    } finally {
+      await refetch();
+      setEightySixBusy(false);
+    }
+  }
+
   function handleBuilderConfirm(line: OrderItem) {
     if (editingLine) updateLine(editingLine.id, line);
     else addLine(line);
@@ -203,6 +246,26 @@ export function TerminalClient({
   async function handlePlaceOrder() {
     const active = items.filter((i) => !i.voided);
     if (active.length === 0) return;
+    // Catch a line 86'd since it was rung up before sending it (the server
+    // would refuse the whole order); name it so the cashier can fix the cart.
+    const soldOutLine = active.find((line) => {
+      const item = menu.categories
+        .flatMap((c) => c.items)
+        .find((i) => i.id === line.item_id);
+      return (
+        (item && isItemSoldOut(item, soldOut)) ||
+        (line.size_id !== null && soldOut.sizes.has(line.size_id)) ||
+        line.modifiers.some((m) => soldOut.modifiers.has(m.modifier_id))
+      );
+    });
+    if (soldOutLine) {
+      toast({
+        title: "Sold out item in the order",
+        description: `${soldOutLine.item_name} (or one of its options) is sold out. Edit or remove it, then place the order.`,
+        variant: "error",
+      });
+      return;
+    }
 
     setPlacing(true);
     try {
@@ -306,6 +369,10 @@ export function TerminalClient({
             menu={menu}
             currency={settings.currency}
             onSelectItem={openBuilderForItem}
+            soldOut={soldOut}
+            canEightySix={canEightySix}
+            onSetItem86={(item, on) => void setItem86(item, on)}
+            eightySixBusy={eightySixBusy}
           />
         </div>
 
@@ -326,6 +393,7 @@ export function TerminalClient({
           item={builderItem}
           currency={settings.currency}
           editing={editingLine ?? undefined}
+          soldOut={soldOut}
           onCancel={() => {
             setBuilderItem(null);
             setEditingLine(null);

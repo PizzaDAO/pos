@@ -2,8 +2,9 @@
  * Service worker (Serwist) for the terminal PWA.
  *
  * - Precaches the Next.js app shell (build manifest injected at `self.__SW_MANIFEST`).
- * - Runtime-caches the menu API (`/api/menu`) with StaleWhileRevalidate so the
- *   terminal can load the menu offline after the first online load.
+ * - Runtime-caches the menu API (`/api/menu`) NetworkFirst (3 s timeout) so the
+ *   terminal can load the menu offline after the first online load, while an
+ *   online till always sees the current 86 / sold-out state.
  * - Payment / card-reader APIs (`/api/terminal/*`, `/api/payments*`,
  *   `/api/admin/terminal*`) and Stripe origins are NetworkOnly: payment state is
  *   never served from a cache, and card needs internet (see sw-routes.ts).
@@ -15,7 +16,7 @@
 /// <reference lib="webworker" />
 import { defaultCache } from "@serwist/next/worker";
 import type { PrecacheEntry, SerwistGlobalConfig } from "serwist";
-import { NetworkOnly, Serwist, StaleWhileRevalidate } from "serwist";
+import { NetworkFirst, NetworkOnly, Serwist } from "serwist";
 import { isNetworkOnlyPath, isStripeOrigin } from "@/lib/offline/sw-routes";
 
 declare global {
@@ -33,9 +34,10 @@ const serwist = new Serwist({
   navigationPreload: true,
   runtimeCaching: [
     {
-      // Keep the menu available offline; revalidate in the background.
+      // Keep the menu available offline, but prefer the network: a cached copy
+      // would keep selling an item that was just 86'd.
       matcher: ({ url }) => url.pathname === "/api/menu",
-      handler: new StaleWhileRevalidate({ cacheName: "pos-menu" }),
+      handler: new NetworkFirst({ cacheName: "pos-menu", networkTimeoutSeconds: 3 }),
     },
     // Payment + card-reader state must never come from a cache (defaultCache
     // would put same-origin GET /api/* behind NetworkFirst and answer a failed

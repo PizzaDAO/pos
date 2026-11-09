@@ -110,7 +110,7 @@ import type {
 } from "./saas-types";
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
-import { buildSalesReport, isoDate } from "@/lib/reports";
+import { buildSalesReport, locationBusinessDate } from "@/lib/reports";
 import { EMPTY_BUNDLE, type OwnerReportBundle } from "@/lib/owner-reports";
 import { fetchAllPages, safeKeyset } from "./paging";
 
@@ -4116,7 +4116,10 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .eq("tenant_id", tenantId),
       ) as Row[];
       const locRows = unwrap(
-        await sb.from("locations").select("id,name").eq("tenant_id", tenantId),
+        await sb
+          .from("locations")
+          .select("*")
+          .eq("tenant_id", tenantId),
       ) as Row[];
       const catNameById = new Map(
         catRows.map((c) => [c.id as string, c.name as string]),
@@ -4140,6 +4143,16 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           return { id: cid, name: catNameById.get(cid) ?? cid };
         },
         locationName: (id: string) => locNameById.get(id) ?? id,
+        locationClock: (id: string) => {
+          const l = locRows.find((r) => r.id === id);
+          return l
+            ? {
+                timezone: (l.timezone as string | null) ?? null,
+                business_day_cutoff_minutes:
+                  (l.business_day_cutoff_minutes as number | null) ?? 0,
+              }
+            : null;
+        },
       });
     },
 
@@ -4179,7 +4192,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       };
     },
 
-    async closeBusinessDay(tenantId, locationId, businessDate) {
+    async closeBusinessDay(tenantId, locationId, businessDate, opts) {
       const existing = await this.getBusinessDayClose(
         tenantId,
         locationId,
@@ -4200,10 +4213,26 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .eq("status", "closed")
           .not("closed_at", "is", null),
       ) as Row[];
+      const locRow = unwrap(
+        await sb
+          .from("locations")
+          .select("*")
+          .eq("id", locationId)
+          .maybeSingle(),
+      ) as Row | null;
+      const clock = locRow
+        ? {
+            timezone: (locRow.timezone as string | null) ?? null,
+            business_day_cutoff_minutes:
+              (locRow.business_day_cutoff_minutes as number | null) ?? 0,
+          }
+        : null;
       const dayShifts = shiftRows
         .map(mapShift)
         .filter(
-          (s) => s.closed_at != null && isoDate(s.closed_at) === businessDate,
+          (s) =>
+            s.closed_at != null &&
+            locationBusinessDate(s.closed_at, clock) === businessDate,
         );
 
       let openingFloat = 0;
@@ -4235,7 +4264,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         counted += rec.counted_cents ?? rec.expected_cents;
       }
 
-      const drawer = {
+      const drawer = opts?.drawer ?? {
         opening_float_cents: openingFloat,
         cash_sales_cents: cashSales,
         expected_cents: expected,
