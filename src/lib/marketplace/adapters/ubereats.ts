@@ -14,6 +14,10 @@
  *    POST /v1/delivery/order/{id}/ready.
  * UNVERIFIED: the exact order JSON field names below, the money unit of
  * `amount` (treated as minor units), the ready endpoint, and the menu endpoint.
+ *
+ * UNVERIFIED: our accept callback can be sent more than once (a retry after a
+ * timeout, or two tablets racing). We assume Uber Eats treats a repeated accept for
+ * an already-accepted order as an idempotent success; confirm with partner docs.
  */
 import {
   fetchClientToken,

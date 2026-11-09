@@ -33,6 +33,28 @@ create unique index if not exists orders_marketplace_ref_uq
   on public.orders (location_id, (source->>'module'), (source->>'external_ref'))
   where source->>'type' = 'marketplace';
 
+-- marketplace_stores: which provider store belongs to which location. ASSIGNED BY
+-- A PLATFORM ADMIN ONLY (tenants cannot write it: a tenant that could claim a
+-- store id could receive another restaurant's orders). The primary key is the
+-- uniqueness guarantee: one (provider, store_id) -> exactly one location; the
+-- second constraint gives a location one store per provider. Webhooks route by
+-- this table. Service-role only (RLS forced, no policy, no client grants).
+create table if not exists public.marketplace_stores (
+  provider text not null,
+  store_id text not null check (btrim(store_id) <> ''),
+  tenant_id uuid not null references public.tenants (id) on delete cascade,
+  location_id uuid not null references public.locations (id) on delete cascade,
+  assigned_by text,
+  assigned_at timestamptz not null default now(),
+  primary key (provider, store_id),
+  unique (location_id, provider)
+);
+
+alter table public.marketplace_stores enable row level security;
+alter table public.marketplace_stores force row level security;
+revoke all on public.marketplace_stores from anon, authenticated;
+grant select, insert, update, delete on public.marketplace_stores to service_role;
+
 commit;
 
 notify pgrst, 'reload schema';

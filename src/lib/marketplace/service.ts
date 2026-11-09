@@ -169,26 +169,39 @@ export async function ingestMarketplaceWebhook(
     }
   }
 
-  // Which provider store is this about? Order references (Uber Eats) and cancels
-  // without a store id are resolved by fetching the order (needs API credentials).
+  // Which provider store is this about? Order references (Uber Eats) are resolved
+  // by fetching the order (needs API credentials). A cancel without a store id
+  // is resolved through the existing order (provider + provider order id), which
+  // already lives in exactly one location.
   let normalized: NormalizedOrder | null = null;
   let storeId: string | null = null;
+  let located: { tenantId: string; locationId: string } | null = null;
   if (parsed.kind === "order") {
     normalized = parsed.order;
     storeId = normalized.storeId;
   } else if (parsed.kind === "cancel") {
     storeId = parsed.storeId ?? null;
-  }
-  if (
-    (parsed.kind === "order_ref" || (parsed.kind === "cancel" && !storeId)) &&
-    adapter.fetchOrder &&
-    canCallProvider(provider)
-  ) {
-    const fetched = await adapter.fetchOrder(
-      {
-        externalId: parsed.externalId,
-        href: parsed.kind === "order_ref" ? parsed.href : null,
-      },
+    if (!storeId) {
+      const found = await driver.findMarketplaceOrdersByRef(
+        provider,
+        parsed.externalId,
+      );
+      if (found.length !== 1)
+        return { status: "ignored", reason: "unknown order" };
+      located = {
+        tenantId: found[0]!.tenant_id,
+        locationId: found[0]!.location_id,
+      };
+    }
+  } else {
+    if (!adapter.fetchOrder || !canCallProvider(provider)) {
+      throw new MarketplaceError(
+        "not_configured",
+        `${provider} API credentials are needed to fetch the order.`,
+      );
+    }
+    normalized = await adapter.fetchOrder(
+      { externalId: parsed.externalId, href: parsed.href },
       {
         tenantId: "",
         locationId: "",
@@ -196,24 +209,25 @@ export async function ingestMarketplaceWebhook(
         fetch: withTimeout(input.fetch),
       },
     );
-    if (parsed.kind === "order_ref") normalized = fetched;
-    storeId = fetched.storeId;
-  } else if (parsed.kind === "order_ref") {
-    throw new MarketplaceError(
-      "not_configured",
-      `${provider} API credentials are needed to fetch the order.`,
-    );
+    storeId = normalized.storeId;
   }
 
-  // A real provider's payload must name its store: it is the tenant binding.
-  if (provider !== "simulator" && !storeId) {
+  // A real provider's payload must name its store (the tenant binding), unless
+  // the location came from an already-ingested order.
+  if (provider !== "simulator" && !storeId && !located) {
     throw new MarketplaceError("bad_payload", "Payload names no store id.");
   }
 
   let tenantId: string;
   let locationId: string;
   if (input.location) {
+    // Trusted internal callers (admin simulate button): simulator only.
+    if (provider !== "simulator") {
+      throw new MarketplaceError("disabled", "Not available.");
+    }
     ({ tenantId, locationId } = input.location);
+  } else if (located) {
+    ({ tenantId, locationId } = located);
   } else {
     const hits = storeId
       ? await driver.findMarketplaceLocations(provider, storeId)
@@ -229,12 +243,17 @@ export async function ingestMarketplaceWebhook(
   if (!isProviderEnabled(settings, provider)) {
     throw new MarketplaceError("disabled", "Not available.");
   }
-  const wantStore = settings.marketplace?.providers[provider]?.store_id ?? null;
-  if (provider !== "simulator" && (!wantStore || wantStore !== storeId)) {
-    throw new MarketplaceError("disabled", "Not available.");
-  }
-  if (wantStore && storeId && wantStore !== storeId) {
-    return { status: "ignored", reason: "order is for a different store" };
+  if (provider === "simulator") {
+    const want = settings.marketplace?.providers.simulator?.store_id ?? null;
+    if (want && storeId && want !== storeId) {
+      return { status: "ignored", reason: "order is for a different store" };
+    }
+  } else if (storeId) {
+    // A cancel that names a store must name THIS order's store.
+    const hits = await driver.findMarketplaceLocations(provider, storeId);
+    if (hits.length !== 1 || hits[0]!.location_id !== locationId) {
+      throw new MarketplaceError("disabled", "Not available.");
+    }
   }
 
   if (parsed.kind === "cancel") {

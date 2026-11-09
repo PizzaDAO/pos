@@ -708,6 +708,12 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
   "orders.cancel": async (ctx) => {
     await requireActiveTenant(ctx);
     const order = await ownedOrder(ctx, ctx.params.order_id!);
+    if (order.channel === "marketplace") {
+      // Reject / cancel go through the marketplace flow so the provider is told.
+      throw ProblemError.of("INVALID_TRANSITION", {
+        detail: "A marketplace order is accepted, rejected or cancelled through the marketplace.",
+      });
+    }
     const parsed = OrderCancelInputSchema.safeParse(await readBody(ctx.req));
     if (!parsed.success) throw zodProblem(parsed.error);
     if (order.status === "voided") {

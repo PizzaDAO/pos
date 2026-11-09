@@ -76,38 +76,47 @@ export async function PUT(request: Request) {
     requireLocation: true,
   });
   if (!auth.ok) return auth.res;
+  const driver = getPosDriver();
+  const current = (
+    await driver.getStoreSettings(auth.tenantId, auth.locationId as string)
+  ).marketplace;
   const providers: MarketplaceSettings["providers"] = {};
   for (const key of MARKETPLACE_PROVIDERS) {
     const p = (body.providers?.[key] ??
       null) as Partial<MarketplaceProviderSettings> | null;
     if (!p) continue;
-    providers[key] = {
-      enabled: p.enabled === true,
-      store_id:
-        typeof p.store_id === "string" && p.store_id.trim()
+    // Store ids of REAL providers are assigned by a platform admin only
+    // (/api/platform/marketplace): whatever the body says, keep what is assigned.
+    // (A tenant that could pick its own store id could claim another
+    // restaurant's orders.) The simulator has no real store, so it may be set.
+    const assigned =
+      key === "simulator"
+        ? typeof p.store_id === "string" && p.store_id.trim()
           ? p.store_id.trim().slice(0, 120)
-          : null,
-    };
-  }
-  // A real provider needs its store id (it is how webhooks are routed and the
-  // tenant binding), and one store id belongs to exactly one location.
-  for (const key of MARKETPLACE_PROVIDERS) {
-    const p = providers[key];
-    if (!p?.enabled || key === "simulator") continue;
-    if (!p.store_id) {
-      return NextResponse.json(
-        {
-          error: `${providerLabel(key)} needs a store id before it can be enabled.`,
-        },
-        { status: 422 },
-      );
+          : null
+        : (current?.providers[key]?.store_id ?? null);
+    if (p.enabled === true && key !== "simulator") {
+      const hits = assigned
+        ? await driver.findMarketplaceLocations(key, assigned)
+        : [];
+      if (hits.length !== 1 || hits[0]!.location_id !== auth.locationId) {
+        return NextResponse.json(
+          {
+            error: `${providerLabel(key)} has no store assigned to this location yet. Ask support to assign it.`,
+          },
+          { status: 422 },
+        );
+      }
     }
-    const hits = await getPosDriver().findMarketplaceLocations(key, p.store_id);
-    if (hits.some((h) => h.location_id !== auth.locationId)) {
-      return NextResponse.json(
-        { error: `That ${providerLabel(key)} store id is already in use.` },
-        { status: 409 },
-      );
+    providers[key] = { enabled: p.enabled === true, store_id: assigned };
+  }
+  // Providers the body omitted keep their assignment (still disabled).
+  for (const key of MARKETPLACE_PROVIDERS) {
+    if (!providers[key] && current?.providers[key]?.store_id) {
+      providers[key] = {
+        enabled: false,
+        store_id: current.providers[key]!.store_id,
+      };
     }
   }
   const next: MarketplaceSettings = {

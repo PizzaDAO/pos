@@ -22,7 +22,7 @@
  */
 import { after, NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { notifyMarketplaceReady } from "@/lib/marketplace/service";
+import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
 import { buildTickets, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
 import { nextBumpStatus, recallStatus } from "@/lib/kds/status";
 import type { KitchenBoardResponse } from "@/lib/kds/types";
@@ -95,6 +95,15 @@ export async function POST(request: Request) {
   const auth = await requireOrderAccess(id, "kitchen");
   if (!auth.ok) return auth.res;
   const current = auth.order;
+
+  // A marketplace order the cashier has not accepted is not the kitchen's yet:
+  // no bump, no recall (accept / reject / provider cancel are its only moves).
+  if (isPendingAcceptance(current)) {
+    return NextResponse.json(
+      { error: "Accept this marketplace order before the kitchen can bump it." },
+      { status: 409 },
+    );
+  }
 
   const next =
     action === "bump"

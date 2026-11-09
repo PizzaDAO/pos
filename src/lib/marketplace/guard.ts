@@ -23,3 +23,11 @@ export class MarketplaceNotPayableError extends Error {
 export function assertTakesPayment(order: Pick<Order, "channel">): void {
   if (isMarketplaceChannel(order)) throw new MarketplaceNotPayableError();
 }
+
+/** Another location already holds this provider store id. */
+export class MarketplaceStoreTakenError extends Error {
+  constructor() {
+    super("That store id is already assigned to another location.");
+    this.name = "MarketplaceStoreTakenError";
+  }
+}

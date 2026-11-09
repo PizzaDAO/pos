@@ -15,6 +15,7 @@
  * Everything here is pure data + maps; it never reads env vars and works with no
  * configuration, so the app builds and runs offline in the Vercel preview.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
@@ -180,6 +181,11 @@ const itemModifierGroups = seedItemModifierGroups.map((l) => ({ ...l }));
 const tenants: Tenant[] = seedTenants.map((t) => ({ ...t }));
 const locations: Location[] = seedLocations.map((l) => ({ ...l }));
 const storeSettings = seedStoreSettings.map((s) => ({ ...s }));
+/** `${provider}:${storeId}` -> owning location (platform-admin assigned). */
+const marketplaceStores = new Map<
+  string,
+  { provider: string; tenantId: string; locationId: string }
+>();
 const paymentSettings = seedPaymentSettings.map((s) => ({ ...s }));
 const usersById = new Map<string, User>(seedUsers.map((u) => [u.id, { ...u }]));
 const platformAdmins: PlatformAdmin[] = seedPlatformAdmins.map((a) => ({
@@ -1089,12 +1095,34 @@ export const mockDriver: PosDriver = {
   },
 
   async findMarketplaceLocations(provider, storeId) {
-    return storeSettings
-      .filter(
-        (s) =>
-          s.marketplace?.providers[provider as MarketplaceProviderKey]?.store_id === storeId,
-      )
-      .map((s) => ({ tenant_id: s.tenant_id, location_id: s.location_id }));
+    const row = marketplaceStores.get(`${provider}:${storeId}`);
+    return row ? [{ tenant_id: row.tenantId, location_id: row.locationId }] : [];
+  },
+
+  async assignMarketplaceStore(input) {
+    for (const [k, v] of marketplaceStores) {
+      if (v.provider === input.provider && v.locationId === input.locationId) {
+        marketplaceStores.delete(k);
+      }
+    }
+    if (input.storeId === null) return;
+    const key = `${input.provider}:${input.storeId}`;
+    if (marketplaceStores.has(key)) throw new MarketplaceStoreTakenError();
+    marketplaceStores.set(key, {
+      provider: input.provider,
+      tenantId: input.tenantId,
+      locationId: input.locationId,
+    });
+  },
+
+  async findMarketplaceOrdersByRef(provider, externalId) {
+    ensureKitchenSeed();
+    return [...orders.values()].filter(
+      (o) =>
+        o.source?.type === "marketplace" &&
+        o.source.module === provider &&
+        o.source.external_ref === externalId,
+    );
   },
 
   async createOrder(input: CreateOrderInput): Promise<Order> {
@@ -3133,6 +3161,7 @@ export const mockDriver: PosDriver = {
 /** Test helper: clear placed orders + reset the sequence + KDS seed flag. */
 export function resetMockOrders(): void {
   orders.clear();
+  marketplaceStores.clear();
   orderSeq = 0;
   kitchenSeeded = false;
 }

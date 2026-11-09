@@ -9,6 +9,10 @@
  *    PICKUP), customer{first_name,last_name,phone}, items[]{id,name,quantity,
  *    price,options[]}, subtotal, tax, tip, total, requested_time};
  *  - confirm / reject / ready are POSTs under /orders/{id}/ with an OAuth bearer.
+ *
+ * UNVERIFIED: our accept callback can be sent more than once (a retry after a
+ * timeout, or two tablets racing). We assume Grubhub treats a repeated accept for
+ * an already-accepted order as an idempotent success; confirm with partner docs.
  */
 import {
   fetchClientToken,
@@ -108,8 +112,14 @@ export const grubhubAdapter: MarketplaceAdapter = {
     const type = str(j.event_type) ?? "order.created";
     const id = str(j.order_id);
     if (!id) return { kind: "ignore", reason: "no order_id" };
-    if (type.includes("cancel"))
-      return { kind: "cancel", externalId: id, reason: str(j.reason) };
+    if (type.includes("cancel")) {
+      return {
+        kind: "cancel",
+        externalId: id,
+        reason: str(j.reason),
+        storeId: str(j.merchant_id),
+      };
+    }
     if (!type.includes("order"))
       return { kind: "ignore", reason: `event ${type}` };
     return { kind: "order", order: mapGrubhubOrder(j) };

@@ -33,6 +33,12 @@ function call(provider: string, body: string, headers: Record<string, string>) {
 }
 
 async function enable(store = "gh-store-1") {
+  await getPosDriver().assignMarketplaceStore({
+    provider: "grubhub",
+    tenantId: T,
+    locationId: L,
+    storeId: store,
+  });
   await getPosDriver().setMarketplaceSettings(T, L, {
     enabled: true,
     auto_accept: false,

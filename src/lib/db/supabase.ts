@@ -23,6 +23,7 @@
  *
  * Money is always integer minor units; nothing here uses floats.
  */
+import { MarketplaceStoreTakenError } from "@/lib/marketplace/guard";
 import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
@@ -1729,15 +1730,53 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     async findMarketplaceLocations(provider, storeId) {
       const rows = unwrap(
         await sb
-          .from("store_settings")
+          .from("marketplace_stores")
           .select("tenant_id,location_id")
-          .eq(`marketplace->providers->${provider}->>store_id`, storeId)
-          .limit(5),
+          .eq("provider", provider)
+          .eq("store_id", storeId)
+          .limit(2),
       ) as Row[];
       return rows.map((r) => ({
         tenant_id: r.tenant_id as string,
         location_id: r.location_id as string,
       }));
+    },
+
+    async assignMarketplaceStore(input) {
+      // One store per (location, provider): clear the old one, then insert. The
+      // primary key (provider, store_id) is the cross-location uniqueness guard.
+      unwrap(
+        await sb
+          .from("marketplace_stores")
+          .delete()
+          .eq("provider", input.provider)
+          .eq("location_id", input.locationId),
+      );
+      if (input.storeId === null) return;
+      const { error } = await sb.from("marketplace_stores").insert({
+        provider: input.provider,
+        store_id: input.storeId,
+        tenant_id: input.tenantId,
+        location_id: input.locationId,
+        assigned_by: input.assignedBy ?? null,
+      });
+      if (error) {
+        if (error.code === "23505") throw new MarketplaceStoreTakenError();
+        throw new Error(error.message);
+      }
+    },
+
+    async findMarketplaceOrdersByRef(provider, externalId) {
+      const rows = unwrap(
+        await sb
+          .from("orders")
+          .select("*")
+          .eq("source->>type", "marketplace")
+          .eq("source->>module", provider)
+          .eq("source->>external_ref", externalId)
+          .limit(5),
+      ) as Row[];
+      return readOrderRows(rows);
     },
 
     // -- Orders ------------------------------------------------------------

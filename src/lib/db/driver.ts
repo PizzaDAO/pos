@@ -487,6 +487,25 @@ export interface PosDriver {
   ): Promise<{ tenant_id: string; location_id: string }[]>;
 
   /**
+   * Platform-admin assignment of a provider store id to a location (null
+   * clears it). One (provider, store id) belongs to one location, enforced by a
+   * unique key: throws `MarketplaceStoreTakenError` when another location holds it.
+   */
+  assignMarketplaceStore(input: {
+    provider: string;
+    tenantId: string;
+    locationId: string;
+    storeId: string | null;
+    assignedBy?: string | null;
+  }): Promise<void>;
+
+  /** Existing marketplace orders for (provider, provider order id), any location. */
+  findMarketplaceOrdersByRef(
+    provider: string,
+    externalId: string,
+  ): Promise<Order[]>;
+
+  /**
    * [SHARED: online checkout + terminal card reader] Compare-and-set status
    * transition: `UPDATE ... WHERE id = ? AND status IN (from) RETURNING`. Returns
    * the updated order, or null when the order is missing or no longer in one of

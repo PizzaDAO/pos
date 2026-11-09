@@ -38,6 +38,15 @@ const ON: MarketplaceSettings = {
   providers: { simulator: { enabled: true, store_id: null } },
 };
 
+async function assign(provider: string, storeId: string | null) {
+  await getPosDriver().assignMarketplaceStore({
+    provider,
+    tenantId: T,
+    locationId: L,
+    storeId,
+  });
+}
+
 async function configure(m: MarketplaceSettings | null) {
   if (m) await getPosDriver().setMarketplaceSettings(T, L, m);
 }
@@ -177,6 +186,7 @@ describe("inert by default", () => {
 
   it("never calls out: accept on a real provider without API credentials is skipped", async () => {
     vi.stubEnv("GRUBHUB_WEBHOOK_SECRET", "gh-secret"); // verify-only, no client id/secret
+    await assign("grubhub", "gh-store");
     await configure({
       enabled: true,
       auto_accept: false,
@@ -299,6 +309,7 @@ describe("mapping", () => {
   it("Uber Eats webhook is a reference; fetching it needs credentials and an OAuth token", async () => {
     vi.stubEnv("UBEREATS_CLIENT_ID", "cid");
     vi.stubEnv("UBEREATS_CLIENT_SECRET", "csecret");
+    await assign("ubereats", "store-9");
     await configure({
       enabled: true,
       auto_accept: true,
@@ -612,6 +623,7 @@ describe("hardening", () => {
   it("a failed accept callback keeps the order pending and off the kitchen board, and is retryable", async () => {
     vi.stubEnv("UBEREATS_CLIENT_ID", "cid");
     vi.stubEnv("UBEREATS_CLIENT_SECRET", "csecret");
+    await assign("ubereats", "s1");
     await configure({
       enabled: true,
       auto_accept: false,
@@ -781,5 +793,149 @@ describe("hardening", () => {
         },
       }),
     ).rejects.toMatchObject({ code: "bad_signature" });
+  });
+});
+
+describe("cancels without a store id (DoorDash, Grubhub)", () => {
+  const post = (
+    provider: "doordash" | "grubhub",
+    raw: string,
+    secret: string,
+  ) =>
+    ingestMarketplaceWebhook({
+      provider,
+      rawBody: raw,
+      headers: {
+        [provider === "doordash"
+          ? "x-doordash-signature"
+          : "x-grubhub-signature"]: hmacSha256Hex(secret, raw),
+      },
+    });
+
+  async function setup(provider: "doordash" | "grubhub") {
+    vi.stubEnv(
+      provider === "doordash"
+        ? "DOORDASH_MARKETPLACE_WEBHOOK_SECRET"
+        : "GRUBHUB_WEBHOOK_SECRET",
+      "k",
+    );
+    await assign(provider, "st-1");
+    await configure({
+      enabled: true,
+      auto_accept: false,
+      providers: { [provider]: { enabled: true, store_id: "st-1" } },
+    });
+    const create =
+      provider === "doordash"
+        ? {
+            event_type: "order.created",
+            id: "X-1",
+            store: { merchant_supplied_id: "st-1" },
+            categories: [
+              {
+                items: [
+                  {
+                    name: "Slice",
+                    quantity: 1,
+                    price: 400,
+                    merchant_supplied_id: "s",
+                  },
+                ],
+              },
+            ],
+            subtotal: 400,
+          }
+        : {
+            event_type: "order.created",
+            order_id: "X-1",
+            merchant_id: "st-1",
+            items: [{ id: "s", name: "Slice", quantity: 1, price: 400 }],
+          };
+    const r = await post(provider, JSON.stringify(create), "k");
+    expect(r.status).toBe("created");
+    return r.orderId!;
+  }
+
+  for (const provider of ["doordash", "grubhub"] as const) {
+    it(`${provider}: a cancel naming the store voids the order`, async () => {
+      const id = await setup(provider);
+      const raw = JSON.stringify(
+        provider === "doordash"
+          ? {
+              event_type: "order.cancelled",
+              id: "X-1",
+              store: { merchant_supplied_id: "st-1" },
+            }
+          : {
+              event_type: "order.cancelled",
+              order_id: "X-1",
+              merchant_id: "st-1",
+            },
+      );
+      expect((await post(provider, raw, "k")).status).toBe("cancelled");
+      expect((await getPosDriver().getOrder(id))!.status).toBe("voided");
+    });
+
+    it(`${provider}: a cancel with no store id resolves the existing order's location`, async () => {
+      const id = await setup(provider);
+      const raw = JSON.stringify(
+        provider === "doordash"
+          ? { event_type: "order.cancelled", id: "X-1" }
+          : { event_type: "order.cancelled", order_id: "X-1" },
+      );
+      expect((await post(provider, raw, "k")).status).toBe("cancelled");
+      expect((await getPosDriver().getOrder(id))!.status).toBe("voided");
+    });
+
+    it(`${provider}: a cancel for an unknown order, or naming another store, does nothing`, async () => {
+      const id = await setup(provider);
+      const unknown = JSON.stringify(
+        provider === "doordash"
+          ? { event_type: "order.cancelled", id: "NOPE" }
+          : { event_type: "order.cancelled", order_id: "NOPE" },
+      );
+      expect((await post(provider, unknown, "k")).status).toBe("ignored");
+      const wrongStore = JSON.stringify(
+        provider === "doordash"
+          ? {
+              event_type: "order.cancelled",
+              id: "X-1",
+              store: { merchant_supplied_id: "other" },
+            }
+          : {
+              event_type: "order.cancelled",
+              order_id: "X-1",
+              merchant_id: "other",
+            },
+      );
+      await expect(post(provider, wrongStore, "k")).rejects.toMatchObject({
+        code: "disabled",
+      });
+      expect((await getPosDriver().getOrder(id))!.status).toBe("placed");
+    });
+  }
+});
+
+describe("pending acceptance blocks other transitions", () => {
+  it("the kitchen cannot bump or recall a pending marketplace order", async () => {
+    const { POST } = await import("@/app/api/kitchen/orders/route");
+    await configure(ON);
+    const r = await ingestSim(71, "SIM-KB");
+    const bump = (action: string) =>
+      POST(
+        new Request("http://x/api/kitchen/orders", {
+          method: "POST",
+          body: JSON.stringify({ id: r.orderId, action }),
+        }),
+      );
+    for (const a of ["bump", "recall"]) {
+      expect((await bump(a)).status).toBe(409);
+    }
+    expect((await getPosDriver().getOrder(r.orderId!))!.status).toBe("placed");
+    await respondToMarketplaceOrder(r.orderId!, "accept");
+    expect((await bump("bump")).status).toBe(200);
+    expect((await getPosDriver().getOrder(r.orderId!))!.status).toBe(
+      "in_kitchen",
+    );
   });
 });

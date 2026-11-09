@@ -155,6 +155,29 @@ describe("no tender against a marketplace order", () => {
     expect(await getPosDriver().listPaymentsForOrder(order.id)).toHaveLength(0);
   });
 
+  it("/v1 cancel is refused (rejecting goes through the marketplace so the provider is told)", async () => {
+    const order = await marketplaceOrder(false, "SIM-PAY5");
+    const p: Principal = {
+      kind: "service",
+      id: "t",
+      tenant_id: T,
+      location_ids: null,
+      scopes: ["orders:read", "orders:write"],
+      module: "kiosk",
+    };
+    const res = await handleV1(
+      new Request(`https://pos.test/api/v1/orders/${order.id}/cancel`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "x" }),
+      }),
+      ["orders", order.id, "cancel"],
+      { principal: p },
+    );
+    expect(res.status).toBe(409);
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("placed");
+  });
+
   it("/v1 order creation reserves source.type marketplace", async () => {
     const call = (path: string, init?: RequestInit) =>
       handleV1(

@@ -14,6 +14,10 @@
  *    tax, tip, is_pickup, delivery_short_code};
  *  - confirm/reject/ready are PATCH/POST calls under
  *    /marketplace/api/v1/orders/{id}/... with an OAuth/JWT bearer.
+ *
+ * UNVERIFIED: our accept callback can be sent more than once (a retry after a
+ * timeout, or two tablets racing). We assume DoorDash treats a repeated accept for
+ * an already-accepted order as an idempotent success; confirm with partner docs.
  */
 import {
   fetchClientToken,
@@ -114,8 +118,16 @@ export const doorDashAdapter: MarketplaceAdapter = {
     const type = str(j.event_type) ?? str(j.type) ?? "order.created";
     const id = str(j.id) ?? str(obj(j.order).id);
     if (!id) return { kind: "ignore", reason: "no order id" };
-    if (type.includes("cancel"))
-      return { kind: "cancel", externalId: id, reason: str(j.reason) };
+    if (type.includes("cancel")) {
+      return {
+        kind: "cancel",
+        externalId: id,
+        reason: str(j.reason),
+        storeId:
+          str(obj(j.store).merchant_supplied_id) ??
+          str(obj(obj(j.order).store).merchant_supplied_id),
+      };
+    }
     if (!type.includes("order"))
       return { kind: "ignore", reason: `event ${type}` };
     return {
