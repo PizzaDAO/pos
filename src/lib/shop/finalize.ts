@@ -23,6 +23,7 @@
  * Idempotent and safe to call for an order in any state: a non-awaiting order
  * returns `{ won: false }` and does nothing.
  */
+import { scheduleAutoPrint } from "@/lib/printing/queue";
 import { getPosDriver } from "@/lib/db";
 import type {
   DeliveryAddress,
@@ -119,6 +120,11 @@ export async function runPostPaymentSteps(paid: Order): Promise<boolean> {
   const driver = getPosDriver();
   const orderId = paid.id;
   let ok = true;
+
+  // The order is live: auto-print its ticket if the location opted in. Here (not
+  // in finalizeOnlinePayment) so the crash-recovery sweep covers it too; the
+  // fire:<orderId> dedupe key keeps repeats from printing twice.
+  scheduleAutoPrint(paid);
 
   // (3) Inventory. A failure must not un-pay the order; surface it.
   try {

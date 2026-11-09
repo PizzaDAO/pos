@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { RateLimiter, RATE_LIMIT_RULES } from "./rate-limit";
 
 describe("RateLimiter", () => {
@@ -73,6 +73,23 @@ describe("RateLimiter", () => {
     for (const rule of Object.values(RATE_LIMIT_RULES)) {
       expect(rule.limit).toBeGreaterThan(0);
       expect(rule.windowMs).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("rateLimitEnabled kill switch", () => {
+  it("ignores RATE_LIMIT_DISABLED in production", async () => {
+    const { rateLimitEnabled } = await import("./rate-limit");
+    try {
+      vi.stubEnv("VITEST", "");
+      vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("RATE_LIMIT_DISABLED", "1");
+      vi.stubEnv("VERCEL_ENV", "production");
+      expect(rateLimitEnabled()).toBe(true);
+      vi.stubEnv("VERCEL_ENV", "preview");
+      expect(rateLimitEnabled()).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 });

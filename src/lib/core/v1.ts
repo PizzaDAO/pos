@@ -25,6 +25,7 @@
  * mode or a positively identified Stripe TEST key only; live keys answer 501
  * unless the tenant is explicitly allow-listed.
  */
+import { scheduleAutoPrint } from "@/lib/printing/queue";
 import {
   AllergenPublishInputSchema,
   AvailabilityUpdateSchema,
@@ -886,6 +887,7 @@ const handlers: Partial<Record<V1Operation | ExtraOperation, Handler>> = {
     if (!res.ok && res.reason === "conflict" && res.order.status === "voided") {
       throw ProblemError.of("INVALID_TRANSITION", { detail: "Order was canceled." });
     }
+    if (res.ok) scheduleAutoPrint(res.order);
     // Released by hand after all: a still-open "stranded" flag is moot.
     const flag = order.fulfillment?.late_payment;
     if (res.ok && flag && flag.kind === "scheduled" && !flag.resolved) {
@@ -2394,6 +2396,8 @@ async function createOrder(ctx: Ctx): Promise<Reply> {
     },
   };
   const order = await ctx.driver.createOrder(create);
+  // Held (draft) orders print when released; placed orders fire now.
+  scheduleAutoPrint(order);
   const tz = bundle.location.timezone;
   const body = await mapOrder(order, tz, ctx.driver);
   return { status: 201, body, headers: { location: `/api/v1/orders/${order.id}` } };

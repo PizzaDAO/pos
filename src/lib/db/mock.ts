@@ -19,6 +19,11 @@ import {
   assertNoSimulatedOverwrite,
   isConnectedForHealth,
 } from "@/lib/payments/connect-status";
+import type {
+  Printer,
+  PrintJob,
+  PrintLocationSettings,
+} from "@/lib/printing/types";
 import type { PosDriver } from "./driver";
 import type {
   CreateOrderInput,
@@ -271,6 +276,21 @@ const connectAccounts = new Map<string, ConnectAccount>();
 /** Stripe Terminal locations keyed by POS location id; readers keyed by tmr_ id. */
 const terminalLocations = new Map<string, TerminalLocation>();
 const terminalReaders = new Map<string, TerminalReader>();
+/**
+ * Network printing: printers, their job queue, per-location auto-print. Held on
+ * globalThis so the admin, kitchen and device routes (separate bundles in
+ * `next dev`) share one queue in the zero-env demo.
+ */
+const printStore = ((globalThis as { __posMockPrint?: unknown }).__posMockPrint ??= {
+  printers: new Map<string, Printer>(),
+  printJobs: new Map<string, PrintJob>(),
+  printSettings: new Map<string, PrintLocationSettings>(),
+}) as {
+  printers: Map<string, Printer>;
+  printJobs: Map<string, PrintJob>;
+  printSettings: Map<string, PrintLocationSettings>;
+};
+const { printers, printJobs, printSettings } = printStore;
 /** Online-ordering customers keyed by id. */
 const customers = new Map<string, Customer>();
 /** Magic-link tokens (stubbed, never emailed) keyed by token. */
@@ -323,6 +343,21 @@ function dropReleasedRefund(
     }
   }
   return idx < 0 ? refunds : refunds.filter((_, i) => i !== idx);
+}
+
+/** A job the printer may take now: queued, or sent but unconfirmed too long (retry). */
+function claimable(
+  j: PrintJob,
+  printerId: string,
+  nowIsoStr: string,
+  reclaimBeforeIso: string,
+): boolean {
+  return (
+    j.printer_id === printerId &&
+    j.expires_at > nowIsoStr &&
+    ((j.status === "queued" && (!j.retry_after || j.retry_after <= nowIsoStr)) ||
+      (j.status === "sent" && !!j.claimed_at && j.claimed_at <= reclaimBeforeIso))
+  );
 }
 
 function nowIso(): string {
@@ -2002,6 +2037,189 @@ export const mockDriver: PosDriver = {
       .slice(0, limit);
   },
 
+  // -- Network printing ------------------------------------------------------
+
+  async listPrinters(tenantId: string, locationId: string) {
+    return [...printers.values()]
+      .filter((p) => p.tenant_id === tenantId && p.location_id === locationId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .map((p) => ({ ...p }));
+  },
+
+  async getPrinter(id: string) {
+    const p = printers.get(id);
+    return p ? { ...p } : null;
+  },
+
+  async createPrinter(row: Omit<Printer, "id" | "created_at" | "last_seen_at">) {
+    const printer: Printer = {
+      ...row,
+      id: genId("prn"),
+      last_seen_at: null,
+      created_at: nowIso(),
+    };
+    printers.set(printer.id, printer);
+    return { ...printer };
+  },
+
+  async deletePrinter(tenantId: string, id: string) {
+    const p = printers.get(id);
+    if (!p || p.tenant_id !== tenantId) return false;
+    printers.delete(id);
+    for (const [jid, j] of printJobs) if (j.printer_id === id) printJobs.delete(jid);
+    return true;
+  },
+
+  async setPrinterTokenHash(tenantId: string, id: string, tokenHash: string) {
+    const p = printers.get(id);
+    if (!p || p.tenant_id !== tenantId) return null;
+    p.token_hash = tokenHash;
+    return { ...p };
+  },
+
+  async touchPrinter(id: string, at: string) {
+    const p = printers.get(id);
+    if (p) p.last_seen_at = at;
+  },
+
+  async getPrintSettings(locationId: string) {
+    const s = printSettings.get(locationId);
+    return s ? { ...s } : null;
+  },
+
+  async setPrintAutoPrint(tenantId: string, locationId: string, autoPrint: boolean) {
+    const row: PrintLocationSettings = {
+      location_id: locationId,
+      tenant_id: tenantId,
+      auto_print: autoPrint,
+      updated_at: nowIso(),
+    };
+    printSettings.set(locationId, row);
+    return { ...row };
+  },
+
+  async enqueuePrintJob(
+    job: Omit<
+      PrintJob,
+      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at" | "retry_after"
+    >,
+  ) {
+    if (job.dedupe_key) {
+      const dup = [...printJobs.values()].find(
+        (j) => j.printer_id === job.printer_id && j.dedupe_key === job.dedupe_key,
+      );
+      if (dup) return { ...dup };
+    }
+    const row: PrintJob = {
+      ...job,
+      id: genId("job"),
+      status: "queued",
+      attempts: 0,
+      error: null,
+      created_at: nowIso(),
+      claimed_at: null,
+      done_at: null,
+      retry_after: null,
+    };
+    printJobs.set(row.id, row);
+    return { ...row };
+  },
+
+  async expirePrintJobs(printerId: string, nowIsoStr: string) {
+    let n = 0;
+    for (const j of printJobs.values()) {
+      if (
+        j.printer_id === printerId &&
+        (j.status === "queued" || j.status === "sent") &&
+        j.expires_at <= nowIsoStr
+      ) {
+        j.status = "expired";
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async claimPrintJob(printerId: string, nowIsoStr: string, reclaimBeforeIso: string) {
+    const next = [...printJobs.values()]
+      .filter((j) => claimable(j, printerId, nowIsoStr, reclaimBeforeIso))
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))[0];
+    if (!next) return null;
+    next.status = "sent";
+    next.attempts += 1;
+    next.claimed_at = nowIsoStr;
+    return { ...next };
+  },
+
+  async hasPrintJobForOrder(printerId: string, orderId: string) {
+    return [...printJobs.values()].some((j) => j.printer_id === printerId && j.order_id === orderId);
+  },
+
+  async retryFailedPrintJobs(tenantId: string, locationId: string, nowIsoStr: string) {
+    let n = 0;
+    for (const j of printJobs.values()) {
+      if (
+        j.tenant_id === tenantId &&
+        j.location_id === locationId &&
+        j.status === "failed" &&
+        j.expires_at > nowIsoStr
+      ) {
+        j.status = "queued";
+        j.attempts = 0;
+        j.retry_after = null;
+        j.done_at = null;
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async pruneFinishedPrintJobs(beforeIso: string) {
+    let n = 0;
+    for (const [id, j] of printJobs) {
+      if (j.status !== "queued" && j.status !== "sent" && j.created_at < beforeIso) {
+        printJobs.delete(id);
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async getPrintJobForPrinter(printerId: string, jobId: string) {
+    const j = printJobs.get(jobId);
+    return j && j.printer_id === printerId ? { ...j } : null;
+  },
+
+  async completePrintJob(
+    printerId: string,
+    jobId: string,
+    outcome: { ok: true } | { ok: false; error: string; retryAt?: string | null },
+    nowIsoStr: string,
+  ) {
+    const j = printJobs.get(jobId);
+    if (!j || j.printer_id !== printerId) return null;
+    if (j.status === "queued" || j.status === "sent") {
+      if (!outcome.ok && outcome.retryAt) {
+        j.status = "queued";
+        j.error = outcome.error;
+        j.retry_after = outcome.retryAt;
+      } else {
+        j.status = outcome.ok ? "done" : "failed";
+        j.error = outcome.ok ? null : outcome.error;
+        j.done_at = nowIsoStr;
+      }
+    }
+    return { ...j };
+  },
+
+  async listPrintJobs(tenantId: string, locationId: string, limit: number) {
+    return [...printJobs.values()]
+      .filter((j) => j.tenant_id === tenantId && j.location_id === locationId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, limit)
+      .map((j) => ({ ...j }));
+  },
+
   // -- Customers (Phase 4) ---------------------------------------------------
 
   async getCustomerByEmail(
@@ -3107,6 +3325,9 @@ export function resetMockPayments(): void {
   connectAccounts.clear();
   terminalLocations.clear();
   terminalReaders.clear();
+  printers.clear();
+  printJobs.clear();
+  printSettings.clear();
 }
 
 /** Test helper: clear customers, magic-link tokens, and deliveries. */

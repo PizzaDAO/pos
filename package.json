@@ -7,6 +7,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "loadtest:serve": "next build && RATE_LIMIT_DISABLED=1 next start -p ${PORT:-3405}",
+    "loadtest": "node loadtest/run.mjs",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest",
@@ -18,7 +20,7 @@
     "format:check": "prettier --check .",
     "db:apply": "bash supabase/apply.sh",
     "db:test:rls": "bash supabase/tests/run-rls-isolation.sh",
-    "db:test:pglite": "node scripts/pglite-migrate.mjs supabase/tests/phase2_external_and_customers.sql supabase/tests/phase3_tip_events.sql supabase/tests/phase4_fidelity.sql supabase/tests/delivery_driver_wiring.sql supabase/tests/security_client_writes.sql supabase/tests/menu_import.sql",
+    "db:test:pglite": "node scripts/pglite-migrate.mjs supabase/tests/phase2_external_and_customers.sql supabase/tests/phase3_tip_events.sql supabase/tests/phase4_fidelity.sql supabase/tests/delivery_driver_wiring.sql supabase/tests/security_client_writes.sql supabase/tests/print_network.sql supabase/tests/menu_import.sql",
     "auth:bootstrap": "node supabase/bootstrap-auth.mjs",
     "core:vendor": "bash scripts/vendor-core.sh"
   },
