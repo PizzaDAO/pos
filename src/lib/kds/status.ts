@@ -47,6 +47,19 @@ export function nextBumpStatus(
 }
 
 /**
+ * Label for the hand-off bump on a `ready` ticket (null when the ticket isn't
+ * waiting for hand-off). Pickup / in-store tickets go to `completed` and leave
+ * the board; delivery tickets go out with the driver.
+ */
+export function handoffLabel(
+  current: OrderStatus,
+  channel?: OrderChannel,
+): string | null {
+  if (current !== "ready") return null;
+  return channel === "online_delivery" ? "Out with driver" : "Picked up";
+}
+
+/**
  * Recall pulls a bumped order back onto the active board. A `ready` or
  * `completed` order returns to `recall` (a distinct, visually-flagged active
  * state) so the kitchen knows it was re-opened. Anything still in progress

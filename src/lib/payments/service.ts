@@ -36,6 +36,7 @@ import { cancelReaderActionForIntent } from "./providers/stripe-terminal-api";
 import { railChargesApplicationFee } from "./fees";
 import { expireCheckoutSession, getCheckoutSession } from "./rails/stripe-online";
 import { CardPaymentsNotReadyError } from "./connect";
+import { cashTenderError } from "./cash-tender";
 import {
   cardRailsSimulated,
   isCoinbaseConfigured,
@@ -60,6 +61,18 @@ export function railIsSimulated(rail: PaymentRailKey | "cash"): boolean {
       return !isCoinbaseConfigured();
     default:
       return true;
+  }
+}
+
+/**
+ * A cash tender whose cash handed over is less than its amount + tip (maps to
+ * HTTP 422). A short tender must be sent as a partial (amount = cash handed over).
+ */
+export class CashUnderTenderError extends Error {
+  readonly code = "cash_under_tender";
+  constructor(message: string) {
+    super(message);
+    this.name = "CashUnderTenderError";
   }
 }
 
@@ -222,6 +235,13 @@ export async function takePaymentDetailed(
   if (existing) {
     if (existing.order_id !== input.orderId) throw new PaymentConflictError();
     return { payment: existing };
+  }
+
+  // Cash must be covered by what was handed over: a short tender is never booked
+  // as the full amount (it would leave the drawer short and the order "paid").
+  if (input.rail === "cash") {
+    const short = cashTenderError(input);
+    if (short) throw new CashUnderTenderError(short);
   }
 
   // Defense in depth: in real mode a card rail must always be scoped to a real

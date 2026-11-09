@@ -81,7 +81,8 @@ export function KitchenBoard({
 
   // Live tickets (oldest first) stay in the main grid; Ready/Done tickets are
   // waiting for hand-off, so they move to their own lane below and stop
-  // pushing live tickets down the board.
+  // pushing live tickets down the board. "Picked up" bumps a Ready ticket to
+  // `completed`, which is not a KDS-active status, so it leaves the feed.
   const liveTickets = useMemo(
     () => visibleTickets.filter((t) => !isHandoff(t.order.status)),
     [visibleTickets],

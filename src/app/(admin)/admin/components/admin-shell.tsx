@@ -294,6 +294,8 @@ export function AdminShell({
             locationName={
               locations.find((l) => l.id === locationId)?.name ?? locationId
             }
+            tenantName={tenantName === "Back office" ? undefined : tenantName}
+            timezone={locations.find((l) => l.id === locationId)?.timezone}
           />
         )}
         {tab === "late" && locationId && (

@@ -2854,6 +2854,7 @@ export const mockDriver: PosDriver = {
     tenantId: string,
     locationId: string,
     businessDate: string,
+    opts?: { drawer?: BusinessDayClose["drawer"] },
   ): Promise<BusinessDayClose> {
     const key = `${locationId}:${businessDate}`;
     const existing = businessDayCloses.get(key);
@@ -2891,7 +2892,7 @@ export const mockDriver: PosDriver = {
       business_date: businessDate,
       closed_at: nowIso(),
       report,
-      drawer: {
+      drawer: opts?.drawer ?? {
         opening_float_cents: openingFloat,
         cash_sales_cents: cashSales,
         expected_cents: expected,

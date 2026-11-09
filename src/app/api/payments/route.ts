@@ -30,6 +30,7 @@ import {
 } from "@/lib/payments/connect";
 import type { PaymentRailKey } from "@/lib/payments/PaymentRail";
 import {
+  CashUnderTenderError,
   PaymentConflictError,
   takePaymentDetailed,
   deriveOnlineTender,
@@ -41,6 +42,7 @@ import {
   nextOnlineTenderId,
 } from "@/lib/payments/service";
 import { LiveTenderConflictError } from "@/lib/db/payment-types";
+import { cashTenderError } from "@/lib/payments/cash-tender";
 import { cancelOnlineCheckout, orderExpiresAt } from "@/lib/shop/lifecycle";
 import { asapAvailability } from "@/lib/shop/scheduling";
 import {
@@ -332,6 +334,23 @@ export async function POST(request: Request) {
     }
   }
 
+  // Cash must be covered by the cash handed over (checked before anything else is
+  // touched, e.g. a live card tender closed below). A short cash tender goes in
+  // as a partial: amountCents = cash handed over, no tip. The service re-checks.
+  if (body.rail === "cash") {
+    const short = cashTenderError({
+      amountCents,
+      tipCents,
+      cashTenderedCents: body.cashTenderedCents,
+    });
+    if (short) {
+      return NextResponse.json(
+        { error: short, code: "cash_under_tender" },
+        { status: 422 },
+      );
+    }
+  }
+
   // IN-STORE: a card tender may be live on the reader (the customer can still tap).
   // Taking cash / crypto now would double charge, so close it first, STRICTLY. If
   // the card already went through, or the customer is mid-authorization, refuse
@@ -448,6 +467,12 @@ export async function POST(request: Request) {
       { status: 201 },
     );
   } catch (err) {
+    if (err instanceof CashUnderTenderError) {
+      return NextResponse.json(
+        { error: err.message, code: err.code },
+        { status: 422 },
+      );
+    }
     if (
       err instanceof CardPaymentsNotReadyError ||
       err instanceof PaymentConflictError ||

@@ -3990,7 +3990,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       };
     },
 
-    async closeBusinessDay(tenantId, locationId, businessDate) {
+    async closeBusinessDay(tenantId, locationId, businessDate, opts) {
       const existing = await this.getBusinessDayClose(
         tenantId,
         locationId,
@@ -4046,7 +4046,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         counted += rec.counted_cents ?? rec.expected_cents;
       }
 
-      const drawer = {
+      const drawer = opts?.drawer ?? {
         opening_float_cents: openingFloat,
         cash_sales_cents: cashSales,
         expected_cents: expected,
