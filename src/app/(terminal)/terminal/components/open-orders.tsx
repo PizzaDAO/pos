@@ -158,6 +158,11 @@ export function OpenOrdersPanel({
                       {order.discountCents > 0 &&
                         ` · discounts ${formatMoney(order.discountCents, order.currency || currency)}`}
                     </div>
+                    {order.unfinishedRefunds > 0 && (
+                      <div className="text-xs font-semibold text-destructive">
+                        Unfinished refund: open to resume or cancel
+                      </div>
+                    )}
                   </div>
                   <Button
                     variant="outline"

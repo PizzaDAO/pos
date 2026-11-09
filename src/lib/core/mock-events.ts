@@ -516,9 +516,9 @@ export function withOutbox(
       return res;
     },
 
-    async releasePaymentRefund(paymentId, amountCents, refundId) {
+    async releasePaymentRefund(paymentId, amountCents, refundId, opts) {
       const before = await inner.getPayment(paymentId);
-      await inner.releasePaymentRefund(paymentId, amountCents, refundId);
+      await inner.releasePaymentRefund(paymentId, amountCents, refundId, opts);
       const after = await inner.getPayment(paymentId);
       if (before && after) {
         paymentEvents(box, await orderAnnounced(after.order_id), after, before);

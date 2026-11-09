@@ -10,9 +10,10 @@
 --   2. payments.tip_refunded_cents: the GRATUITY part of refunded_cents. Tip
 --      refunds are tracked separately from food refunds (who absorbs them is not
 --      decided; it is only recorded). Backfilled with the legacy rule: refunds
---      came off the tip first (least(refunded, tip)), so nothing that was
---      already reported moves. A writer that bypasses the reservation functions
---      gets the same legacy rule from a BEFORE UPDATE trigger.
+--      Backfilled tip LAST (greatest(refunded - amount, 0) capped at the tip),
+--      matching the owner reports in production. A writer that bypasses the
+--      reservation functions gets the old tip-first rule from a BEFORE UPDATE
+--      trigger (what core_trg_payments' tip events always assumed).
 --   3. reserve_payment_refund gains p_tip_amount (the tip part of the refund;
 --      NULL = legacy tip-first). Base and tip are capped separately, under the
 --      row lock. Every refunds[] entry records its `tip_cents`.
@@ -53,9 +54,11 @@ set local lock_timeout = '3s';
 alter table public.payments
   add column if not exists tip_refunded_cents integer not null default 0;
 
+-- Backfill: tip LAST (only what was refunded beyond the base is tip), the rule
+-- the owner reports already in production read refunds with.
 update public.payments
-   set tip_refunded_cents = least(refunded_cents, tip_cents)
- where tip_refunded_cents = 0 and refunded_cents > 0 and tip_cents > 0;
+   set tip_refunded_cents = least(greatest(refunded_cents - amount_cents, 0), tip_cents)
+ where tip_refunded_cents = 0 and refunded_cents > amount_cents and tip_cents > 0;
 
 alter table public.payments drop constraint if exists payments_tip_refunded_bounds;
 alter table public.payments add constraint payments_tip_refunded_bounds
@@ -91,6 +94,8 @@ create trigger payments_tip_refund_split
 
 -- ---- 3. refund reservation with an explicit tip part ------------------------
 drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text);
+drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text, integer);
+drop function if exists public.release_payment_refund(uuid, integer, text);
 
 create or replace function public.reserve_payment_refund(
   p_payment_id uuid,
@@ -98,7 +103,9 @@ create or replace function public.reserve_payment_refund(
   p_refund_id text,
   p_processor_ref text default null,
   p_reason text default null,
-  p_tip_amount integer default null
+  p_tip_amount integer default null,
+  -- Card refunds: reserved BEFORE Stripe is called, confirmed after.
+  p_pending boolean default false
 ) returns jsonb
 language plpgsql
 as $$
@@ -140,7 +147,9 @@ begin
            'at', to_jsonb(now()),
            'processor_ref', p_processor_ref,
            'reason', p_reason,
-           'request_id', p_refund_id
+           'request_id', p_refund_id,
+           'state', case when coalesce(p_pending, false) then 'pending' else 'succeeded' end,
+           'status_before', r.status::text
          )),
          status = case
            when p.refunded_cents + p_amount >= p.amount_cents + p.tip_cents
@@ -156,24 +165,69 @@ begin
 end;
 $$;
 
--- Undo a reservation whose rail call failed (or a refund Stripe later failed):
--- drops its refunds[] entry (the one reserved under p_refund_id, else the latest
--- of that amount) and gives its tip part back.
+-- A pending card refund that Stripe accepted: mark it succeeded + its re_ id.
+create or replace function public.confirm_payment_refund(
+  p_payment_id uuid,
+  p_refund_id text,
+  p_processor_ref text
+) returns jsonb
+language plpgsql
+as $$
+declare
+  r public.payments;
+  v_idx bigint;
+begin
+  select * into r from public.payments where id = p_payment_id for update;
+  if not found then
+    return null;
+  end if;
+  select t.o into v_idx
+    from jsonb_array_elements(r.refunds) with ordinality as t(e, o)
+   where t.e ->> 'request_id' = p_refund_id
+   limit 1;
+  if v_idx is null then
+    return null;
+  end if;
+  update public.payments p
+     set refunds = (
+           select jsonb_agg(
+                    case when t.o = v_idx
+                         then t.e || jsonb_build_object(
+                                'state', 'succeeded',
+                                'processor_ref', coalesce(p_processor_ref, t.e ->> 'processor_ref'))
+                         else t.e end
+                    order by t.o)
+             from jsonb_array_elements(p.refunds) with ordinality as t(e, o)),
+         updated_at = now()
+   where p.id = p_payment_id
+  returning * into r;
+  return to_jsonb(r);
+end;
+$$;
+
+-- Undo a reservation (the rail call failed, or Stripe later failed the refund):
+-- drops the refunds[] entry reserved under p_refund_id (required), gives its
+-- base and tip part back and restores the tender status it had before.
+-- p_tombstone keeps p_refund_id in refund_ids so the failed refund's
+-- idempotency key is never reused (Stripe would replay the failed refund).
 create or replace function public.release_payment_refund(
   p_payment_id uuid,
   p_amount integer,
-  p_refund_id text
+  p_refund_id text,
+  p_tombstone boolean default false
 ) returns void
 language plpgsql
 as $$
 declare
   v_idx bigint;
   v_entry jsonb;
+  v_amount integer;
   v_tip integer;
   r public.payments;
 begin
-  -- Lock the row first so concurrent releases serialize and each computes its
-  -- index against the other's result.
+  if p_refund_id is null then
+    raise exception 'release_payment_refund: a refund id is required';
+  end if;
   select * into r from public.payments where id = p_payment_id for update;
   if not found then
     return;
@@ -181,37 +235,38 @@ begin
 
   select t.o, t.e into v_idx, v_entry
     from jsonb_array_elements(r.refunds) with ordinality as t(e, o)
-   where (p_refund_id is not null and t.e ->> 'request_id' = p_refund_id)
-      or (p_refund_id is null and (t.e ->> 'amount_cents')::integer = p_amount)
+   where t.e ->> 'request_id' = p_refund_id
    order by t.o desc
    limit 1;
-
+  if v_idx is null then
+    return;
+  end if;
+  v_amount := coalesce((v_entry ->> 'amount_cents')::integer, p_amount);
   v_tip := case
-    when v_entry is not null and (v_entry ->> 'tip_cents') ~ '^[0-9]{1,9}$'
-      then (v_entry ->> 'tip_cents')::integer
-    else least(p_amount, r.tip_refunded_cents)
+    when (v_entry ->> 'tip_cents') ~ '^[0-9]{1,9}$' then (v_entry ->> 'tip_cents')::integer
+    else least(v_amount, r.tip_refunded_cents)
   end;
 
   perform set_config('pos.refund_split', 'explicit', true);
   update public.payments p
-     set refunded_cents = greatest(0, p.refunded_cents - p_amount),
+     set refunded_cents = greatest(0, p.refunded_cents - v_amount),
          tip_refunded_cents = greatest(0, least(
            p.tip_refunded_cents - v_tip,
-           greatest(0, p.refunded_cents - p_amount))),
+           greatest(0, p.refunded_cents - v_amount))),
          refund_ids = case
-           when p_refund_id is null then p.refund_ids
+           when coalesce(p_tombstone, false) then p.refund_ids
            else array_remove(p.refund_ids, p_refund_id)
          end,
-         refunds = case
-           when v_idx is null then p.refunds
-           else coalesce((
-             select jsonb_agg(t.e order by t.o)
-               from jsonb_array_elements(p.refunds) with ordinality as t(e, o)
-              where t.o <> v_idx
-           ), '[]'::jsonb)
-         end,
+         refunds = coalesce((
+           select jsonb_agg(t.e order by t.o)
+             from jsonb_array_elements(p.refunds) with ordinality as t(e, o)
+            where t.o <> v_idx
+         ), '[]'::jsonb),
          status = case
-           when p.status = 'refunded' then 'captured'::public.payment_status
+           when p.status = 'refunded' then
+             case when v_entry ->> 'status_before' = 'authorized'
+                  then 'authorized'::public.payment_status
+                  else 'captured'::public.payment_status end
            else p.status
          end,
          updated_at = now()
@@ -219,9 +274,11 @@ begin
 end;
 $$;
 
-revoke all on function public.reserve_payment_refund(uuid, integer, text, text, text, integer)
+revoke all on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean)
   from public, anon, authenticated;
-revoke all on function public.release_payment_refund(uuid, integer, text)
+revoke all on function public.confirm_payment_refund(uuid, text, text)
+  from public, anon, authenticated;
+revoke all on function public.release_payment_refund(uuid, integer, text, boolean)
   from public, anon, authenticated;
 
 -- ---- 4. comps / discounts on the order; approval thresholds ------------------
@@ -361,6 +418,56 @@ begin
 end;
 $$;
 
+-- Resume a FAILED item refund under its own id: take its units again under the
+-- order row lock (exceeds when another refund took them meanwhile).
+create or replace function public.reopen_order_refund(p_order_id uuid, p_id text)
+returns jsonb
+language plpgsql
+as $$
+declare
+  v_order public.orders;
+  r public.order_adjustments;
+  v_line jsonb;
+  v_item public.order_items;
+  v_used integer;
+  v_avail integer;
+begin
+  select * into v_order from public.orders where id = p_order_id for update;
+  if not found then
+    return jsonb_build_object('outcome', 'not_found');
+  end if;
+  select * into r from public.order_adjustments where order_id = p_order_id and id = p_id;
+  if not found then
+    return jsonb_build_object('outcome', 'not_found');
+  end if;
+  if r.status <> 'failed' then
+    return jsonb_build_object('outcome', 'duplicate', 'record', to_jsonb(r));
+  end if;
+  for v_line in select e from jsonb_array_elements(r.lines) e loop
+    select * into v_item from public.order_items
+     where order_id = p_order_id and id::text = v_line ->> 'line_id';
+    if not found or v_item.voided then
+      v_avail := 0;
+    else
+      select coalesce(sum((l ->> 'quantity')::integer), 0) into v_used
+        from public.order_adjustments a, jsonb_array_elements(a.lines) l
+       where a.order_id = p_order_id and a.kind = 'refund' and a.status <> 'failed'
+         and l ->> 'line_id' = v_line ->> 'line_id';
+      v_avail := greatest(0, v_item.quantity - v_used);
+    end if;
+    if (v_line ->> 'quantity')::integer > v_avail then
+      return jsonb_build_object('outcome', 'exceeds', 'line_id', v_line ->> 'line_id',
+                                'available', v_avail);
+    end if;
+  end loop;
+  update public.order_adjustments
+     set status = 'pending', updated_at = now()
+   where order_id = p_order_id and id = p_id
+  returning * into r;
+  return jsonb_build_object('outcome', 'ok', 'record', to_jsonb(r));
+end;
+$$;
+
 create or replace function public.finish_order_adjustment(
   p_order_id uuid,
   p_id text,
@@ -422,6 +529,21 @@ begin
   if v_order.status::text not in
      ('draft', 'placed', 'paid', 'in_kitchen', 'ready', 'recall', 'out_for_delivery', 'completed') then
     return jsonb_build_object('outcome', 'invalid_state', 'reason', 'order is ' || v_order.status::text);
+  end if;
+
+  -- Marketplace orders and stored-value (gift card) sales are not re-priced or
+  -- voided here.
+  if coalesce(v_order.source ->> 'channel', '') = 'marketplace'
+     or coalesce(v_order.channel::text, '') = 'marketplace'
+     or coalesce(v_order.core_ext ? 'stored_value', false) then
+    return jsonb_build_object('outcome', 'invalid_state', 'reason', 'not_adjustable');
+  end if;
+  -- Once money went back, the price is settled history: no comp / discount /
+  -- line void (a whole-order void is still allowed).
+  if not v_void_order and exists (
+       select 1 from public.payments p
+        where p.order_id = v_order.id and p.refunded_cents > 0) then
+    return jsonb_build_object('outcome', 'invalid_state', 'reason', 'refund_exists');
   end if;
 
   if v_void_order then
@@ -521,12 +643,15 @@ revoke all on function public.begin_order_refund(jsonb) from public, anon, authe
 revoke all on function public.finish_order_adjustment(uuid, text, text, jsonb, jsonb)
   from public, anon, authenticated;
 revoke all on function public.apply_order_edit(jsonb) from public, anon, authenticated;
+revoke all on function public.reopen_order_refund(uuid, text) from public, anon, authenticated;
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant execute on function public.reserve_payment_refund(uuid, integer, text, text, text, integer)
+    grant execute on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean)
       to service_role;
-    grant execute on function public.release_payment_refund(uuid, integer, text) to service_role;
+    grant execute on function public.confirm_payment_refund(uuid, text, text) to service_role;
+    grant execute on function public.release_payment_refund(uuid, integer, text, boolean) to service_role;
+    grant execute on function public.reopen_order_refund(uuid, text) to service_role;
     grant execute on function public.order_adjustment_insert(jsonb, text) to service_role;
     grant execute on function public.begin_order_refund(jsonb) to service_role;
     grant execute on function public.finish_order_adjustment(uuid, text, text, jsonb, jsonb)

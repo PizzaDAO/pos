@@ -316,10 +316,18 @@ export const stripeOnlineRail: PaymentRail = {
         idempotencyKey: req.context.idempotencyKey,
       },
     );
+    // A replayed idempotency key returns the ORIGINAL refund, which may have
+    // failed since: say so, never report it as a refund in progress.
     return {
       refundId: refund.id,
-      status: refund.status === "succeeded" ? "refunded" : "pending",
+      status:
+        refund.status === "succeeded"
+          ? "refunded"
+          : refund.status === "failed" || refund.status === "canceled"
+            ? "failed"
+            : "pending",
       amount,
+      providerStatus: refund.status,
     };
   },
 

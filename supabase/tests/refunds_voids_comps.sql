@@ -69,6 +69,31 @@ begin
     raise exception 'release kept the tip part (% / %)', pay.refunded_cents, pay.tip_refunded_cents;
   end if;
 
+  -- pending card reservation -> confirm; tombstone release never frees the id
+  out := public.reserve_payment_refund(p1, 100, 'r-card-1', null, 'x', 0, true);
+  select * into pay from public.payments where id = p1;
+  if (select e ->> 'state' from jsonb_array_elements(pay.refunds) e where e ->> 'request_id' = 'r-card-1') <> 'pending' then
+    raise exception 'card reservation not pending';
+  end if;
+  out := public.confirm_payment_refund(p1, 'r-card-1', 're_card_1');
+  if (select e ->> 'state' from jsonb_array_elements((out -> 'refunds')) e where e ->> 'request_id' = 'r-card-1') <> 'succeeded'
+     or (select e ->> 'processor_ref' from jsonb_array_elements((out -> 'refunds')) e where e ->> 'request_id' = 'r-card-1') <> 're_card_1' then
+    raise exception 'confirm did not mark succeeded: %', out;
+  end if;
+  perform public.release_payment_refund(p1, 100, 'r-card-1', true);
+  select * into pay from public.payments where id = p1;
+  if pay.refunded_cents <> 500 or not ('r-card-1' = any (pay.refund_ids)) then
+    raise exception 'tombstone release wrong (% / %)', pay.refunded_cents, pay.refund_ids;
+  end if;
+  out := public.reserve_payment_refund(p1, 100, 'r-card-1', null, null, 0, true);
+  if out ->> 'outcome' <> 'duplicate' then raise exception 'tombstoned id reused: %', out; end if;
+  begin
+    perform public.release_payment_refund(p1, 100, null);
+    raise exception 'release without an id was accepted';
+  exception when others then
+    if sqlerrm not like '%refund id is required%' then raise; end if;
+  end;
+
   -- legacy (no tip part): tip first
   out := public.reserve_payment_refund(p1, 600, 'r-legacy', null, null, null);
   select * into pay from public.payments where id = p1;
@@ -76,10 +101,15 @@ begin
     raise exception 'legacy split wrong (% / %)', pay.refunded_cents, pay.tip_refunded_cents;
   end if;
 
-  -- full refund flips to refunded
+  -- full refund flips to refunded; its release restores the prior status
   out := public.reserve_payment_refund(p1, 1300, 'r-rest', null, null, 0);
   select * into pay from public.payments where id = p1;
   if pay.status <> 'refunded' then raise exception 'not refunded after the rest: %', pay.status; end if;
+  perform public.release_payment_refund(p1, 1300, 'r-rest');
+  if (select status::text from public.payments where id = p1) <> 'captured' then
+    raise exception 'release did not restore captured';
+  end if;
+  out := public.reserve_payment_refund(p1, 1300, 'r-rest-2', null, null, 0);
 
   -- ---- item refund quantities --------------------------------------------------
   out := public.begin_order_refund(jsonb_build_object(
@@ -101,15 +131,22 @@ begin
     'kind', 'refund', 'amount_cents', 1000, 'lines', '[]'::jsonb,
     'reason_code', 'quality', 'actor_user_id', 'u1'));
   if out ->> 'outcome' <> 'duplicate' then raise exception 'retry not duplicate: %', out; end if;
-  -- a failed refund gives its units back
+  -- a failed refund gives its units back; it can be reopened while they are free
   out := public.finish_order_adjustment(o1, 'req-item-0001', 'failed', '[]'::jsonb, '{"error":"x"}'::jsonb);
   if out ->> 'status' <> 'failed' then raise exception 'finish did not update: %', out; end if;
+  out := public.reopen_order_refund(o1, 'req-item-0001');
+  if out ->> 'outcome' <> 'ok' or out -> 'record' ->> 'status' <> 'pending' then
+    raise exception 'reopen failed: %', out;
+  end if;
+  out := public.finish_order_adjustment(o1, 'req-item-0001', 'failed', '[]'::jsonb, null);
   out := public.begin_order_refund(jsonb_build_object(
     'id', 'req-item-0003', 'order_id', o1, 'tenant_id', t, 'location_id', loc,
     'kind', 'refund', 'amount_cents', 2000,
     'lines', jsonb_build_array(jsonb_build_object('line_id', l1, 'quantity', 2, 'amount_cents', 2000)),
     'reason_code', 'quality', 'actor_user_id', 'u2'));
   if out ->> 'outcome' <> 'ok' then raise exception 'units of a failed refund not released: %', out; end if;
+  out := public.reopen_order_refund(o1, 'req-item-0001');
+  if out ->> 'outcome' <> 'exceeds' then raise exception 'reopen took units another refund holds: %', out; end if;
 
   -- ---- apply_order_edit ----------------------------------------------------------
   select version into v from public.orders where id = o2;
@@ -151,6 +188,18 @@ begin
     'record', jsonb_build_object('id', 'edit-split-01')));
   if out ->> 'outcome' <> 'duplicate' then raise exception 'edit replay not duplicate: %', out; end if;
 
+  -- marketplace / stored value -> not adjustable
+  update public.orders set core_ext = '{"stored_value":true}'::jsonb where id = o2;
+  out := public.apply_order_edit(jsonb_build_object(
+    'orderId', o2, 'tenantId', t, 'expectVersion', v + 2, 'voidOrder', false,
+    'totals', '{"total_cents":2000,"tip_cents":0}'::jsonb,
+    'record', jsonb_build_object('id', 'edit-sv-0001', 'order_id', o2, 'tenant_id', t,
+      'location_id', loc, 'kind', 'discount', 'reason_code', 'promotion', 'actor_user_id', 'u1')));
+  if out ->> 'reason' <> 'not_adjustable' then raise exception 'stored value edited: %', out; end if;
+  update public.orders set core_ext = null where id = o2;
+  select version into v from public.orders where id = o2;
+  v := v - 1;
+
   -- paid more than the new due -> refused
   insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated)
   values (pc, o2, t, loc, 'cash', 'captured', 1500, 0, 'USD', false);
@@ -165,6 +214,18 @@ begin
   if out ->> 'outcome' <> 'invalid_state' or out ->> 'reason' <> 'paid_exceeds' then
     raise exception 'discount below the paid amount allowed: %', out;
   end if;
+  -- a refund on the order -> no more comps / discounts
+  update public.payments set refunded_cents = 100 where id = pc;
+  out := public.apply_order_edit(jsonb_build_object(
+    'orderId', o2, 'tenantId', t, 'expectVersion', v + 1,
+    'voidLineIds', '[]'::jsonb, 'splits', '[]'::jsonb,
+    'totals', '{"total_cents":1900,"tip_cents":0}'::jsonb, 'discountCents', 100,
+    'adjustments', '[]'::jsonb, 'voidOrder', false,
+    'record', jsonb_build_object('id', 'edit-disc-002', 'order_id', o2, 'tenant_id', t,
+      'location_id', loc, 'kind', 'discount', 'reason_code', 'promotion', 'actor_user_id', 'u1')));
+  if out ->> 'reason' <> 'refund_exists' then raise exception 'comp after a refund allowed: %', out; end if;
+  update public.payments set refunded_cents = 0 where id = pc;
+
   -- void with captured money -> refused
   out := public.apply_order_edit(jsonb_build_object(
     'orderId', o2, 'tenantId', t, 'expectVersion', v + 1, 'voidOrder', true,

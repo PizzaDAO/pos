@@ -9,7 +9,13 @@
  *   paymentId?,                      // only this tender (default: card, then cash, ...)
  *   reasonCode, reasonText?,         // required (see src/lib/adjustments/reasons.ts)
  *   approval?: { staffId, pin },     // manager PIN above the location threshold
+ *   cancel?: true,                   // give up on an unfinished request (requestId)
  * }
+ *
+ * Resuming: resend the SAME requestId (any body): a pending / partial / failed
+ * request finishes what is left, never moving money twice. `cancel: true`
+ * closes one that is stuck so its item units are released (refused while a
+ * card refund of it may still be in flight at Stripe).
  *
  * Owner | manager | cashier (the ACTIVE staff member's role); above the
  * location's refund threshold a non-manager needs `approval` (403
@@ -22,7 +28,7 @@
 import { NextResponse } from "next/server";
 import { isUuid } from "@/lib/security";
 import { optCents, parseLineSelections, prepareAction, respond } from "@/lib/adjustments/route";
-import { refundOrder } from "@/lib/adjustments/service";
+import { cancelRefundRequest, refundOrder } from "@/lib/adjustments/service";
 
 export const runtime = "nodejs";
 
@@ -31,6 +37,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
   const prepared = await prepareAction(request, id, "refund");
   if (!prepared.ok) return prepared.res;
   const { body, input } = prepared.action;
+  if (body.cancel === true) return respond(await cancelRefundRequest(input));
 
   const lines =
     body.lines === undefined ? undefined : parseLineSelections(body.lines, { quantityRequired: true });

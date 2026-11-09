@@ -67,3 +67,52 @@ export function orderRefundTotals(payments: Payment[]): {
   }
   return { refundedCents, tipRefundedCents: tip };
 }
+
+/** Base money ever SETTLED on these tenders: captured / authorized, plus tenders since refunded. */
+export function grossSettledBase(payments: readonly Payment[]): number {
+  return payments
+    .filter((p) => p.status === "captured" || p.status === "authorized" || p.status === "refunded")
+    .reduce((n, p) => n + p.amount_cents, 0);
+}
+
+/**
+ * Do REFUNDED tenders still count toward the amount due? Only when the order was
+ * paid in full (live + refunded settled money reached the amount due): a refund
+ * after the sale never re-opens the balance (no second charge). On an order that
+ * was never paid in full a refunded tender is money given back, not money owed:
+ * it does not count (split $100: A $30 refunded, B $30 live => $70 due).
+ */
+export function refundedTendersCover(payments: readonly Payment[], dueCents: number): boolean {
+  return grossSettledBase(payments) >= dueCents;
+}
+
+/**
+ * Base money covering the amount due: pending (crypto confirming), authorized,
+ * captured, and refunded tenders when `refundedTendersCover`. Shared by the
+ * balance, the receipt and the paid check, so they always agree.
+ */
+export function coveringBaseCents(payments: readonly Payment[], dueCents: number): number {
+  const withRefunded = refundedTendersCover(payments, dueCents);
+  return payments
+    .filter(
+      (p) =>
+        p.status === "pending" ||
+        p.status === "authorized" ||
+        p.status === "captured" ||
+        (withRefunded && p.status === "refunded"),
+    )
+    .reduce((n, p) => n + p.amount_cents, 0);
+}
+
+/** Settled base money (pending excluded) under the same rule: the "paid" check. */
+export function settledBaseCents(payments: readonly Payment[], dueCents: number): number {
+  const withRefunded = refundedTendersCover(payments, dueCents);
+  return payments
+    .filter(
+      (p) =>
+        p.status === "authorized" ||
+        p.status === "captured" ||
+        (withRefunded && p.status === "refunded"),
+    )
+    .reduce((n, p) => n + p.amount_cents, 0);
+}

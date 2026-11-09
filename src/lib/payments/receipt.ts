@@ -8,7 +8,12 @@
  */
 import type { Order, OrderItem, Payment } from "@/lib/db";
 import { tenderRailLabel } from "./registry";
-import { isFullyRefunded, liveTenders, tipRefundedCents } from "./refund-state";
+import {
+  coveringBaseCents,
+  isFullyRefunded,
+  liveTenders,
+  tipRefundedCents,
+} from "./refund-state";
 import { currentAdjustments, foodDueCents } from "@/lib/adjustments/math";
 
 export interface ReceiptLine {
@@ -146,14 +151,9 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
     (sum, p) => sum + p.application_fee_cents,
     0,
   );
-  // Same rule as the payments service: a refunded tender still covers the
-  // order (a refund never re-opens the balance; requires_action never covers).
-  const coveredCents = payments
-    .filter(
-      (p) =>
-        p.status !== "failed" && p.status !== "canceled" && p.status !== "requires_action",
-    )
-    .reduce((sum, p) => sum + p.amount_cents, 0);
+  // Same rule as the payments service (refund-state.ts coveringBaseCents): a
+  // refund after the order was paid in full never re-opens the balance.
+  const coveredCents = coveringBaseCents(payments, foodDueCents(order));
 
   const tenders: ReceiptTender[] = payments.map((p) => ({
     rail: p.rail,

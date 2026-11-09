@@ -31,13 +31,21 @@ import { finalizeOnlinePayment } from "@/lib/shop/finalize";
 import { deriveTenderId } from "./ids";
 import {
   baseRefundedCents,
+  coveringBaseCents,
+  grossSettledBase,
   isFullyRefunded,
   refundableParts,
-  tipRefundedCents,
+  refundedTendersCover,
+  settledBaseCents,
 } from "./refund-state";
 import type { PaymentRailKey } from "./PaymentRail";
 import { requirePaymentRail } from "./registry";
-import { mapIntentStatus, stripeGet, stripeRequest } from "./providers/stripe-client";
+import {
+  mapIntentStatus,
+  StripeError,
+  stripeGet,
+  stripeRequest,
+} from "./providers/stripe-client";
 import { cancelReaderActionForIntent } from "./providers/stripe-terminal-api";
 import { railChargesApplicationFee } from "./fees";
 import { expireCheckoutSession, getCheckoutSession } from "./rails/stripe-online";
@@ -107,35 +115,38 @@ export function orderDueCents(order: Order): number {
 }
 
 /**
- * Tenders that cover the balance: pending, authorized, captured or REFUNDED —
- * INCLUDING pending crypto, so the cashier isn't asked to collect twice while it
- * confirms. A refund (full or partial) is money given back AFTER the sale: it
- * never re-opens the balance, or a fully refunded tender next to a live one (or
- * a refunded order with an earlier declined card) would show "Balance due" and
- * invite a second charge. To collect again, staff ring a new order.
- * `requires_action` (an intent nobody has paid yet), failed and canceled tenders
- * do NOT cover. (The order is only marked `paid` once tenders SETTLE — see
- * `settledCents`.)
+ * Tenders that cover the balance: pending, authorized, captured -- INCLUDING
+ * pending crypto, so the cashier isn't asked to collect twice while it
+ * confirms -- and REFUNDED tenders when the order was paid in full (a refund
+ * after the sale never re-opens the balance or invites a second charge; to
+ * collect again, staff ring a new order). On an order never paid in full a
+ * refunded tender was given back and does not count. `requires_action`,
+ * failed and canceled tenders never cover. See refund-state.ts.
  */
-function coveredTenders(payments: Payment[]): Payment[] {
+function coveredTenders(payments: Payment[], dueCents: number): Payment[] {
+  const withRefunded = refundedTendersCover(payments, dueCents);
   return payments.filter(
     (p) =>
       p.status === "pending" ||
       p.status === "authorized" ||
       p.status === "captured" ||
-      p.status === "refunded",
+      (withRefunded && p.status === "refunded"),
   );
 }
 
-function coveredCents(payments: Payment[]): number {
-  return coveredTenders(payments).reduce((sum, p) => sum + p.amount_cents, 0);
+function coveredCents(payments: Payment[], dueCents: number): number {
+  return coveringBaseCents(payments, dueCents);
 }
 
-/** Sum of base amounts covered by SETTLED tenders (captured/authorized). */
-function settledCents(payments: Payment[]): number {
-  return payments
-    .filter((p) => p.status === "captured" || p.status === "authorized")
-    .reduce((sum, p) => sum + p.amount_cents, 0);
+/** Settled base money under the same rule (the order is `paid` once it covers the due). */
+function settledCents(payments: Payment[], dueCents: number): number {
+  return settledBaseCents(payments, dueCents);
+}
+
+/** Base money ever settled on the order (live + refunded tenders), in its currency. */
+export function grossSettledCents(payments: Payment[], currency: string): number {
+  const cur = currency.toUpperCase();
+  return grossSettledBase(payments.filter((p) => p.currency.toUpperCase() === cur));
 }
 
 /**
@@ -158,7 +169,8 @@ export function orderBalanceFromPayments(
 ): number {
   const cur = order.currency.toUpperCase();
   const payments = all.filter((p) => p.currency.toUpperCase() === cur);
-  return Math.max(0, orderDueCents(order) - coveredCents(payments));
+  const due = orderDueCents(order);
+  return Math.max(0, due - coveredCents(payments, due));
 }
 
 /** Remaining unpaid balance on an order, in cents (never negative). */
@@ -176,7 +188,7 @@ export async function deriveOnlineTender(
   order: Order,
 ): Promise<{ amountCents: number; tipCents: number }> {
   const payments = await listOrderCurrencyPayments(order);
-  const covering = coveredTenders(payments);
+  const covering = coveredTenders(payments, orderDueCents(order));
   const amountCents = Math.max(
     0,
     orderDueCents(order) - covering.reduce((n, p) => n + p.amount_cents, 0),
@@ -683,7 +695,7 @@ async function closeSiblingsOfSettledOrder(settled: Payment): Promise<void> {
   const order = await driver.getOrder(settled.order_id);
   if (!order) return;
   const payments = await listOrderCurrencyPayments(order);
-  if (settledCents(payments) < orderDueCents(order)) return;
+  if (settledCents(payments, orderDueCents(order)) < orderDueCents(order)) return;
   for (const o of payments) {
     if (o.id === settled.id) continue;
     if (o.status !== "requires_action" && o.status !== "pending") continue;
@@ -933,17 +945,71 @@ function isCardRail(rail: Payment["rail"]): boolean {
 }
 
 /**
- * Refund a tender (full or partial). The local bookkeeping (refunded_cents,
- * refund-id append, over-refund cap) is ATOMIC in the driver
- * (`reservePaymentRefund`), so concurrent refunds never lose an update.
+ * The provider REFUSED a refund for sure (a 4xx answer other than an
+ * idempotency conflict or a rate limit): no money moved, so the reservation can
+ * be released. Anything else (network error, 5xx, 409/429, an unknown error)
+ * may or may not have moved money: the reservation stays `pending` and a retry
+ * under the same refund id asks the provider again with the same key.
+ */
+export function isDefiniteRefundFailure(err: unknown): boolean {
+  return (
+    err instanceof StripeError &&
+    err.status >= 400 &&
+    err.status < 500 &&
+    err.status !== 409 &&
+    err.status !== 429
+  );
+}
+
+/** A card refund is reserved and its provider outcome is not known yet (retry to finish). */
+export class RefundPendingError extends Error {
+  constructor(message = "The refund is still in progress at the card processor: retry to finish it.") {
+    super(message);
+    this.name = "RefundPendingError";
+  }
+}
+
+/** The provider refused or failed the refund (nothing was recorded). */
+export class RefundRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RefundRejectedError";
+  }
+}
+
+type RefundOutcome = Payment & {
+  replayed?: boolean;
+  refundedNowCents?: number;
+  /** The tip part of what was refunded now. */
+  tipRefundedNowCents?: number;
+  /** Provider refund id (Stripe re_...) of this refund, when there is one. */
+  processorRef?: string | null;
+  /**
+   * True when the rail only RECORDS the refund (crypto): no money moved, staff
+   * must send it back themselves. Callers must say so, never "refunded".
+   */
+  manualRefund?: boolean;
+};
+
+/**
+ * Refund a tender (full or partial). The bookkeeping (refunded_cents, the
+ * separate base and tip caps, the refund-id append) is ATOMIC in the driver
+ * (`reservePaymentRefund`), so concurrent refunds never lose an update or
+ * overshoot a cap.
  *
- *  - cash / crypto: nothing external caps the money, so RESERVE first, then call
- *    the rail; if the rail fails the reservation is released.
- *  - card: Stripe caps the money (and dedupes on the idempotency key), so call
- *    the rail first, then record atomically. (Reserving first would turn a crash
- *    between reserve and the Stripe call into a refund recorded but never made.)
+ * The money is ALWAYS reserved first, then the rail is called:
+ *  - cash / crypto: if the rail call fails the reservation is released.
+ *  - card: reserved as `pending` (it already holds its share of the caps, so
+ *    two tills refunding one card at once are serialized by the reservation),
+ *    then Stripe is called with the reserved amount and an idempotency key
+ *    derived from `refundId`, then the entry is confirmed. A definite refusal
+ *    (or a refund Stripe reports failed / canceled) releases it with a
+ *    tombstone, so the key is never reused; an unknown outcome leaves it
+ *    `pending` and a retry under the same `refundId` asks Stripe again with
+ *    the same key (Stripe replays the original result: no second refund).
  *
- * Returns `replayed: true` (and writes nothing) for a repeated `refundId`.
+ * Returns `replayed: true` (and moves nothing) for a refund id that is already
+ * done (or was released).
  */
 export async function refundPayment(input: {
   paymentId: string;
@@ -952,7 +1018,8 @@ export async function refundPayment(input: {
   /**
    * Client-minted id for THIS refund request. A retry with the same id is
    * idempotent (same Stripe key, and never applied to the tender twice), while a
-   * new id is a new refund, so repeated partial refunds work.
+   * new id is a new refund, so repeated partial refunds work. Minted here when
+   * absent (such a call is not retry-safe).
    */
   refundId?: string;
   /**
@@ -963,22 +1030,7 @@ export async function refundPayment(input: {
   tipCents?: number;
   /** Provider correlation (Stripe refund metadata). */
   metadata?: Record<string, string>;
-}): Promise<
-  | (Payment & {
-      replayed?: boolean;
-      refundedNowCents?: number;
-      /** The tip part of what was refunded now. */
-      tipRefundedNowCents?: number;
-      /** Provider refund id (Stripe re_...) of this refund, when there is one. */
-      processorRef?: string | null;
-      /**
-       * True when the rail only RECORDS the refund (crypto): no money moved, staff
-       * must send it back themselves. Callers must say so, never "refunded".
-       */
-      manualRefund?: boolean;
-    })
-  | null
-> {
+}): Promise<RefundOutcome | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(input.paymentId);
   if (!payment) return null;
@@ -988,13 +1040,86 @@ export async function refundPayment(input: {
   // beats pretending (and an unrecoverable local-only "refund").
   if (payment.rail === "external") throw new ExternalRefundUnsupportedError();
 
-  const total = payment.amount_cents + payment.tip_cents;
-  const refundId = input.refundId ?? null;
-  if (refundId && (payment.refund_ids ?? []).includes(refundId)) {
+  const rail = requirePaymentRail(payment.rail);
+  const card = isCardRail(payment.rail);
+  const refundId = input.refundId ?? `auto-${globalThis.crypto.randomUUID()}`;
+
+  const callRail = (amountCents: number, tipCents: number) =>
+    rail.refund({
+      context: {
+        tenantId: payment.tenant_id,
+        locationId: payment.location_id,
+        connectAccountId: payment.connect_account_id,
+        // One key per refund id: a retry is the SAME refund at Stripe.
+        idempotencyKey: `refund_${payment.id}_${refundId}`,
+      },
+      chargeId: payment.charge_id ?? payment.id,
+      amount: { amount: amountCents, currency: payment.currency },
+      reason: input.reason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        order_id: payment.order_id,
+        payment_id: payment.id,
+        ...(tipCents ? { tip_cents: String(tipCents) } : {}),
+      },
+    });
+
+  /** Card: ask Stripe for a reserved refund, then confirm or release it. */
+  const settleCard = async (amountCents: number, tipCents: number): Promise<string | null> => {
+    let result;
+    try {
+      result = await callRail(amountCents, tipCents);
+    } catch (err) {
+      if (isDefiniteRefundFailure(err)) {
+        await driver.releasePaymentRefund(payment.id, amountCents, refundId, { tombstone: true });
+        throw err;
+      }
+      captureError(err, { scope: "refund-pending", paymentId: payment.id, refundId });
+      throw new RefundPendingError();
+    }
+    if (result.status === "failed" || result.status === "canceled") {
+      await driver.releasePaymentRefund(payment.id, amountCents, refundId, { tombstone: true });
+      throw new RefundRejectedError(
+        `The card processor did not refund it (${result.providerStatus ?? result.status}).`,
+      );
+    }
+    const ref = result.refundId ?? null;
+    // If this write fails the entry stays pending: a retry replays the same
+    // Stripe refund (same key) and confirms it. Never recorded twice.
+    await driver.confirmPaymentRefund(payment.id, refundId, ref);
+    return ref;
+  };
+
+  const finish = async (
+    updated: Payment,
+    amountCents: number,
+    tipCents: number,
+    processorRef: string | null,
+  ): Promise<RefundOutcome> => {
+    await maybeMarkOrderRefunded(payment.order_id);
+    const fresh = (await driver.getPayment(payment.id)) ?? updated;
+    return {
+      ...fresh,
+      refundedNowCents: amountCents,
+      tipRefundedNowCents: tipCents,
+      processorRef,
+      manualRefund: isManualRefundRail(payment.rail),
+    };
+  };
+
+  // A refund id seen before: finish it if its card refund is still pending,
+  // else it is done (or was released): replay.
+  if ((payment.refund_ids ?? []).includes(refundId)) {
+    const entry = (payment.refunds ?? []).find((r) => r.request_id === refundId);
+    if (card && entry?.state === "pending") {
+      const tip = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
+      const ref = await settleCard(entry.amount_cents, tip);
+      return finish(payment, entry.amount_cents, tip, ref);
+    }
     return { ...payment, replayed: true, refundedNowCents: 0, tipRefundedNowCents: 0 };
   }
 
-  const rail = requirePaymentRail(payment.rail);
+  const total = payment.amount_cents + payment.tip_cents;
   const refundAmount = input.amountCents ?? total - payment.refunded_cents;
   if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
     throw new RefundExceedsError();
@@ -1015,112 +1140,36 @@ export async function refundPayment(input: {
     }
   }
 
-  const callRail = () =>
-    rail.refund({
-      context: {
-        tenantId: payment.tenant_id,
-        locationId: payment.location_id,
-        connectAccountId: payment.connect_account_id,
-        // Unique per refund request. Without a client refundId fall back to a
-        // counter of what was already refunded + the amount (clients should
-        // send refundId).
-        idempotencyKey: refundId
-          ? `refund_${payment.id}_${refundId}`
-          : `refund_${payment.id}_${payment.refunded_cents}_${refundAmount}`,
-      },
-      chargeId: payment.charge_id ?? payment.id,
-      amount: { amount: refundAmount, currency: payment.currency },
-      reason: input.reason,
-      metadata: {
-        ...(input.metadata ?? {}),
-        order_id: payment.order_id,
-        payment_id: payment.id,
-        ...(tipPart ? { tip_cents: String(tipPart) } : {}),
-      },
-    });
-
-  let recorded: RefundReservation;
-  let processorRef: string | null = null;
-  if (isCardRail(payment.rail)) {
-    const railRefund = await callRail();
-    processorRef = railRefund?.refundId ?? null;
-    const meta = {
-      // Stripe's refund id (re_...) rides on the payment's refunds[] entry.
-      processorRef,
-      reason: input.reason ?? null,
-      tipCents: tipPart ?? null,
-    };
-    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, meta);
-    if (!recorded.ok && recorded.reason === "exceeds" && tipPart !== undefined) {
-      // Stripe already moved this money (it caps refunds at the charge, the
-      // same amount + tip cap as ours), but a concurrent refund on this tender
-      // took the base/tip room we split it into. The money MUST be recorded:
-      // record it with the legacy split (bounded by the same total cap) and alert.
-      captureError(new Error("card refund recorded with an adjusted tip/base split"), {
-        scope: "refund-split-adjusted",
-        paymentId: payment.id,
-        refundId,
-        amountCents: refundAmount,
-        tipCents: tipPart,
-      });
-      recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
-        ...meta,
-        tipCents: null,
-      });
-    }
-    if (!recorded.ok && recorded.reason === "exceeds") {
-      // Money left Stripe but no room to record it: never silent.
-      captureError(new Error("card refund succeeded at the provider but could not be recorded"), {
-        scope: "refund-unrecorded",
-        paymentId: payment.id,
-        refundId,
-        amountCents: refundAmount,
-        processorRef,
-      });
-    }
-  } else {
-    recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
-      reason: input.reason ?? null,
-      tipCents: tipPart ?? null,
-    });
-    if (recorded.ok) {
-      try {
-        const r = await callRail();
-        processorRef = r?.refundId ?? null;
-      } catch (err) {
-        await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
-        throw err;
-      }
-    }
-  }
-
+  const recorded: RefundReservation = await driver.reservePaymentRefund(
+    payment.id,
+    refundAmount,
+    refundId,
+    { reason: input.reason ?? null, tipCents: tipPart ?? null, pending: card },
+  );
   if (!recorded.ok) {
-    if (recorded.reason === "duplicate" && recorded.payment) {
-      return {
-        ...recorded.payment,
-        replayed: true,
-        refundedNowCents: 0,
-        tipRefundedNowCents: 0,
-      };
+    if (recorded.reason === "duplicate") {
+      // A concurrent call with the same id got there first: hand it over.
+      return refundPayment(input);
     }
     if (recorded.reason === "not_found") return null;
     throw new RefundExceedsError();
   }
-  const updated = recorded.payment;
-  const entry = (updated.refunds ?? []).find((r) => r.id === recorded.refundEntryId);
+  const entry = (recorded.payment.refunds ?? []).find((r) => r.id === recorded.refundEntryId);
+  const tipNow = typeof entry?.tip_cents === "number" ? entry.tip_cents : 0;
 
-  await maybeMarkOrderRefunded(payment.order_id);
-
-  return {
-    ...updated,
-    refundedNowCents: refundAmount,
-    tipRefundedNowCents:
-      typeof entry?.tip_cents === "number"
-        ? entry.tip_cents
-        : tipRefundedCents(updated) - tipRefundedCents(payment),
-    processorRef,
-    manualRefund: isManualRefundRail(payment.rail),
-  };
+  let processorRef: string | null = null;
+  if (card) {
+    processorRef = await settleCard(refundAmount, tipNow);
+  } else {
+    try {
+      const r = await callRail(refundAmount, tipNow);
+      processorRef = r?.refundId ?? null;
+    } catch (err) {
+      await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
+      throw err;
+    }
+  }
+  return finish(recorded.payment, refundAmount, tipNow, processorRef);
 }
 
 /**
@@ -1180,7 +1229,7 @@ async function maybeMarkOrderPaid(
     await flagLatePayment(order, payments);
     return;
   }
-  if (settledCents(payments) < orderDueCents(order)) return;
+  if (settledCents(payments, orderDueCents(order)) < orderDueCents(order)) return;
 
   if (
     order.status === "draft" &&

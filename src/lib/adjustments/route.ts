@@ -66,6 +66,7 @@ export async function prepareAction(
   }
   const policy = await loadPolicy(order.tenant_id, order.location_id);
   const tenantId = order.tenant_id;
+  const locationId = order.location_id;
   const actor = who.actor;
   return {
     ok: true,
@@ -80,6 +81,7 @@ export async function prepareAction(
         authorize: (kind, amountCents, opts) =>
           authorizeAdjustment({
             tenantId,
+            locationId,
             actor,
             policy,
             kind,

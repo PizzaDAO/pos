@@ -43,7 +43,6 @@ import type {
   ExternalTenderResult,
   ExternalTenderWrite,
   Payment,
-  PaymentRefund,
   PaymentSessionRow,
   AllergenPublicationRecord,
   AllergenRow,
@@ -325,24 +324,6 @@ function fireLines(order: Order, prev: OrderStatus, at: string): OrderItem[] {
   );
 }
 
-/** Remove the refunds[] entry of a released reservation (by request id, else the latest of that amount). */
-function dropReleasedRefund(
-  refunds: PaymentRefund[],
-  amountCents: number,
-  requestId: string | null,
-): PaymentRefund[] {
-  let idx = -1;
-  if (requestId) idx = refunds.findIndex((r) => r.request_id === requestId);
-  if (idx < 0) {
-    for (let i = refunds.length - 1; i >= 0; i--) {
-      if (refunds[i]!.amount_cents === amountCents) {
-        idx = i;
-        break;
-      }
-    }
-  }
-  return idx < 0 ? refunds : refunds.filter((_, i) => i !== idx);
-}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -1075,6 +1056,11 @@ export const mockDriver: PosDriver = {
       .map((r) => structuredClone(r));
   },
 
+  async listOrderAdjustmentsForOrders(orderIds: string[]): Promise<AdjustmentRecord[]> {
+    const wanted = new Set(orderIds);
+    return adjustmentRecords.filter((r) => wanted.has(r.order_id)).map((r) => structuredClone(r));
+  },
+
   // Mirrors begin_order_refund(): one synchronous block (no awaits), so it is
   // atomic in the single-threaded mock exactly as the SQL is under its lock.
   async beginOrderRefund(record: AdjustmentRecord): Promise<BeginRefundResult> {
@@ -1107,6 +1093,28 @@ export const mockDriver: PosDriver = {
     return { outcome: "ok", record: structuredClone(stored) };
   },
 
+  // Mirrors reopen_order_refund(): synchronous, atomic in the mock.
+  async reopenOrderRefund(orderId: string, id: string): Promise<BeginRefundResult> {
+    const order = orders.get(orderId);
+    const idx = adjustmentRecords.findIndex((r) => r.order_id === orderId && r.id === id);
+    if (!order || idx < 0) return { outcome: "not_found" };
+    const rec = adjustmentRecords[idx]!;
+    if (rec.status !== "failed") return { outcome: "duplicate", record: structuredClone(rec) };
+    for (const sel of rec.lines) {
+      const line = order.items.find((i) => i.id === sel.line_id);
+      const used = adjustmentRecords
+        .filter((r) => r.order_id === orderId && r.kind === "refund" && r.status !== "failed")
+        .flatMap((r) => r.lines)
+        .filter((l) => l.line_id === sel.line_id)
+        .reduce((n, l) => n + l.quantity, 0);
+      const available = line && !line.voided ? Math.max(0, line.quantity - used) : 0;
+      if (sel.quantity > available) return { outcome: "exceeds", line_id: sel.line_id, available };
+    }
+    const next: AdjustmentRecord = { ...rec, status: "pending", updated_at: nowIso() };
+    adjustmentRecords[idx] = next;
+    return { outcome: "ok", record: structuredClone(next) };
+  },
+
   async finishOrderAdjustment(orderId, id, patch): Promise<AdjustmentRecord | null> {
     const idx = adjustmentRecords.findIndex((r) => r.order_id === orderId && r.id === id);
     if (idx < 0) return null;
@@ -1137,6 +1145,17 @@ export const mockDriver: PosDriver = {
       return { outcome: "invalid_state", reason: `order is ${order.status}` };
     }
     const mine = [...payments.values()].filter((p) => p.order_id === order.id);
+    const ext = order.core_ext as Record<string, unknown> | null | undefined;
+    if (
+      (order.channel as string) === "marketplace" ||
+      order.source?.channel === "marketplace" ||
+      (ext && Object.prototype.hasOwnProperty.call(ext, "stored_value"))
+    ) {
+      return { outcome: "invalid_state", reason: "not_adjustable" };
+    }
+    if (!write.voidOrder && mine.some((p) => p.refunded_cents > 0)) {
+      return { outcome: "invalid_state", reason: "refund_exists" };
+    }
     if (write.voidOrder) {
       const inFlight = mine.some(
         (p) =>
@@ -1848,7 +1867,12 @@ export const mockDriver: PosDriver = {
     paymentId: string,
     amountCents: number,
     refundId: string | null,
-    meta?: { processorRef?: string | null; reason?: string | null; tipCents?: number | null },
+    meta?: {
+      processorRef?: string | null;
+      reason?: string | null;
+      tipCents?: number | null;
+      pending?: boolean;
+    },
   ): Promise<RefundReservation> {
     // One synchronous block (no awaits): atomic in the single-threaded mock,
     // exactly as reserve_payment_refund() is under its row lock.
@@ -1889,6 +1913,8 @@ export const mockDriver: PosDriver = {
       reason: meta?.reason ?? null,
       request_id: refundId,
       tip_cents: tipPart,
+      state: meta?.pending ? ("pending" as const) : ("succeeded" as const),
+      status_before: p.status,
     };
     const updated: Payment = {
       ...p,
@@ -1903,30 +1929,53 @@ export const mockDriver: PosDriver = {
     return { ok: true, payment: updated, refundEntryId: entry.id };
   },
 
+  // Mirrors confirm_payment_refund(): synchronous, idempotent.
+  async confirmPaymentRefund(paymentId, refundId, processorRef) {
+    const p = payments.get(paymentId);
+    if (!p) return null;
+    const idx = (p.refunds ?? []).findIndex((r) => r.request_id === refundId);
+    if (idx < 0) return null;
+    const refunds = [...(p.refunds ?? [])];
+    refunds[idx] = {
+      ...refunds[idx]!,
+      state: "succeeded",
+      processor_ref: processorRef ?? refunds[idx]!.processor_ref,
+    };
+    const updated: Payment = { ...p, refunds, updated_at: nowIso() };
+    payments.set(paymentId, updated);
+    return updated;
+  },
+
+  // Mirrors release_payment_refund(): the entry reserved under refundId only.
   async releasePaymentRefund(
     paymentId: string,
-    amountCents: number,
-    refundId: string | null,
+    _amountCents: number,
+    refundId: string,
+    opts?: { tombstone?: boolean },
   ): Promise<void> {
     const p = payments.get(paymentId);
-    if (!p) return;
+    if (!p || !refundId) return;
     const refunds = p.refunds ?? [];
-    const kept = dropReleasedRefund(refunds, amountCents, refundId);
-    const dropped = refunds.find((r) => !kept.includes(r));
+    const dropped = refunds.find((r) => r.request_id === refundId);
+    if (!dropped) return;
     const tipDone = tipRefundedCents(p);
     const tipBack =
-      typeof dropped?.tip_cents === "number"
+      typeof dropped.tip_cents === "number"
         ? dropped.tip_cents
-        : Math.min(amountCents, tipDone);
+        : Math.min(dropped.amount_cents, tipDone);
+    const before =
+      dropped.status_before === "authorized" || dropped.status_before === "captured"
+        ? dropped.status_before
+        : "captured";
     payments.set(paymentId, {
       ...p,
-      refunded_cents: Math.max(0, p.refunded_cents - amountCents),
+      refunded_cents: Math.max(0, p.refunded_cents - dropped.amount_cents),
       tip_refunded_cents: Math.max(0, tipDone - tipBack),
-      refund_ids: refundId
-        ? (p.refund_ids ?? []).filter((x) => x !== refundId)
-        : p.refund_ids,
-      refunds: kept,
-      status: p.status === "refunded" ? "captured" : p.status,
+      refund_ids: opts?.tombstone
+        ? p.refund_ids
+        : (p.refund_ids ?? []).filter((x) => x !== refundId),
+      refunds: refunds.filter((r) => r !== dropped),
+      status: p.status === "refunded" ? before : p.status,
       updated_at: nowIso(),
     });
   },
@@ -3043,6 +3092,9 @@ export const mockDriver: PosDriver = {
   },
 
   async addShiftCashEvent(event: ShiftCashEvent): Promise<ShiftCashEvent> {
+    // An explicit id is an idempotency key (refund cash-outs): never twice.
+    const prior = event.id ? shiftCashEvents.find((e) => e.id === event.id) : undefined;
+    if (prior) return { ...prior };
     const created: ShiftCashEvent = {
       ...event,
       id: event.id || genId("cash"),

@@ -46,14 +46,18 @@ import { publicTender } from "@/lib/payments/public";
 import {
   cancelOpenTender,
   getOrderBalance,
+  grossSettledCents,
   isManualRefundRail,
   refundPayment,
   RefundExceedsError,
+  RefundPendingError,
 } from "@/lib/payments/service";
+import { deriveDrawerEventId } from "@/lib/payments/ids";
 import { isFullyRefunded, liveTenders } from "@/lib/payments/refund-state";
 import {
   AdjustmentInputError,
   currentAdjustments,
+  foodDueCents,
   lineRefundAmounts,
   normalizeAdjustments,
   planLineVoid,
@@ -159,40 +163,48 @@ function baseRecord(
 // Refunds
 // ---------------------------------------------------------------------------
 
-export interface RefundInput extends ActionInput {
-  /** Item refund: lines + units (amount derived from the order). */
-  lines?: { line_id: string; quantity: number }[];
-  /** Amount refund: base (food) cents. */
-  amountCents?: number;
-  /** Tip to refund on top (kept separate, flagged). */
-  tipCents?: number;
-  /** Refund only this tender. */
-  paymentId?: string | null;
-}
 
 /** Per-tender refund ids of one request: `<request>_<8 hex of tender>_<n>`. */
 function tenderRefundIdPrefix(requestId: string, paymentId: string): string {
   return `${requestId}_${paymentId.replace(/[^0-9a-zA-Z]/g, "").slice(0, 8)}_`;
 }
 
-function entriesOfRequest(p: Payment, requestId: string) {
+function isRequestRefundId(id: string | null | undefined, p: Payment, requestId: string): boolean {
   const prefix = tenderRefundIdPrefix(requestId, p.id);
-  return (p.refunds ?? []).filter(
-    (r) => typeof r.request_id === "string" && r.request_id.startsWith(prefix) &&
-      /^\d+$/.test(r.request_id.slice(prefix.length)),
-  );
+  return typeof id === "string" && id.startsWith(prefix) && /^\d+$/.test(id.slice(prefix.length));
 }
 
-/** What this request has already moved, per tender (from the tenders themselves). */
+/** This request's live refund entries on a tender (pending + succeeded). */
+function entriesOfRequest(p: Payment, requestId: string) {
+  return (p.refunds ?? []).filter((r) => isRequestRefundId(r.request_id, p, requestId));
+}
+
+/**
+ * The next per-tender refund id for this request. Counts every id ever used on
+ * the tender (`refund_ids` keeps released ones as tombstones), so a refund the
+ * provider failed is never retried under its old idempotency key (Stripe would
+ * replay the failed refund).
+ */
+function nextTenderRefundId(p: Payment, requestId: string): string {
+  const used = (p.refund_ids ?? []).filter((id) => isRequestRefundId(id, p, requestId)).length;
+  return `${tenderRefundIdPrefix(requestId, p.id)}${used}`;
+}
+
+/** What this request has moved, per tender (from the tenders themselves). */
 function moneyDone(
   payments: Payment[],
   requestId: string,
-): { base: number; tip: number; byPayment: Map<string, RefundAllocation> } {
+): { base: number; tip: number; pending: number; byPayment: Map<string, RefundAllocation> } {
   let base = 0;
   let tip = 0;
+  let pending = 0;
   const byPayment = new Map<string, RefundAllocation>();
   for (const p of payments) {
     for (const e of entriesOfRequest(p, requestId)) {
+      if (e.state === "pending") {
+        pending += 1;
+        continue;
+      }
       const t = typeof e.tip_cents === "number" ? e.tip_cents : 0;
       const b = e.amount_cents - t;
       base += b;
@@ -211,13 +223,18 @@ function moneyDone(
       byPayment.set(p.id, a);
     }
   }
-  return { base, tip, byPayment };
+  return { base, tip, pending, byPayment };
 }
 
-/** Record a cash refund as a cash-out on the open drawer (the staff's, else any). */
+/**
+ * Take a cash refund out of the open drawer (the staff member's shift, else any
+ * open one). Keyed by the refund entry id: a resumed refund re-writes the SAME
+ * payout, never a second one.
+ */
 async function drawerCashOut(input: {
   order: Order;
   staffId: string | null;
+  refundId: string;
   amountCents: number;
   note: string;
 }): Promise<{ eventId: string | null; note: string | null }> {
@@ -234,7 +251,7 @@ async function drawerCashOut(input: {
     }
     if (!shift) return { eventId: null, note: "No open drawer: the cash-out was not recorded." };
     const ev = await driver.addShiftCashEvent({
-      id: "",
+      id: deriveDrawerEventId(input.refundId),
       shift_id: shift.id,
       tenant_id: shift.tenant_id,
       location_id: shift.location_id,
@@ -255,7 +272,10 @@ async function drawerCashOut(input: {
 
 /**
  * Move the money of a refund record (resumable: what the tenders already show
- * for this request is not moved again). Returns the final record.
+ * for this request is not moved again; this request's card refunds still
+ * `pending` at Stripe are finished first, under their own key). Only a
+ * reservation refused BEFORE any provider call (another till took the room) is
+ * re-planned onto another tender; any other failure stops with an error.
  */
 async function executeRefund(
   record: AdjustmentRecord,
@@ -265,82 +285,104 @@ async function executeRefund(
   const driver = getPosDriver();
   const only = typeof record.meta?.only_payment_id === "string" ? record.meta.only_payment_id : null;
   const targetTotal = record.amount_cents + record.tip_cents;
-  const drawer = new Map<string, { eventId: string | null; note: string | null }>();
-  for (const a of record.allocations) {
-    if (a.drawer_event_id || a.drawer_note) {
-      drawer.set(a.payment_id, { eventId: a.drawer_event_id ?? null, note: a.drawer_note ?? null });
-    }
-  }
   let error: string | null = null;
   let manual = false;
+  const refundArgs = { reason: summary, metadata: { adjustment_id: record.id } };
+
+  const hardStop = (err: unknown, paymentId: string) => {
+    captureError(err, { scope: "refund-order", orderId: order.id, paymentId, requestId: record.id });
+    error = err instanceof Error ? err.message : "Refund failed.";
+  };
 
   for (let attempt = 0; attempt < 4 && !error; attempt++) {
+    // 1. Finish this request's card refunds still pending at Stripe.
+    for (const p of await driver.listPaymentsForOrder(order.id)) {
+      for (const e of entriesOfRequest(p, record.id)) {
+        if (e.state !== "pending" || !e.request_id || error) continue;
+        try {
+          await refundPayment({ paymentId: p.id, refundId: e.request_id, ...refundArgs });
+        } catch (err) {
+          hardStop(err, p.id);
+        }
+      }
+    }
+    if (error) break;
+
+    // 2. Refund what is left.
     const payments = await driver.listPaymentsForOrder(order.id);
     const done = moneyDone(payments, record.id);
     const remTotal = targetTotal - done.base - done.tip;
     if (remTotal <= 0) break;
     let remBase = Math.max(0, record.amount_cents - done.base);
     let remTip = Math.max(0, record.tip_cents - done.tip);
-    // A card refund recorded with an adjusted split (see refundPayment) can
-    // leave base/tip off by the same amount; the total is what must match.
     let excess = remBase + remTip - remTotal;
-    const cutTip = Math.min(excess, remTip);
+    const cutTip = Math.min(Math.max(0, excess), remTip);
     remTip -= cutTip;
     excess -= cutTip;
-    remBase -= Math.min(excess, remBase);
+    remBase -= Math.min(Math.max(0, excess), remBase);
     const plan = planRefundAllocation(payments, remBase, remTip, { onlyPaymentId: only });
     if (!plan) {
       error = "The tenders no longer have that much left to refund.";
       break;
     }
-    let replan = false;
     for (const step of plan) {
-      const n = entriesOfRequest(step.payment, record.id).length;
-      const refundId = `${tenderRefundIdPrefix(record.id, step.payment.id)}${n}`;
       try {
         const r = await refundPayment({
           paymentId: step.payment.id,
           amountCents: step.baseCents + step.tipCents,
           tipCents: step.tipCents,
-          reason: summary,
-          refundId,
-          metadata: { adjustment_id: record.id },
+          refundId: nextTenderRefundId(step.payment, record.id),
+          ...refundArgs,
         });
         if (r?.manualRefund) manual = true;
-        if (r && !r.replayed && step.payment.rail === "cash") {
-          // Cash went back over the counter: take it out of the drawer.
-          const ev = await drawerCashOut({
-            order,
-            staffId: record.staff_id,
-            amountCents: r.refundedNowCents ?? step.baseCents + step.tipCents,
-            note: `Refund order ${order.order_number}: ${summary}`,
-          });
-          const prev = drawer.get(step.payment.id);
-          drawer.set(step.payment.id, {
-            eventId: prev?.eventId ?? ev.eventId,
-            note: ev.note ?? prev?.note ?? null,
-          });
-        }
       } catch (err) {
-        if (err instanceof RefundExceedsError) {
-          // A concurrent refund took this tender's room: re-plan the rest.
-          replan = true;
-          break;
-        }
-        captureError(err, { scope: "refund-order", orderId: order.id, paymentId: step.payment.id });
-        error = err instanceof Error ? err.message : "Refund failed.";
+        // Refused at reservation (nothing sent anywhere): re-plan the rest.
+        if (err instanceof RefundExceedsError) break;
+        hardStop(err, step.payment.id);
         break;
       }
     }
-    if (!replan && !error) continue; // loop once more to confirm everything landed
   }
 
   const payments = await driver.listPaymentsForOrder(order.id);
+  // 3. Cash that went back over the counter comes out of the drawer, once per
+  //    refund entry (idempotent: a resume re-writes the same payout).
+  const drawer = new Map<string, { eventId: string | null; note: string | null }>();
+  for (const p of payments) {
+    if (p.rail !== "cash") continue;
+    for (const e of entriesOfRequest(p, record.id)) {
+      if (!e.request_id) continue;
+      const ev = await drawerCashOut({
+        order,
+        staffId: record.staff_id,
+        refundId: e.request_id,
+        amountCents: e.amount_cents,
+        note: `Refund order ${order.order_number}: ${summary}`,
+      });
+      const prev = drawer.get(p.id);
+      drawer.set(p.id, { eventId: prev?.eventId ?? ev.eventId, note: ev.note ?? prev?.note ?? null });
+    }
+  }
+  for (const p of payments) {
+    for (const e of entriesOfRequest(p, record.id)) {
+      if (isManualRefundRail(p.rail) && e.state !== "pending") manual = true;
+    }
+  }
+
   const done = moneyDone(payments, record.id);
   const movedTotal = done.base + done.tip;
   const status: AdjustmentRecord["status"] =
-    movedTotal >= targetTotal ? "completed" : movedTotal > 0 ? "partial" : "failed";
-  if (status !== "completed" && !error) error = "Only part of the refund could be made.";
+    done.pending > 0
+      ? "pending"
+      : movedTotal >= targetTotal
+        ? "completed"
+        : movedTotal > 0
+          ? "partial"
+          : "failed";
+  if (status === "pending" && !error) error = new RefundPendingError().message;
+  if ((status === "partial" || status === "failed") && !error) {
+    error = "Only part of the refund could be made.";
+  }
   const allocations = [...done.byPayment.values()].map((a) => {
     const d = drawer.get(a.payment_id);
     return d ? { ...a, drawer_event_id: d.eventId, drawer_note: d.note } : a;
@@ -352,6 +394,27 @@ async function executeRefund(
       meta: error ? { error } : undefined,
     })) ?? { ...record, status, allocations };
   return { record: finished, error, manual };
+}
+
+/** Food money ever taken on the order (live + refunded tenders), vs the amount due. */
+function wasPaidInFull(order: Order, payments: Payment[]): boolean {
+  return grossSettledCents(payments, order.currency) >= foodDueCents(order);
+}
+
+export interface RefundInput extends ActionInput {
+  /** Item refund: lines + units (amount derived from the order). */
+  lines?: { line_id: string; quantity: number }[];
+  /** Amount refund: base (food) cents. */
+  amountCents?: number;
+  /** Tip to refund on top (kept separate, flagged). */
+  tipCents?: number;
+  /** Refund only this tender. */
+  paymentId?: string | null;
+  /**
+   * Allow refunding an order that was never paid in full (only `voidOrder`,
+   * which gives back a part payment and voids the order).
+   */
+  allowUnpaid?: boolean;
 }
 
 export async function refundOrder(input: RefundInput): Promise<ActionResult> {
@@ -371,15 +434,32 @@ export async function refundOrder(input: RefundInput): Promise<ActionResult> {
     return { ok: true, body: { ...(await snapshot(order.id)), record, replayed: true } };
   }
   if (record && record.status === "failed" && record.lines.length > 0) {
-    // A failed item refund gave its units back: another till may have taken
-    // them since, so it cannot be resumed under the same id.
-    return fail(409, "That refund failed: start a new one.", "refund_failed");
+    // A failed item refund gave its units back: take them again (atomically,
+    // under the order lock) before resuming under the same id.
+    const reopened = await driver.reopenOrderRefund(order.id, record.id);
+    if (reopened.outcome === "exceeds") {
+      return fail(
+        409,
+        `Only ${reopened.available} of that item can still be refunded (another refund took it meanwhile).`,
+        "refund_exceeds",
+        { lineId: reopened.line_id, available: reopened.available },
+      );
+    }
+    if (reopened.outcome === "ok" || reopened.outcome === "duplicate") record = reopened.record;
   }
-  // pending (crashed / lost response), partial or failed (an amount refund):
-  // resume. What the tenders already show for this request is not moved again.
+  // pending (crashed / lost response / unknown outcome at Stripe), partial or
+  // failed: resume. What the tenders already show for this request is not
+  // moved again.
 
   if (!record) {
     const payments = await driver.listPaymentsForOrder(order.id);
+    if (!input.allowUnpaid && !wasPaidInFull(order, payments)) {
+      return fail(
+        409,
+        "This order isn't paid in full: void it (which gives back what was taken) instead of refunding.",
+        "order_unpaid",
+      );
+    }
     let lines: AdjustmentRecord["lines"] = [];
     let base: number;
     try {
@@ -414,6 +494,7 @@ export async function refundOrder(input: RefundInput): Promise<ActionResult> {
       tip_cents: tip,
       lines,
       meta: {
+        order_status_before: order.status,
         ...(input.paymentId ? { only_payment_id: input.paymentId } : {}),
         ...(tip > 0 ? { tip_refund: true } : {}),
       },
@@ -433,11 +514,15 @@ export async function refundOrder(input: RefundInput): Promise<ActionResult> {
     }
   }
 
+  const movedBefore = (() => {
+    return record.allocations.reduce((n, a) => n + a.base_cents + a.tip_cents, 0);
+  })();
   const { record: finished, error, manual } = await executeRefund(record, order, summary);
 
   const after = await driver.getOrder(order.id);
   const paymentsAfter = await driver.listPaymentsForOrder(order.id);
-  const moved = finished.allocations.reduce((n, a) => n + a.base_cents + a.tip_cents, 0);
+  const movedTotal = finished.allocations.reduce((n, a) => n + a.base_cents + a.tip_cents, 0);
+  const moved = Math.max(0, movedTotal - movedBefore);
   const tipMoved = finished.allocations.reduce((n, a) => n + a.tip_cents, 0);
   if (moved > 0) {
     const fully = isFullyRefunded(after, paymentsAfter);
@@ -469,14 +554,76 @@ export async function refundOrder(input: RefundInput): Promise<ActionResult> {
       note: manual
         ? "Refund recorded, but no money was sent for the crypto part. Return it to the customer manually from your wallet / Coinbase account."
         : drawerNotes[0],
-      ...(error ? { error, partial: finished.status === "partial" } : {}),
+      ...(error
+        ? { error, partial: finished.status === "partial", pending: finished.status === "pending" }
+        : {}),
     },
   };
+}
+
+/**
+ * Give up on a refund request that is stuck `pending` (a crash, or Stripe never
+ * answered) or `partial`, so its item units are not reserved forever. Refused
+ * while a card refund of it may still be in flight at Stripe (a `pending`
+ * entry: resume it instead). A request that moved money ends `partial` (its
+ * units stay refunded); one that moved nothing ends `failed` (units released).
+ */
+export async function cancelRefundRequest(input: ActionInput): Promise<ActionResult> {
+  const driver = getPosDriver();
+  const order = await driver.getOrder(input.orderId);
+  if (!order) return fail(404, "Order not found.");
+  const record = (await driver.listOrderAdjustments(order.id)).find((r) => r.id === input.requestId);
+  if (!record || record.kind !== "refund") return fail(404, "No such refund on this order.");
+  if (record.status === "completed" || record.status === "failed") {
+    return { ok: true, body: { ...(await snapshot(order.id)), record, replayed: true } };
+  }
+  const payments = await driver.listPaymentsForOrder(order.id);
+  const done = moneyDone(payments, record.id);
+  if (done.pending > 0) {
+    return fail(
+      409,
+      "A card refund of this request may still be going through: resume it instead.",
+      "refund_in_flight",
+    );
+  }
+  const moved = done.base + done.tip;
+  const finished = await driver.finishOrderAdjustment(order.id, record.id, {
+    status: moved > 0 ? "partial" : "failed",
+    allocations: [...done.byPayment.values()],
+    meta: { canceled_by: input.actor.staff?.id ?? input.actor.user.id, canceled_at: nowIso() },
+  });
+  await recordAudit({
+    actor: { id: input.actor.user.id, label: input.actor.user.email },
+    action: "payment_refund",
+    tenantId: order.tenant_id,
+    detail: auditDetail(
+      input.actor,
+      null,
+      `Canceled the unfinished refund ${record.id} on order ${order.id} (${moved}¢ had moved)`,
+    ),
+  });
+  return { ok: true, body: { ...(await snapshot(order.id)), record: finished } };
 }
 
 // ---------------------------------------------------------------------------
 // Voids, comps, discounts (order edits)
 // ---------------------------------------------------------------------------
+
+/**
+ * Orders POS must not re-price or void itself: marketplace orders (the
+ * marketplace owns the price and the refund) and stored-value (gift card)
+ * sales. Null when the order can be adjusted.
+ */
+export function editBlockedReason(order: Order): string | null {
+  if ((order.channel as string) === "marketplace" || order.source?.channel === "marketplace") {
+    return "Marketplace orders are adjusted in the marketplace, not at the till.";
+  }
+  const ext = order.core_ext as Record<string, unknown> | null | undefined;
+  if (ext && Object.prototype.hasOwnProperty.call(ext, "stored_value")) {
+    return "Gift card / stored-value sales can't be comped, discounted or voided here.";
+  }
+  return null;
+}
 
 /** Has any money been taken on the order that is still held (not refunded)? */
 function holdsMoney(payments: Payment[]): boolean {
@@ -505,15 +652,33 @@ async function editLoop(
         record: Partial<AdjustmentRecord>;
         audit: string;
       },
+  opts: { preApproved?: { amount: number; approver: Staff | null } } = {},
 ): Promise<ActionResult> {
   const driver = getPosDriver();
-  let approved: { amount: number; approver: Staff | null } | null = null;
+  let approved: { amount: number; approver: Staff | null } | null = opts.preApproved ?? null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const order = await driver.getOrder(input.orderId);
     if (!order) return fail(404, "Order not found.");
     const prior = (await driver.listOrderAdjustments(order.id)).find((r) => r.id === input.requestId);
     if (prior) {
+      if (prior.kind !== kind) {
+        return fail(409, "That request id was already used for another action.", "request_conflict");
+      }
       return { ok: true, body: { ...(await snapshot(order.id)), record: prior, replayed: true } };
+    }
+    const blocked = editBlockedReason(order);
+    if (blocked) return fail(409, blocked, "not_adjustable");
+    if (kind !== "void_order") {
+      // Once money went back on this order its price is settled history: a comp
+      // or discount now would re-price what was already refunded.
+      const payments = await driver.listPaymentsForOrder(order.id);
+      if (payments.some((p) => p.refunded_cents > 0)) {
+        return fail(
+          409,
+          "This order already has a refund: refund instead of comping or discounting it.",
+          "refund_exists",
+        );
+      }
     }
     const settings = await driver.getStoreSettings(order.tenant_id, order.location_id);
     let c;
@@ -561,6 +726,16 @@ async function editLoop(
           "This order is already paid: refund the item instead.",
           "use_refund",
         );
+      }
+      if (res.reason === "refund_exists") {
+        return fail(
+          409,
+          "This order already has a refund: refund instead of comping or discounting it.",
+          "refund_exists",
+        );
+      }
+      if (res.reason === "not_adjustable") {
+        return fail(409, "This order can't be adjusted at the till.", "not_adjustable");
       }
       if (res.reason === "in_flight") {
         return fail(409, "A payment is still in progress on this order.", "payment_in_flight");
@@ -653,13 +828,17 @@ export async function voidOrder(input: ActionInput): Promise<ActionResult> {
   if (order.status === "voided") {
     return { ok: true, body: { ...(await snapshot(order.id)), replayed: true } };
   }
+  const blocked = editBlockedReason(order);
+  if (blocked) return fail(409, blocked, "not_adjustable");
   const payments = await driver.listPaymentsForOrder(order.id);
   if (holdsMoney(payments)) {
+    // Void after payment = the refund flow (approved inside, before any money moves).
     const left = refundableTotals(payments);
     const result = await refundOrder({
       ...input,
       amountCents: left.baseCents,
       tipCents: left.tipCents,
+      allowUnpaid: true,
     });
     // Still in the kitchen: the sale is off, so the order ends `voided` (the
     // kitchen screen shows STOP) rather than `refunded` (a refund after hand-off).
@@ -673,6 +852,12 @@ export async function voidOrder(input: ActionInput): Promise<ActionResult> {
     }
     return result;
   }
+  // Approve BEFORE anything is touched: a refused approval cancels no tender.
+  const live = order.items.filter((i) => !i.voided);
+  const auth = await input.authorize("void_order", order.totals.total_cents, {
+    fired: live.some((i) => !!i.fired_at),
+  });
+  if (!auth.ok) return auth;
   for (const p of liveTenders(payments)) {
     if (p.status !== "requires_action" && p.status !== "pending") continue;
     if (p.rail === "external") continue; // a pending external promise is voided with the order
@@ -712,7 +897,7 @@ export async function voidOrder(input: ActionInput): Promise<ActionResult> {
       },
       audit: `Voided the whole order (${o.totals.total_cents}¢)`,
     };
-  });
+  }, { preApproved: { amount: order.totals.total_cents, approver: auth.approver } });
 }
 
 export interface CompInput extends ActionInput {

@@ -30,6 +30,7 @@ import {
   refundedQuantities,
 } from "@/lib/adjustments/math";
 import { refundableParts } from "@/lib/payments/refund-state";
+import { isDefiniteRefusal } from "@/lib/adjustments/retry";
 import { tenderRailLabel } from "@/lib/payments/registry";
 import type { AdjustAction, AdjustResponse } from "@/lib/store/use-checkout";
 import { cn } from "@/lib/utils";
@@ -249,9 +250,12 @@ export function AdjustOrderDialog({
       return;
     }
     if (!res.ok) {
-      // A refused action (use_refund, exceeds, ...) did nothing: a new attempt
-      // gets a new request id. A partial refund keeps its id (resume on retry).
-      if (!res.partial) requestId.current = newRequestId();
+      // Only a DEFINITE refusal (a 4xx: use_refund, exceeds, reason, ...) did
+      // nothing, so only then does the next attempt get a new request id. A lost
+      // response (offline, status 0), a 5xx, a timeout or a partial / pending
+      // refund may have moved money: the retry MUST reuse the same id so the
+      // server resumes it instead of refunding again.
+      if (isDefiniteRefusal(res)) requestId.current = newRequestId();
       setError(res.error ?? "That didn't go through.");
       return;
     }

@@ -362,6 +362,9 @@ export interface PosDriver {
   /** Every adjustment record of an order, oldest first. */
   listOrderAdjustments(orderId: string): Promise<AdjustmentRecord[]>;
 
+  /** Batch read: adjustment records of several orders (one query). */
+  listOrderAdjustmentsForOrders(orderIds: string[]): Promise<AdjustmentRecord[]>;
+
   /**
    * ATOMICALLY open a refund record (status `pending`): under the order row
    * lock, refuse when any selected line is voided/unknown or would be refunded
@@ -371,6 +374,14 @@ export interface PosDriver {
    * exactly one gets it.
    */
   beginOrderRefund(record: AdjustmentRecord): Promise<BeginRefundResult>;
+
+  /**
+   * Resume a FAILED item refund under its own id: under the order row lock,
+   * take its units again (refused with `exceeds` when another refund took them
+   * meanwhile) and set it back to `pending`. A row that is not `failed` is
+   * returned as `duplicate`.
+   */
+  reopenOrderRefund(orderId: string, id: string): Promise<BeginRefundResult>;
 
   /** Record what a refund actually moved (status, allocations, meta). */
   finishOrderAdjustment(
@@ -662,14 +673,33 @@ export interface PosDriver {
       processorRef?: string | null;
       reason?: string | null;
       tipCents?: number | null;
+      /** Card refunds: reserve as `pending` before the provider is called. */
+      pending?: boolean;
     },
   ): Promise<RefundReservation>;
 
-  /** Undo a reservation whose rail call failed (also drops its `refunds[]` entry). */
+  /**
+   * Mark a `pending` refund entry (reserved under `refundId`) as accepted by the
+   * provider and record its provider id. Idempotent; null when no such entry.
+   */
+  confirmPaymentRefund(
+    paymentId: string,
+    refundId: string,
+    processorRef: string | null,
+  ): Promise<Payment | null>;
+
+  /**
+   * Undo a reservation (the rail call failed, or the provider later failed the
+   * refund): drops its `refunds[]` entry, gives the base and tip part back and
+   * restores the tender status it had before. `tombstone` keeps `refundId` in
+   * `refund_ids`, so a provider refund that FAILED can never be "replayed" under
+   * the same idempotency key (a retry must mint the next id).
+   */
   releasePaymentRefund(
     paymentId: string,
     amountCents: number,
-    refundId: string | null,
+    refundId: string,
+    opts?: { tombstone?: boolean },
   ): Promise<void>;
 
   /**

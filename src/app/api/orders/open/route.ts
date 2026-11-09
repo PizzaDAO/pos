@@ -36,7 +36,8 @@ export async function GET(request: Request) {
     .filter((o) => o.channel === "in_store");
   const payments = await driver.listPaymentsForOrders(orders.map((o) => o.id));
   if (searchParams.get("view") === "recent") {
-    return NextResponse.json({ orders: selectRecentOrders(orders, payments) });
+    const adjustments = await driver.listOrderAdjustmentsForOrders(orders.map((o) => o.id));
+    return NextResponse.json({ orders: selectRecentOrders(orders, payments, 50, adjustments) });
   }
   return NextResponse.json({ orders: selectOpenOrders(orders, payments) });
 }

@@ -80,6 +80,8 @@ export type ApprovalOutcome =
  */
 export async function authorizeAdjustment(input: {
   tenantId: string;
+  /** The order's location: the approving manager must work there. */
+  locationId: string;
   actor: TillActor;
   policy: AdjustmentPolicy;
   kind: AdjustmentKind;
@@ -118,6 +120,10 @@ export async function authorizeAdjustment(input: {
   const driver = getPosDriver();
   const staff = await driver.getStaffById(input.tenantId, input.approval.staffId);
   if (!staff || !staff.active || !isManagerRole(staff.role)) return { ok: false, res: incorrect() };
+  // A manager scoped to other locations cannot approve here (empty = all).
+  if (staff.location_ids?.length && !staff.location_ids.includes(input.locationId)) {
+    return { ok: false, res: incorrect() };
+  }
   const attempt = await driver.beginPinAttempt(input.tenantId, staff.id);
   if (!attempt.allowed) {
     return {

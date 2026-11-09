@@ -24,7 +24,7 @@
 
 import { useMemo, useState } from "react";
 import { Ban, CreditCard, Loader2, Percent, RotateCcw, X } from "lucide-react";
-import type { AdjustmentKind } from "@/lib/db";
+import type { AdjustmentKind, AdjustmentRecord } from "@/lib/db";
 import { reasonLabel } from "@/lib/adjustments/reasons";
 import { AdjustOrderDialog, type AdjustMode } from "./adjust-order-dialog";
 import type { PaymentSettings } from "@/lib/db";
@@ -117,6 +117,22 @@ export function PaymentScreen({
       p.amount_cents + p.tip_cents > p.refunded_cents,
   );
   const canRefund = holdsMoney && checkout.payments.some((p) => p.rail !== "external");
+  const [adjustError, setAdjustError] = useState<string | null>(null);
+
+  /**
+   * Resume (same request id: finishes what is left, never twice) or cancel (so
+   * its item units are released) a refund that did not finish.
+   */
+  async function unfinishedRefund(a: AdjustmentRecord, action: "resume" | "cancel") {
+    setAdjustError(null);
+    const res = await checkout.adjust("refund", {
+      requestId: a.id,
+      reasonCode: a.reason_code,
+      reasonText: a.reason_text ?? undefined,
+      ...(action === "cancel" ? { cancel: true } : {}),
+    });
+    if (!res.ok) setAdjustError(res.error ?? "That didn't go through.");
+  }
   const changeGivenCents = checkout.payments
     .filter((p) => p.status === "captured")
     .reduce((sum, p) => sum + (p.cash_change_cents ?? 0), 0);
@@ -589,6 +605,11 @@ export function PaymentScreen({
                     <Percent className="mr-1 h-3.5 w-3.5" /> Comp
                   </Button>
                 </div>
+                {adjustError && (
+                  <p role="alert" className="mt-2 text-xs text-destructive">
+                    {adjustError}
+                  </p>
+                )}
                 {checkout.adjustments.length > 0 && (
                   <ul className="mt-3 space-y-1 text-xs text-muted-foreground" aria-label="Adjustment history">
                     {checkout.adjustments.map((a) => (
@@ -603,8 +624,32 @@ export function PaymentScreen({
                             <span className="ml-1 font-semibold text-destructive">{a.status}</span>
                           )}
                         </span>
-                        <span className="tabular-nums">
+                        <span className="flex items-center gap-2 tabular-nums">
                           {formatMoney(a.amount_cents + a.tip_cents, currency)}
+                          {a.kind === "refund" && a.status !== "completed" && (
+                              <>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-8 px-2"
+                                  disabled={checkout.loading}
+                                  onClick={() => void unfinishedRefund(a, "resume")}
+                                >
+                                  Resume
+                                </Button>
+                                {a.status !== "failed" && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-8 px-2"
+                                    disabled={checkout.loading}
+                                    onClick={() => void unfinishedRefund(a, "cancel")}
+                                  >
+                                    Cancel
+                                  </Button>
+                                )}
+                              </>
+                            )}
                         </span>
                       </li>
                     ))}

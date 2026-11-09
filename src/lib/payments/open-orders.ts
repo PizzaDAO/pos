@@ -2,7 +2,7 @@
  * Pure rules for the till's "Open orders" list and the refunded state.
  * No I/O: the route loads orders + tenders and hands them here.
  */
-import type { Order, Payment } from "@/lib/db";
+import type { AdjustmentRecord, Order, Payment } from "@/lib/db";
 import { isFullyRefunded, liveTenders } from "./refund-state";
 import { orderBalanceFromPayments } from "./service";
 
@@ -69,6 +69,8 @@ export interface RecentOrderRow {
   money: "paid" | "partially_refunded" | "refunded" | "voided" | "unpaid";
   /** Comps + discounts applied. */
   discountCents: number;
+  /** Refund requests that did not finish (pending / partial / failed item refunds). */
+  unfinishedRefunds: number;
   created_at: string;
 }
 
@@ -77,7 +79,14 @@ export function selectRecentOrders(
   orders: Order[],
   paymentsByOrder: Map<string, Payment[]>,
   limit = 50,
+  adjustments: readonly AdjustmentRecord[] = [],
 ): RecentOrderRow[] {
+  const unfinished = new Map<string, number>();
+  for (const r of adjustments) {
+    if (r.kind !== "refund" || r.status === "completed") continue;
+    if (r.status === "failed" && r.lines.length === 0) continue; // nothing reserved
+    unfinished.set(r.order_id, (unfinished.get(r.order_id) ?? 0) + 1);
+  }
   const rows: RecentOrderRow[] = [];
   const newestFirst = [...orders].sort(
     (a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id),
@@ -107,6 +116,7 @@ export function selectRecentOrders(
       refundedCents,
       money,
       discountCents: order.totals.discount_cents,
+      unfinishedRefunds: unfinished.get(order.id) ?? 0,
       created_at: order.created_at,
     });
     if (rows.length >= limit) break;

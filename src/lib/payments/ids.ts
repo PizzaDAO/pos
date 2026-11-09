@@ -42,3 +42,11 @@ export function deriveTenderId(
 ): string {
   return uuidV5(`tender:${orderId}:${rail}:${seq}`, TENDER_NAMESPACE);
 }
+
+/**
+ * Stable id of the drawer cash-out written for one cash refund entry (its
+ * refund id): a resumed refund re-writes the SAME row, never a second payout.
+ */
+export function deriveDrawerEventId(refundId: string): string {
+  return uuidV5(`drawer-refund:${refundId}`, TENDER_NAMESPACE);
+}

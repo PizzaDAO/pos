@@ -16,6 +16,7 @@ import {
 } from "./math";
 import { needsApproval, parsePolicy, resolvePolicy } from "./policy";
 import { validateReason } from "./reasons";
+import { isDefiniteRefusal } from "./retry";
 
 const line = (o: Partial<OrderItem> & { id: string; unit: number; qty: number }): OrderItem =>
   ({
@@ -308,5 +309,42 @@ describe("policy + reasons", () => {
     expect(validateReason("refund", "other", "  ").ok).toBe(false);
     expect(validateReason("refund", "other", "burnt crust")).toEqual({ ok: true, code: "other", text: "burnt crust" });
     expect(validateReason("void_line", "entry_error", null)).toEqual({ ok: true, code: "entry_error", text: null });
+  });
+});
+
+describe("comping units one at a time", () => {
+  it("a second single-unit comp of the same line applies", () => {
+    const items = [line({ id: "a", unit: 1000, qty: 3 })];
+    const comp = (id: string): OrderAdjustment => ({
+      id,
+      type: "comp",
+      source: "pos.manual",
+      label: "Comp",
+      percent_bps: null,
+      amount_cents: 1000,
+      line_ids: ["a"],
+      quantity: 1,
+      reason_code: "quality",
+      reason_text: null,
+      staff_id: null,
+      approved_by: null,
+      created_at: "",
+    });
+    const out = normalizeAdjustments(items, [comp("c1"), comp("c2"), comp("c3"), comp("c4")]);
+    expect(out.map((a) => a.amount_cents)).toEqual([1000, 1000, 1000]);
+  });
+});
+
+describe("till request ids", () => {
+  it("only a definite 4xx refusal mints a new id", () => {
+    expect(isDefiniteRefusal({ status: 409 })).toBe(true);
+    expect(isDefiniteRefusal({ status: 422 })).toBe(true);
+    expect(isDefiniteRefusal({ status: 0 })).toBe(false); // offline / lost response
+    expect(isDefiniteRefusal({ status: 502 })).toBe(false);
+    expect(isDefiniteRefusal({ status: 504 })).toBe(false);
+    expect(isDefiniteRefusal({ status: 408 })).toBe(false);
+    expect(isDefiniteRefusal({ status: 429 })).toBe(false);
+    expect(isDefiniteRefusal({ status: 200, partial: true })).toBe(false);
+    expect(isDefiniteRefusal({ status: 409, pending: true })).toBe(false);
   });
 });

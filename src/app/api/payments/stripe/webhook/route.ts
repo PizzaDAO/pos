@@ -302,21 +302,54 @@ async function handleRefundUpdate(account: string | undefined, refund: RefundObj
   }
   const entry = (tender.refunds ?? []).find((r) => r.processor_ref === refund.id);
   if (!entry) return NextResponse.json({ received: true, ignored: "unknown_refund" });
-  await driver.releasePaymentRefund(tender.id, entry.amount_cents, entry.request_id ?? null);
-  // The order was closed out as refunded on the strength of this refund.
-  await driver.transitionOrderStatus(tender.order_id, ["refunded"], "completed");
-  const requestId = entry.request_id?.replace(/_[0-9a-zA-Z]{1,8}_\d+$/, "") ?? null;
-  if (requestId && requestId !== entry.request_id) {
-    const record = (await driver.listOrderAdjustments(tender.order_id)).find(
-      (r) => r.id === requestId,
-    );
-    if (record) {
-      await driver.finishOrderAdjustment(tender.order_id, record.id, {
-        status: "partial",
-        allocations: record.allocations,
-        meta: { refund_failed: refund.id, refund_failure: refund.failure_reason ?? refund.status },
-      });
-    }
+  if (!entry.request_id) {
+    // A refund recorded before refund ids existed cannot be released by id:
+    // alert loudly, staff correct it by hand.
+    captureError(new Error(`stripe refund ${refund.status} on an unreleasable legacy refund`), {
+      scope: "refund-failed",
+      paymentId: tender.id,
+      refundId: refund.id,
+    });
+    return NextResponse.json({ received: true, flagged: "legacy_refund" });
+  }
+  // Tombstone: the failed refund's idempotency key is never reused.
+  await driver.releasePaymentRefund(tender.id, entry.amount_cents, entry.request_id, {
+    tombstone: true,
+  });
+  const order = await driver.getOrder(tender.order_id);
+  const requestId = entry.request_id.replace(/_[0-9a-zA-Z]{1,8}_\d+$/, "");
+  const record =
+    requestId !== entry.request_id
+      ? ((await driver.listOrderAdjustments(tender.order_id)).find((r) => r.id === requestId) ??
+        null)
+      : null;
+  // The order was closed out (refunded, or voided by a full refund) on the
+  // strength of this refund: the money is held again, so put it back where it
+  // was before the refund (as recorded on the ledger row; else completed) and
+  // say so -- never leave a voided order silently holding money.
+  const restoredFrom = order?.status;
+  if (order && (order.status === "refunded" || order.status === "voided")) {
+    const before =
+      typeof record?.meta?.order_status_before === "string"
+        ? (record.meta.order_status_before as typeof order.status)
+        : "completed";
+    const target = before === "refunded" || before === "voided" ? "completed" : before;
+    await driver.transitionOrderStatus(order.id, [order.status], target);
+  }
+  if (record) {
+    await driver.finishOrderAdjustment(tender.order_id, record.id, {
+      status: "partial",
+      allocations: record.allocations,
+      meta: { refund_failed: refund.id, refund_failure: refund.failure_reason ?? refund.status },
+    });
+  }
+  if (restoredFrom === "voided") {
+    captureError(new Error("refund failed on a VOIDED order: money is held again"), {
+      scope: "refund-failed-voided",
+      orderId: tender.order_id,
+      paymentId: tender.id,
+      amountCents: entry.amount_cents,
+    });
   }
   captureError(new Error(`stripe refund ${refund.status}: money was NOT returned`), {
     scope: "refund-failed",

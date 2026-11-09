@@ -1717,6 +1717,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       ).map(mapAdjustmentRecord);
     },
 
+    async listOrderAdjustmentsForOrders(orderIds) {
+      if (orderIds.length === 0) return [];
+      return (await selectIn("order_adjustments", "order_id", orderIds)).map(mapAdjustmentRecord);
+    },
+
     async beginOrderRefund(record) {
       const out = unwrap(
         await sb.rpc("begin_order_refund", { p_record: record }),
@@ -1730,6 +1735,19 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           line_id: out.line_id ?? "",
           available: out.available ?? 0,
         };
+      }
+      return { outcome: "not_found" };
+    },
+
+    async reopenOrderRefund(orderId, id) {
+      const out = unwrap(
+        await sb.rpc("reopen_order_refund", { p_order_id: orderId, p_id: id }),
+      ) as { outcome: string; record?: Row; line_id?: string; available?: number };
+      if (out.outcome === "ok" || out.outcome === "duplicate") {
+        return { outcome: out.outcome, record: mapAdjustmentRecord(out.record as Row) };
+      }
+      if (out.outcome === "exceeds") {
+        return { outcome: "exceeds", line_id: out.line_id ?? "", available: out.available ?? 0 };
       }
       return { outcome: "not_found" };
     },
@@ -2419,6 +2437,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           // Only sent when set (an explicit tip split needs migration
           // 20261113000300; without it the legacy tip-first rule applies).
           ...(typeof meta?.tipCents === "number" ? { p_tip_amount: meta.tipCents } : {}),
+          ...(meta?.pending ? { p_pending: true } : {}),
         }),
       ) as { outcome: string; payment?: Row; refund_entry_id?: string };
       const payment = out.payment ? mapPayment(out.payment) : null;
@@ -2432,12 +2451,24 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { ok: false, reason, payment };
     },
 
-    async releasePaymentRefund(paymentId, amountCents, refundId) {
+    async confirmPaymentRefund(paymentId, refundId, processorRef) {
+      const out = unwrap(
+        await sb.rpc("confirm_payment_refund", {
+          p_payment_id: paymentId,
+          p_refund_id: refundId,
+          p_processor_ref: processorRef,
+        }),
+      ) as Row | null;
+      return out ? mapPayment(out) : null;
+    },
+
+    async releasePaymentRefund(paymentId, amountCents, refundId, opts) {
       unwrap(
         await sb.rpc("release_payment_refund", {
           p_payment_id: paymentId,
           p_amount: amountCents,
           p_refund_id: refundId,
+          p_tombstone: opts?.tombstone ?? false,
         }),
       );
     },
@@ -4133,6 +4164,25 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async addShiftCashEvent(event) {
+      // An explicit id is an idempotency key (refund cash-outs): never twice.
+      if (event.id) {
+        const prior = unwrap(
+          await sb.from("shift_cash_events").select("*").eq("id", event.id).maybeSingle(),
+        ) as Row | null;
+        if (prior) {
+          return {
+            id: prior.id as string,
+            shift_id: prior.shift_id as string,
+            tenant_id: prior.tenant_id as string,
+            location_id: prior.location_id as string,
+            type: prior.type as ShiftCashEvent["type"],
+            amount_cents: prior.amount_cents as number,
+            order_id: (prior.order_id as string | null) ?? null,
+            note: (prior.note as string | null) ?? null,
+            created_at: prior.created_at as string,
+          };
+        }
+      }
       const r = unwrap(
         await sb
           .from("shift_cash_events")

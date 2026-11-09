@@ -13,6 +13,7 @@ import {
   getPosDriver,
 } from "@/lib/db";
 import { resetMockOrders, resetMockPayments } from "@/lib/db/mock";
+import { StripeError } from "@/lib/payments/providers/stripe-client";
 
 const stripeRequest = vi.fn();
 const stripeGet = vi.fn();
@@ -173,6 +174,11 @@ async function policy(p: { refund?: number; comp?: number; void?: number }) {
   });
 }
 const sum = (ps: Payment[]) => ps.reduce((n, p) => n + p.refunded_cents, 0);
+function goLiveStripe() {
+  vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_adj");
+  vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "http://localhost:54321");
+  vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "test-service-key");
+}
 
 beforeEach(async () => {
   resetMockOrders();
@@ -692,7 +698,7 @@ describe("Stripe card refunds (real mode)", () => {
     expect(p.refunds![0]!.processor_ref).toBe("re_live_1");
   });
 
-  it("a Stripe error records nothing; the retry uses the same idempotency key", async () => {
+  it("an unknown Stripe outcome (network) keeps the refund pending; the retry uses the same key, refunds once", async () => {
     goLive();
     const order = await seedOrder([item("l-y1", 1000, 1)], { status: "paid" });
     await seedTender(order, {
@@ -701,16 +707,117 @@ describe("Stripe card refunds (real mode)", () => {
       connect_account_id: ACCT,
       simulated: false,
     });
-    stripeRequest.mockRejectedValueOnce(new Error("stripe down"));
+    stripeRequest.mockRejectedValueOnce(new Error("socket hang up"));
     const requestId = rid("retry");
     const first = await refund(order.id, { amountCents: 400, requestId });
-    expect(first.status).toBe(502);
-    expect(sum(await getPosDriver().listPaymentsForOrder(order.id))).toBe(0);
+    const fb = await first.json();
+    expect(fb.record.status).toBe("pending");
+    expect(fb.pending).toBe(true);
+    // Reserved (holds the cap) but not confirmed.
+    const p1 = (await getPosDriver().listPaymentsForOrder(order.id))[0]!;
+    expect(p1.refunds![0]).toMatchObject({ state: "pending", amount_cents: 400 });
     stripeRequest.mockResolvedValue({ id: "re_live_2", status: "succeeded" });
     const second = await refund(order.id, { amountCents: 400, requestId });
     expect(second.status).toBe(200);
+    expect((await second.json()).record.status).toBe("completed");
+    expect(stripeRequest).toHaveBeenCalledTimes(2);
     expect(stripeRequest.mock.calls[0]![2].idempotencyKey).toBe(stripeRequest.mock.calls[1]![2].idempotencyKey);
+    const p2 = (await getPosDriver().listPaymentsForOrder(order.id))[0]!;
+    expect(p2.refunded_cents).toBe(400);
+    expect(p2.refunds).toHaveLength(1);
+    expect(p2.refunds![0]).toMatchObject({ state: "succeeded", processor_ref: "re_live_2" });
+  });
+
+  it("Stripe succeeded but the response was lost: the retry refunds nothing more", async () => {
+    goLive();
+    stripeRequest.mockResolvedValue({ id: "re_lost", status: "succeeded" });
+    const order = await seedOrder([item("l-y2", 1000, 1)], { status: "paid" });
+    await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_lost", connect_account_id: ACCT, simulated: false });
+    const requestId = rid("lost");
+    expect((await refund(order.id, { amountCents: 300, requestId })).status).toBe(200);
+    const again = await refund(order.id, { amountCents: 300, requestId });
+    expect((await again.json()).replayed).toBe(true);
+    expect(stripeRequest).toHaveBeenCalledTimes(1);
+    expect(sum(await getPosDriver().listPaymentsForOrder(order.id))).toBe(300);
+  });
+
+  it("Stripe succeeded but recording it failed: the retry records it once (same key), no other tender is touched", async () => {
+    goLive();
+    stripeRequest.mockResolvedValue({ id: "re_db", status: "succeeded" });
+    const order = await seedOrder([item("l-y3", 1000, 2)], { status: "paid" });
+    const card = await seedTender(order, {
+      rail: "stripe_terminal",
+      charge_id: "pi_db",
+      connect_account_id: ACCT,
+      simulated: false,
+      amount_cents: 1000,
+    });
+    const cash = await seedTender(order, { amount_cents: 1000 });
+    const driver = getPosDriver();
+    const spy = vi.spyOn(driver, "confirmPaymentRefund").mockRejectedValueOnce(new Error("db down"));
+    const requestId = rid("db");
+    const first = await refund(order.id, { amountCents: 1500, requestId });
+    const fb = await first.json();
+    expect(fb.error).toBeTruthy();
+    // Never re-planned onto the cash tender after the card money moved.
+    expect((await driver.getPayment(cash.id))!.refunded_cents).toBe(0);
+    spy.mockRestore();
+    const second = await refund(order.id, { amountCents: 1500, requestId });
+    expect((await second.json()).record.status).toBe("completed");
+    const c = (await driver.getPayment(card.id))!;
+    expect(c.refunded_cents).toBe(1000);
+    expect(c.refunds).toHaveLength(1);
+    expect((await driver.getPayment(cash.id))!.refunded_cents).toBe(500);
+    // Stripe was asked twice for the card part, with ONE key (it replays, no second refund).
+    const keys = stripeRequest.mock.calls.map((c) => c[2].idempotencyKey);
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it("a definite Stripe refusal releases the reservation and the retry uses the NEXT key", async () => {
+    goLive();
+    const order = await seedOrder([item("l-y4", 1000, 1)], { status: "paid" });
+    await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_4xx", connect_account_id: ACCT, simulated: false });
+    stripeRequest.mockRejectedValueOnce(new StripeError("charge disputed", 400, null));
+    const requestId = rid("4xx");
+    const first = await refund(order.id, { amountCents: 400, requestId });
+    expect(first.status).toBe(502);
+    expect(sum(await getPosDriver().listPaymentsForOrder(order.id))).toBe(0);
+    stripeRequest.mockResolvedValue({ id: "re_ok", status: "succeeded" });
+    const second = await refund(order.id, { amountCents: 400, requestId });
+    expect((await second.json()).record.status).toBe("completed");
+    const [k1, k2] = stripeRequest.mock.calls.map((c) => c[2].idempotencyKey);
+    expect(k1).not.toBe(k2);
     expect(sum(await getPosDriver().listPaymentsForOrder(order.id))).toBe(400);
+  });
+
+  it("a replayed Stripe refund that FAILED is never recorded as a success", async () => {
+    goLive();
+    stripeRequest.mockResolvedValue({ id: "re_failed", status: "failed" });
+    const order = await seedOrder([item("l-y5", 1000, 1)], { status: "paid" });
+    await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_failed", connect_account_id: ACCT, simulated: false });
+    const res = await refund(order.id, { amountCents: 400 });
+    expect(res.status).toBe(502);
+    expect(sum(await getPosDriver().listPaymentsForOrder(order.id))).toBe(0);
+  });
+
+  it("concurrent card refunds are serialized by the reservation: no overflow into the tip", async () => {
+    goLive();
+    stripeRequest.mockImplementation(async () => ({ id: `re_${Math.random()}`, status: "succeeded" }));
+    const order = await seedOrder([item("l-y6", 1000, 1)], { status: "paid" });
+    const card = await seedTender(order, {
+      rail: "stripe_terminal",
+      charge_id: "pi_conc",
+      connect_account_id: ACCT,
+      simulated: false,
+      amount_cents: 1000,
+      tip_cents: 300,
+    });
+    await Promise.all([refund(order.id, { amountCents: 700 }), refund(order.id, { amountCents: 700 })]);
+    const p = (await getPosDriver().getPayment(card.id))!;
+    expect(p.tip_refunded_cents).toBe(0);
+    expect(p.refunded_cents).toBeLessThanOrEqual(1000);
+    const stripeTotal = stripeRequest.mock.calls.reduce((n, c) => n + (c[1].amount as number), 0);
+    expect(stripeTotal).toBe(p.refunded_cents);
   });
 
   it("a refund Stripe later fails is released by the webhook (money held again)", async () => {
@@ -724,7 +831,7 @@ describe("Stripe card refunds (real mode)", () => {
       connect_account_id: ACCT,
       simulated: false,
     });
-    await refund(order.id, { amountCents: 1000 });
+    await refund(order.id, { amountCents: 1000, requestId: rid("wh") });
     expect((await getPosDriver().getOrder(order.id))!.status).toBe("refunded");
     const payload = JSON.stringify({
       type: "charge.refund.updated",
@@ -753,9 +860,16 @@ describe("Stripe card refunds (real mode)", () => {
     expect((await res.json()).released).toBe(true);
     const p = (await getPosDriver().getPayment(card.id))!;
     expect(p).toMatchObject({ status: "captured", refunded_cents: 0 });
-    expect((await getPosDriver().getOrder(order.id))!.status).toBe("completed");
+    // Back to the status it had before the refund (from the ledger row).
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("paid");
     const record = (await getPosDriver().listOrderAdjustments(order.id))[0]!;
     expect(record.status).toBe("partial");
+    // Resuming the request uses a NEW key: the failed refund is never replayed.
+    stripeRequest.mockClear();
+    stripeRequest.mockResolvedValue({ id: "re_live_3b", status: "succeeded" });
+    const resumed = await refund(order.id, { requestId: record.id, amountCents: 1000 });
+    expect((await resumed.json()).record.status).toBe("completed");
+    expect(stripeRequest.mock.calls[0]![2].idempotencyKey).toMatch(/_1$/);
   });
 });
 
@@ -792,5 +906,222 @@ describe("reports reflect partial refunds, tip refunds, comps and line voids", (
       discount_cents: 1000,
     });
     expect(report.paymentMix[0]!.refunded_cents).toBe(350);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes (phase 1)
+// ---------------------------------------------------------------------------
+
+describe("refunded tenders and the balance", () => {
+  it("an UNPAID order: a refunded tender does not count ($100 split: A $30 refunded, B $30 live => $70 due)", async () => {
+    const order = await seedOrder([item("l-ba", 10_000, 1)]);
+    await seedTender(order, { amount_cents: 3000, status: "refunded", refunded_cents: 3000 });
+    await seedTender(order, { amount_cents: 3000 });
+    expect(await getOrderBalance((await getPosDriver().getOrder(order.id))!)).toBe(7000);
+  });
+
+  it("a PAID order with refunds owes nothing and takes no new tender", async () => {
+    const order = await seedOrder([item("l-bb", 5000, 1)], { status: "paid" });
+    await seedTender(order, { amount_cents: 2000, status: "refunded", refunded_cents: 2000 });
+    await seedTender(order, { amount_cents: 3000 });
+    const fresh = (await getPosDriver().getOrder(order.id))!;
+    expect(await getOrderBalance(fresh)).toBe(0);
+    expect(buildReceipt(fresh, await getPosDriver().listPaymentsForOrder(order.id)).balanceCents).toBe(0);
+  });
+
+  it("refunds are refused on an order never paid in full; voiding it gives the part payment back", async () => {
+    const order = await seedOrder([item("l-bc", 5000, 1)]);
+    const cash = await seedTender(order, { amount_cents: 2000 });
+    const res = await refund(order.id, { amountCents: 500 });
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("order_unpaid");
+    const v = await voidReq(order.id, { wholeOrder: true, reasonCode: "walkout" });
+    expect(v.status).toBe(200);
+    expect((await getPosDriver().getPayment(cash.id))!.refunded_cents).toBe(2000);
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("voided");
+  });
+});
+
+describe("edits after a refund, marketplace and stored value", () => {
+  it("no comp / discount once any refund exists", async () => {
+    const order = await seedOrder([item("l-ca", 1000, 2)], { status: "paid" });
+    await seedTender(order);
+    await refund(order.id, { amountCents: 100 });
+    const r = await discount(order.id, { type: "comp", lineId: "l-ca" });
+    expect(r.status).toBe(409);
+    expect((await r.json()).code).toBe("refund_exists");
+  });
+
+  it("marketplace orders and stored-value sales cannot be comped, discounted or voided", async () => {
+    const mk = await seedOrder([item("l-cb", 1000, 1)]);
+    const driver = getPosDriver();
+    // Mark them the way the channels / gift card modules do.
+    const o1 = (await driver.getOrder(mk.id))!;
+    o1.source = { type: "integration", channel: "marketplace" };
+    expect((await discount(mk.id, { type: "discount", amountCents: 100 })).status).toBe(409);
+    expect((await voidReq(mk.id, { wholeOrder: true, reasonCode: "walkout" })).status).toBe(409);
+    const sv = await seedOrder([item("l-cc", 1000, 1)]);
+    const o2 = (await driver.getOrder(sv.id))!;
+    o2.core_ext = { ...(o2.core_ext ?? {}), stored_value: true } as never;
+    const r = await voidReq(sv.id, { lines: [{ lineId: "l-cc" }] });
+    expect(r.status).toBe(409);
+    expect((await r.json()).code).toBe("not_adjustable");
+  });
+});
+
+describe("voids: approval first", () => {
+  it("a refused approval cancels no tender", async () => {
+    await policy({ void: 0 });
+    await asCashier();
+    const order = await seedOrder([item("l-da", 1000, 1)]);
+    const open = await seedTender(order, { rail: "stripe_terminal", status: "requires_action", charge_id: "sim_pi_da" });
+    const res = await voidReq(order.id, { wholeOrder: true, reasonCode: "walkout" });
+    expect(res.status).toBe(403);
+    expect((await getPosDriver().getPayment(open.id))!.status).toBe("requires_action");
+  });
+
+  it("an approver must work at the order's location", async () => {
+    await policy({ refund: 0 });
+    await asCashier();
+    const driver = getPosDriver();
+    const carmela = (await driver.getStaffById(TENANT, CARMELA))!;
+    await driver.upsertStaff({ ...carmela, location_ids: ["10000000-0000-0000-0000-0000000009ff"] });
+    try {
+      const order = await seedOrder([item("l-db", 1000, 1)], { status: "paid" });
+      await seedTender(order);
+      const r = await refund(order.id, { amountCents: 100, approval: { staffId: CARMELA, pin: "2222" } });
+      expect(r.status).toBe(401);
+    } finally {
+      await driver.upsertStaff({ ...carmela, location_ids: [] });
+    }
+  });
+
+  it("a request id replayed for another kind of edit is a conflict", async () => {
+    const order = await seedOrder([item("l-dc", 1000, 1), item("l-dd", 500, 1)]);
+    const requestId = rid("kind");
+    expect((await discount(order.id, { type: "discount", amountCents: 100, requestId })).status).toBe(200);
+    const r = await voidReq(order.id, { lines: [{ lineId: "l-dd" }], requestId });
+    expect(r.status).toBe(409);
+    expect((await r.json()).code).toBe("request_conflict");
+  });
+});
+
+describe("unfinished item refunds", () => {
+  it("a failed item refund resumes under the same id (units re-reserved)", async () => {
+    goLiveStripe();
+    const order = await seedOrder([item("l-ea", 1000, 2)], { status: "paid" });
+    await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_ea", connect_account_id: ACCT, simulated: false });
+    stripeRequest.mockRejectedValueOnce(new StripeError("try later", 400, null));
+    const requestId = rid("ea");
+    const first = await refund(order.id, { lines: [{ lineId: "l-ea", quantity: 1 }], requestId });
+    expect((await first.json()).record.status).toBe("failed");
+    stripeRequest.mockResolvedValue({ id: "re_ea", status: "succeeded" });
+    const second = await refund(order.id, { lines: [{ lineId: "l-ea", quantity: 1 }], requestId });
+    expect((await second.json()).record.status).toBe("completed");
+    expect(await getPosDriver().listOrderAdjustments(order.id)).toHaveLength(1);
+  });
+
+  it("a stuck pending item refund can be canceled, which releases its units", async () => {
+    const order = await seedOrder([item("l-eb", 1000, 1)], { status: "paid" });
+    await seedTender(order);
+    const driver = getPosDriver();
+    const requestId = rid("stuck");
+    await driver.beginOrderRefund({
+      id: requestId,
+      tenant_id: TENANT,
+      location_id: LOCATION,
+      order_id: order.id,
+      kind: "refund",
+      status: "pending",
+      amount_cents: 1000,
+      tip_cents: 0,
+      lines: [{ line_id: "l-eb", quantity: 1, amount_cents: 1000 }],
+      allocations: [],
+      reason_code: "quality",
+      reason_text: null,
+      staff_id: null,
+      actor_user_id: "device-1",
+      approved_by: null,
+      meta: null,
+      created_at: "",
+      updated_at: "",
+    });
+    const payments = await driver.listPaymentsForOrder(order.id);
+    const fresh = (await driver.getOrder(order.id))!;
+    const rows = selectRecentOrders([fresh], new Map([[order.id, payments]]), 50, await driver.listOrderAdjustments(order.id));
+    expect(rows[0]!.unfinishedRefunds).toBe(1);
+    expect((await refund(order.id, { lines: [{ lineId: "l-eb", quantity: 1 }] })).status).toBe(422);
+    const c = await refund(order.id, { requestId, cancel: true });
+    expect((await c.json()).record.status).toBe("failed");
+    expect((await refund(order.id, { lines: [{ lineId: "l-eb", quantity: 1 }] })).status).toBe(200);
+  });
+
+  it("a cash refund resumed after a crash writes its drawer payout exactly once", async () => {
+    const order = await seedOrder([item("l-ec", 1000, 1)], { status: "paid" });
+    const cash = await seedTender(order);
+    const driver = getPosDriver();
+    const shift = await driver.openShift({ tenantId: TENANT, locationId: LOCATION, staffId: CARMELA, openingFloatCents: 0 });
+    const requestId = rid("cash");
+    await driver.beginOrderRefund({
+      id: requestId,
+      tenant_id: TENANT,
+      location_id: LOCATION,
+      order_id: order.id,
+      kind: "refund",
+      status: "pending",
+      amount_cents: 400,
+      tip_cents: 0,
+      lines: [],
+      allocations: [],
+      reason_code: "quality",
+      reason_text: null,
+      staff_id: CARMELA,
+      actor_user_id: "device-1",
+      approved_by: null,
+      meta: null,
+      created_at: "",
+      updated_at: "",
+    });
+    // The money moved, then the process died before the drawer row.
+    await refundPayment({
+      paymentId: cash.id,
+      amountCents: 400,
+      tipCents: 0,
+      refundId: `${requestId}_${cash.id.replace(/[^0-9a-zA-Z]/g, "").slice(0, 8)}_0`,
+    });
+    await refund(order.id, { requestId, amountCents: 400 });
+    await refund(order.id, { requestId, amountCents: 400 });
+    const events = (await driver.listShiftCashEvents(shift.id)).filter((e) => e.order_id === order.id);
+    expect(events).toMatchObject([{ type: "payout", amount_cents: -400 }]);
+    await driver.closeShift({ shiftId: shift.id, countedCents: 0 });
+  });
+});
+
+describe("webhook: failed refund on a voided order", () => {
+  it("restores the status it had and keeps the money visible", async () => {
+    goLiveStripe();
+    vi.stubEnv("STRIPE_WEBHOOK_SECRET", "whsec_adj2");
+    stripeRequest.mockResolvedValue({ id: "re_void_1", status: "succeeded" });
+    const order = await seedOrder([item("l-fa", 1000, 1)], { status: "paid" });
+    const card = await seedTender(order, { rail: "stripe_terminal", charge_id: "pi_void_1", connect_account_id: ACCT, simulated: false });
+    await voidReq(order.id, { wholeOrder: true, reasonCode: "walkout" });
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("voided");
+    const payload = JSON.stringify({
+      type: "refund.failed",
+      account: ACCT,
+      data: { object: { id: "re_void_1", object: "refund", status: "failed", payment_intent: "pi_void_1" } },
+    });
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = createHmac("sha256", "whsec_adj2").update(`${ts}.${payload}`).digest("hex");
+    await webhookPOST(
+      new Request("http://localhost/api/payments/stripe/webhook", {
+        method: "POST",
+        headers: { "stripe-signature": `t=${ts},v1=${sig}` },
+        body: payload,
+      }),
+    );
+    expect((await getPosDriver().getOrder(order.id))!.status).toBe("paid");
+    expect((await getPosDriver().getPayment(card.id))!.status).toBe("captured");
   });
 });

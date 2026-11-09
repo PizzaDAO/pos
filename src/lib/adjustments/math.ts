@@ -291,13 +291,17 @@ export function normalizeAdjustments(
     if (a.type !== "comp") continue;
     const ids = (a.line_ids ?? []).filter((id) => live.has(id));
     if (ids.length === 0) continue;
+    // Room = what is left of the line(s) after earlier comps, so units can be
+    // comped one at a time; the comp's own amount (unit x its units) caps it.
     let room = 0;
+    let own = 0;
     for (const id of ids) {
       const line = live.get(id)!;
       const units = a.quantity ? Math.min(a.quantity, line.quantity) : line.quantity;
-      room += Math.max(0, line.unit_price_cents * units - (compOnLine.get(id) ?? 0));
+      own += line.unit_price_cents * units;
+      room += Math.max(0, line.unit_price_cents * line.quantity - (compOnLine.get(id) ?? 0));
     }
-    const amount = Math.min(a.amount_cents, room);
+    const amount = Math.min(a.amount_cents, own, room);
     if (amount <= 0) continue;
     const parts = allocateCents(amount, ids.map(() => 1));
     ids.forEach((id, i) => compOnLine.set(id, (compOnLine.get(id) ?? 0) + parts[i]!));

@@ -66,6 +66,8 @@ export interface AdjustResponse {
   note?: string;
   /** Partial refunds: what landed. */
   partial?: boolean;
+  /** A card refund whose outcome at Stripe is not known yet (retry the same request). */
+  pending?: boolean;
 }
 
 export interface TakeTenderInput {
@@ -299,6 +301,7 @@ export function useCheckout(
           code?: string;
           note?: string;
           partial?: boolean;
+          pending?: boolean;
           manualRefund?: boolean;
         };
         if (data.order) setOrder(data.order);
@@ -313,6 +316,7 @@ export function useCheckout(
           code: data.code,
           note: data.note,
           partial: data.partial,
+          pending: data.pending,
         };
       } catch (e) {
         return {

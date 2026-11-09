@@ -160,6 +160,22 @@ describe.skipIf(!PGLITE)("supabase driver refunds / voids / comps on PGlite", ()
     expect(p.refunds![0]!.tip_cents).toBe(0);
   });
 
+  it("card refunds: pending reservation, confirm, tombstone release, status restored", async () => {
+    const r = await driver.reservePaymentRefund(PAY, 200, "sr-card-1", { tipCents: 0, pending: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.payment.refunds!.find((e) => e.request_id === "sr-card-1")!.state).toBe("pending");
+    const c = await driver.confirmPaymentRefund(PAY, "sr-card-1", "re_sr_1");
+    expect(c!.refunds!.find((e) => e.request_id === "sr-card-1")).toMatchObject({
+      state: "succeeded",
+      processor_ref: "re_sr_1",
+    });
+    await driver.releasePaymentRefund(PAY, 200, "sr-card-1", { tombstone: true });
+    const p = (await driver.getPayment(PAY))!;
+    expect(p.refunds!.some((e) => e.request_id === "sr-card-1")).toBe(false);
+    expect(p.refund_ids).toContain("sr-card-1");
+    expect((await driver.reservePaymentRefund(PAY, 200, "sr-card-1", { tipCents: 0 })).ok).toBe(false);
+  });
+
   it("beginOrderRefund reserves item units under the order lock", async () => {
     const rec = (id: string, qty: number) => ({
       id,
@@ -196,6 +212,10 @@ describe.skipIf(!PGLITE)("supabase driver refunds / voids / comps on PGlite", ()
     });
     expect(done).toMatchObject({ status: "completed", allocations: [{ base_cents: 2000 }] });
     expect((await driver.listOrderAdjustments(ORDER)).map((r) => r.id)).toContain("sr-item-0001");
+    expect((await driver.listOrderAdjustmentsForOrders([ORDER])).length).toBeGreaterThan(0);
+    // A failed refund reopens only while its units are free.
+    await driver.finishOrderAdjustment(ORDER, "sr-item-0001", { status: "failed", allocations: [] });
+    expect((await driver.reopenOrderRefund(ORDER, "sr-item-0001")).outcome).toBe("ok");
   });
 
   it("applyOrderEdit: compare-and-set, partial void split, money check, ledger row", async () => {

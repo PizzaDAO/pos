@@ -41,6 +41,15 @@ export interface PaymentRefund {
    * which came off the tip first (see `tipRefundedCents`).
    */
   tip_cents?: number | null;
+  /**
+   * Card refunds are reserved BEFORE the provider is called: `pending` until the
+   * provider accepted it (`confirmPaymentRefund`), then `succeeded`. Absent =
+   * succeeded (cash / crypto, older entries). A pending entry already counts
+   * against the tender's caps, so concurrent refunds can never overshoot.
+   */
+  state?: "pending" | "succeeded";
+  /** The tender status before this refund (restored if it is released). */
+  status_before?: string | null;
 }
 
 /**

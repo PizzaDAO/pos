@@ -122,6 +122,8 @@ export interface RefundResult {
   refundId: string;
   status: ChargeStatus;
   amount: Money;
+  /** The provider's own refund status (Stripe: succeeded / pending / failed / canceled ...). */
+  providerStatus?: string;
 }
 
 /**
