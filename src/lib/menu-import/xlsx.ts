@@ -73,8 +73,20 @@ function* elements(xml: string, tag: string): Generator<Element> {
 }
 
 function attr(attrs: string, name: string): string | undefined {
-  const m = new RegExp(`(?:^|\\s)${name}="([^"]*)"`).exec(attrs);
-  return m?.[1];
+  // Attribute lists are tiny in real files; bound the scan so a hostile
+  // megabyte-long "attribute" can't make repeated lookups quadratic.
+  const a = attrs.length > 2000 ? attrs.slice(0, 2000) : attrs;
+  const needle = `${name}="`;
+  let from = 0;
+  for (;;) {
+    const i = a.indexOf(needle, from);
+    if (i < 0) return undefined;
+    if (i === 0 || /\s/.test(a.charAt(i - 1))) {
+      const end = a.indexOf('"', i + needle.length);
+      return end < 0 ? undefined : a.slice(i + needle.length, end);
+    }
+    from = i + needle.length;
+  }
 }
 
 /** Concatenate every <t> run in a fragment (rich-text strings have several). */
@@ -82,6 +94,15 @@ function textOf(fragment: string): string {
   let out = "";
   for (const t of elements(fragment, "t")) out += decodeXml(t.body);
   return out;
+}
+
+/** Text of the first <v>...</v> (capped), via indexOf: no regex backtracking. */
+function valueOf(body: string): string | undefined {
+  const start = body.indexOf("<v>");
+  if (start < 0) return undefined;
+  const end = body.indexOf("</v>", start + 3);
+  if (end < 0 || end - start - 3 > 4096) return undefined;
+  return body.slice(start + 3, end);
 }
 
 /** 0-based column from a cell ref ("B2" -> 1); -1 when malformed or absurd. */
@@ -181,7 +202,7 @@ export function parseXlsx(bytes: Uint8Array): string[][] {
       }
       next = idx + 1;
       const type = attr(c.attrs, "t");
-      const v = /<v>([\s\S]{0,4096}?)<\/v>/.exec(c.body)?.[1];
+      const v = valueOf(c.body);
       let value = "";
       if (type === "s") value = shared[Number.parseInt(v ?? "", 10)] ?? "";
       else if (type === "inlineStr") value = textOf(c.body);

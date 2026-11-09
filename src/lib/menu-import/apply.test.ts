@@ -108,6 +108,22 @@ describe("buildImportRows", () => {
     expect(summary.removed.itemNames.sort()).toEqual(["Extra", "Gone"]);
   });
 
+  it("replace keeps the id of an item moved to another or renamed category", () => {
+    const snap: MenuSnapshot = {
+      ...existing(),
+      items: [
+        ...existing().items,
+        { id: "i-cola", category_id: "c-pizzas", name: "Cola", description: null, is_half_and_half_capable: false, station: "oven" },
+      ],
+    };
+    const { changes, summary } = buildImportRows("t1", snap, plan(), "replace");
+    const moved = changes.update.items.find((i) => i.id === "i-cola");
+    expect(moved?.category_id).toBe(changes.insert.categories.find((c) => c.name === "Drinks")?.id);
+    expect(changes.insert.items.some((i) => i.name === "Cola")).toBe(false);
+    expect(changes.delete.items).not.toContain("i-cola");
+    expect(summary.updatedItems).toBe(2);
+  });
+
   it("replace leaves modifier groups and links alone when the file has none", () => {
     const snap: MenuSnapshot = {
       ...existing(),

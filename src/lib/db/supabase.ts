@@ -3092,12 +3092,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         table: string,
         cols: string,
         order: string,
-        extra?: (q: any) => any, // eslint-disable-line @typescript-eslint/no-explicit-any
       ) =>
         fetchAllPages<Row>(async (from, to) => {
           let q = sb.from(table).select(cols).eq("tenant_id", tenantId);
-          if (extra) q = extra(q);
-          return unwrap(await q.order(order).range(from, to)) as unknown as Row[];
+          // Stable total order: every column of the (composite) key.
+          for (const o of order.split(",")) q = q.order(o.trim());
+          return unwrap(await q.range(from, to)) as unknown as Row[];
         });
       const [cats, items, groups, recipes, allergens] = await Promise.all([
         tenantRows("menu_categories", "id,name,sort_order", "id"),
@@ -3112,7 +3112,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           "id",
         ),
         tenantRows("item_inventory_links", "id,source_id", "id"),
-        tenantRows("menu_allergen_rows", "publication_id,target_id,target_type", "target_id"),
+        tenantRows("menu_allergen_rows", "publication_id,target_id,target_type", "publication_id,target_type,target_id"),
       ]);
       const itemIds = items.map((r) => r.id as string);
       const groupIds = groups.map((r) => r.id as string);

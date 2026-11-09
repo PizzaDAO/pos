@@ -167,13 +167,16 @@ end;
 $$;
 
 
+-- Supersedes the earlier (uuid, boolean, jsonb) draft signature.
+drop function if exists public.import_menu(uuid, boolean, jsonb);
+
 create or replace function public.import_menu(
   p_tenant_id uuid,
   p_changes jsonb
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   ins jsonb := coalesce(p_changes -> 'insert', '{}'::jsonb);

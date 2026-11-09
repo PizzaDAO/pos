@@ -288,6 +288,13 @@ describe("hostile XLSX input", () => {
     expect(timed(() => parseMenuImport(xlsx(sheetWith(`<c r="A1" t="inlineStr"><is>${"<t>".repeat(100_000)}</is></c>`))))).toBeLessThan(1000);
   });
 
+  it("is linear on a multi-MB cell body of repeated <v> and on huge attribute lists", () => {
+    const body = "<v>".repeat(800_000);
+    expect(timed(() => parseMenuImport(xlsx(sheetWith(`<c r="A1">${body}</c>`))))).toBeLessThan(1000);
+    const attrs = ' r="'.repeat(400_000);
+    expect(timed(() => parseMenuImport(xlsx(sheetWith(`<c${attrs}></c>`))))).toBeLessThan(1000);
+  });
+
   it("caps shared strings, cells and unpacked size", () => {
     const many = `<sst>${"<si><t>x</t></si>".repeat(IMPORT_LIMITS.maxXlsxSharedStrings + 1)}</sst>`;
     expect(() => parseMenuImport(xlsx(sheetWith(`<c r="A1"/>`), many))).toThrow(/too many strings|too large/);

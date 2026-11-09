@@ -3,8 +3,10 @@
  *
  * Pure (ids come from `newId`), so preview and apply share one code path and
  * the matching rules are unit-tested without a database. Matching is by
- * case-insensitive name: category; item within category; size within item;
- * modifier group; option within group.
+ * case-insensitive name: category; item within category (replace mode also falls
+ * back to a UNIQUE tenant-wide item name, so an item moved to another category
+ * or under a renamed category keeps its id and just gets a new category_id);
+ * size within item; modifier group; option within group.
  *
  *   "add"     only INSERTS. Existing categories/groups are reused, an item that
  *             already exists in its category is SKIPPED (never duplicated or
@@ -239,6 +241,15 @@ export function buildImportRows(
     const k = `${i.category_id}\u0000${key(i.name)}`;
     if (!itemsByCatName.has(k)) itemsByCatName.set(k, i);
   }
+  // Replace-mode fallback: a name that is unique in the file AND on the menu.
+  const existingByName = new Map<string, MenuSnapshot["items"]>();
+  for (const i of snapshot.items) {
+    existingByName.set(key(i.name), [...(existingByName.get(key(i.name)) ?? []), i]);
+  }
+  const planNameCount = new Map<string, number>();
+  for (const c of plan.categories) {
+    for (const i of c.items) planNameCount.set(key(i.name), (planNameCount.get(key(i.name)) ?? 0) + 1);
+  }
   const keptCategoryIds = new Set<string>();
   const keptItemIds = new Set<string>();
   const unresolved = new Map<string, { name: string; items: number }>();
@@ -269,7 +280,11 @@ export function buildImportRows(
       if (replace) update.categories.push({ id: cid, name: c.name, sort_order: ci + 1 });
     }
     for (const item of c.items) {
-      const existing = cid ? itemsByCatName.get(`${cid}\u0000${key(item.name)}`) : undefined;
+      let existing = cid ? itemsByCatName.get(`${cid}\u0000${key(item.name)}`) : undefined;
+      if (!existing && replace && planNameCount.get(key(item.name)) === 1) {
+        const only = existingByName.get(key(item.name));
+        if (only?.length === 1) existing = only[0];
+      }
       if (existing && !replace) {
         skippedItems++;
         continue;
