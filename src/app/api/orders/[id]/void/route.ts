@@ -18,6 +18,8 @@ import { parseLineSelections, prepareAction, respond } from "@/lib/adjustments/r
 import { voidLines, voidOrder } from "@/lib/adjustments/service";
 
 export const runtime = "nodejs";
+// Must stay under the 2-minute order_adjustments claim (voiding a paid order refunds).
+export const maxDuration = 60;
 
 export async function POST(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
