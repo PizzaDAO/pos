@@ -16,6 +16,7 @@
  *
  * No env vars are read; everything runs against the in-memory mock driver.
  */
+import { autoPrintOnFire } from "@/lib/printing/queue";
 import { NextResponse } from "next/server";
 import { getPosDriver, type CreateOrderInput } from "@/lib/db";
 import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
@@ -206,6 +207,8 @@ export async function POST(request: Request) {
     // createOrder is an idempotent upsert-by-UUID — retries return the existing
     // order, so this log line may report the same order id more than once.
     const order = await driver.createOrder(input);
+    // Per-location auto-print (off by default); idempotent per order, never throws.
+    await autoPrintOnFire(order);
     log.info("order_upserted", {
       orderId: order.id,
       tenantId: order.tenant_id,

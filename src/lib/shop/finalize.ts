@@ -23,6 +23,7 @@
  * Idempotent and safe to call for an order in any state: a non-awaiting order
  * returns `{ won: false }` and does nothing.
  */
+import { autoPrintOnFire } from "@/lib/printing/queue";
 import { getPosDriver } from "@/lib/db";
 import type {
   DeliveryAddress,
@@ -100,6 +101,8 @@ export async function finalizeOnlinePayment(
   }
 
   await runPostPaymentSteps(paid);
+  // The order is now live: auto-print its ticket if the location opted in.
+  await autoPrintOnFire(paid);
   return { order: (await driver.getOrder(orderId)) ?? paid, won: true };
 }
 
