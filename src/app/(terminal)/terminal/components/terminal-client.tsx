@@ -448,7 +448,7 @@ export function TerminalClient({
         <StaffSwitch
           tenantId={menu.tenantId}
           current={activeStaff}
-          onVerify={verifyPin}
+          onVerify={(staffId, pin) => verifyPin(staffId, pin, location)}
           onSignOut={signOutStaff}
           onClose={() => setShowStaffSwitch(false)}
         />

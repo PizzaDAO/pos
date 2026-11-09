@@ -71,6 +71,8 @@ import type {
   Staff,
   StaffModuleRole,
   StaffSession,
+  StaffPinRecord,
+  StaffProfilePatch,
   SizeInput,
 } from "./backoffice-types";
 import type {
@@ -1487,8 +1489,54 @@ export interface PosDriver {
     staffId: string,
     pinHash: string | null,
   ): Promise<boolean>;
+  /**
+   * Replace a PIN but keep the OLD one valid until `graceUntil` (or until the
+   * new one is first used, see clearPreviousPin). If an earlier replacement's
+   * old PIN is still in grace it is kept (with its own deadline), so a retry
+   * after a lost response still accepts the PIN the person actually knows.
+   * Resets the lockout. False when the staff member is not in the tenant.
+   */
+  rotateStaffPin(
+    tenantId: string,
+    staffId: string,
+    pinHash: string,
+    graceUntil: string,
+  ): Promise<boolean>;
+  /** Drop a replaced PIN's grace (the new PIN was used). */
+  clearPreviousPin(tenantId: string, staffId: string): Promise<void>;
   /** Does the tenant have any ACTIVE staff member with a PIN set? */
   tenantHasStaffPins(tenantId: string): Promise<boolean>;
+  /**
+   * Every staff member's PIN hash + locations (server-only: the PIN uniqueness
+   * check when issuing a PIN). Never returned to a client.
+   */
+  listStaffPinRecords(tenantId: string): Promise<StaffPinRecord[]>;
+  /**
+   * Targeted update of the editable profile fields that are PRESENT in `patch`
+   * (scoped by tenant AND id; pin_hash / user_id never move). null when no such
+   * staff in that tenant.
+   */
+  updateStaffProfile(
+    tenantId: string,
+    staffId: string,
+    patch: StaffProfilePatch,
+  ): Promise<Staff | null>;
+  /** Newest PIN sign-in (staff session opened, any kind) per staff member. */
+  lastStaffSignIns(tenantId: string): Promise<Map<string, string>>;
+
+  // -- PIN attempt budgets per device / per location (persisted) --------------
+  /**
+   * ATOMICALLY count a PIN attempt against a (scope, key) budget BEFORE the PIN
+   * is checked: refused while locked; once `max` unproven attempts are spent
+   * inside `windowMinutes`, the next sets a `lockMinutes` lock and is refused.
+   */
+  beginPinLimitAttempt(
+    scope: "device" | "location",
+    key: string,
+    limits: { max: number; windowMinutes: number; lockMinutes: number },
+  ): Promise<PinAttempt>;
+  /** A verified PIN un-counts its own attempt (never clears a lock). */
+  releasePinLimitAttempt(scope: "device" | "location", key: string): Promise<void>;
 
   // -- Terminal staff sessions (server-side revocation of PIN switch-ins) ----
   createStaffSession(session: StaffSession): Promise<StaffSession>;
@@ -1496,6 +1544,8 @@ export interface PosDriver {
   revokeStaffSession(id: string): Promise<void>;
   /** Revoke every live staff session opened by this device user. */
   revokeStaffSessionsForUser(userId: string): Promise<void>;
+  /** Revoke every live session (any device) of one staff member (PIN reset, role change). */
+  revokeStaffSessionsForStaff(tenantId: string, staffId: string): Promise<void>;
 
   /** Fetch a single shift by id (any tenant), or null. */
   getShift(id: string): Promise<Shift | null>;

@@ -59,3 +59,24 @@ export function verifyPin(pin: string, storedHash: string | null | undefined): b
 export function isValidPinFormat(pin: unknown): pin is string {
   return typeof pin === "string" && /^[0-9]{4,8}$/.test(pin);
 }
+
+/**
+ * Which of a staff member's PINs `pin` matches: the current one, a replaced
+ * short PIN still in its grace window (`pin_previous_until` in the future),
+ * or none. Both hashes are always checked so timing doesn't reveal which.
+ */
+export function matchStaffPin(
+  pin: string,
+  staff: {
+    pin_hash?: string | null;
+    pin_previous_hash?: string | null;
+    pin_previous_until?: string | null;
+  },
+  now = Date.now(),
+): "current" | "previous" | null {
+  const current = verifyPin(pin, staff.pin_hash);
+  const inGrace =
+    !!staff.pin_previous_until && new Date(staff.pin_previous_until).getTime() > now;
+  const previous = verifyPin(pin, staff.pin_previous_hash) && inGrace;
+  return current ? "current" : previous ? "previous" : null;
+}

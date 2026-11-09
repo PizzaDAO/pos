@@ -23,6 +23,7 @@ import {
 import { resetMockOnline, resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 import { ExternalRefundUnsupportedError, refundPayment } from "@/lib/payments/service";
 import { handleV1 } from "./v1";
+import { hashPin } from "@/lib/auth/pin";
 import { hydrateEvent, memoryOutbox } from "./outbox";
 
 const T0 = new Date("2026-06-04T22:00:00.000Z");
@@ -782,6 +783,44 @@ describe("4. staff.setPin", () => {
     expect(stored.pin_hash).not.toContain("4321");
     expect((await verify(FURIO, "4321")).status).toBe(200);
     expect((await verify(FURIO, "4444")).status).toBe(403);
+  });
+
+  it("setting or clearing a PIN signs the member out of the till and the back office", async () => {
+    const driver = getPosDriver();
+    const open = async (id: string, kind: "till" | "admin") =>
+      driver.createStaffSession({
+        id,
+        user_id: "device-user",
+        tenant_id: DEMO_TENANT_ID,
+        staff_id: FURIO,
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        revoked_at: null,
+        kind,
+      });
+    await open("9a7e0000-0000-4000-8000-000000000001", "till");
+    await open("9a7e0000-0000-4000-8000-000000000002", "admin");
+    expect((await set(FURIO, "4321")).status).toBe(200);
+    for (const id of ["9a7e0000-0000-4000-8000-000000000001", "9a7e0000-0000-4000-8000-000000000002"]) {
+      expect((await driver.getStaffSession(id))?.revoked_at).toBeTruthy();
+    }
+    await open("9a7e0000-0000-4000-8000-000000000003", "till");
+    expect((await set(FURIO, null)).status).toBe(200);
+    expect((await driver.getStaffSession("9a7e0000-0000-4000-8000-000000000003"))?.revoked_at).toBeTruthy();
+  });
+
+  it("verify-pin honours a replaced short PIN's grace until the new PIN is used", async () => {
+    const driver = getPosDriver();
+    await set(FURIO, "4321");
+    await driver.rotateStaffPin(
+      DEMO_TENANT_ID,
+      FURIO,
+      hashPin("905172"),
+      new Date(Date.now() + 600_000).toISOString(),
+    );
+    expect((await verify(FURIO, "4321")).status).toBe(200);
+    expect((await verify(FURIO, "905172")).status).toBe(200);
+    expect((await verify(FURIO, "4321")).status).toBe(403);
   });
 
   it("null clears the PIN", async () => {

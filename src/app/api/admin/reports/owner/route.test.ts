@@ -8,7 +8,13 @@ let allowed = true;
 vi.mock("@/lib/auth/tenant-guard", () => ({
   requireTenantAccess: async (tenantId: string | null) =>
     allowed
-      ? { ok: true, tenantId: tenantId ?? DEMO_TENANT_ID, locationId: null }
+      ? {
+          ok: true,
+          tenantId: tenantId ?? DEMO_TENANT_ID,
+          locationId: null,
+          role: "owner",
+          user: { id: "owner-reports-test", email: "o@x" },
+        }
       : { ok: false, res: NextResponse.json({ error: "Not authorized." }, { status: 403 }) },
 }));
 

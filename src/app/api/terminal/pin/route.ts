@@ -12,11 +12,12 @@
  *     the body.
  *   - The PIN is verified SERVER-SIDE against `staff.pin_hash`; the hash never
  *     leaves the server.
- *   - Brute force: a strict per-IP rate limit PLUS a persisted per-staff
- *     lockout (5 attempts without a success → 15-minute lock;
- *     staff.pin_failed_attempts / pin_locked_until). Each attempt is counted
- *     atomically BEFORE the PIN is checked (begin_pin_attempt, row lock), so
- *     concurrent guesses cannot race past the budget.
+ *   - Brute force: a strict per-IP rate limit, persisted per-DEVICE and
+ *     per-LOCATION attempt budgets, PLUS a persisted per-staff lockout (5
+ *     attempts without a success → 15-minute lock; staff.pin_failed_attempts /
+ *     pin_locked_until). Each attempt is counted atomically BEFORE the PIN is
+ *     checked (row locks), so concurrent guesses cannot race past a budget.
+ *     See src/lib/auth/pin-attempt.ts.
  *   - A generic 401 is returned for a wrong PIN / unknown staff (no
  *     enumeration); a locked staff member gets 423 with the unlock time.
  *   - Success opens a server-side staff session and sets a signed httpOnly
@@ -32,7 +33,17 @@ import { getPosDriver } from "@/lib/db";
 import { getCurrentUser } from "@/lib/auth/session";
 import { tenantsForSurface } from "@/lib/auth/roles";
 import { requireTenantAccess } from "@/lib/auth/tenant-guard";
-import { isValidPinFormat, verifyPin } from "@/lib/auth/pin";
+import { isValidPinFormat } from "@/lib/auth/pin";
+import {
+  DEVICE_COOKIE,
+  attemptStaffPin,
+  deviceCookieOptions,
+} from "@/lib/auth/pin-attempt";
+import {
+  ADMIN_UNLOCK_COOKIE,
+  adminUnlockCookieOptions,
+  revokeAdminUnlock,
+} from "@/lib/auth/admin-gate";
 import { enforceRateLimit, readJsonBody, recordAudit } from "@/lib/security";
 import {
   ACTIVE_STAFF_COOKIE,
@@ -69,6 +80,8 @@ interface Body {
    * still ends the previous staff member's session.
    */
   previousSessionId?: unknown;
+  /** The till's location (scopes the per-location PIN budget). */
+  locationId?: unknown;
 }
 
 function isValid(b: unknown): b is Body {
@@ -76,9 +89,6 @@ function isValid(b: unknown): b is Body {
   const r = b as Record<string, unknown>;
   return typeof r.staffId === "string" && typeof r.pin === "string";
 }
-
-const incorrect = () =>
-  NextResponse.json({ error: "Incorrect PIN." }, { status: 401 });
 
 export async function POST(request: Request) {
   // Brute-force defence on PIN verification — strict per-IP rate limit.
@@ -109,47 +119,19 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Not authorized." }, { status: 403 });
   }
 
-  const driver = getPosDriver();
-  // Find the staff member among the device user's authorized tenants.
-  // getStaffById carries pin_hash; it never goes to the client.
-  let matched: Awaited<ReturnType<typeof driver.getStaffById>> = null;
-  for (const tenantId of allowedTenants) {
-    const staff = await driver.getStaffById(tenantId, body.staffId);
-    if (staff) {
-      matched = staff;
-      break;
-    }
-  }
-  if (!matched || !matched.active) return incorrect();
-
-  // Per-staff lockout (persisted), ATOMIC: begin_pin_attempt counts this
-  // attempt under a row lock BEFORE the PIN is checked, so N concurrent
-  // guesses can't all slip past a "not locked yet" read. Refused while locked.
-  const attemptState = await driver.beginPinAttempt(
-    matched.tenant_id,
-    matched.id,
-  );
-  if (!attemptState.allowed) {
-    if (attemptState.justLocked) {
-      await recordAudit({
-        actor: { id: user.id, label: user.email },
-        action: "staff_pin_switch",
-        tenantId: matched.tenant_id,
-        detail: `PIN locked for ${matched.name} after repeated failures (until ${attemptState.lockedUntil}).`,
-      });
-    }
-    return NextResponse.json(
-      {
-        error: "Too many incorrect PINs. Try again later.",
-        lockedUntil: attemptState.lockedUntil,
-      },
-      { status: 423 },
-    );
-  }
-
-  if (!verifyPin(body.pin, matched.pin_hash)) return incorrect();
-  // Reset the count — unless a concurrent burst set a lock meanwhile.
-  await driver.clearPinAttempts(matched.tenant_id, matched.id);
+  // Device, location and per-staff budgets + the scrypt check (shared with
+  // the back-office unlock): see src/lib/auth/pin-attempt.ts.
+  const attempt = await attemptStaffPin({
+    request,
+    user,
+    tenantIds: allowedTenants,
+    staffId: body.staffId,
+    pin: body.pin,
+    locationId: body.locationId,
+    context: "Till PIN switch",
+  });
+  if (!attempt.ok) return attempt.res;
+  const matched = attempt.staff;
 
   // Replace any previous switch-in on this device (revoke it server-side):
   // the cookie's session, and the session the client last knew about when it
@@ -190,16 +172,28 @@ export async function POST(request: Request) {
     },
   });
   res.cookies.set(ACTIVE_STAFF_COOKIE, opened.cookie, activeStaffCookieOptions());
+  if (attempt.newDeviceCookie) {
+    res.cookies.set(DEVICE_COOKIE, attempt.newDeviceCookie, deviceCookieOptions());
+  }
+  // Someone new is at the till: a back-office unlock left open on this
+  // browser ends with the previous person's turn.
+  await revokeAdminUnlock(request);
+  res.cookies.set(ADMIN_UNLOCK_COOKIE, "", { ...adminUnlockCookieOptions(), maxAge: 0 });
   return res;
 }
 
-/** DELETE /api/terminal/pin — switch the active staff out (revoke + clear). */
+/**
+ * DELETE /api/terminal/pin — switch the active staff out / lock the till:
+ * revoke + clear the till session AND any back-office unlock on this browser.
+ */
 export async function DELETE(request: Request) {
   await revokeRequestStaffSession(request);
+  await revokeAdminUnlock(request);
   const res = NextResponse.json({ ok: true });
   res.cookies.set(ACTIVE_STAFF_COOKIE, "", {
     ...activeStaffCookieOptions(),
     maxAge: 0,
   });
+  res.cookies.set(ADMIN_UNLOCK_COOKIE, "", { ...adminUnlockCookieOptions(), maxAge: 0 });
   return res;
 }

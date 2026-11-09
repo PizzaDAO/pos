@@ -15,7 +15,7 @@ import type {
   MarketplaceSettings,
   MarketplaceProviderSettings,
 } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { getAdapter } from "@/lib/marketplace/adapters";
 import {
   buildSimulatedOrder,
@@ -33,14 +33,10 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(
-    searchParams.get("tenantId"),
-    "admin",
-    {
-      locationId: searchParams.get("locationId"),
-      requireLocation: true,
-    },
-  );
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
+    locationId: searchParams.get("locationId"),
+    requireLocation: true,
+  });
   if (!auth.ok) return auth.res;
   const settings = await getPosDriver().getStoreSettings(
     auth.tenantId,
@@ -71,7 +67,7 @@ export async function PUT(request: Request) {
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
-  const auth = await requireTenantAccess(body.tenantId, "admin", {
+  const auth = await requireAdminAccess(request, body.tenantId, {
     locationId: body.locationId,
     requireLocation: true,
   });
@@ -145,7 +141,7 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
-  const auth = await requireTenantAccess(body.tenantId, "admin", {
+  const auth = await requireAdminAccess(request, body.tenantId, {
     locationId: body.locationId,
     requireLocation: true,
   });

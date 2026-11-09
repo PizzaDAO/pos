@@ -59,9 +59,17 @@ export function useActiveStaff() {
     void fetch("/api/terminal/pin", { method: "DELETE" }).catch(() => null);
   }, []);
 
-  /** Verify a PIN server-side and, on success, set the active staff. */
+  /**
+   * Verify a PIN server-side and, on success, set the active staff. Returns
+   * true, false (wrong PIN) or the message to show (e.g. locked out).
+   * `locationId` scopes the server's per-location attempt budget.
+   */
   const verifyPin = useCallback(
-    async (staffId: string, pin: string): Promise<boolean> => {
+    async (
+      staffId: string,
+      pin: string,
+      locationId?: string,
+    ): Promise<boolean | string> => {
       const res = await fetch("/api/terminal/pin", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -70,9 +78,13 @@ export function useActiveStaff() {
         body: JSON.stringify({
           staffId,
           pin,
+          locationId,
           previousSessionId: read()?.session_id,
         }),
       });
+      if (res.status === 423 || res.status === 429) {
+        return "Too many incorrect PINs. Try again later.";
+      }
       if (!res.ok) return false;
       const data = (await res.json()) as { activeStaff: ActiveStaff };
       signIn(data.activeStaff);

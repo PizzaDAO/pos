@@ -201,7 +201,14 @@ export type AuditAction =
   // A manager overrode a stuck driver conflict and dispatched in-house instead.
   | "delivery_manual_override"
   // A menu was bulk-imported (add or replace) from a Square/Toast/Clover/CSV file.
-  | "menu_import";
+  | "menu_import"
+  // Admin > Staff: roster changes and PIN resets; the back-office PIN unlock.
+  | "staff_create"
+  | "staff_update"
+  | "staff_deactivate"
+  | "staff_reactivate"
+  | "staff_pin_reset"
+  | "admin_unlock";
 
 /**
  * An append-only audit entry written when a platform operator takes a

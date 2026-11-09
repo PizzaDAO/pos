@@ -12,7 +12,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
-import { ADMIN_ROLES, authorizeLocation } from "@/lib/payments/terminal/http";
+import { authorizeAdminLocation } from "@/lib/payments/terminal/http";
 import { createPrinter, printHealth, publicOrigin } from "@/lib/printing/queue";
 import { publicJob, publicPrinter, setupUrl } from "@/lib/printing/public";
 import type { PrinterFormat, PrinterProtocol } from "@/lib/printing/types";
@@ -40,10 +40,10 @@ async function body(tenantId: string, locationId: string) {
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await authorizeLocation(
+  const auth = await authorizeAdminLocation(
+    request,
     searchParams.get("tenantId"),
     searchParams.get("locationId"),
-    ADMIN_ROLES,
   );
   if (!auth.ok) return auth.res;
   return NextResponse.json(await body(auth.tenantId, auth.location.id), {
@@ -55,9 +55,13 @@ export async function POST(request: Request) {
   const limited = enforceRateLimit(request, "payments");
   if (limited) return limited;
   const parsed = await readJsonBody(request);
-  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
+  if (!parsed.ok)
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   const b = (parsed.body ?? {}) as Record<string, unknown>;
-  const auth = await authorizeLocation(b.tenantId, b.locationId, ADMIN_ROLES);
+  const auth = await authorizeAdminLocation(request, b.tenantId, b.locationId);
   if (!auth.ok) return auth.res;
 
   const protocol = b.protocol;
@@ -69,19 +73,34 @@ export async function POST(request: Request) {
   }
   const columns = b.columns === undefined ? 42 : b.columns;
   if (columns !== 42 && columns !== 48) {
-    return NextResponse.json({ error: "columns must be 42 or 48." }, { status: 422 });
+    return NextResponse.json(
+      { error: "columns must be 42 or 48." },
+      { status: 422 },
+    );
   }
   const format = b.format === undefined ? "markup" : b.format;
   if (format !== "markup" && format !== "text") {
-    return NextResponse.json({ error: "format must be markup or text." }, { status: 422 });
+    return NextResponse.json(
+      { error: "format must be markup or text." },
+      { status: 422 },
+    );
   }
   const label = typeof b.label === "string" ? b.label.trim() : "";
-  if (!label) return NextResponse.json({ error: "A printer name is required." }, { status: 422 });
+  if (!label)
+    return NextResponse.json(
+      { error: "A printer name is required." },
+      { status: 422 },
+    );
 
-  const existing = await getPosDriver().listPrinters(auth.tenantId, auth.location.id);
+  const existing = await getPosDriver().listPrinters(
+    auth.tenantId,
+    auth.location.id,
+  );
   if (existing.length >= MAX_PRINTERS_PER_LOCATION) {
     return NextResponse.json(
-      { error: `A location can have at most ${MAX_PRINTERS_PER_LOCATION} printers.` },
+      {
+        error: `A location can have at most ${MAX_PRINTERS_PER_LOCATION} printers.`,
+      },
       { status: 409 },
     );
   }
@@ -106,23 +125,34 @@ export async function POST(request: Request) {
 
 export async function PATCH(request: Request) {
   const parsed = await readJsonBody(request);
-  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
+  if (!parsed.ok)
+    return NextResponse.json(
+      { error: parsed.error },
+      { status: parsed.status },
+    );
   const b = (parsed.body ?? {}) as Record<string, unknown>;
-  const auth = await authorizeLocation(b.tenantId, b.locationId, ADMIN_ROLES);
+  const auth = await authorizeAdminLocation(request, b.tenantId, b.locationId);
   if (!auth.ok) return auth.res;
   if (typeof b.autoPrint !== "boolean") {
-    return NextResponse.json({ error: "autoPrint must be a boolean." }, { status: 422 });
+    return NextResponse.json(
+      { error: "autoPrint must be a boolean." },
+      { status: 422 },
+    );
   }
-  await getPosDriver().setPrintAutoPrint(auth.tenantId, auth.location.id, b.autoPrint);
+  await getPosDriver().setPrintAutoPrint(
+    auth.tenantId,
+    auth.location.id,
+    b.autoPrint,
+  );
   return NextResponse.json(await body(auth.tenantId, auth.location.id));
 }
 
 export async function DELETE(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await authorizeLocation(
+  const auth = await authorizeAdminLocation(
+    request,
     searchParams.get("tenantId"),
     searchParams.get("locationId"),
-    ADMIN_ROLES,
   );
   if (!auth.ok) return auth.res;
   const printerId = searchParams.get("printerId") ?? "";

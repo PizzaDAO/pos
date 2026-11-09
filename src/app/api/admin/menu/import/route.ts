@@ -14,7 +14,7 @@
  * a `menu_import` audit entry. No env vars.
  */
 import { NextResponse } from "next/server";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { getPosDriver } from "@/lib/db";
 import {
   FORMAT_LABELS,
@@ -38,9 +38,9 @@ function fail(error: string, status: number) {
 export async function POST(request: Request) {
   // Authorize first: the tenant comes from the query string so nothing is
   // buffered or parsed for a caller who may not import.
-  const auth = await requireTenantAccess(
+  const auth = await requireAdminAccess(
+    request,
     new URL(request.url).searchParams.get("tenantId"),
-    "admin",
   );
   if (!auth.ok) return auth.res;
   const tenantId = auth.tenantId;
@@ -124,7 +124,9 @@ export async function POST(request: Request) {
         `Imported menu (${mode}) from ${FORMAT_LABELS[plan.format]}: ` +
         `${summary.items} items, ${summary.categories} categories, ` +
         `${summary.modifierGroups} modifier groups` +
-        (summary.skippedItems ? `, ${summary.skippedItems} existing skipped` : "") +
+        (summary.skippedItems
+          ? `, ${summary.skippedItems} existing skipped`
+          : "") +
         (mode === "replace"
           ? `; updated ${summary.updatedItems} in place, removed ${summary.removed.items} items / ${summary.removed.categories} categories.`
           : "."),
@@ -133,7 +135,10 @@ export async function POST(request: Request) {
   } catch (err) {
     if (err instanceof MenuImportError) return fail(err.message, err.status);
     if (err instanceof Error && /menu changed/i.test(err.message)) {
-      return fail("Your menu changed while importing. Nothing was changed; preview again.", 409);
+      return fail(
+        "Your menu changed while importing. Nothing was changed; preview again.",
+        409,
+      );
     }
     return fail("Menu import failed. Nothing was changed.", 500);
   }

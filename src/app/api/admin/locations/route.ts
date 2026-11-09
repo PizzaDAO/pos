@@ -15,7 +15,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { canAddLocation, resolveEntitlements } from "@/lib/saas/entitlements";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { recordAudit } from "@/lib/security";
 import { canonicalTimezone } from "@/lib/owner-reports";
 
@@ -32,7 +32,7 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin");
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"));
   if (!auth.ok) return auth.res;
   const tenantId = auth.tenantId;
   const driver = getPosDriver();
@@ -84,7 +84,7 @@ export async function PATCH(request: Request) {
   if (country && !/^[A-Z]{2}$/.test(country)) {
     return NextResponse.json({ error: "country must be a 2-letter ISO code." }, { status: 422 });
   }
-  const auth = await requireTenantAccess(body.tenantId, "admin");
+  const auth = await requireAdminAccess(request, body.tenantId);
   if (!auth.ok) return auth.res;
   const driver = getPosDriver();
   const before = (await driver.listLocations(auth.tenantId)).find((l) => l.id === body.locationId);
@@ -130,7 +130,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "timezone must be an IANA zone like America/New_York (or UTC)." }, { status: 422 });
   }
   // Only an owner|manager of this tenant may add a location.
-  const auth = await requireTenantAccess(body.tenantId, "admin");
+  const auth = await requireAdminAccess(request, body.tenantId);
   if (!auth.ok) return auth.res;
 
   const driver = getPosDriver();

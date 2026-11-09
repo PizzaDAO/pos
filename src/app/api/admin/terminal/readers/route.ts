@@ -11,8 +11,7 @@
 import { NextResponse } from "next/server";
 import { registerTerminalReader } from "@/lib/payments/terminal/readers";
 import {
-  ADMIN_ROLES,
-  authorizeLocation,
+  authorizeAdminLocation,
   errorResponse,
 } from "@/lib/payments/terminal/http";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
@@ -25,7 +24,7 @@ export async function POST(request: Request) {
   const parsed = await readJsonBody(request);
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
   const b = (parsed.body ?? {}) as Record<string, unknown>;
-  const auth = await authorizeLocation(b.tenantId, b.locationId, ADMIN_ROLES);
+  const auth = await authorizeAdminLocation(request, b.tenantId, b.locationId);
   if (!auth.ok) return auth.res;
   if (typeof b.registrationCode !== "string" || !b.registrationCode.trim()) {
     return NextResponse.json({ error: "registrationCode is required." }, { status: 422 });

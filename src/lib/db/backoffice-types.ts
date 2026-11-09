@@ -190,6 +190,36 @@ export interface StaffSession {
   created_at: string;
   expires_at: string;
   revoked_at: string | null;
+  /**
+   * 'till' = a PIN switch-in at the terminal; 'admin' = a short back-office
+   * unlock by an owner/manager PIN. Each check honours only its own kind.
+   * Absent on rows written before the column existed = 'till'.
+   */
+  kind?: StaffSessionKind;
+}
+
+export type StaffSessionKind = "till" | "admin";
+
+/** Fields an owner/manager may edit on a staff member (Admin > Staff). */
+export interface StaffProfilePatch {
+  name?: string;
+  role?: MembershipRole;
+  active?: boolean;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  location_ids?: string[];
+  module_roles?: StaffModuleRole[];
+}
+
+/** A staff member's PIN material, for the server-side uniqueness check only. */
+export interface StaffPinRecord {
+  id: string;
+  active: boolean;
+  location_ids: string[];
+  pin_hash: string | null;
+  /** A replaced short PIN still honoured until `pin_previous_until`. */
+  pin_previous_hash: string | null;
+  pin_previous_until: string | null;
 }
 
 /** Per-staff PIN lockout state. */
@@ -238,12 +268,21 @@ export interface Staff {
    * `src/lib/auth/pin.ts`.
    */
   pin_hash?: string | null;
+  /**
+   * A replaced short owner/manager PIN that stays valid until the new PIN is
+   * first used or `pin_previous_until` passes (server-only, like pin_hash).
+   */
+  pin_previous_hash?: string | null;
+  pin_previous_until?: string | null;
   /** Linked login (auth user id), null until linked (POS-7). */
   user_id?: string | null;
   /** Locations this person works at; empty/absent = all (POS-7). */
   location_ids?: string[];
   /** Roles for other modules (driver, dispatcher); empty/absent = none. */
   module_roles?: StaffModuleRole[];
+  /** Optional contact details (informational; NOT an identity key). */
+  contact_email?: string | null;
+  contact_phone?: string | null;
   created_at: string;
 }
 
