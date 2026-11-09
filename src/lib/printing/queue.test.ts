@@ -7,7 +7,14 @@ import {
 } from "@/lib/db";
 import { resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 import {
+  MAX_PRINT_ATTEMPTS,
   RECLAIM_MS,
+  printHealth,
+  publicOrigin,
+  retryBackoffMs,
+  retryFailed,
+  rotatePrinterToken,
+  scheduleAutoPrint,
   authenticatePrinter,
   autoPrintOnFire,
   claimNext,
@@ -152,16 +159,105 @@ describe("queue claim / confirm", () => {
     expect((await confirm(printer, job!.id, { ok: true }))?.status).toBe("expired");
   });
 
-  it("a failed print is recorded and a reprint queues a fresh job", async () => {
+  it("a failed print is retried with backoff, then final, then Retry requeues it", async () => {
+    const { printer } = await star();
+    const [j] = await enqueueOrderTicket(await placeOrder());
+    let now = new Date();
+    for (let attempt = 1; attempt <= MAX_PRINT_ATTEMPTS; attempt++) {
+      expect((await claimNext(printer, now))?.id).toBe(j!.id);
+      const r = await confirm(printer, j!.id, { ok: false, error: "52 Paper empty" }, now);
+      if (attempt < MAX_PRINT_ATTEMPTS) {
+        expect(r?.status).toBe("queued");
+        expect(r?.retry_after).toBe(new Date(now.getTime() + retryBackoffMs(attempt)).toISOString());
+        // Not claimable during the backoff, claimable right after.
+        expect(await claimNext(printer, new Date(now.getTime() + retryBackoffMs(attempt) - 1000))).toBeNull();
+        now = new Date(now.getTime() + retryBackoffMs(attempt) + 1000);
+      } else {
+        expect(r?.status).toBe("failed");
+        expect(r?.error).toBe("52 Paper empty");
+      }
+    }
+    expect(await claimNext(printer, now)).toBeNull();
+    const health = await printHealth(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID);
+    expect(health.failedCount).toBe(1);
+    expect(health.lastError).toBe("52 Paper empty");
+    expect(await retryFailed(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID)).toBe(1);
+    expect((await claimNext(printer))?.id).toBe(j!.id);
+    expect((await printHealth(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID)).failedCount).toBe(0);
+  });
+
+  it("retry never crosses tenants and skips expired jobs", async () => {
+    const { printer } = await star();
+    const other = await rival();
+    const [j] = await enqueueOrderTicket(await placeOrder());
+    for (let i = 0; i < MAX_PRINT_ATTEMPTS; i++) {
+      await claimNext(printer, new Date(Date.now() + i * 1e6));
+      await confirm(printer, j!.id, { ok: false, error: "x" }, new Date(Date.now() + i * 1e6));
+    }
+    expect(await retryFailed(other.tenantId, other.locationId)).toBe(0);
+    expect(await getPosDriver().retryFailedPrintJobs(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID, new Date(Date.parse(j!.expires_at) + 1).toISOString())).toBe(0);
+  });
+
+  it("reprint queues a fresh REPRINT-flagged job; a repeated manual send does not", async () => {
     const { printer } = await star();
     const order = await placeOrder();
-    const [j] = await enqueueOrderTicket(order);
-    await claimNext(printer);
-    expect((await confirm(printer, j!.id, { ok: false, error: "paper out" }))?.status).toBe("failed");
+    const [first] = await enqueueOrderTicket(order, { dedupeKey: `manual:${order.id}` });
+    expect(first!.document.lines[0]!.text).not.toBe("*** REPRINT ***");
+    const [again] = await enqueueOrderTicket(order, { dedupeKey: `manual:${order.id}` });
+    expect(again!.id).toBe(first!.id); // refresh / second screen: no duplicate
     const [re] = await enqueueOrderTicket(order, { reprint: true });
-    expect(re!.id).not.toBe(j!.id);
+    expect(re!.id).not.toBe(first!.id);
     expect(re!.document.lines[0]!.text).toBe("*** REPRINT ***");
-    expect((await claimNext(printer))?.id).toBe(re!.id);
+    const jobs = await getPosDriver().listPrintJobs(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID, 50);
+    expect(jobs.filter((j) => j.printer_id === printer.id)).toHaveLength(2);
+  });
+
+  it("a manual send after the auto-print ticket is flagged REPRINT", async () => {
+    await star();
+    await getPosDriver().setPrintAutoPrint(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID, true);
+    const order = await placeOrder();
+    await autoPrintOnFire(order);
+    const [manual] = await enqueueOrderTicket(order, { dedupeKey: `manual:${order.id}` });
+    expect(manual!.document.lines[0]!.text).toBe("*** REPRINT ***");
+  });
+
+  it("rotating a token revokes the old one; only the owning tenant can rotate", async () => {
+    const { printer, token } = await star();
+    const other = await rival();
+    expect(await rotatePrinterToken(other.tenantId, printer.id)).toBeNull();
+    expect(await authenticatePrinter(token, "star_cloudprnt")).not.toBeNull();
+    const rotated = await rotatePrinterToken(DEMO_TENANT_ID, printer.id);
+    expect(await authenticatePrinter(token, "star_cloudprnt")).toBeNull();
+    expect(await authenticatePrinter(rotated!.token, "star_cloudprnt")).not.toBeNull();
+  });
+
+  it("prunes finished jobs older than the cutoff, keeps pending ones", async () => {
+    const { printer } = await star();
+    const [done] = await enqueueOrderTicket(await placeOrder());
+    await enqueueOrderTicket(await placeOrder());
+    await claimNext(printer);
+    await confirm(printer, done!.id, { ok: true });
+    const future = new Date(Date.now() + 5 * 864e5).toISOString();
+    expect(await getPosDriver().pruneFinishedPrintJobs(future)).toBe(1);
+    expect((await getPosDriver().listPrintJobs(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID, 10))).toHaveLength(1);
+  });
+
+  it("scheduleAutoPrint prints outside a request scope and never throws", async () => {
+    await star();
+    await getPosDriver().setPrintAutoPrint(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID, true);
+    const order = await placeOrder();
+    expect(() => scheduleAutoPrint(order)).not.toThrow();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await getPosDriver().listPrintJobs(DEMO_TENANT_ID, DEMO_LOCATION_DOWNTOWN_ID, 10)).toHaveLength(1);
+  });
+
+  it("setup URLs prefer the configured app origin", () => {
+    const old = process.env.NEXT_PUBLIC_APP_URL;
+    process.env.NEXT_PUBLIC_APP_URL = "https://pos.example.com/x";
+    expect(publicOrigin("http://internal:3000/api")).toBe("https://pos.example.com");
+    delete process.env.NEXT_PUBLIC_APP_URL;
+    expect(publicOrigin("http://internal:3000/api")).toBe("http://internal:3000");
+    if (old) process.env.NEXT_PUBLIC_APP_URL = old;
   });
 
   it("dedupe key makes enqueue idempotent per printer", async () => {
@@ -271,8 +367,13 @@ describe("Star CloudPRNT protocol (simulated poller)", () => {
     await starPoll(token);
     await starConfirm(token, j!.id, "52 Paper empty");
     const row = await getPosDriver().getPrintJobForPrinter(printer.id, j!.id);
-    expect(row?.status).toBe("failed");
+    expect(row?.status).toBe("queued"); // retried with backoff
     expect(row?.error).toBe("52 Paper empty");
+    expect(row?.retry_after).not.toBeNull();
+    // Junk tokens are 401/404, never a 500.
+    expect((await starPoll("not-a-uuid.secret")).status).toBe(401);
+    expect((await starGetJob(token, "junk")).status).toBe(404);
+    expect((await starConfirm(token, "junk", "200 OK")).status).toBe(200);
     expect((await starPoll("bad.token")).status).toBe(401);
     expect((await starGetJob(`${printer.id}.x`, j!.id)).status).toBe(401);
     expect((await starConfirm(`${printer.id}.x`, j!.id, "200 OK")).status).toBe(401);
@@ -320,7 +421,7 @@ describe("Epson Server Direct Print protocol (simulated poller)", () => {
     const bad = `<response success="false" code="EPTR_COVER_OPEN"/><printjobid>${encodeJobId(job!.id)}</printjobid>`;
     await epsonRequest(e.token, form({ ConnectionType: "SetResponse", ResponseFile: bad }));
     const row = await getPosDriver().getPrintJobForPrinter(e.printer.id, job!.id);
-    expect(row?.status).toBe("failed");
+    expect(row?.status).toBe("queued");
     expect(row?.error).toBe("epson:EPTR_COVER_OPEN");
     expect((await epsonRequest(s.token, form({ ConnectionType: "GetRequest" }))).status).toBe(401);
   });

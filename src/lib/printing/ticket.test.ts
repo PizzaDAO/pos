@@ -113,6 +113,7 @@ describe("ticket document", () => {
   it("wraps and cleans text", () => {
     expect(wrapText("aaa bbb ccc", 7)).toEqual(["aaa bbb", "ccc"]);
     expect(wrapText("abcdefghij", 4)).toEqual(["abcd", "efgh", "ij"]);
+    expect(cleanText("a\\b")).toBe("a/b");
     expect(cleanText("Café [x] “q” ×3 \u{1F355}")).toBe('Cafe (x) "q" x3 ?');
   });
 });

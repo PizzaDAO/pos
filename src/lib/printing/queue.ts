@@ -11,6 +11,7 @@
  *     (printer retry after a dropped confirm)
  *   - confirm is idempotent; reprint = enqueue a fresh job (no dedupe key)
  */
+import { after } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { isLiveOrderStatus } from "@/lib/db/menu-types";
 import type { Order } from "@/lib/db";
@@ -33,8 +34,18 @@ import type {
 /** A ticket nobody collected for this long is stale: don't print it hours later. */
 export const JOB_TTL_MS = 30 * 60_000;
 export const TEST_JOB_TTL_MS = 10 * 60_000;
-/** Served-but-unconfirmed jobs become claimable again after this. */
-export const RECLAIM_MS = 60_000;
+/**
+ * Served-but-unconfirmed jobs become claimable again after this. Long enough for
+ * a slow printer to print and confirm (a premature reclaim risks a duplicate
+ * ticket), short enough that a dropped confirm is retried within the shift rush.
+ */
+export const RECLAIM_MS = 120_000;
+/** A failed print (paper out, cover open) is retried this many times in total... */
+export const MAX_PRINT_ATTEMPTS = 4;
+/** ...waiting 30 s, 60 s, 120 s between attempts (still bounded by the job's expiry). */
+export function retryBackoffMs(attempts: number): number {
+  return 30_000 * 2 ** Math.max(0, attempts - 1);
+}
 /** A printer polled within this window counts as online in the admin UI. */
 export const ONLINE_WINDOW_MS = 2 * 60_000;
 
@@ -106,14 +117,82 @@ export async function getServable(
   return job;
 }
 
-/** Printer's verdict. Idempotent: repeats and unknown/foreign ids are harmless no-ops. */
+/**
+ * Printer's verdict. Idempotent: repeats and unknown/foreign ids are harmless
+ * no-ops. A failure is retried with backoff until `MAX_PRINT_ATTEMPTS` or expiry,
+ * then it is final (`failed`) and shows in the "not printed" banner with a Retry.
+ */
 export async function confirm(
   printer: Printer,
   jobId: string,
   outcome: { ok: true } | { ok: false; error: string },
   now = new Date(),
 ): Promise<PrintJob | null> {
-  return getPosDriver().completePrintJob(printer.id, jobId, outcome, now.toISOString());
+  const driver = getPosDriver();
+  if (outcome.ok) return driver.completePrintJob(printer.id, jobId, outcome, now.toISOString());
+  const job = await driver.getPrintJobForPrinter(printer.id, jobId);
+  if (!job) return null;
+  const retryAt = new Date(now.getTime() + retryBackoffMs(job.attempts));
+  const retryable = job.attempts < MAX_PRINT_ATTEMPTS && retryAt.toISOString() < job.expires_at;
+  return driver.completePrintJob(
+    printer.id,
+    jobId,
+    { ...outcome, retryAt: retryable ? retryAt.toISOString() : null },
+    now.toISOString(),
+  );
+}
+
+/** Rotate: new secret, old token stops working immediately. Returns the new token. */
+export async function rotatePrinterToken(
+  tenantId: string,
+  printerId: string,
+): Promise<{ printer: Printer; token: string } | null> {
+  const { secret, hash } = generatePrinterSecret();
+  const printer = await getPosDriver().setPrinterTokenHash(tenantId, printerId, hash);
+  return printer ? { printer, token: formatToken(printer.id, secret) } : null;
+}
+
+/** Canonical public origin for setup URLs: configured app URL, else the request's. */
+export function publicOrigin(requestUrl: string): string {
+  const configured = process.env.NEXT_PUBLIC_APP_URL?.trim();
+  if (configured) {
+    try {
+      return new URL(configured).origin;
+    } catch {
+      /* fall through */
+    }
+  }
+  return new URL(requestUrl).origin;
+}
+
+export interface PrintHealth {
+  /** Final-failed, still-printable tickets (not yet expired). */
+  failedCount: number;
+  lastError: string | null;
+  offlinePrinters: string[];
+}
+
+/** What the KDS / admin banner shows for a location. */
+export async function printHealth(
+  tenantId: string,
+  locationId: string,
+  now = new Date(),
+): Promise<PrintHealth> {
+  const driver = getPosDriver();
+  const [printers, jobs] = await Promise.all([
+    driver.listPrinters(tenantId, locationId),
+    driver.listPrintJobs(tenantId, locationId, 50),
+  ]);
+  const failed = jobs.filter((j) => j.status === "failed" && j.expires_at > now.toISOString());
+  return {
+    failedCount: failed.length,
+    lastError: failed[0]?.error ?? null,
+    offlinePrinters: printers.filter((p) => !isOnline(p, now.getTime())).map((p) => p.label),
+  };
+}
+
+export async function retryFailed(tenantId: string, locationId: string, now = new Date()): Promise<number> {
+  return getPosDriver().retryFailedPrintJobs(tenantId, locationId, now.toISOString());
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +222,9 @@ export async function enqueueOrderTicket(
   const expires = new Date(now.getTime() + JOB_TTL_MS).toISOString();
   const jobs: PrintJob[] = [];
   for (const p of printers) {
+    // A second ticket for the same order on the same printer is flagged REPRINT so
+    // the line never mistakes a duplicate for a new order.
+    const prior = opts.reprint || (await driver.hasPrintJobForOrder(p.id, order.id));
     jobs.push(
       await driver.enqueuePrintJob({
         tenant_id: order.tenant_id,
@@ -150,7 +232,7 @@ export async function enqueueOrderTicket(
         printer_id: p.id,
         order_id: order.id,
         kind: "ticket",
-        document: buildTicketDoc(order, { columns: p.columns, timezone, reprint: opts.reprint }),
+        document: buildTicketDoc(order, { columns: p.columns, timezone, reprint: prior }),
         dedupe_key: opts.dedupeKey ?? null,
         expires_at: expires,
       }),
@@ -193,6 +275,20 @@ export async function autoPrintOnFire(order: Order): Promise<number> {
   } catch (err) {
     captureError(err, { scope: "print.autoPrintOnFire", orderId: order.id });
     return 0;
+  }
+}
+
+/**
+ * Run `autoPrintOnFire` after the response is sent (Next `after()`), so printer
+ * lookups never add latency to the money path. Outside a request scope (tests,
+ * scripts) it falls back to fire-and-forget. Never throws.
+ */
+export function scheduleAutoPrint(order: Order): void {
+  const run = () => autoPrintOnFire(order).then(() => undefined);
+  try {
+    after(run);
+  } catch {
+    void run();
   }
 }
 

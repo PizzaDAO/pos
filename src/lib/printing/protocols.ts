@@ -14,6 +14,7 @@
  * Auth for both: the device token in the URL path (see `tokens.ts`). A bad token
  * is always 401 with no detail, whether the printer id or the secret was wrong.
  */
+import { UUID_RE } from "./tokens";
 import { authenticatePrinter, claimNext, confirm, getServable, markSeen } from "./queue";
 import {
   renderEpsonSdp,
@@ -66,6 +67,7 @@ export async function starGetJob(token: string, jobToken: string | null): Promis
   if (!printer) return unauthorized;
   await markSeen(printer);
   // No job token (a printer that ignored ours): serve the next claimable job.
+  if (jobToken && !UUID_RE.test(jobToken)) return { status: 404 };
   const job = jobToken ? await getServable(printer, jobToken) : await claimNext(printer);
   if (!job) return { status: 404 };
   const r = renderStar(printer, job);
@@ -79,7 +81,7 @@ export async function starConfirm(
 ): Promise<DeviceResponse> {
   const printer = await authenticatePrinter(token, "star_cloudprnt");
   if (!printer) return unauthorized;
-  if (jobToken) {
+  if (jobToken && UUID_RE.test(jobToken)) {
     const ok = !code || /^2/.test(code.trim());
     await confirm(printer, jobToken, ok ? { ok: true } : { ok: false, error: (code ?? "").slice(0, 200) });
   }

@@ -58,6 +58,8 @@ export interface PrintJob {
   expires_at: string;
   claimed_at: string | null;
   done_at: string | null;
+  /** Failed attempts are retried (status back to queued) but not before this. */
+  retry_after: string | null;
 }
 
 export interface PrintLocationSettings {

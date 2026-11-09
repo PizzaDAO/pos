@@ -1,5 +1,8 @@
 /**
  * POST { orderId, reprint? } -> print a kitchen ticket for an order.
+ * Without `reprint` it is idempotent per order+printer (a refresh or a second
+ * screen never queues a duplicate); a ticket that follows an earlier one prints
+ * a REPRINT banner. `reprint: true` always queues another copy.
  *
  * Network printer when the order's location has one registered (queues a job per
  * printer; always a fresh ticket, so this is also "reprint"), else
@@ -25,6 +28,11 @@ export async function POST(request: Request) {
   const auth = await requireOrderAccess(b.orderId, "kitchen");
   if (!auth.ok) return auth.res;
   const printer = await resolveTicketPrinter(auth.order.tenant_id, auth.order.location_id);
-  const result = await printer.print(auth.order, { reprint: b.reprint === true });
+  const result = await printer.print(auth.order, {
+    reprint: b.reprint === true,
+    // The automatic send (page open / refresh / second screen) is once per order
+    // per printer; only the explicit Reprint button queues another copy.
+    dedupeKey: b.reprint === true ? undefined : `manual:${auth.order.id}`,
+  });
   return NextResponse.json(result, { status: result.ok ? 200 : 409 });
 }

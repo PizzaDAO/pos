@@ -18,6 +18,8 @@
 -- Re-runnable; additive; no locks on existing tables.
 -- ============================================================================
 
+begin;
+
 create table if not exists public.print_printers (
   id uuid primary key default gen_random_uuid(),
   tenant_id uuid not null references public.tenants (id) on delete cascade,
@@ -52,10 +54,16 @@ create table if not exists public.print_jobs (
   created_at timestamptz not null default now(),
   expires_at timestamptz not null,
   claimed_at timestamptz,
-  done_at timestamptz
+  done_at timestamptz,
+  -- A failed attempt is retried with backoff until it expires; not claimable before this.
+  retry_after timestamptz
 );
 create unique index if not exists print_jobs_dedupe_key
   on public.print_jobs (printer_id, dedupe_key) where dedupe_key is not null;
+create index if not exists print_jobs_order_idx
+  on public.print_jobs (order_id) where order_id is not null;
+create index if not exists print_jobs_created_idx
+  on public.print_jobs (created_at);
 create index if not exists print_jobs_pending_idx
   on public.print_jobs (printer_id, created_at) where status in ('queued', 'sent');
 
@@ -76,3 +84,13 @@ alter table public.print_location_settings force row level security;
 revoke all on public.print_printers from anon, authenticated;
 revoke all on public.print_jobs from anon, authenticated;
 revoke all on public.print_location_settings from anon, authenticated;
+
+-- The app's driver is the service role; grant it explicitly (default privileges
+-- are not guaranteed on every project).
+grant select, insert, update, delete on public.print_printers to service_role;
+grant select, insert, update, delete on public.print_jobs to service_role;
+grant select, insert, update, delete on public.print_location_settings to service_role;
+
+commit;
+
+notify pgrst, 'reload schema';

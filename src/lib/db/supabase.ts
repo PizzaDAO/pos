@@ -582,6 +582,7 @@ function mapPrintJob(r: Row): PrintJob {
     expires_at: r.expires_at as string,
     claimed_at: (r.claimed_at as string | null) ?? null,
     done_at: (r.done_at as string | null) ?? null,
+    retry_after: (r.retry_after as string | null) ?? null,
   };
 }
 
@@ -2754,6 +2755,18 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return rows.length > 0;
     },
 
+    async setPrinterTokenHash(tenantId, id, tokenHash) {
+      const rows = unwrap(
+        await sb
+          .from("print_printers")
+          .update({ token_hash: tokenHash })
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .select(),
+      ) as Row[];
+      return rows[0] ? mapPrinter(rows[0]) : null;
+    },
+
     async touchPrinter(id, at) {
       unwrap(await sb.from("print_printers").update({ last_seen_at: at }).eq("id", id));
     },
@@ -2841,7 +2854,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             .select("*")
             .eq("printer_id", printerId)
             .gt("expires_at", now)
-            .or(`status.eq.queued,and(status.eq.sent,claimed_at.lte.${reclaimBefore})`)
+            .or(`and(status.eq.queued,or(retry_after.is.null,retry_after.lte.${now})),and(status.eq.sent,claimed_at.lte.${reclaimBefore})`)
             .order("created_at")
             .limit(1),
         ) as Row[];
@@ -2866,6 +2879,44 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return null;
     },
 
+    async hasPrintJobForOrder(printerId, orderId) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .select("id")
+          .eq("printer_id", printerId)
+          .eq("order_id", orderId)
+          .limit(1),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async retryFailedPrintJobs(tenantId, locationId, now) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .update({ status: "queued", attempts: 0, retry_after: null, done_at: null })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .eq("status", "failed")
+          .gt("expires_at", now)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async pruneFinishedPrintJobs(beforeIso) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .delete()
+          .in("status", ["done", "failed", "expired"])
+          .lt("created_at", beforeIso)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
     async getPrintJobForPrinter(printerId, jobId) {
       const r = unwrap(
         await sb
@@ -2879,14 +2930,17 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async completePrintJob(printerId, jobId, outcome, now) {
+      const retry = !outcome.ok && outcome.retryAt;
       unwrap(
         await sb
           .from("print_jobs")
-          .update({
-            status: outcome.ok ? "done" : "failed",
-            error: outcome.ok ? null : outcome.error,
-            done_at: now,
-          })
+          .update(
+            outcome.ok
+              ? { status: "done", error: null, done_at: now }
+              : retry
+                ? { status: "queued", error: outcome.error, retry_after: outcome.retryAt }
+                : { status: "failed", error: outcome.error, done_at: now },
+          )
           .eq("id", jobId)
           .eq("printer_id", printerId)
           .in("status", ["queued", "sent"]),

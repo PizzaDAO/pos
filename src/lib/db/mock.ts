@@ -353,7 +353,7 @@ function claimable(
   return (
     j.printer_id === printerId &&
     j.expires_at > nowIsoStr &&
-    (j.status === "queued" ||
+    ((j.status === "queued" && (!j.retry_after || j.retry_after <= nowIsoStr)) ||
       (j.status === "sent" && !!j.claimed_at && j.claimed_at <= reclaimBeforeIso))
   );
 }
@@ -2068,6 +2068,13 @@ export const mockDriver: PosDriver = {
     return true;
   },
 
+  async setPrinterTokenHash(tenantId: string, id: string, tokenHash: string) {
+    const p = printers.get(id);
+    if (!p || p.tenant_id !== tenantId) return null;
+    p.token_hash = tokenHash;
+    return { ...p };
+  },
+
   async touchPrinter(id: string, at: string) {
     const p = printers.get(id);
     if (p) p.last_seen_at = at;
@@ -2092,7 +2099,7 @@ export const mockDriver: PosDriver = {
   async enqueuePrintJob(
     job: Omit<
       PrintJob,
-      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at"
+      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at" | "retry_after"
     >,
   ) {
     if (job.dedupe_key) {
@@ -2110,6 +2117,7 @@ export const mockDriver: PosDriver = {
       created_at: nowIso(),
       claimed_at: null,
       done_at: null,
+      retry_after: null,
     };
     printJobs.set(row.id, row);
     return { ...row };
@@ -2141,6 +2149,40 @@ export const mockDriver: PosDriver = {
     return { ...next };
   },
 
+  async hasPrintJobForOrder(printerId: string, orderId: string) {
+    return [...printJobs.values()].some((j) => j.printer_id === printerId && j.order_id === orderId);
+  },
+
+  async retryFailedPrintJobs(tenantId: string, locationId: string, nowIsoStr: string) {
+    let n = 0;
+    for (const j of printJobs.values()) {
+      if (
+        j.tenant_id === tenantId &&
+        j.location_id === locationId &&
+        j.status === "failed" &&
+        j.expires_at > nowIsoStr
+      ) {
+        j.status = "queued";
+        j.attempts = 0;
+        j.retry_after = null;
+        j.done_at = null;
+        n++;
+      }
+    }
+    return n;
+  },
+
+  async pruneFinishedPrintJobs(beforeIso: string) {
+    let n = 0;
+    for (const [id, j] of printJobs) {
+      if (j.status !== "queued" && j.status !== "sent" && j.created_at < beforeIso) {
+        printJobs.delete(id);
+        n++;
+      }
+    }
+    return n;
+  },
+
   async getPrintJobForPrinter(printerId: string, jobId: string) {
     const j = printJobs.get(jobId);
     return j && j.printer_id === printerId ? { ...j } : null;
@@ -2149,15 +2191,21 @@ export const mockDriver: PosDriver = {
   async completePrintJob(
     printerId: string,
     jobId: string,
-    outcome: { ok: true } | { ok: false; error: string },
+    outcome: { ok: true } | { ok: false; error: string; retryAt?: string | null },
     nowIsoStr: string,
   ) {
     const j = printJobs.get(jobId);
     if (!j || j.printer_id !== printerId) return null;
     if (j.status === "queued" || j.status === "sent") {
-      j.status = outcome.ok ? "done" : "failed";
-      j.error = outcome.ok ? null : outcome.error;
-      j.done_at = nowIsoStr;
+      if (!outcome.ok && outcome.retryAt) {
+        j.status = "queued";
+        j.error = outcome.error;
+        j.retry_after = outcome.retryAt;
+      } else {
+        j.status = outcome.ok ? "done" : "failed";
+        j.error = outcome.ok ? null : outcome.error;
+        j.done_at = nowIsoStr;
+      }
     }
     return { ...j };
   },

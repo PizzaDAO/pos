@@ -13,7 +13,7 @@
 import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import { ADMIN_ROLES, authorizeLocation } from "@/lib/payments/terminal/http";
-import { createPrinter } from "@/lib/printing/queue";
+import { createPrinter, printHealth, publicOrigin } from "@/lib/printing/queue";
 import { publicJob, publicPrinter, setupUrl } from "@/lib/printing/public";
 import type { PrinterFormat, PrinterProtocol } from "@/lib/printing/types";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
@@ -34,6 +34,7 @@ async function body(tenantId: string, locationId: string) {
     printers: printers.map(publicPrinter),
     autoPrint: settings?.auto_print ?? false,
     jobs: jobs.map(publicJob),
+    health: await printHealth(tenantId, locationId),
   };
 }
 
@@ -97,7 +98,7 @@ export async function POST(request: Request) {
     {
       printer: publicPrinter(printer),
       token,
-      setupUrl: setupUrl(new URL(request.url).origin, printer.protocol, token),
+      setupUrl: setupUrl(publicOrigin(request.url), printer.protocol, token),
     },
     { status: 201, headers: { "Cache-Control": "no-store" } },
   );

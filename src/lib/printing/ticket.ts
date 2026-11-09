@@ -53,6 +53,9 @@ export function cleanText(s: string): string {
     .replace(/[“”]/g, '"')
     .replace(/[–—]/g, "-")
     .replace(/×/g, "x")
+    // Backslash may be an escape in Star markup (unverified) and is a yen sign in
+    // some code pages; a slash is always safe on a kitchen ticket.
+    .replace(/\\/g, "/")
     .normalize("NFKD")
     .replace(/[̀-ͯ]/g, "")
     .replace(/[\[\]]/g, (c) => (c === "[" ? "(" : ")"))

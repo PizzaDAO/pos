@@ -32,7 +32,7 @@ export interface TicketPrinter {
    * (the print happens client-side via `window.print()` in the print view); the
    * network printer queues a job per printer at the order's location.
    */
-  print(order: Order, opts?: { reprint?: boolean }): Promise<PrintResult>;
+  print(order: Order, opts?: { reprint?: boolean; dedupeKey?: string }): Promise<PrintResult>;
 }
 
 /** Default browser printer: relies on the print route + `window.print()`. */
@@ -50,7 +50,7 @@ export const browserPrinter: TicketPrinter = {
 export const networkPrinter: TicketPrinter = {
   name: "network",
   async print(order, opts): Promise<PrintResult> {
-    const jobs = await enqueueOrderTicket(order, { reprint: opts?.reprint });
+    const jobs = await enqueueOrderTicket(order, { reprint: opts?.reprint, dedupeKey: opts?.dedupeKey });
     return jobs.length > 0
       ? {
           ok: true,

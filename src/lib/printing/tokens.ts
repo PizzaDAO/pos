@@ -7,6 +7,8 @@
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function hashSecret(secret: string): string {
   return createHash("sha256").update(secret).digest("hex");
 }
@@ -25,7 +27,7 @@ export function parseToken(token: string): { printerId: string; secret: string }
   if (i <= 0 || i === token.length - 1) return null;
   const printerId = token.slice(0, i);
   const secret = token.slice(i + 1);
-  if (!/^[0-9a-f-]{36}$/i.test(printerId) || secret.length > 200) return null;
+  if (!UUID_RE.test(printerId) || secret.length > 200) return null;
   return { printerId, secret };
 }
 

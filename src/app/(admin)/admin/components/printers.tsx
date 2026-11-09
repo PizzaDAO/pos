@@ -15,6 +15,7 @@ import { Loader2, Plus, Printer as PrinterIcon, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { PrinterBanner } from "@/components/printer-banner";
 import { cn } from "@/lib/utils";
 
 interface PrinterRow {
@@ -76,6 +77,7 @@ export function Printers({
   const [format, setFormat] = useState<PrinterRow["format"]>("markup");
   const [created, setCreated] = useState<{ label: string; setupUrl: string } | null>(null);
   const [removing, setRemoving] = useState<PrinterRow | null>(null);
+  const [rotating, setRotating] = useState<PrinterRow | null>(null);
 
   const query = `tenantId=${encodeURIComponent(tenantId)}&locationId=${encodeURIComponent(locationId)}`;
 
@@ -157,6 +159,8 @@ export function Printers({
         </div>
       )}
 
+      <PrinterBanner tenantId={tenantId} locationId={locationId} refreshKey={setup?.jobs.length} />
+
       {setup && (
         <div className="space-y-3 rounded-lg border p-4">
           <label className="flex items-start gap-3 text-sm">
@@ -173,7 +177,9 @@ export function Printers({
               <span className="font-medium">Auto-print when an order fires</span>
               <span className="block text-xs text-muted-foreground">
                 Off by default. Prints each new order on every printer here the
-                moment it reaches the kitchen.
+                moment it reaches the kitchen: POS tills, online orders once paid,
+                and API orders (when placed, or when a held order is released).
+                Each order prints once per printer; use Reprint for another copy.
               </span>
             </span>
           </label>
@@ -225,6 +231,14 @@ export function Printers({
                       }
                     >
                       Print test ticket
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => setRotating(p)}
+                    >
+                      Rotate token
                     </Button>
                     <Button
                       variant="ghost"
@@ -369,6 +383,22 @@ export function Printers({
         </Dialog>
       )}
 
+      {rotating && (
+        <ConfirmDialog
+          title={`Rotate ${rotating.label}'s token?`}
+          description="The current setup URL stops working immediately; you must paste the new one into the printer."
+          confirmLabel="Rotate"
+          onCancel={() => setRotating(null)}
+          onConfirm={() => {
+            const p = rotating;
+            setRotating(null);
+            void run(
+              () => post("/api/admin/printers/rotate", "POST", { printerId: p.id }),
+              (data) => setCreated({ label: p.label, setupUrl: String(data.setupUrl) }),
+            );
+          }}
+        />
+      )}
       {removing && (
         <ConfirmDialog
           title={`Remove ${removing.label}?`}

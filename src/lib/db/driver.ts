@@ -782,6 +782,8 @@ export interface PosDriver {
   ): Promise<Printer>;
   /** Delete a printer (its jobs go with it). Tenant-scoped; false if not found. */
   deletePrinter(tenantId: string, id: string): Promise<boolean>;
+  /** Replace a printer's token hash (rotate). Tenant-scoped; null if not found. */
+  setPrinterTokenHash(tenantId: string, id: string, tokenHash: string): Promise<Printer | null>;
   /** Stamp `last_seen_at` (every poll). */
   touchPrinter(id: string, at: string): Promise<void>;
 
@@ -799,7 +801,7 @@ export interface PosDriver {
   enqueuePrintJob(
     job: Omit<
       PrintJob,
-      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at"
+      "id" | "status" | "attempts" | "error" | "created_at" | "claimed_at" | "done_at" | "retry_after"
     >,
   ): Promise<PrintJob>;
   /** Mark this printer's overdue queued/sent jobs `expired`; returns how many. */
@@ -1092,16 +1094,24 @@ export interface PosDriver {
     nowIso: string,
     reclaimBeforeIso: string,
   ): Promise<PrintJob | null>;
+  /** Has any job (any status) ever been queued for this order on this printer? */
+  hasPrintJobForOrder(printerId: string, orderId: string): Promise<boolean>;
+  /** Failed jobs of a location that have not expired go back to `queued` (attempts reset). */
+  retryFailedPrintJobs(tenantId: string, locationId: string, nowIso: string): Promise<number>;
+  /** Retention: delete done/failed/expired jobs created before `beforeIso`. */
+  pruneFinishedPrintJobs(beforeIso: string): Promise<number>;
   /** One job, scoped to a printer (a printer can never read another's job). */
   getPrintJobForPrinter(printerId: string, jobId: string): Promise<PrintJob | null>;
   /**
    * Printer's answer for a job: done or failed. Idempotent: only a sent/queued
-   * job changes; an already-done/failed/expired job is returned untouched.
+   * job changes; an already-done/failed/expired job is returned untouched. A
+   * failure with `retryAt` goes back to `queued` (not claimable before then);
+   * without it the job is final (`failed`).
    */
   completePrintJob(
     printerId: string,
     jobId: string,
-    outcome: { ok: true } | { ok: false; error: string },
+    outcome: { ok: true } | { ok: false; error: string; retryAt?: string | null },
     nowIso: string,
   ): Promise<PrintJob | null>;
   /** Recent jobs for a location (admin UI), newest first. */
