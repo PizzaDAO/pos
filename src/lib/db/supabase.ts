@@ -29,6 +29,11 @@ import {
 } from "@/lib/payments/connect-status";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { captureError } from "@/lib/observability";
+import type {
+  Printer,
+  PrintJob,
+  PrintLocationSettings,
+} from "@/lib/printing/types";
 import type { PosDriver } from "./driver";
 import type {
   ItemSize,
@@ -542,6 +547,51 @@ function mapTerminalReader(r: Row): TerminalReader {
     serial_number: (r.serial_number as string | null) ?? null,
     livemode: (r.livemode as boolean) ?? false,
     created_at: r.created_at as string,
+    updated_at: r.updated_at as string,
+  };
+}
+
+function mapPrinter(r: Row): Printer {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    location_id: r.location_id as string,
+    label: (r.label as string) ?? "",
+    protocol: r.protocol as Printer["protocol"],
+    format: r.format as Printer["format"],
+    columns: r.columns as Printer["columns"],
+    token_hash: r.token_hash as string,
+    last_seen_at: (r.last_seen_at as string | null) ?? null,
+    created_at: r.created_at as string,
+  };
+}
+
+function mapPrintJob(r: Row): PrintJob {
+  return {
+    id: r.id as string,
+    tenant_id: r.tenant_id as string,
+    location_id: r.location_id as string,
+    printer_id: r.printer_id as string,
+    order_id: (r.order_id as string | null) ?? null,
+    kind: r.kind as PrintJob["kind"],
+    document: r.document as PrintJob["document"],
+    status: r.status as PrintJob["status"],
+    attempts: (r.attempts as number) ?? 0,
+    error: (r.error as string | null) ?? null,
+    dedupe_key: (r.dedupe_key as string | null) ?? null,
+    created_at: r.created_at as string,
+    expires_at: r.expires_at as string,
+    claimed_at: (r.claimed_at as string | null) ?? null,
+    done_at: (r.done_at as string | null) ?? null,
+    retry_after: (r.retry_after as string | null) ?? null,
+  };
+}
+
+function mapPrintSettings(r: Row): PrintLocationSettings {
+  return {
+    location_id: r.location_id as string,
+    tenant_id: r.tenant_id as string,
+    auto_print: (r.auto_print as boolean) ?? false,
     updated_at: r.updated_at as string,
   };
 }
@@ -2706,6 +2756,259 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     async deleteTerminalReader(id) {
       unwrap(await sb.from("terminal_readers").delete().eq("id", id));
+    },
+
+    // -- Network printing ----------------------------------------------------
+
+    async listPrinters(tenantId, locationId) {
+      return (
+        unwrap(
+          await sb
+            .from("print_printers")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at"),
+        ) as Row[]
+      ).map(mapPrinter);
+    },
+
+    async getPrinter(id) {
+      const r = unwrap(
+        await sb.from("print_printers").select("*").eq("id", id).maybeSingle(),
+      ) as Row | null;
+      return r ? mapPrinter(r) : null;
+    },
+
+    async createPrinter(row) {
+      return mapPrinter(
+        unwrap(
+          await sb
+            .from("print_printers")
+            .insert({ ...row, id: genUuid(), created_at: nowIso() })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async deletePrinter(tenantId, id) {
+      const rows = unwrap(
+        await sb
+          .from("print_printers")
+          .delete()
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .select("id"),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async setPrinterTokenHash(tenantId, id, tokenHash) {
+      const rows = unwrap(
+        await sb
+          .from("print_printers")
+          .update({ token_hash: tokenHash })
+          .eq("id", id)
+          .eq("tenant_id", tenantId)
+          .select(),
+      ) as Row[];
+      return rows[0] ? mapPrinter(rows[0]) : null;
+    },
+
+    async touchPrinter(id, at) {
+      unwrap(await sb.from("print_printers").update({ last_seen_at: at }).eq("id", id));
+    },
+
+    async getPrintSettings(locationId) {
+      const r = unwrap(
+        await sb
+          .from("print_location_settings")
+          .select("*")
+          .eq("location_id", locationId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPrintSettings(r) : null;
+    },
+
+    async setPrintAutoPrint(tenantId, locationId, autoPrint) {
+      return mapPrintSettings(
+        unwrap(
+          await sb
+            .from("print_location_settings")
+            .upsert({
+              location_id: locationId,
+              tenant_id: tenantId,
+              auto_print: autoPrint,
+              updated_at: nowIso(),
+            })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async enqueuePrintJob(job) {
+      if (job.dedupe_key) {
+        // Unique (printer_id, dedupe_key): a concurrent duplicate loses the
+        // insert and falls through to the lookup, so a retried fire prints once.
+        const ins = await sb
+          .from("print_jobs")
+          .insert({ ...job, id: genUuid(), status: "queued", created_at: nowIso() })
+          .select()
+          .single();
+        if (!ins.error) return mapPrintJob(ins.data as Row);
+        const dup = unwrap(
+          await sb
+            .from("print_jobs")
+            .select("*")
+            .eq("printer_id", job.printer_id)
+            .eq("dedupe_key", job.dedupe_key)
+            .maybeSingle(),
+        ) as Row | null;
+        if (!dup) throw new Error(`Supabase: ${ins.error.message}`);
+        return mapPrintJob(dup);
+      }
+      return mapPrintJob(
+        unwrap(
+          await sb
+            .from("print_jobs")
+            .insert({ ...job, id: genUuid(), status: "queued", created_at: nowIso() })
+            .select()
+            .single(),
+        ) as Row,
+      );
+    },
+
+    async expirePrintJobs(printerId, now) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .update({ status: "expired" })
+          .eq("printer_id", printerId)
+          .in("status", ["queued", "sent"])
+          .lte("expires_at", now)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async claimPrintJob(printerId, now, reclaimBefore) {
+      // Select the oldest candidate, then claim it with a conditional update
+      // (status still claimable). Losing the race returns no row; try the next.
+      for (let i = 0; i < 3; i++) {
+        const cand = unwrap(
+          await sb
+            .from("print_jobs")
+            .select("*")
+            .eq("printer_id", printerId)
+            .gt("expires_at", now)
+            .or(`and(status.eq.queued,or(retry_after.is.null,retry_after.lte.${now})),and(status.eq.sent,claimed_at.lte.${reclaimBefore})`)
+            .order("created_at")
+            .limit(1),
+        ) as Row[];
+        if (cand.length === 0) return null;
+        const c = cand[0]!;
+        const won = unwrap(
+          await sb
+            .from("print_jobs")
+            .update({
+              status: "sent",
+              attempts: ((c.attempts as number) ?? 0) + 1,
+              claimed_at: now,
+            })
+            .eq("id", c.id as string)
+            .eq("printer_id", printerId)
+            .eq("status", c.status as string)
+            .eq("attempts", (c.attempts as number) ?? 0)
+            .select(),
+        ) as Row[];
+        if (won.length > 0) return mapPrintJob(won[0]!);
+      }
+      return null;
+    },
+
+    async hasPrintJobForOrder(printerId, orderId) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .select("id")
+          .eq("printer_id", printerId)
+          .eq("order_id", orderId)
+          .limit(1),
+      ) as Row[];
+      return rows.length > 0;
+    },
+
+    async retryFailedPrintJobs(tenantId, locationId, now) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .update({ status: "queued", attempts: 0, retry_after: null, done_at: null })
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId)
+          .eq("status", "failed")
+          .gt("expires_at", now)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async pruneFinishedPrintJobs(beforeIso) {
+      const rows = unwrap(
+        await sb
+          .from("print_jobs")
+          .delete()
+          .in("status", ["done", "failed", "expired"])
+          .lt("created_at", beforeIso)
+          .select("id"),
+      ) as Row[];
+      return rows.length;
+    },
+
+    async getPrintJobForPrinter(printerId, jobId) {
+      const r = unwrap(
+        await sb
+          .from("print_jobs")
+          .select("*")
+          .eq("id", jobId)
+          .eq("printer_id", printerId)
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapPrintJob(r) : null;
+    },
+
+    async completePrintJob(printerId, jobId, outcome, now) {
+      const retry = !outcome.ok && outcome.retryAt;
+      unwrap(
+        await sb
+          .from("print_jobs")
+          .update(
+            outcome.ok
+              ? { status: "done", error: null, done_at: now }
+              : retry
+                ? { status: "queued", error: outcome.error, retry_after: outcome.retryAt }
+                : { status: "failed", error: outcome.error, done_at: now },
+          )
+          .eq("id", jobId)
+          .eq("printer_id", printerId)
+          .in("status", ["queued", "sent"]),
+      );
+      return this.getPrintJobForPrinter(printerId, jobId);
+    },
+
+    async listPrintJobs(tenantId, locationId, limit) {
+      return (
+        unwrap(
+          await sb
+            .from("print_jobs")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("location_id", locationId)
+            .order("created_at", { ascending: false })
+            .limit(limit),
+        ) as Row[]
+      ).map(mapPrintJob);
     },
 
     async listStaleTerminalTenders(olderThan, limit) {
