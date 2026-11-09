@@ -99,6 +99,9 @@ import type {
   TenantOnboarding,
 } from "./saas-types";
 
+import type { MenuSnapshot } from "@/lib/menu-import/types";
+import type { ImportChanges } from "@/lib/menu-import/apply";
+
 /** Menu entity kinds addressable by the back-office menu editor. */
 export type MenuEntityKind =
   | "category"
@@ -1258,6 +1261,24 @@ export interface PosDriver {
     entity: MenuEntityKind,
     id: string,
   ): Promise<string | null>;
+
+  /**
+   * Raw (override-free) names + ids of the tenant's whole menu, for the menu
+   * importer's add-mode matching.
+   */
+  getMenuSnapshot(tenantId: string): Promise<MenuSnapshot>;
+
+  /**
+   * Menu import apply. ATOMIC: the whole change set (in-place updates of
+   * matched rows, inserts, and deletes of rows absent from a replace file, plus
+   * the recipe / allergen / override rows of deleted targets) runs in ONE
+   * transaction; any failure rolls everything back. Matched rows keep their ids
+   * so carts, queued orders and recipes keep working; historical orders are
+   * untouched (order lines snapshot name/size/price; item ids have no FK).
+   * Every id and row must belong to `tenantId`, and inserts must not collide
+   * with names already present (a concurrent change): either throws.
+   */
+  applyMenuImport(tenantId: string, changes: ImportChanges): Promise<void>;
 
   listCategories(tenantId: string): Promise<MenuCategory[]>;
   upsertCategory(input: CategoryInput): Promise<MenuCategory>;

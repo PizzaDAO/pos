@@ -199,7 +199,9 @@ export type AuditAction =
   // A location's country (how phone numbers are read) was changed.
   | "location_country_change"
   // A manager overrode a stuck driver conflict and dispatched in-house instead.
-  | "delivery_manual_override";
+  | "delivery_manual_override"
+  // A menu was bulk-imported (add or replace) from a Square/Toast/Clover/CSV file.
+  | "menu_import";
 
 /**
  * An append-only audit entry written when a platform operator takes a
