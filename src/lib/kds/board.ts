@@ -64,7 +64,8 @@ export function buildTickets(
   const nowMs = now.getTime();
 
   return orders
-    .filter((o) => active.has(o.status))
+    // A gift card sale/reload order has nothing to cook.
+    .filter((o) => active.has(o.status) && !o.core_ext?.stored_value)
     .map((order) => {
       const placedMs = new Date(order.created_at).getTime();
       const elapsedSeconds = Math.max(

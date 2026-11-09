@@ -22,7 +22,11 @@ export type PaymentRailKey =
   | "stripe_online"
   | "crypto_onchain_usdc"
   | "crypto_coinbase"
-  | "cash";
+  | "cash"
+  // Stored value (src/lib/giftcards): redeemed through their own atomic writer,
+  // never through `createCharge`; `refund` credits the card's ledger.
+  | "gift_card"
+  | "store_credit";
 
 /**
  * Money as an integer minor-unit amount plus an ISO-4217 currency code.

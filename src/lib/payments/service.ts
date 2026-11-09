@@ -50,7 +50,9 @@ function nowIso(): string {
 export function railIsSimulated(rail: PaymentRailKey | "cash"): boolean {
   switch (rail) {
     case "cash":
-      return false; // cash is always real
+    case "gift_card":
+    case "store_credit":
+      return false; // cash and stored value are always real
     case "stripe_terminal":
     case "stripe_online":
       return cardRailsSimulated();
@@ -976,6 +978,12 @@ export async function refundPayment(input: {
   if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
     throw new RefundExceedsError();
   }
+  // Gift-card SALE tenders: refundable only once the card is voided (or the
+  // reload reversed), so the card and the money never both survive.
+  await (await import("@/lib/giftcards/service")).assertStoredValueRefundAllowed(
+    payment,
+    refundAmount,
+  );
 
   const callRail = () =>
     rail.refund({
@@ -1115,6 +1123,12 @@ async function maybeMarkOrderPaid(
     console.info(
       `[payments] order ${orderId} settled while ${order.status}; status left unchanged`,
     );
+  }
+  // A gift-card sale/reload order: credit the card now that it is paid.
+  if (order.core_ext?.stored_value) {
+    await (await import("@/lib/giftcards/service"))
+      .settleStoredValueOrder(orderId)
+      .catch((err) => captureError(err, { scope: "giftcard-settle", orderId }));
   }
   await flagDuplicatePayment(order, payments);
 }

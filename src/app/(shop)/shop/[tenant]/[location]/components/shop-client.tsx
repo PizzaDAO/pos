@@ -134,20 +134,30 @@ export function ShopClient({
               </p>
             )}
           </div>
-          <Button
-            variant="outline"
-            className="relative h-11"
-            aria-label={`Open cart, ${itemCount} item${itemCount === 1 ? "" : "s"}, ${formatMoney(subtotalCents, currency)}`}
-            onClick={() => setCartOpen(true)}
-          >
-            <ShoppingBag className="mr-2 h-4 w-4" aria-hidden="true" />
-            {formatMoney(subtotalCents, currency)}
-            {itemCount > 0 && (
-              <span className="ml-2 rounded-full bg-primary px-2 py-0.5 text-xs font-bold text-primary-foreground">
-                {itemCount}
-              </span>
+          <div className="flex shrink-0 items-center gap-2">
+            {data.giftCards && (
+              <Link
+                href={`/shop/${store.tenantSlug}/${store.locationSlug}/gift-cards`}
+                className="inline-flex min-h-11 items-center px-2 text-sm font-medium underline"
+              >
+                Gift cards
+              </Link>
             )}
-          </Button>
+            <Button
+              variant="outline"
+              className="relative h-11"
+              aria-label={`Open cart, ${itemCount} item${itemCount === 1 ? "" : "s"}, ${formatMoney(subtotalCents, currency)}`}
+              onClick={() => setCartOpen(true)}
+            >
+              <ShoppingBag className="mr-2 h-4 w-4" aria-hidden="true" />
+              {formatMoney(subtotalCents, currency)}
+              {itemCount > 0 && (
+                <span className="ml-2 rounded-full bg-primary px-2 py-0.5 text-xs font-bold text-primary-foreground">
+                  {itemCount}
+                </span>
+              )}
+            </Button>
+          </div>
         </div>
       </header>
 

@@ -118,7 +118,12 @@ export async function closeOpenTenders(
   // provider is still processing: leave it for a human / the next sweep, and
   // alert -- an expired order holding customer money needs attention.
   const settledMoney = after.filter(
-    (p) => p.status === "authorized" || p.status === "captured",
+    (p) =>
+      (p.status === "authorized" || p.status === "captured") &&
+      // A gift card / store credit tender goes back to its card once the order
+      // is abandoned (releaseStoredValue): it never blocks giving the order up.
+      p.rail !== "gift_card" &&
+      p.rail !== "store_credit",
   );
   if (settledMoney.length > 0) {
     captureError(
@@ -172,7 +177,10 @@ export async function cancelOnlineCheckout(
   if (!order || order.channel === "in_store") {
     return { ok: false, reason: "not_found" };
   }
-  if (order.status === "abandoned") return { ok: true, order };
+  if (order.status === "abandoned") {
+    await releaseStoredValue(orderId);
+    return { ok: true, order };
+  }
   if (order.status !== "awaiting_payment") {
     return { ok: false, reason: "not_awaiting" };
   }
@@ -186,11 +194,19 @@ export async function cancelOnlineCheckout(
   if (!abandoned) {
     // Lost a race: it was paid (or abandoned) meanwhile.
     const now = await driver.getOrder(orderId);
+    if (now?.status === "abandoned") await releaseStoredValue(orderId);
     return now?.status === "abandoned"
       ? { ok: true, order: now }
       : { ok: false, reason: "has_payment" };
   }
+  await releaseStoredValue(orderId);
   return { ok: true, order: abandoned };
+}
+
+/** Return any gift card / store credit applied to an abandoned checkout. */
+async function releaseStoredValue(orderId: string): Promise<void> {
+  const { releaseStoredValueTenders } = await import("@/lib/giftcards/service");
+  await releaseStoredValueTenders(orderId);
 }
 
 export interface ExpireSummary {
@@ -695,6 +711,7 @@ async function sweepOne(
       )
     ) {
       summary.abandoned += 1;
+      await releaseStoredValue(order.id);
     } else {
       summary.finalized += 1; // paid between the last look and the move
     }

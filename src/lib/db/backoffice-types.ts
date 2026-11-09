@@ -376,6 +376,31 @@ export interface SalesReport {
   byChannel: SalesBucket[];
   byLocation: SalesBucket[];
   paymentMix: PaymentMixSlice[];
+  /**
+   * Gift cards / store credit (src/lib/giftcards/report.ts). Gift card SALES are
+   * a liability: their orders are NOT in the figures above (nor the payment mix).
+   * Absent on reports closed before it existed.
+   */
+  stored_value?: StoredValueReport;
+}
+
+export interface StoredValueReport {
+  /** Gift card sale + reload orders with settled money, and that money (base). */
+  sold_count: number;
+  sold_cents: number;
+  /** Refunded on those orders (voided cards / reversed reloads). */
+  sold_refunded_cents: number;
+  /** The money taken for cards by tender family (drawer reconciliation). */
+  sold_by_family: { cash: number; card: number; crypto: number; other: number };
+  /** Gift card / store credit tenders on sales orders (in the payment mix too). */
+  redeemed_count: number;
+  redeemed_gift_card_cents: number;
+  redeemed_store_credit_cents: number;
+  /** Refunds of those tenders, returned to the card. */
+  returned_to_card_cents: number;
+  /** Store credit issued in the range (added by the reports route, live). */
+  store_credit_issued_count?: number;
+  store_credit_issued_cents?: number;
 }
 
 // ----------------------------------------------------------------------------

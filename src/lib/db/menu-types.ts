@@ -467,6 +467,21 @@ export interface OrderCoreExt {
   metadata?: Record<string, string>;
   /** Caller's intended fire time; POS stores and echoes it, it does not act on it. */
   fire_at?: string | null;
+  /**
+   * Set ONLY on a gift-card sale / reload order (src/lib/giftcards): the order
+   * has no menu lines and no tax, is never cooked, and is not revenue (reports
+   * treat it as a liability). Once it settles the amount is credited to the card.
+   */
+  stored_value?: StoredValueOrderExt;
+}
+
+/** See `OrderCoreExt.stored_value`. */
+export interface StoredValueOrderExt {
+  op: "sell" | "reload";
+  /** The gift card account the paid amount is credited to. */
+  account_id: string;
+  amount_cents: number;
+  code_last4: string;
 }
 
 export interface OrderTotals {

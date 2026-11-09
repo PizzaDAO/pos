@@ -18,6 +18,8 @@ const PUBLIC_RAW_KEYS = [
   "last_error",
   "reader_action_status",
   "reader_id",
+  // Gift card / store credit tenders: the card's last 4 (never the code).
+  "code_last4",
 ] as const;
 
 export function publicTender(p: Payment): Payment {

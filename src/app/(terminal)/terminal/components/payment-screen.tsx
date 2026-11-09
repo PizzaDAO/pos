@@ -33,6 +33,7 @@ import {
 import { useCheckout } from "@/lib/store/use-checkout";
 import { isLiveCardTender, tenderReaderId } from "@/lib/store/use-card-reader";
 import { TipSelector } from "./tip-selector";
+import { GiftCardTender } from "./gift-card-tender";
 import { ReceiptView } from "./receipt-view";
 
 /** Short staff-facing method names (provider detail lives in Admin). */
@@ -42,6 +43,8 @@ const STAFF_RAIL_LABELS: Record<PaymentRailKey, string> = {
   stripe_online: "Card (online)",
   crypto_onchain_usdc: "USDC",
   crypto_coinbase: "Coinbase",
+  gift_card: "Gift card",
+  store_credit: "Store credit",
 };
 
 /** Quick-cash note choices at or above what is owed (plus Exact, always). */
@@ -62,6 +65,8 @@ export interface PaymentScreenProps {
   paymentSettings: PaymentSettings;
   /** False hides card tenders (tenant not Stripe-onboarded in real mode). */
   cardReady?: boolean;
+  /** Offer the gift card / store credit tender. */
+  giftCards?: boolean;
   onClose: () => void;
   onPaid: () => void;
 }
@@ -72,6 +77,7 @@ export function PaymentScreen({
   locationId,
   paymentSettings,
   cardReady = true,
+  giftCards = false,
   locationName,
   onClose,
   onPaid,
@@ -223,6 +229,17 @@ export function PaymentScreen({
 
             {!finished && (
               <>
+                {/* Gift card / store credit (never on a gift card sale itself) */}
+                {giftCards && checkout.order && !checkout.order.core_ext?.stored_value && (
+                  <GiftCardTender
+                    orderId={orderId}
+                    tenantId={tenantId}
+                    balanceCents={balance}
+                    currency={currency}
+                    onApplied={() => void checkout.refresh()}
+                  />
+                )}
+
                 {/* Rail picker */}
                 <div>
                   <div className="mb-2 text-sm font-medium text-muted-foreground">
