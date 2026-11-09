@@ -74,7 +74,10 @@ function MenuBrowseImpl({
     pressTimer.current = null;
   }
 
-  const sizeNames = sizeNamesOf(menu.categories.flatMap((c) => c.items));
+  const allItems = menu.categories.flatMap((c) => c.items);
+  const sizeNames = sizeNamesOf(allItems);
+  // Pizzas' sizes: what the default applies to (shown when the saved/fallback one is absent).
+  const pizzaSizeNames = sizeNamesOf(allItems.filter((i) => i.is_half_and_half_capable));
   const activeCategory =
     menu.categories.find((c) => c.id === activeCategoryId) ??
     menu.categories[0];
@@ -117,7 +120,9 @@ function MenuBrowseImpl({
             <select
               aria-label="Default size"
               value={
-                sizeNames.find((n) => leadWord(n) === leadWord(defaultSizeName ?? "")) ?? ""
+                sizeNames.find((n) => leadWord(n) === leadWord(defaultSizeName ?? "")) ??
+                pizzaSizeNames[0] ??
+                ""
               }
               onChange={(e) => onDefaultSizeChange(e.target.value)}
               className="min-h-11 rounded-md border bg-background px-2 text-sm text-foreground"

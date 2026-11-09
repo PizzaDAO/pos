@@ -48,8 +48,8 @@ export function nextBumpStatus(
 
 /**
  * Bumps that carry a no-prep (drink-only) ticket to hand-off in one tap: through
- * in_kitchen to ready, then on to completed (pickup / in-store). A delivery
- * stops at Ready, where the usual hand-off button takes over. Each step goes
+ * in_kitchen to ready, then on to completed for in-store orders. Pickup,
+ * marketplace and delivery stop at Ready, where the usual hand-off button takes over. Each step goes
  * through the normal bump route, so ready callbacks and events all still fire.
  */
 export function noPrepBumpCount(
@@ -62,7 +62,9 @@ export function noPrepBumpCount(
     cur = nextBumpStatus(cur, channel);
     n++;
   }
-  if (cur === "ready" && channel !== "online_delivery") n++;
+  // Only in-store orders are handed over at the counter; pickup, marketplace and
+  // delivery stop at Ready for the normal Picked up / Out with driver hand-off.
+  if (cur === "ready" && channel === "in_store") n++;
   return n;
 }
 

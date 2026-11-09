@@ -48,9 +48,10 @@ describe("drink-only (no prep) orders", () => {
     );
     expect(tickets.map((t) => t.order.id).sort()).toEqual(["a", "b"]);
   });
-  it("one tap bumps through to completed (delivery stops at Ready)", () => {
+  it("one tap bumps in-store through to completed; others stop at Ready", () => {
     expect(noPrepBumpCount("placed", "in_store")).toBe(3);
-    expect(noPrepBumpCount("paid", "online_pickup")).toBe(3);
+    expect(noPrepBumpCount("paid", "online_pickup")).toBe(2);
+    expect(noPrepBumpCount("placed", "marketplace")).toBe(2);
     expect(noPrepBumpCount("in_kitchen", "in_store")).toBe(2);
     expect(noPrepBumpCount("placed", "online_delivery")).toBe(2);
   });
