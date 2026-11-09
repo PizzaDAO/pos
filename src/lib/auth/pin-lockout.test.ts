@@ -11,6 +11,7 @@ vi.mock("./session", () => ({
 }));
 
 import { DEMO_TENANT_ID, getPosDriver } from "@/lib/db";
+import { resetMockPinLimits } from "@/lib/db/mock";
 import { GET as pinGET, POST as pinPOST } from "@/app/api/terminal/pin/route";
 
 const device: SessionUser = {
@@ -31,6 +32,9 @@ const device: SessionUser = {
 
 beforeEach(() => {
   session.user = device;
+  // These tests are about the per-staff lockout; the per-device/location
+  // budgets (pin-limits.test.ts) start fresh for each.
+  resetMockPinLimits();
 });
 
 const attempt = (staffId: string, pin: string) =>

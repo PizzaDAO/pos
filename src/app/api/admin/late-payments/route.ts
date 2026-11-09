@@ -37,7 +37,7 @@
  */
 import { NextResponse } from "next/server";
 import { getPosDriver, type LatePaymentMarker, type Payment } from "@/lib/db";
-import { requireTenantRole } from "@/lib/auth/api";
+import { requireAdminRole } from "@/lib/auth/admin-gate";
 import {
   cancelOpenOnlineIntents,
   isManualRefundRail,
@@ -90,7 +90,7 @@ export async function GET(request: Request) {
       { status: 400 },
     );
   }
-  const auth = await requireTenantRole(tenantId, [...ROLES]);
+  const auth = await requireAdminRole(request, tenantId, ROLES);
   if (!auth.ok) return auth.res;
   const driver = getPosDriver();
   // A scheduled-hold item resolves itself once the order leaves `draft` (refunded
@@ -132,7 +132,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Order not found." }, { status: 404 });
   }
   // Authorize against the ORDER's tenant, never a client-named one.
-  const auth = await requireTenantRole(order.tenant_id, [...ROLES]);
+  const auth = await requireAdminRole(request, order.tenant_id, ROLES);
   if (!auth.ok) return auth.res;
 
   const pre = order.fulfillment?.late_payment;

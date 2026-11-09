@@ -627,6 +627,23 @@ export function withOutbox(
       return result;
     },
 
+    async updateStaffProfile(tenantId, staffId, patch) {
+      const before = await inner.getStaffById(tenantId, staffId);
+      const result = await inner.updateStaffProfile(tenantId, staffId, patch);
+      if (result) {
+        box.append({
+          tenant_id: result.tenant_id,
+          location_id: null,
+          event_type:
+            before?.active && !result.active ? "staff.deactivated" : "staff.updated",
+          subject_type: "staff",
+          subject_id: result.id,
+          row_snapshot: { id: result.id },
+        });
+      }
+      return result;
+    },
+
     async setStaffModuleRoles(tenantId, staffId, roles) {
       const result = await inner.setStaffModuleRoles(tenantId, staffId, roles);
       if (result) {

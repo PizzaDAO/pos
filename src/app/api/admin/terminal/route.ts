@@ -20,8 +20,7 @@ import {
 } from "@/lib/payments/terminal/locations";
 import { getCardReadiness } from "@/lib/payments/terminal/readers";
 import {
-  ADMIN_ROLES,
-  authorizeLocation,
+  authorizeAdminLocation,
   errorResponse,
 } from "@/lib/payments/terminal/http";
 import { enforceRateLimit, readJsonBody } from "@/lib/security";
@@ -49,10 +48,10 @@ export async function GET(request: Request) {
   const limited = enforceRateLimit(request, "payments");
   if (limited) return limited;
   const { searchParams } = new URL(request.url);
-  const auth = await authorizeLocation(
+  const auth = await authorizeAdminLocation(
+    request,
     searchParams.get("tenantId"),
     searchParams.get("locationId"),
-    ADMIN_ROLES,
   );
   if (!auth.ok) return auth.res;
   try {
@@ -70,7 +69,7 @@ export async function PUT(request: Request) {
   const parsed = await readJsonBody(request);
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: parsed.status });
   const b = (parsed.body ?? {}) as Record<string, unknown>;
-  const auth = await authorizeLocation(b.tenantId, b.locationId, ADMIN_ROLES);
+  const auth = await authorizeAdminLocation(request, b.tenantId, b.locationId);
   if (!auth.ok) return auth.res;
 
   let address;

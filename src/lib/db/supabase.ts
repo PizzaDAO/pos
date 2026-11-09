@@ -358,6 +358,8 @@ function mapStaff(r: Row, opts?: { includePin?: boolean }): Staff {
     user_id: (r.user_id as string | null) ?? null,
     location_ids: (r.location_ids as string[] | null) ?? [],
     module_roles: normalizeModuleRoles(r.module_roles),
+    contact_email: (r.contact_email as string | null) ?? null,
+    contact_phone: (r.contact_phone as string | null) ?? null,
     created_at: r.created_at as string,
   };
 }
@@ -3850,6 +3852,118 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .limit(1),
       ) as Row[];
       return rows.length > 0;
+    },
+
+    async listStaffPinRecords(tenantId) {
+      const rows = unwrap(
+        await sb
+          .from("staff")
+          .select("id, active, location_ids, pin_hash")
+          .eq("tenant_id", tenantId),
+      ) as Row[];
+      return rows.map((r) => ({
+        id: r.id as string,
+        active: r.active as boolean,
+        location_ids: (r.location_ids as string[] | null) ?? [],
+        pin_hash: (r.pin_hash as string | null) ?? null,
+      }));
+    },
+
+    async updateStaffProfile(tenantId, staffId, patch) {
+      // Targeted update of the fields present in the patch only, scoped by
+      // tenant AND id (never a whole-row write of a stale snapshot).
+      const row: Record<string, unknown> = {};
+      for (const k of [
+        "name",
+        "role",
+        "active",
+        "contact_email",
+        "contact_phone",
+        "location_ids",
+        "module_roles",
+      ] as const) {
+        if (patch[k] !== undefined) row[k] = patch[k];
+      }
+      if (Object.keys(row).length === 0) {
+        const cur = unwrap(
+          await sb
+            .from("staff")
+            .select("*")
+            .eq("tenant_id", tenantId)
+            .eq("id", staffId)
+            .maybeSingle(),
+        ) as Row | null;
+        return cur ? mapStaff(cur) : null;
+      }
+      const r = unwrap(
+        await sb
+          .from("staff")
+          .update(row)
+          .eq("tenant_id", tenantId)
+          .eq("id", staffId)
+          .select()
+          .maybeSingle(),
+      ) as Row | null;
+      return r ? mapStaff(r) : null;
+    },
+
+    async lastStaffSignIns(tenantId) {
+      // Newest first; the first row seen per staff member wins.
+      const rows = unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .select("staff_id, created_at")
+          .eq("tenant_id", tenantId)
+          .order("created_at", { ascending: false })
+          .limit(2000),
+      ) as Row[];
+      const out = new Map<string, string>();
+      for (const r of rows) {
+        const id = r.staff_id as string;
+        if (!out.has(id)) out.set(id, r.created_at as string);
+      }
+      return out;
+    },
+
+    async beginPinLimitAttempt(scope, key, limits) {
+      const res = unwrap(
+        await sb.rpc("begin_pin_limit_attempt", {
+          p_scope: scope,
+          p_key: key,
+          p_max: limits.max,
+          p_window_minutes: limits.windowMinutes,
+          p_lock_minutes: limits.lockMinutes,
+        }),
+      ) as {
+        allowed?: boolean;
+        just_locked?: boolean;
+        attempts?: number;
+        locked_until?: string | null;
+      } | null;
+      return {
+        allowed: res?.allowed === true,
+        justLocked: res?.just_locked === true,
+        attempts: Number(res?.attempts ?? 0),
+        lockedUntil: res?.locked_until ?? null,
+      };
+    },
+
+    async releasePinLimitAttempt(scope, key) {
+      unwrap(
+        await sb.rpc("release_pin_limit_attempt", { p_scope: scope, p_key: key }),
+      );
+    },
+
+    async revokeStaffSessionsForStaff(tenantId, staffId) {
+      unwrap(
+        await sb
+          .from("terminal_staff_sessions")
+          .update({ revoked_at: nowIso() })
+          .eq("tenant_id", tenantId)
+          .eq("staff_id", staffId)
+          .is("revoked_at", null)
+          .select("id"),
+      );
     },
 
     async createStaffSession(session) {

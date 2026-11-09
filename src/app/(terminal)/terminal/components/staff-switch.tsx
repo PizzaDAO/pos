@@ -3,6 +3,9 @@
  * 4–8 digit PIN; verification happens SERVER-SIDE (/api/terminal/pin) against
  * `staff.pin_hash` — the hash never reaches this component. On success the active
  * staff is attributed to subsequently placed orders.
+ *
+ * Also the back-office unlock (/admin, see admin-lock.tsx): same picker and
+ * keypad, limited to owners/managers, verified by /api/admin/unlock.
  */
 "use client";
 
@@ -26,13 +29,25 @@ export function StaffSwitch({
   onVerify,
   onSignOut,
   onClose,
+  title = "Switch staff",
+  intro,
+  roles,
+  submitLabel = "Switch",
+  closeLabel = "Close",
 }: {
   /** The terminal's tenant (the picker lists only its staff). */
   tenantId?: string;
   current: ActiveStaff | null;
-  onVerify: (staffId: string, pin: string) => Promise<boolean>;
+  /** true = verified; false = wrong PIN; a string = the error to show. */
+  onVerify: (staffId: string, pin: string) => Promise<boolean | string>;
   onSignOut: () => void;
   onClose: () => void;
+  title?: string;
+  intro?: React.ReactNode;
+  /** Only list staff with these roles (e.g. owner/manager for the back office). */
+  roles?: readonly string[];
+  submitLabel?: string;
+  closeLabel?: string;
 }) {
   const [staff, setStaff] = useState<StaffOption[]>([]);
   const [staffState, setStaffState] = useState<"loading" | "ready" | "error">(
@@ -89,7 +104,9 @@ export function StaffSwitch({
       })
       .then((d: { staff?: StaffOption[] }) => {
         if (!alive) return;
-        setStaff(d.staff ?? []);
+        setStaff(
+          (d.staff ?? []).filter((s) => !roles || roles.includes(s.role)),
+        );
         setStaffState("ready");
       })
       .catch(() => {
@@ -98,6 +115,8 @@ export function StaffSwitch({
     return () => {
       alive = false;
     };
+    // `roles` is a static prop per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenantId, reloadKey]);
 
   async function submit() {
@@ -115,11 +134,11 @@ export function StaffSwitch({
     setBusy(true);
     try {
       const ok = await onVerify(selected, pin);
-      if (ok) {
+      if (ok === true) {
         setPin("");
         onClose();
       } else {
-        setError("Incorrect PIN.");
+        setError(typeof ok === "string" ? ok : "Incorrect PIN.");
         setPin("");
         setShake(true);
         setTimeout(() => setShake(false), 500);
@@ -136,16 +155,18 @@ export function StaffSwitch({
       <div className="w-full max-w-md rounded-lg bg-background p-6 shadow-xl">
         <div className="mb-4 flex items-center justify-between">
           <h2 id="staff-switch-title" className="text-lg font-semibold">
-            Switch staff
+            {title}
           </h2>
           <Button
             variant="ghost"
             className="h-11 px-4"
             onClick={onClose}
           >
-            Close
+            {closeLabel}
           </Button>
         </div>
+
+        {intro && <div className="mb-3 text-sm text-muted-foreground">{intro}</div>}
 
         {current && (
           <p className="mb-3 text-sm text-muted-foreground">
@@ -313,7 +334,7 @@ export function StaffSwitch({
             onMouseDown={noFocus}
             onClick={() => void submit()}
           >
-            {busy ? "Verifying…" : "Switch"}
+            {busy ? "Verifying…" : submitLabel}
           </Button>
         </div>
       </div>

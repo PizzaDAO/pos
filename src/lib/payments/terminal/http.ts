@@ -6,6 +6,7 @@ import { NextResponse } from "next/server";
 import { getPosDriver } from "@/lib/db";
 import type { Location, MembershipRole, Payment } from "@/lib/db";
 import { requireTenantRole } from "@/lib/auth/api";
+import { requireAdminRole } from "@/lib/auth/admin-gate";
 import { captureError } from "@/lib/observability";
 import { CardPaymentsNotReadyError } from "../connect";
 import { LiveKeyOutsideProductionError } from "../env";
@@ -44,6 +45,36 @@ export async function authorizeLocation(
     };
   }
   const auth = await requireTenantRole(tenantId, roles);
+  if (!auth.ok) return auth;
+  const location = (await getPosDriver().listLocations(tenantId)).find(
+    (l) => l.id === locationId,
+  );
+  if (!location) {
+    return { ok: false, res: NextResponse.json({ error: "Location not found." }, { status: 404 }) };
+  }
+  return { ok: true, tenantId, location };
+}
+
+/**
+ * Reader administration (/api/admin/terminal*): owner|manager of the tenant,
+ * the back-office PIN gate (src/lib/auth/admin-gate.ts), and the location must
+ * belong to the tenant.
+ */
+export async function authorizeAdminLocation(
+  request: Request,
+  tenantId: unknown,
+  locationId: unknown,
+): Promise<
+  | { ok: true; tenantId: string; location: Location }
+  | { ok: false; res: NextResponse }
+> {
+  if (typeof tenantId !== "string" || typeof locationId !== "string" || !tenantId || !locationId) {
+    return {
+      ok: false,
+      res: NextResponse.json({ error: "tenantId and locationId are required." }, { status: 400 }),
+    };
+  }
+  const auth = await requireAdminRole(request, tenantId, ADMIN_ROLES);
   if (!auth.ok) return auth;
   const location = (await getPosDriver().listLocations(tenantId)).find(
     (l) => l.id === locationId,

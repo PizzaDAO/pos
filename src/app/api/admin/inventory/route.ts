@@ -19,7 +19,7 @@ import {
   type InventoryItem,
   type MovementReason,
 } from "@/lib/db";
-import { requireTenantAccess } from "@/lib/auth/tenant-guard";
+import { requireAdminAccess } from "@/lib/auth/admin-gate";
 
 const MOVEMENT_REASONS: MovementReason[] = [
   "restock",
@@ -32,7 +32,7 @@ export const runtime = "nodejs";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const auth = await requireTenantAccess(searchParams.get("tenantId"), "admin", {
+  const auth = await requireAdminAccess(request, searchParams.get("tenantId"), {
     locationId: searchParams.get("locationId"),
     requireLocation: true,
   });
@@ -70,7 +70,7 @@ export async function POST(request: Request) {
   if (!tenantId) {
     return NextResponse.json({ error: "tenantId is required." }, { status: 422 });
   }
-  const auth = await requireTenantAccess(tenantId, "admin");
+  const auth = await requireAdminAccess(request, tenantId);
   if (!auth.ok) return auth.res;
 
   const driver = getPosDriver();

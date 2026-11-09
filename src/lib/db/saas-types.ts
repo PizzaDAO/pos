@@ -199,7 +199,14 @@ export type AuditAction =
   // A location's country (how phone numbers are read) was changed.
   | "location_country_change"
   // A manager overrode a stuck driver conflict and dispatched in-house instead.
-  | "delivery_manual_override";
+  | "delivery_manual_override"
+  // Admin > Staff: roster changes and PIN resets; the back-office PIN unlock.
+  | "staff_create"
+  | "staff_update"
+  | "staff_deactivate"
+  | "staff_reactivate"
+  | "staff_pin_reset"
+  | "admin_unlock";
 
 /**
  * An append-only audit entry written when a platform operator takes a

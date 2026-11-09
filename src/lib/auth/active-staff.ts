@@ -38,23 +38,30 @@ export interface ActiveStaffClaim {
   sessionId: string;
 }
 
-function mac(payload: string): string | null {
+/**
+ * Domain-separated MAC: the till cookie ("active-staff:v2") and the back-office
+ * unlock cookie ("admin-unlock:v1", see ./admin-gate) can't be swapped.
+ */
+function mac(payload: string, purpose: string): string | null {
   const key = signingSecret();
   if (!key) return null;
   return createHmac("sha256", key)
-    .update(`active-staff:v2:${payload}`)
+    .update(`${purpose}:${payload}`)
     .digest("hex");
 }
+
+const TILL_PURPOSE = "active-staff:v2";
 
 /** Signed cookie value for a claim; null if no secret (fail closed). */
 export function signActiveStaff(
   claim: ActiveStaffClaim,
   expiresAtMs: number,
+  purpose: string = TILL_PURPOSE,
 ): string | null {
   const parts = [claim.tenantId, claim.staffId, claim.userId, claim.sessionId];
   if (parts.some((p) => !p || p.includes("."))) return null;
   const payload = `${parts.join(".")}.${expiresAtMs}`;
-  const sig = mac(payload);
+  const sig = mac(payload, purpose);
   return sig ? `${payload}.${sig}` : null;
 }
 
@@ -62,6 +69,7 @@ export function signActiveStaff(
 export function verifyActiveStaff(
   value: string | null | undefined,
   now = Date.now(),
+  purpose: string = TILL_PURPOSE,
 ): ActiveStaffClaim | null {
   if (!value) return null;
   const parts = value.split(".");
@@ -76,7 +84,10 @@ export function verifyActiveStaff(
   ];
   if (!tenantId || !staffId || !userId || !sessionId || !sig) return null;
   if (!(Number(exp) > now)) return null;
-  const expected = mac(`${tenantId}.${staffId}.${userId}.${sessionId}.${exp}`);
+  const expected = mac(
+    `${tenantId}.${staffId}.${userId}.${sessionId}.${exp}`,
+    purpose,
+  );
   if (!expected) return null;
   const a = Buffer.from(expected, "hex");
   let b: Buffer;
@@ -129,6 +140,7 @@ export async function openStaffSession(input: {
     created_at: new Date(now).toISOString(),
     expires_at: new Date(expiresAt).toISOString(),
     revoked_at: null,
+    kind: "till",
   });
   const cookie = signActiveStaff({ ...input, sessionId }, expiresAt);
   return cookie ? { cookie, sessionId } : null;
@@ -170,6 +182,8 @@ async function liveSessionStaff(
   const session = await driver.getStaffSession(sessionId);
   if (
     !session ||
+    // Only till switch-ins: a back-office unlock session is not a till session.
+    (session.kind ?? "till") !== "till" ||
     session.revoked_at ||
     session.user_id !== expected.userId ||
     session.tenant_id !== expected.tenantId ||
