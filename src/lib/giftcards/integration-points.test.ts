@@ -8,6 +8,7 @@ import { DEMO_LOCATION_DOWNTOWN_ID, DEMO_TENANT_ID, getPosDriver, type Order, ty
 import { resetMockOrders, resetMockPayments } from "@/lib/db/mock";
 import { railToMethod, toContractOrder, toContractPayment } from "@/lib/core/mappers";
 import { autoPrintOnFire } from "@/lib/printing/queue";
+import { OrderSchema, PaymentSchema } from "@openpizza/core";
 import { lookupKeys } from "./http";
 import { mockStoredValueStore, resetMockStoredValue } from "./store-mock";
 
@@ -43,11 +44,21 @@ function saleOrder(): Order {
     totals: { subtotal_cents: 0, discount_cents: 0, taxable_cents: 0, tax_cents: 0, tip_cents: 0, total_cents: 5000 },
     notes: null,
     order_number: "1",
-    core_ext: { stored_value: { op: "sell", account_id: "a", amount_cents: 5000, code_last4: "ABCD" } },
+    core_ext: { stored_value: { op: "sell", account_id: randomUUID(), amount_cents: 5000, code_last4: "ABCD" } },
     created_at: at,
     updated_at: at,
   };
 }
+
+describe("till lockout keys", () => {
+  it("the authenticated till is keyed by device login and staff, never by IP", () => {
+    expect(lookupKeys({ ip: "9.9.9.9", device: "user-1", staff: "staff-1", surface: "till" }, "t")).toEqual([
+      "till:dev:user-1:t",
+      "till:staff:staff-1:t",
+    ]);
+    expect(lookupKeys({ ip: "9.9.9.9", device: "user-1", surface: "till" }, "t")).toEqual(["till:dev:user-1:t"]);
+  });
+});
 
 describe("hub mapping", () => {
   it("flags sale orders and maps stored-value tenders to their own method", () => {
@@ -56,7 +67,13 @@ describe("hub mapping", () => {
     const reload = { ...o, core_ext: { stored_value: { ...o.core_ext!.stored_value!, op: "reload" as const } } };
     expect(toContractOrder({ order: reload, payments: [], timezone: "UTC" }).metadata.stored_value).toBe("gift_card_reload");
     expect(railToMethod("gift_card")).toBe("gift_card");
-    expect(railToMethod("store_credit")).toBe("store_credit");
+    expect(railToMethod("store_credit")).toBe("gift_card");
+    const mapped = toContractOrder({ order: o, payments: [], timezone: "UTC" });
+    expect(mapped.lines).toEqual([
+      expect.objectContaining({ line_type: "gift_card_load", kind: "gift_card", line_total_cents: 5000, tax_exempt: true }),
+    ]);
+    // The hub contract accepts it as is.
+    expect(() => OrderSchema.parse(mapped)).not.toThrow();
     const p = {
       id: randomUUID(), order_id: o.id, tenant_id: o.tenant_id, location_id: o.location_id, rail: "gift_card",
       status: "captured", amount_cents: 100, tip_cents: 0, application_fee_cents: 0, currency: "USD",
@@ -65,6 +82,9 @@ describe("hub mapping", () => {
       created_at: o.created_at, updated_at: o.created_at,
     } as Payment;
     expect(toContractPayment(p)).toMatchObject({ method: "gift_card", processor: "pos" });
+    const sc = toContractPayment({ ...p, rail: "store_credit" });
+    expect(sc).toMatchObject({ method: "gift_card", processor: "store_credit" });
+    expect(() => PaymentSchema.parse(sc)).not.toThrow();
   });
 });
 

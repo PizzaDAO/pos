@@ -554,8 +554,10 @@ $$;
 
 -- ---- sv_issue_store_credit (create + credit, one transaction) -------------------
 -- Outcomes: ok | replayed | approval_required | code_taken | bad_amount
--- A non-manager may not take their own store credit issued today (UTC) above
--- p_daily_cap; serialized per (tenant, actor) by an advisory lock.
+-- A non-manager may not take their own store credit issued since p_day_start
+-- (the start of the location's business day, computed by the app) above
+-- p_daily_cap; serialized per (tenant, actor) by an advisory lock. The actor is
+-- the PIN-switched staff member (else the device login).
 create or replace function public.sv_issue_store_credit(
   p_tenant_id uuid,
   p_account_id uuid,
@@ -568,7 +570,8 @@ create or replace function public.sv_issue_store_credit(
   p_reason text,
   p_actor_id text,
   p_is_manager boolean,
-  p_daily_cap integer
+  p_daily_cap integer,
+  p_day_start timestamptz default null
 )
 returns jsonb
 language plpgsql
@@ -597,7 +600,7 @@ begin
       join public.stored_value_accounts a on a.id = l.account_id
      where l.tenant_id = p_tenant_id and a.kind = 'store_credit' and l.kind = 'issue'
        and l.actor_id = p_actor_id
-       and l.created_at >= date_trunc('day', now() at time zone 'UTC') at time zone 'UTC';
+       and l.created_at >= coalesce(p_day_start, date_trunc('day', now() at time zone 'UTC') at time zone 'UTC');
     if v_today + p_amount > p_daily_cap then
       return jsonb_build_object('outcome', 'approval_required');
     end if;
@@ -730,6 +733,39 @@ as $$
   );
 $$;
 
+-- ---- sv_unreleased_orders (the release sweep's target set) -----------------------
+-- Abandoned orders that still hold a captured, not fully refunded gift_card /
+-- store_credit tender: newest first, keyset-paged on (created_at, id).
+create index if not exists payments_stored_value_open_idx
+  on public.payments (order_id)
+  where rail in ('gift_card', 'store_credit') and status = 'captured';
+
+create or replace function public.sv_unreleased_orders(
+  p_limit integer,
+  p_before_created_at timestamptz default null,
+  p_before_id uuid default null
+)
+returns table (order_id uuid, created_at timestamptz)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select o.id, o.created_at
+    from public.orders o
+   where o.status = 'abandoned'
+     and exists (
+       select 1 from public.payments p
+        where p.order_id = o.id
+          and p.rail in ('gift_card', 'store_credit')
+          and p.status = 'captured'
+          and p.refunded_cents < p.amount_cents + p.tip_cents)
+     and (p_before_created_at is null
+          or (o.created_at, o.id) < (p_before_created_at, p_before_id))
+   order by o.created_at desc, o.id desc
+   limit least(greatest(coalesce(p_limit, 100), 1), 500);
+$$;
+
 -- ---- grants: service_role only ---------------------------------------------------
 do $$
 declare
@@ -741,11 +777,12 @@ begin
     'public.sv_void(uuid, uuid, uuid, text, text, text)',
     'public.sv_redeem(uuid, uuid, uuid, uuid, integer, text, uuid)',
     'public.sv_create_account(jsonb)',
-    'public.sv_issue_store_credit(uuid, uuid, uuid, text, text, text, uuid, integer, text, text, boolean, integer)',
+    'public.sv_issue_store_credit(uuid, uuid, uuid, text, text, text, uuid, integer, text, text, boolean, integer, timestamptz)',
     'public.sv_mark_revealed(uuid, uuid)',
     'public.sv_guard_check(text[])',
     'public.sv_guard_fail(text[], integer, integer)',
     'public.sv_summary(uuid, uuid, timestamptz, timestamptz)',
+    'public.sv_unreleased_orders(integer, timestamptz, uuid)',
     'public.sv_order_due(public.orders)',
     'public.sv_order_sum(public.orders, text[])'
   ] loop

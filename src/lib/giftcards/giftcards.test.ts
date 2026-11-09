@@ -26,6 +26,7 @@ import { getStoredValueStore } from "./store";
 import {
   StoredValueError,
   StoredValueRefundBlockedError,
+  businessDayStartIso,
   createGiftCardReload,
   createGiftCardSale,
   findAccountByCode,
@@ -33,11 +34,13 @@ import {
   redeemStoredValue,
   revealOnlineCode,
   reverseReload,
+  settleStoredValueOrder,
   sweepUnreleasedStoredValue,
   voidStoredValue,
 } from "./service";
 import { expireOnlineOrders } from "@/lib/shop/lifecycle";
 import { vi } from "vitest";
+import { requirePaymentRail } from "@/lib/payments/registry";
 
 const TENANT = DEMO_TENANT_ID;
 const LOCATION = DEMO_LOCATION_DOWNTOWN_ID;
@@ -660,5 +663,93 @@ describe("review fixes", () => {
     ).rejects.toMatchObject({ code: "approval_required" });
     const mgr = await issueStoreCredit({ ...base, accountId: randomUUID(), amountCents: 2500, role: "manager", actor: ACTOR });
     expect(mgr.account.balance_cents).toBe(2500);
+  });
+});
+
+describe("card refunds on gift card sales (no crash window)", () => {
+  async function cardPaidSale(amount: number) {
+    const sale = await createGiftCardSale({
+      tenantId: TENANT, locationId: LOCATION, orderId: randomUUID(), amountCents: amount, channel: "in_store", currency: "USD",
+    });
+    const now = new Date().toISOString();
+    const p = await getPosDriver().upsertPayment({
+      id: randomUUID(), order_id: sale.order.id, tenant_id: TENANT, location_id: LOCATION, rail: "stripe_terminal",
+      status: "captured", amount_cents: amount, tip_cents: 0, application_fee_cents: 0, currency: "USD",
+      charge_id: `sim_pi_${randomUUID()}`, connect_account_id: "acct_sim_1", crypto_tx_hash: null, crypto_chain: null,
+      cash_tendered_cents: null, cash_change_cents: null, refunded_cents: 0, simulated: true, raw: null,
+      created_at: now, updated_at: now,
+    });
+    await settleStoredValueOrder(sale.order.id);
+    return { sale, p };
+  }
+
+  it("a voided card's card-paid sale refunds Stripe-first (rail before the record)", async () => {
+    const { sale, p } = await cardPaidSale(3000);
+    expect((await account(sale.account.id)).status).toBe("active");
+    const driver = getPosDriver();
+    const order: string[] = [];
+    const rail = requirePaymentRail("stripe_terminal");
+    const railSpy = vi.spyOn(rail, "refund").mockImplementation(async (r) => {
+      order.push("rail");
+      return { refundId: "re_sim_1", status: "refunded", amount: r.amount! };
+    });
+    const reserveSpy = vi.spyOn(driver, "reservePaymentRefund");
+    reserveSpy.mockImplementation(async (...args) => {
+      order.push("reserve");
+      reserveSpy.mockRestore();
+      return driver.reservePaymentRefund(...args);
+    });
+    await voidStoredValue({ tenantId: TENANT, accountId: sale.account.id, locationId: LOCATION, reason: "x", actor: ACTOR });
+    railSpy.mockRestore();
+    expect(order).toEqual(["rail", "reserve"]);
+    expect((await driver.getPayment(p.id))!.refunds?.[0]?.processor_ref).toBe("re_sim_1");
+  });
+
+  it("a replayed card refund with no provider id calls the rail again with the same key and records the id", async () => {
+    const { p } = await cardPaidSale(3000);
+    const driver = getPosDriver();
+    // A duplicate card tender: refunding one is EXCESS money (reserve-first path).
+    const dup = await driver.upsertPayment({ ...p, id: randomUUID() });
+    // Simulate the crash: reserved, then the process died before the Stripe call.
+    await driver.reservePaymentRefund(dup.id, 3000, "r-crash", { reason: null });
+    expect((await driver.getPayment(dup.id))!.refunds?.[0]?.processor_ref).toBeNull();
+    const rail = requirePaymentRail("stripe_terminal");
+    const railSpy = vi.spyOn(rail, "refund").mockResolvedValue({
+      refundId: "re_late", status: "refunded", amount: { amount: 3000, currency: "USD" },
+    });
+    const out = await refundPayment({ paymentId: dup.id, refundId: "r-crash" });
+    expect(out?.replayed).toBe(true);
+    expect(railSpy).toHaveBeenCalledTimes(1);
+    expect(railSpy.mock.calls[0]![0].context.idempotencyKey).toBe(`refund_${dup.id}_r-crash`);
+    expect((await driver.getPayment(dup.id))!.refunds?.[0]?.processor_ref).toBe("re_late");
+    // A second replay does nothing more.
+    await refundPayment({ paymentId: dup.id, refundId: "r-crash" });
+    expect(railSpy).toHaveBeenCalledTimes(1);
+    railSpy.mockRestore();
+  });
+});
+
+describe("store credit daily cap: per staff member, per business day", () => {
+  it("finds the location's business-day start (time zone + cutoff, DST-aware)", () => {
+    const ny = { timezone: "America/New_York", business_day_cutoff_minutes: 0 };
+    expect(businessDayStartIso(ny, new Date("2026-03-10T16:00:00Z"))).toBe("2026-03-10T04:00:00.000Z");
+    const late = { ...ny, business_day_cutoff_minutes: 240 };
+    expect(businessDayStartIso(late, new Date("2026-03-10T16:00:00Z"))).toBe("2026-03-10T08:00:00.000Z");
+    expect(businessDayStartIso(late, new Date("2026-03-10T06:00:00Z"))).toBe("2026-03-09T08:00:00.000Z");
+    expect(businessDayStartIso(null, new Date("2026-03-10T16:00:00Z"))).toBe("2026-03-10T00:00:00.000Z");
+  });
+
+  it("counts against the PIN-switched staff member, and resets at the business-day start", async () => {
+    const base = { tenantId: TENANT, locationId: LOCATION, reason: "late", currency: "USD", role: "cashier", actor: ACTOR };
+    const today = new Date(Date.now() - 60_000).toISOString();
+    const issue = (capActorId: string, dayStartIso = today, amountCents = 2500) =>
+      issueStoreCredit({ ...base, accountId: randomUUID(), amountCents, capActorId, dayStartIso });
+    for (let i = 0; i < 4; i += 1) await issue("staff-a");
+    await expect(issue("staff-a", today, 100)).rejects.toMatchObject({ code: "approval_required" });
+    // The same device login, another staff member: their own cap.
+    await expect(issue("staff-b")).resolves.toMatchObject({ replayed: false });
+    // A new business day: staff A starts again.
+    const tomorrow = new Date(Date.now() + 1000).toISOString();
+    await expect(issue("staff-a", tomorrow)).resolves.toMatchObject({ replayed: false });
   });
 });

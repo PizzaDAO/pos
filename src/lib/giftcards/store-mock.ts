@@ -136,11 +136,25 @@ export const mockStoredValueStore: StoredValueStore = {
       .map((e) => ({ ...e }));
   },
 
-  async listRecentRedemptions(sinceIso, limit) {
-    return ledger
-      .filter((e) => e.kind === "redeem" && e.created_at >= sinceIso)
-      .slice(0, limit)
-      .map((e) => ({ ...e }));
+  async listUnreleasedOrders(limit, before) {
+    const driver = getPosDriver();
+    const out = new Map<string, { id: string; created_at: string }>();
+    for (const e of ledger) {
+      if (e.kind !== "redeem" || !e.payment_id || !e.order_id || out.has(e.order_id)) continue;
+      const [p, o] = [await driver.getPayment(e.payment_id), await driver.getOrder(e.order_id)];
+      if (!p || !o || o.status !== "abandoned") continue;
+      if (p.status !== "captured" || p.refunded_cents >= p.amount_cents + p.tip_cents) continue;
+      out.set(o.id, { id: o.id, created_at: o.created_at });
+    }
+    return [...out.values()]
+      .sort((x, y) => y.created_at.localeCompare(x.created_at) || y.id.localeCompare(x.id))
+      .filter(
+        (r) =>
+          !before ||
+          r.created_at < before.created_at ||
+          (r.created_at === before.created_at && r.id < before.id),
+      )
+      .slice(0, limit);
   },
 
   async summary(tenantId, locationId, fromIso, toIso) {
@@ -171,14 +185,13 @@ export const mockStoredValueStore: StoredValueStore = {
       const existing = owned(input.tenantId, input.accountId);
       if (existing) return { outcome: "replayed" as const, account: publicAccount(existing) };
       if (!input.isManager && input.dailyCapCents != null) {
-        const day = nowIso().slice(0, 10);
         const today = ledger
           .filter(
             (e) =>
               e.tenant_id === input.tenantId &&
               e.kind === "issue" &&
               e.actor_id === input.actorId &&
-              e.created_at.slice(0, 10) === day &&
+              e.created_at >= input.dayStartIso &&
               accounts.get(e.account_id)?.kind === "store_credit",
           )
           .reduce((n, e) => n + e.amount_cents, 0);

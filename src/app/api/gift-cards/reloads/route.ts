@@ -42,7 +42,7 @@ export async function POST(request: Request) {
   const auth = await requireTillStaff(request, b.tenantId, b.locationId);
   if (!auth.ok) return auth.res;
   const { grant } = auth;
-  const id = lookupIdentity(request, "till", grant.user.id);
+  const id = lookupIdentity(request, "till", grant.user.id, grant.staff?.id ?? null);
   const blocked = await admitLookup(id, grant.tenantId);
   if (blocked) return blocked;
   try {

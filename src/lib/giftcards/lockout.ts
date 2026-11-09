@@ -28,14 +28,29 @@ export interface LookupIdentity {
   ip: string;
   /** Till device login id, or the storefront device cookie; null if none. */
   device: string | null;
+  /** Till only: the PIN-switched staff member, if any. */
+  staff?: string | null;
   /** Bucket prefix so storefront and till keys never share a window. */
   surface: "till" | "shop";
 }
 
+/**
+ * The authenticated till is NOT keyed by IP (every tablet of a shop shares one
+ * NAT address: one cashier's typos must not lock the whole shop out); it is
+ * keyed by device login and by staff member. The anonymous storefront is keyed
+ * by IP and by device cookie.
+ */
+export function identityKeys(id: LookupIdentity): string[] {
+  const out: string[] = [];
+  if (id.surface === "shop") out.push(`ip:${id.ip}`);
+  if (id.device) out.push(`dev:${id.device}`);
+  if (id.surface === "till" && id.staff) out.push(`staff:${id.staff}`);
+  if (out.length === 0) out.push(`ip:${id.ip}`);
+  return out.map((k) => `${id.surface}:${k}`);
+}
+
 function keys(id: LookupIdentity): string[] {
-  const out = [`gc:${id.surface}:ip:${id.ip}`];
-  if (id.device) out.push(`gc:${id.surface}:dev:${id.device}`);
-  return out;
+  return identityKeys(id).map((k) => `gc:${k}`);
 }
 
 export class LookupGuard {

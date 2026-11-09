@@ -22,6 +22,7 @@
  * survive a refund.
  */
 import { getPosDriver, type Order, type OrderFulfillment, type Payment } from "@/lib/db";
+import { locationBusinessDate, type LocationClock } from "@/lib/reports";
 import { captureError } from "@/lib/observability";
 import { deploymentCheckoutMode } from "@/lib/payments/env";
 import {
@@ -537,35 +538,29 @@ export async function releaseStoredValueTenders(orderId: string): Promise<void> 
   }
 }
 
-/** How far back the sweeper re-checks redemptions on abandoned checkouts. */
-export const RELEASE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+/** Release sweep batch size and the per-run page cap (the next run continues). */
+const RELEASE_PAGE = 100;
+const RELEASE_MAX_PAGES = 20;
 
 /**
  * Sweep: an abandoned online checkout that STILL holds a captured stored-value
  * tender (a release that failed or never ran) gets it released again. The
- * refund id is fixed per tender (`release_<id>`), so this is idempotent with
- * the release that ran at abandonment. Returns how many orders it released.
+ * target set is queried directly (newest first, keyset-batched); the refund id
+ * is fixed per tender (`release_<id>`), so this is idempotent with the release
+ * that ran at abandonment. Returns how many orders it released.
  */
-export async function sweepUnreleasedStoredValue(now: Date = new Date()): Promise<number> {
+export async function sweepUnreleasedStoredValue(): Promise<number> {
   const store = await getStoredValueStore();
-  const driver = getPosDriver();
-  const since = new Date(now.getTime() - RELEASE_LOOKBACK_MS).toISOString();
-  const seen = new Set<string>();
   let released = 0;
-  for (const e of await store.listRecentRedemptions(since, 1000)) {
-    if (!e.order_id || seen.has(e.order_id)) continue;
-    seen.add(e.order_id);
-    const order = await driver.getOrder(e.order_id);
-    if (!order || order.status !== "abandoned") continue;
-    const held = (await driver.listPaymentsForOrder(order.id)).some(
-      (p) =>
-        (p.rail === "gift_card" || p.rail === "store_credit") &&
-        p.status === "captured" &&
-        p.refunded_cents < p.amount_cents + p.tip_cents,
-    );
-    if (!held) continue;
-    await releaseStoredValueTenders(order.id);
-    released += 1;
+  let before: { created_at: string; id: string } | null = null;
+  for (let page = 0; page < RELEASE_MAX_PAGES; page += 1) {
+    const batch = await store.listUnreleasedOrders(RELEASE_PAGE, before);
+    for (const o of batch) {
+      await releaseStoredValueTenders(o.id);
+      released += 1;
+    }
+    if (batch.length < RELEASE_PAGE) break;
+    before = batch[batch.length - 1]!;
   }
   return released;
 }
@@ -574,9 +569,47 @@ export async function sweepUnreleasedStoredValue(now: Date = new Date()): Promis
 // Refund guard (called by refundPayment)
 // ---------------------------------------------------------------------------
 
-/** True for a tender on a gift-card SALE / RELOAD order (refundPayment's policy). */
-export async function isStoredValueSaleTender(payment: Payment): Promise<boolean> {
-  return !!storedValueExt(await getPosDriver().getOrder(payment.order_id));
+/**
+ * refundPayment's policy for a tender, decided BEFORE any money moves:
+ *  - null: not a gift-card sale/reload tender (normal rules);
+ *  - "released": the value it bought already left the card (voided, reload
+ *    reversed, never credited): refund normally (card rails Stripe-first with
+ *    the fixed idempotency key, then record), no crash window;
+ *  - "excess": the order would still hold the card's value without it (a
+ *    duplicate tender): reserve first, re-check (assertStoredValueRefundAllowed)
+ *    after the atomic reservation, then call the rail.
+ * Throws StoredValueRefundBlockedError while the card still holds the value.
+ */
+export async function storedValueSaleRefundMode(
+  payment: Payment,
+  refundCents: number,
+): Promise<"released" | "excess" | null> {
+  const driver = getPosDriver();
+  const order = await driver.getOrder(payment.order_id);
+  const ext = storedValueExt(order);
+  if (!order || !ext) return null;
+  if (await valueLeftCard(order, ext)) return "released";
+  const held = heldCents(await driver.listPaymentsForOrder(order.id));
+  if (held - refundCents >= ext.amount_cents) return "excess";
+  throw new StoredValueRefundBlockedError();
+}
+
+function heldCents(payments: Payment[]): number {
+  return payments
+    .filter((p) => p.status === "captured" || p.status === "authorized" || p.status === "refunded")
+    .reduce((n, p) => n + Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents), 0);
+}
+
+/** The value a sale/reload order bought is no longer on the card (or never was). */
+async function valueLeftCard(order: Order, ext: StoredValueOrderExt): Promise<boolean> {
+  const store = await getStoredValueStore();
+  const ledger = await store.listLedger(order.tenant_id, ext.account_id);
+  if (!ledger.some((e) => e.idempotency_key === `sale:${order.id}`)) return true;
+  if (ext.op === "sell") {
+    const account = await store.getAccount(order.tenant_id, ext.account_id);
+    return !account || account.status === "voided";
+  }
+  return ledger.some((e) => e.idempotency_key === `reverse:${order.id}`);
 }
 
 /**
@@ -596,23 +629,8 @@ export async function assertStoredValueRefundAllowed(payment: Payment): Promise<
   const order = await driver.getOrder(payment.order_id);
   const ext = storedValueExt(order);
   if (!order || !ext) return;
-
-  const payments = await driver.listPaymentsForOrder(order.id);
-  const held = payments
-    .filter((p) => p.status === "captured" || p.status === "authorized" || p.status === "refunded")
-    .reduce((n, p) => n + Math.max(0, p.amount_cents + p.tip_cents - p.refunded_cents), 0);
-  if (held >= ext.amount_cents) return; // excess (a duplicate tender)
-
-  const store = await getStoredValueStore();
-  const ledger = await store.listLedger(order.tenant_id, ext.account_id);
-  // Paid but never credited (the card refused it): nothing to take back.
-  if (!ledger.some((e) => e.idempotency_key === `sale:${order.id}`)) return;
-  if (ext.op === "sell") {
-    const account = await store.getAccount(order.tenant_id, ext.account_id);
-    if (!account || account.status === "voided") return;
-  } else if (ledger.some((e) => e.idempotency_key === `reverse:${order.id}`)) {
-    return;
-  }
+  if (heldCents(await driver.listPaymentsForOrder(order.id)) >= ext.amount_cents) return; // excess
+  if (await valueLeftCard(order, ext)) return;
   throw new StoredValueRefundBlockedError();
 }
 
@@ -686,10 +704,14 @@ export async function voidStoredValue(input: {
 
   let refunds: Awaited<ReturnType<typeof refundOrderTenders>> = [];
   if (sale) {
-    if (sale.status === "draft" || sale.status === "awaiting_payment") {
-      await driver.transitionOrderStatus(sale.id, ["draft", "awaiting_payment"], "voided");
-    } else {
+    // Decided by the MONEY, not the order status: any settled tender is refunded.
+    const settled = (await driver.listPaymentsForOrder(sale.id)).some(
+      (p) => p.status === "captured" || p.status === "authorized",
+    );
+    if (settled) {
       refunds = await refundOrderTenders(sale, `gcvoid_${account.id}`, `Gift card voided: ${input.reason}`);
+    } else if (sale.status === "draft" || sale.status === "awaiting_payment") {
+      await driver.transitionOrderStatus(sale.id, ["draft", "awaiting_payment"], "voided");
     }
   }
   if (!voided.replayed) {
@@ -749,6 +771,26 @@ export async function reverseReload(input: {
 // Store credit
 // ---------------------------------------------------------------------------
 
+/**
+ * The instant the location's current business day began (its time zone and
+ * business-day cutoff, same rule as the reports): the earliest instant with
+ * today's business date, found by a minute-precision search over the last 48 h.
+ */
+export function businessDayStartIso(
+  loc: LocationClock | null | undefined,
+  now: Date = new Date(),
+): string {
+  const today = locationBusinessDate(now.toISOString(), loc);
+  let lo = now.getTime() - 48 * 60 * 60_000; // a different business date
+  let hi = now.getTime(); // today
+  while (hi - lo > 60_000) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (locationBusinessDate(new Date(mid).toISOString(), loc) === today) hi = mid;
+    else lo = mid;
+  }
+  return new Date(hi - (hi % 60_000)).toISOString();
+}
+
 export interface IssueStoreCreditInput {
   tenantId: string;
   locationId: string | null;
@@ -759,6 +801,13 @@ export interface IssueStoreCreditInput {
   customerId?: string | null;
   /** The role that authorizes it (the active PIN staff, else the device login). */
   role: string;
+  /**
+   * Whose daily cap it counts against: the PIN-switched staff member, else the
+   * device login. Recorded as the ledger actor. Defaults to `actor.id`.
+   */
+  capActorId?: string;
+  /** Start of the location's business day (default: the UTC day). */
+  dayStartIso?: string;
   actor: Actor;
   currency: string;
 }
@@ -801,9 +850,10 @@ export async function issueStoreCredit(
       customerId: input.customerId ?? null,
       amountCents: input.amountCents,
       reason,
-      actorId: input.actor.id,
+      actorId: input.capActorId ?? input.actor.id,
       isManager: manager,
       dailyCapCents: storeCreditDailyCapCents(),
+      dayStartIso: input.dayStartIso ?? `${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`,
     });
   }
   if (out.outcome === "replayed") {

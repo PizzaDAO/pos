@@ -78,6 +78,17 @@ export async function POST(request: Request) {
       return withDeviceCookie(await unknownCode(id, order.tenant_id), device);
     }
     const paymentId = deriveTenderId(order.id, `${account.kind}:${account.id}`, 0);
+    // An open card intent nobody is paying (requires_payment_method /
+    // requires_confirmation) is canceled FIRST, strictly, so "gift card
+    // instead" works. If Stripe refuses (the customer is paying it right now),
+    // fall back to debit-then-close below.
+    let intentsClosed = true;
+    if (!(await driver.getPayment(paymentId))) {
+      intentsClosed = await cancelSupersededTenders(order.id, paymentId).then(
+        () => true,
+        () => false,
+      );
+    }
     const { payment, account: after, replayed } = await redeemStoredValue({
       order,
       account,
@@ -88,7 +99,7 @@ export async function POST(request: Request) {
     // Only now, with the card debited, close any open card intent: it was for
     // the full amount and must not stay payable. If it cannot be closed (the
     // customer is paying it right now) the card is credited back.
-    if (!replayed) {
+    if (!replayed && !intentsClosed) {
       try {
         await cancelSupersededTenders(order.id, paymentId);
       } catch {

@@ -132,6 +132,13 @@ begin
   if exists (select 1 from jsonb_array_elements(r -> 'tenders') x where x ->> 'key' = 'cash') then
     raise exception 'sale tender in the tender list: %', r -> 'tenders';
   end if;
+  -- redeemed is NET of value refunded back to the card
+  update public.payments set refunded_cents = 500 where id = p1;
+  r := public.report_sales_bundle(t, loc, current_date - 2, current_date + 2);
+  if (r -> 'stored_value' ->> 'redeemed_gift_card_cents')::int <> 1500 then
+    raise exception 'redeemed not net of refunds: %', r -> 'stored_value';
+  end if;
+  update public.payments set refunded_cents = 0 where id = p1;
 
   -- ---- one-time reveal, guard, atomic store credit ------------------------------
   update public.stored_value_accounts set source = 'online' where id = acct;
@@ -154,6 +161,30 @@ begin
   -- refund-to-card is capped at what the tender redeemed
   r := public.sv_credit(t, acct, loc, 'refund', 1, 'refund-extra', food, p1);
   if r ->> 'outcome' <> 'exceeds_max' then raise exception 'refund over the redemption: %', r; end if;
+
+  -- ---- set_payment_refund_ref (20261113000930) ------------------------------------
+  update public.payments
+     set refunds = '[{"id":"e0","request_id":"r0","processor_ref":"re_0","amount_cents":1},
+                     {"id":"e1","request_id":"r1","processor_ref":null,"amount_cents":1}]'::jsonb
+   where id = cash;
+  if not public.set_payment_refund_ref(cash, 'r1', 're_1') then raise exception 'ref not set'; end if;
+  if public.set_payment_refund_ref(cash, 'r1', 're_other') then raise exception 'ref overwritten'; end if;
+  if public.set_payment_refund_ref(cash, 'r0', 're_other') then raise exception 'existing ref overwritten'; end if;
+  if (select refunds -> 1 ->> 'processor_ref' from public.payments where id = cash) <> 're_1'
+     or (select refunds -> 0 ->> 'processor_ref' from public.payments where id = cash) <> 're_0'
+     or (select jsonb_array_length(refunds) from public.payments where id = cash) <> 2 then
+    raise exception 'refunds after ref fill: %', (select refunds from public.payments where id = cash);
+  end if;
+
+  -- ---- release sweep target set ---------------------------------------------------
+  select count(*) into n from public.sv_unreleased_orders(100) where order_id = food;
+  if n <> 0 then raise exception 'a live order listed as unreleased'; end if;
+  update public.orders set status = 'abandoned' where id = food;
+  select count(*) into n from public.sv_unreleased_orders(100) where order_id = food;
+  if n <> 1 then raise exception 'abandoned order holding a gift card tender not listed'; end if;
+  update public.payments set refunded_cents = amount_cents, status = 'refunded' where id = p1;
+  select count(*) into n from public.sv_unreleased_orders(100) where order_id = food;
+  if n <> 0 then raise exception 'a released order still listed'; end if;
 
   -- ---- append-only + sign rules --------------------------------------------------
   begin

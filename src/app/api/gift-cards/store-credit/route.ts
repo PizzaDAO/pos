@@ -17,7 +17,7 @@ import {
   featureOff,
   requireTillStaff,
 } from "@/lib/giftcards/http";
-import { issueStoreCredit } from "@/lib/giftcards/service";
+import { businessDayStartIso, issueStoreCredit } from "@/lib/giftcards/service";
 
 export const runtime = "nodejs";
 
@@ -63,6 +63,9 @@ export async function POST(request: Request) {
     const currency = locationId
       ? (await driver.getStoreSettings(grant.tenantId, locationId)).currency
       : "USD";
+    const location = locationId
+      ? (await driver.listLocations(grant.tenantId)).find((l) => l.id === locationId) ?? null
+      : null;
     const out = await issueStoreCredit({
       tenantId: grant.tenantId,
       locationId,
@@ -72,6 +75,10 @@ export async function POST(request: Request) {
       customerId: (b.customerId as string | undefined) ?? null,
       role: grant.role,
       actor: grant.actor,
+      // The daily cap follows the PIN-switched staff member (else the device
+      // login) and resets at the location's business-day start.
+      capActorId: grant.staff?.id ?? grant.user.id,
+      dayStartIso: businessDayStartIso(location),
       currency,
     });
     return NextResponse.json(out, { status: out.replayed ? 200 : 201 });

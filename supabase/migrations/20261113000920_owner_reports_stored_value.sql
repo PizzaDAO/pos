@@ -10,8 +10,8 @@
 --     (gift_card_cents, store_credit_cents) instead of falling into `other`
 --     (the tender list already keys them by rail);
 --   * a `stored_value` section: sold (count, money, refunded), redeemed (gift
---     card / store credit, on sales in range) and the current outstanding
---     liability.
+--     card / store credit on sales in range, NET of value refunded back to the
+--     cards) and the current outstanding liability.
 -- Mirrored in src/lib/owner-reports.ts. Same signature: create or replace only.
 -- Needs 20261113000910 (stored_value_accounts) first.
 -- ============================================================================
@@ -274,8 +274,15 @@ select jsonb_build_object(
       'sold_count', sv.sold_count,
       'sold_cents', sv.sold_cents,
       'sold_refunded_cents', sv.sold_refunded_cents,
-      'redeemed_gift_card_cents', coalesce((select sum(t_gift_card) from sales), 0),
-      'redeemed_store_credit_cents', coalesce((select sum(t_store_credit) from sales), 0),
+      -- Net of value returned to the cards (refunds of those tenders).
+      'redeemed_gift_card_cents', coalesce((
+        select sum(p.amount_cents - least(p.refunded_cents, p.amount_cents))
+          from sales sl join public.payments p on p.order_id = sl.id and p.tenant_id = p_tenant_id
+         where p.rail::text = 'gift_card' and p.status::text in ('captured', 'refunded')), 0),
+      'redeemed_store_credit_cents', coalesce((
+        select sum(p.amount_cents - least(p.refunded_cents, p.amount_cents))
+          from sales sl join public.payments p on p.order_id = sl.id and p.tenant_id = p_tenant_id
+         where p.rail::text = 'store_credit' and p.status::text in ('captured', 'refunded')), 0),
       -- Current (not range-bound) liability across the tenant.
       'outstanding_cents', coalesce((select sum(a.balance_cents) from public.stored_value_accounts a
                                       where a.tenant_id = p_tenant_id and a.status = 'active'), 0))

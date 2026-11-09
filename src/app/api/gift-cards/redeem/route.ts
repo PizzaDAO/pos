@@ -58,13 +58,21 @@ export async function POST(request: Request) {
       { status: 422 },
     );
   }
-  const id = lookupIdentity(request, "till", auth.grant.user.id);
+  const id = lookupIdentity(request, "till", auth.grant.user.id, auth.grant.staff?.id ?? null);
   const blocked = await admitLookup(id, order.tenant_id);
   if (blocked) return blocked;
 
   try {
     const account = await findAccountByCode(order.tenant_id, b.code);
     if (!account) return unknownCode(id, order.tenant_id);
+
+    // "Gift card instead": an open reader payment with no money in flight (the
+    // reader idle, waiting for a card) is canceled FIRST, so it stops covering
+    // the balance. One the customer is mid-way through stays: the card is
+    // debited for what is left and, if that payment then cannot be closed, the
+    // value goes back to the card.
+    const pre = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
+    const cardStillOpen = pre === "in_flight" || pre === "needs_review";
 
     const { payment, account: after, replayed } = await redeemStoredValue({
       order,
@@ -75,10 +83,9 @@ export async function POST(request: Request) {
       staffId: auth.grant.staff?.id ?? null,
     });
 
-    // A card tender may still be live on the reader: close it now (strictly,
-    // same rule as every other in-store tender). If it went through or is still
-    // in flight, give the gift card value back rather than risk double pay.
-    if (!replayed) {
+    // The in-flight case: close it now (strictly). If it went through or is
+    // still in flight, give the gift card value back rather than risk double pay.
+    if (!replayed && cardStillOpen) {
       const closed = await closeOpenCardTender(order.id).catch(() => "in_flight" as const);
       if (closed === "settled" || closed === "in_flight" || closed === "needs_review") {
         await releaseStoredValueTender(payment.id);

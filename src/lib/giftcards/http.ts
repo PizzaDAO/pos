@@ -13,14 +13,19 @@ import { captureError } from "@/lib/observability";
 import { clientIp } from "@/lib/security/http";
 import { GiftCardsUnavailableError } from "./codes";
 import { giftCardsEnabled } from "./limits";
-import { LOOKUP_RULES, lookupGuard, type LookupIdentity } from "./lockout";
+import { LOOKUP_RULES, identityKeys, lookupGuard, type LookupIdentity } from "./lockout";
 import { getStoredValueStore } from "./store";
 import { rateLimitEnabled } from "@/lib/security/rate-limit";
 import { StoredValueError } from "./service";
 
 export const DEVICE_COOKIE = "gc_device";
-/** Signed one-time reveal token for an online purchase (see codes.signRevealToken). */
-export const REVEAL_COOKIE = "gc_reveal";
+/**
+ * Signed one-time reveal token for an online purchase (see codes.signRevealToken).
+ * One cookie PER ORDER, so a buyer with several purchases in flight keeps each.
+ */
+export function revealCookieName(orderId: string): string {
+  return `gc_reveal_${orderId.replace(/[^0-9a-fA-F]/g, "").toLowerCase()}`;
+}
 
 export function featureOff(): NextResponse | null {
   if (giftCardsEnabled()) return null;
@@ -98,15 +103,14 @@ export function lookupIdentity(
   request: Request,
   surface: LookupIdentity["surface"],
   device: string | null,
+  staff: string | null = null,
 ): LookupIdentity {
-  return { ip: clientIp(request.headers), device, surface };
+  return { ip: clientIp(request.headers), device, staff, surface };
 }
 
 /** Limiter keys: per IP AND per device, each scoped to the tenant. */
 export function lookupKeys(id: LookupIdentity, tenantId: string): string[] {
-  const keys = [`${id.surface}:ip:${id.ip}:${tenantId}`];
-  if (id.device) keys.push(`${id.surface}:dev:${id.device}:${tenantId}`);
-  return keys;
+  return identityKeys(id).map((k) => `${k}:${tenantId}`);
 }
 
 function tooMany(wait: number): NextResponse {
@@ -127,9 +131,18 @@ export async function admitLookup(id: LookupIdentity, tenantId: string): Promise
   const burst = lookupGuard.admit(id);
   if (burst > 0) return tooMany(burst);
   if (!rateLimitEnabled()) return null;
-  const store = await getStoredValueStore();
-  const wait = await store.guardCheck(lookupKeys(id, tenantId));
-  return wait > 0 ? tooMany(wait) : null;
+  try {
+    const store = await getStoredValueStore();
+    const wait = await store.guardCheck(lookupKeys(id, tenantId));
+    return wait > 0 ? tooMany(wait) : null;
+  } catch (err) {
+    // Fail CLOSED (never an unguarded lookup), but as a clean 503, not a raw 500.
+    captureError(err, { scope: "giftcard-guard-check" });
+    return NextResponse.json(
+      { error: "Gift cards are temporarily unavailable. Try again shortly.", code: "unavailable" },
+      { status: 503 },
+    );
+  }
 }
 
 /** The uniform "unknown code" answer (counts toward the shared lockout). */

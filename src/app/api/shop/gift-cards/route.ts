@@ -9,7 +9,7 @@
  * path (POST /api/payments with the card rail); the card activates once that
  * settles, and the (inert) recipient delivery hook runs. `code` is returned in
  * the FIRST creation response only; a retry with the same orderId gets
- * `code: null`. The response also sets a short-lived signed `gc_reveal` cookie
+ * `code: null`. The response also sets a short-lived signed `gc_reveal_<order>` cookie (one per purchase)
  * so this browser alone can reveal the code once after paying (/reveal).
  */
 import { NextResponse } from "next/server";
@@ -23,7 +23,7 @@ import {
   anyOnlinePaymentAllowed,
 } from "@/lib/shop/training-online";
 import { canUseOnlineOrdering, resolveEntitlements } from "@/lib/saas/entitlements";
-import { REVEAL_COOKIE, cleanText, errorResponse, featureOff } from "@/lib/giftcards/http";
+import { cleanText, errorResponse, featureOff, revealCookieName } from "@/lib/giftcards/http";
 import { REVEAL_TTL_MS, signRevealToken } from "@/lib/giftcards/codes";
 import { createGiftCardSale } from "@/lib/giftcards/service";
 
@@ -97,7 +97,7 @@ export async function POST(request: Request) {
     // Bind the purchase to this browser: only it can reveal the code once after
     // paying (POST /api/shop/gift-cards/reveal). A replay never re-issues it.
     if (!sale.replayed) {
-      res.cookies.set(REVEAL_COOKIE, signRevealToken(sale.order.id), {
+      res.cookies.set(revealCookieName(sale.order.id), signRevealToken(sale.order.id), {
         httpOnly: true,
         sameSite: "strict",
         secure: process.env.NODE_ENV === "production",

@@ -1808,6 +1808,19 @@ export const mockDriver: PosDriver = {
     return { ok: true, payment: updated, refundEntryId: entry.id };
   },
 
+  async setRefundProcessorRef(paymentId: string, requestId: string, processorRef: string) {
+    const p = payments.get(paymentId);
+    if (!p) return false;
+    let hit = false;
+    const refunds = (p.refunds ?? []).map((r) => {
+      if (r.request_id !== requestId || r.processor_ref) return r;
+      hit = true;
+      return { ...r, processor_ref: processorRef };
+    });
+    if (hit) payments.set(paymentId, { ...p, refunds, updated_at: nowIso() });
+    return hit;
+  },
+
   async releasePaymentRefund(
     paymentId: string,
     amountCents: number,

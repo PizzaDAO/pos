@@ -373,6 +373,7 @@ describe("stored value (gift cards) in owner reports", () => {
       payments: [
         pay(sale, { amount_cents: 5000 }),
         pay(food, { rail: "gift_card", amount_cents: 2000 }),
+        pay(food, { rail: "gift_card", amount_cents: 400, refunded_cents: 400, status: "refunded" }),
         pay(food, { rail: "store_credit", amount_cents: 500 }),
         pay(food, { amount_cents: 750 }),
       ],
@@ -381,13 +382,14 @@ describe("stored value (gift cards) in owner reports", () => {
     const s = summarize(b.daily);
     expect(s.orders).toBe(1);
     expect(s.gross_cents).toBe(3000);
-    expect(s.tax_cents).toBe(250);
+    expect(s.tax_cents + s.refund_tax_cents).toBe(250); // 400 went back to a card
+    expect(s.refund_cents).toBe(400);
     expect(s.cash_cents).toBe(750); // the 5000 that bought the card is not a sale
-    expect(s.gift_card_cents).toBe(2000);
+    expect(s.gift_card_cents).toBe(2400); // tender column: what was tendered
     expect(s.store_credit_cents).toBe(500);
     expect(s.other_cents).toBe(0);
     expect(b.tenders.map((t) => [t.key, t.amount_cents])).toEqual([
-      ["gift_card", 2000],
+      ["gift_card", 2400],
       ["cash", 750],
       ["store_credit", 500],
     ]);
@@ -396,7 +398,7 @@ describe("stored value (gift cards) in owner reports", () => {
       sold_count: 1,
       sold_cents: 5000,
       sold_refunded_cents: 0,
-      redeemed_gift_card_cents: 2000,
+      redeemed_gift_card_cents: 2000, // net of the 400 returned to the card
       redeemed_store_credit_cents: 500,
       outstanding_cents: 3000,
     });

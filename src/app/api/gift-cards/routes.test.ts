@@ -217,15 +217,15 @@ describe("storefront routes", () => {
     const body = { orderId: randomUUID(), tenantSlug: tenant.slug, locationSlug: loc.slug, amountCents: 2000, email: "b@example.com" };
     const first = await shopBuyPOST(req(body));
     const cookie = first.headers.get("set-cookie") ?? "";
-    expect(cookie).toContain("gc_reveal=");
+    expect(cookie).toContain("gc_reveal_");
     expect(cookie.toLowerCase()).toContain("httponly");
     const { code, order: o } = (await first.json()) as { code: string; order: { id: string } };
     expect(code).toBeTruthy();
     const replay = await shopBuyPOST(req(body));
     expect((await replay.json()).code).toBeNull();
-    expect(replay.headers.get("set-cookie") ?? "").not.toContain("gc_reveal=");
+    expect(replay.headers.get("set-cookie") ?? "").not.toContain("gc_reveal_");
 
-    const token = cookie.split(";")[0]!; // gc_reveal=...
+    const token = cookie.split(";")[0]!; // gc_reveal_<order>=...
     const reveal = (c?: string) =>
       shopRevealPOST(
         new Request("https://pos.test/api/shop/gift-cards/reveal", {
@@ -235,8 +235,15 @@ describe("storefront routes", () => {
         }),
       );
     expect((await reveal()).status).toBe(403); // no token: some other browser
-    expect((await reveal("gc_reveal=" + o.id + ".99999999999999.deadbeef")).status).toBe(403); // forged
-    expect((await reveal(token)).status).toBe(202); // not paid yet
+    const name = token.split("=")[0]!;
+    expect((await reveal(`${name}=${o.id}.99999999999999.deadbeef`)).status).toBe(403); // forged
+    // Another purchase's token does not open this one.
+    const other = await shopBuyPOST(req({ ...body, orderId: randomUUID() }));
+    const otherToken = (other.headers.get("set-cookie") ?? "").split(";")[0]!;
+    expect(otherToken.split("=")[0]).not.toBe(name);
+    expect((await reveal(otherToken)).status).toBe(403);
+    // Both tokens together (two purchases in one browser) still work for this one.
+    expect((await reveal(`${otherToken}; ${token}`)).status).toBe(202); // not paid yet
     await takePayment({
       paymentId: randomUUID(), orderId: o.id, tenantId: TENANT, locationId: LOCATION,
       rail: "cash", amountCents: 2000, tipCents: 0, currency: "USD",

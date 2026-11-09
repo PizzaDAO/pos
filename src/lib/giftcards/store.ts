@@ -48,8 +48,10 @@ export interface IssueStoreCreditWrite {
   actorId: string;
   /** Owner/manager: recorded as approved_by and exempt from the daily cap. */
   isManager: boolean;
-  /** A non-manager's store credit issued today (UTC) may not exceed this. */
+  /** A non-manager's store credit issued since `dayStartIso` may not exceed this. */
   dailyCapCents: number | null;
+  /** Start of the location's current business day (ISO instant). */
+  dayStartIso: string;
 }
 
 export type IssueStoreCreditOutcome =
@@ -71,8 +73,15 @@ export interface StoredValueStore {
   /** One account's ledger, oldest first. */
   listLedger(tenantId: string, accountId: string): Promise<LedgerEntry[]>;
   getLedgerEntry(id: string): Promise<LedgerEntry | null>;
-  /** Redeem rows (all tenants) created since `sinceIso`, oldest first (release sweep). */
-  listRecentRedemptions(sinceIso: string, limit: number): Promise<LedgerEntry[]>;
+  /**
+   * The release sweep's target set, queried directly: abandoned orders (all
+   * tenants) still holding a captured, not fully refunded stored-value tender.
+   * Newest first, keyset-paged with `before` (the last row of the previous page).
+   */
+  listUnreleasedOrders(
+    limit: number,
+    before?: { created_at: string; id: string } | null,
+  ): Promise<{ id: string; created_at: string }[]>;
   /** Aggregates for reports, computed by the store (SQL), never by paging rows. */
   summary(
     tenantId: string,

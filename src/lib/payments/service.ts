@@ -996,11 +996,11 @@ export async function refundPayment(input: {
   if (payment.rail === "external") throw new ExternalRefundUnsupportedError();
 
   const total = payment.amount_cents + payment.tip_cents;
+  const rail = requirePaymentRail(payment.rail);
   if (input.refundId && (payment.refund_ids ?? []).includes(input.refundId)) {
-    return { ...payment, replayed: true, refundedNowCents: 0 };
+    return { ...(await repairReplayedCardRefund(payment, input.refundId, rail)), replayed: true, refundedNowCents: 0 };
   }
 
-  const rail = requirePaymentRail(payment.rail);
   const refundAmount = input.amountCents ?? total - payment.refunded_cents;
   if (refundAmount <= 0 || payment.refunded_cents + refundAmount > total) {
     throw new RefundExceedsError();
@@ -1009,13 +1009,15 @@ export async function refundPayment(input: {
   // to the card before it is recorded (like a card refund), so a crash can never
   // record a refund the card did not get; it always carries a refund id so the
   // retry is the same credit (the credit is idempotent on it and capped at the
-  // redeemed amount). A refund of a tender that BOUGHT a gift card is checked
-  // after an atomic reservation (see below).
+  // redeemed amount). A refund of a tender that BOUGHT a gift card is refused
+  // while the card still holds that value; as EXCESS money (a duplicate tender)
+  // it is reserved first and re-checked after the atomic reservation.
   const giftcards = await import("@/lib/giftcards/service");
   const storedValueRail = payment.rail === "gift_card" || payment.rail === "store_credit";
   const refundId =
     input.refundId ?? (storedValueRail ? `auto_${payment.refunded_cents}_${refundAmount}` : null);
-  const saleTender = await giftcards.isStoredValueSaleTender(payment);
+  const saleMode = await giftcards.storedValueSaleRefundMode(payment, refundAmount);
+  const excessCheck = saleMode === "excess";
 
   const callRail = () =>
     rail.refund({
@@ -1036,7 +1038,7 @@ export async function refundPayment(input: {
     });
 
   let recorded: RefundReservation;
-  if (!saleTender && (isCardRail(payment.rail) || storedValueRail)) {
+  if (!excessCheck && (isCardRail(payment.rail) || storedValueRail)) {
     const railRefund = await callRail();
     recorded = await driver.reservePaymentRefund(payment.id, refundAmount, refundId, {
       // Stripe's refund id (re_...) rides on the payment's refunds[] entry.
@@ -1049,10 +1051,11 @@ export async function refundPayment(input: {
     });
     if (recorded.ok) {
       try {
-        // Gift-card SALE tenders: refundable only once the card is voided (or
-        // the reload reversed), or as excess money. Checked after the atomic
-        // reservation, so concurrent refunds cannot both pass.
-        if (saleTender) await giftcards.assertStoredValueRefundAllowed(recorded.payment);
+        // Excess money on a gift-card SALE: re-checked after the atomic
+        // reservation, so concurrent "excess" refunds cannot both pass. (A crash
+        // before the rail call is repaired by a replay with the same refund id:
+        // repairReplayedCardRefund.)
+        if (excessCheck) await giftcards.assertStoredValueRefundAllowed(recorded.payment);
         await callRail();
       } catch (err) {
         await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
@@ -1063,7 +1066,10 @@ export async function refundPayment(input: {
 
   if (!recorded.ok) {
     if (recorded.reason === "duplicate" && recorded.payment) {
-      return { ...recorded.payment, replayed: true, refundedNowCents: 0 };
+      const repaired = refundId
+        ? await repairReplayedCardRefund(recorded.payment, refundId, rail)
+        : recorded.payment;
+      return { ...repaired, replayed: true, refundedNowCents: 0 };
     }
     if (recorded.reason === "not_found") return null;
     throw new RefundExceedsError();
@@ -1098,6 +1104,43 @@ export async function refundPayment(input: {
     refundedNowCents: refundAmount,
     manualRefund: isManualRefundRail(payment.rail),
   };
+}
+
+/**
+ * A replayed CARD refund whose refunds[] entry has no provider id (the process
+ * died between recording it and the Stripe call, or Stripe returned none):
+ * call the rail again with the SAME idempotency key (Stripe returns the
+ * original refund, or makes it now if it never happened) and record the id.
+ * Best effort: a failure leaves the entry as it was and is alerted.
+ */
+async function repairReplayedCardRefund(
+  payment: Payment,
+  refundId: string,
+  rail: ReturnType<typeof requirePaymentRail>,
+): Promise<Payment> {
+  if (!isCardRail(payment.rail)) return payment;
+  const entry = (payment.refunds ?? []).find((r) => r.request_id === refundId);
+  if (!entry || entry.processor_ref) return payment;
+  const driver = getPosDriver();
+  if (!driver.setRefundProcessorRef) return payment;
+  try {
+    const railRefund = await rail.refund({
+      context: {
+        tenantId: payment.tenant_id,
+        locationId: payment.location_id,
+        connectAccountId: payment.connect_account_id,
+        idempotencyKey: `refund_${payment.id}_${refundId}`,
+      },
+      chargeId: payment.charge_id ?? payment.id,
+      amount: { amount: entry.amount_cents, currency: payment.currency },
+    });
+    if (railRefund?.refundId) {
+      await driver.setRefundProcessorRef(payment.id, refundId, railRefund.refundId);
+    }
+  } catch (err) {
+    captureError(err, { scope: "refund-replay-repair", paymentId: payment.id });
+  }
+  return (await driver.getPayment(payment.id)) ?? payment;
 }
 
 /**

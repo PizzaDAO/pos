@@ -162,17 +162,15 @@ export function createSupabaseStoredValueStore(config: SupabaseDriverConfig): St
       }
     },
 
-    async listRecentRedemptions(sinceIso, limit) {
+    async listUnreleasedOrders(limit, before) {
       const rows = unwrap(
-        await sb
-          .from("stored_value_ledger")
-          .select("*")
-          .eq("kind", "redeem")
-          .gte("created_at", sinceIso)
-          .order("created_at", { ascending: true })
-          .limit(Math.min(Math.max(limit, 1), PAGE)),
-      ) as Row[] | null;
-      return (rows ?? []).map(mapEntry);
+        await sb.rpc("sv_unreleased_orders", {
+          p_limit: limit,
+          p_before_created_at: before?.created_at ?? null,
+          p_before_id: before?.id ?? null,
+        }),
+      ) as { order_id: string; created_at: string }[] | null;
+      return (rows ?? []).map((r) => ({ id: r.order_id, created_at: r.created_at }));
     },
 
     async summary(tenantId, locationId, fromIso, toIso) {
@@ -206,6 +204,7 @@ export function createSupabaseStoredValueStore(config: SupabaseDriverConfig): St
           p_actor_id: input.actorId,
           p_is_manager: input.isManager,
           p_daily_cap: input.dailyCapCents,
+          p_day_start: input.dayStartIso,
         }),
       ) as RpcOut;
       if (out.outcome === "ok" && out.account && out.entry) {

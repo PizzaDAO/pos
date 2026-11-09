@@ -155,7 +155,7 @@ export interface OwnerStoredValue {
   sold_count: number;
   sold_cents: number;
   sold_refunded_cents: number;
-  /** Redeemed on sales in range (the gift_card / store_credit tender columns). */
+  /** Redeemed on sales in range, net of value refunded back to the cards. */
   redeemed_gift_card_cents: number;
   redeemed_store_credit_cents: number;
   /** Current outstanding balance on active cards (not range-bound). */
@@ -543,8 +543,10 @@ export function buildOwnerBundle(input: BuildBundleInput): OwnerReportBundle {
     d.tip_cents += tip - ref.tip;
     for (const p of counted) {
       d[`${tenderFamily(p)}_cents`] += p.amount_cents;
-      if (p.rail === "gift_card") sv.redeemed_gift_card_cents += p.amount_cents;
-      if (p.rail === "store_credit") sv.redeemed_store_credit_cents += p.amount_cents;
+      // Net of value returned to the card (a refund of that tender).
+      const kept = p.amount_cents - Math.min(p.refunded_cents, p.amount_cents);
+      if (p.rail === "gift_card") sv.redeemed_gift_card_cents += kept;
+      if (p.rail === "store_credit") sv.redeemed_store_credit_cents += kept;
       const tk = tenderKey(p);
       const t = tenders.get(tk) ?? { key: tk, count: 0, amount_cents: 0, tip_cents: 0, refunded_cents: 0 };
       t.count += 1;
