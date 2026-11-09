@@ -55,7 +55,12 @@ tickets from every order in memory. Server RSS went 447 MB to 686 MB at 1000x.
 Round-trip counts assume the real Supabase auth mode (`getCurrentUser`: 1 GoTrue call + memberships +
 platform-admin) and one location with ~1,000 orders (about 8 hours at 120/hour).
 
-1. **KDS poll reads the whole order history (HIGH).** `GET /api/kitchen/orders` calls
+1. **`assembleMenu` silently truncates menus (CORRECTNESS BUG, rank 1).** Its unfiltered `item_sizes`,
+   `modifiers` and `item_modifier_groups` selects (no tenant filter, no `.range()` paging) hit PostgREST's
+   1000-row `max_rows` cap platform-wide. Once the platform holds more than 1000 rows of any of them,
+   tenants silently get menus missing sizes/modifiers, and repricing then rejects or mis-prices those
+   items. Fix: scope by the tenant's ids and page with `fetchAllPages`. (Cost aspects are in fix 4.)
+2. **KDS poll reads the whole order history (HIGH).** `GET /api/kitchen/orders` calls
    `driver.listOrders(tenant, location)` with no status filter and the default limit of 1,000
    (`supabase.ts` `listOrders`, then `readOrderRows`). `selectIn` fetches `order_items` in 100-order
    chunks and `order_item_modifiers` in 100-item chunks, **sequentially**: about 1 + 10 + 25 = 36
@@ -66,43 +71,43 @@ platform-admin) and one location with ~1,000 orders (about 8 hours at 120/hour).
    run the `selectIn` chunks with `Promise.all`. With Supabase Realtime enabled (`getRealtimeProvider`
    picks it when the public Supabase env is set) every order write also triggers a debounced (150 ms)
    full board refetch per screen, so a burst is up to about 6 refetches/s/screen of the same 41-query
-   read: fix 1 matters even more there.
-2. **Per-request auth and location check overhead (HIGH, cross-cutting).** Every authenticated route pays
+   read: the KDS fix matters even more there.
+3. **Per-request auth and location check overhead (HIGH, cross-cutting).** Every authenticated route pays
    `auth.getUser()` (an external call) + `listMembershipsForUser` + `isPlatformAdmin`, and routes passing
    a `locationId` add `listLocations(tenant)` (`tenant-guard.ts` `grantFor` / `requireLocationInTenant`).
    About 4 round trips before any work, on every poll and every bump. Fix: verify the JWT locally
    (`getClaims`) and cache memberships + a tenant's location ids for 30-60 s.
-3. **`assembleMenu` is 7 queries per call and 3 are not tenant-scoped (HIGH).** `item_sizes`, `modifiers`,
+4. **`assembleMenu` is 7 queries per call and 3 are not tenant-scoped (HIGH).** `item_sizes`, `modifiers`,
    `item_modifier_groups` are selected with no filter (whole platform), then filtered in memory with
    `.filter` per item (O(items x rows)). It runs on every order create (`priceOrder`), every storefront
    order, `/api/menu`, `/api/shop/location`. Cost grows with total platform menu size, not the tenant's.
    Fix: scope by the tenant's item/group ids, and cache the assembled menu per (tenant, location) for a
    short TTL, invalidated on menu/override writes.
-4. **`createOrder` fan-out and order numbers (MEDIUM).** Per order: `select` existing, exact `count(*)`
+5. **`createOrder` fan-out and order numbers (MEDIUM).** Per order: `select` existing, exact `count(*)`
    of every order at the location for `nextOrderNumber` (grows with history, and two concurrent tills
-   can compute the same `A-####`), insert, `writeOrderItems`, `readOrderRow` (2 queries), then
+   can compute the same `A-####`, and `order_number` has no unique constraint, so colliding numbers are both inserted), insert, `writeOrderItems`, `readOrderRow` (2 queries), then
    `depleteForOrder`: `tenant_settings`, all `item_inventory_links` for the tenant, a sequential
    `resolveLocationInventory` per link, and `inventory_movements`. Roughly 12-25 round trips per order
-   before pricing (which adds the 9 from fix 3). The order + lines write is not atomic (compensating
+   before pricing (which adds the 9 from the menu item). The order + lines write is not atomic (compensating
    delete). Fix: Postgres sequence / RPC for order numbers and for insert-order-with-lines; cache the
    tenant's inventory links.
-5. **Kitchen bump (MEDIUM).** `requireOrderAccess` (auth 3 + `getOrder` 3 + `listLocations` 1), then
+6. **Kitchen bump (MEDIUM).** `requireOrderAccess` (auth 3 + `getOrder` 3 + `listLocations` 1), then
    `updateOrderStatus` (select + CAS update + `readOrderRow` 2): about 12 round trips per bump, and an
    order takes 3 bumps. At 3x peak that is small; it is the largest write-side count after order create.
-6. **Dispatch board (MEDIUM, partly fixed here).** `GET /api/delivery/dispatch` did an N+1 (`getOrder`
+7. **Dispatch board (MEDIUM, partly fixed here).** `GET /api/delivery/dispatch` did an N+1 (`getOrder`
    per delivery, 3 queries each) and `listDeliveries` is unbounded (every delivery ever). The N+1 is fixed
    in this PR (one `getOrdersByIds`). Still open: filter to active/recent deliveries and add a limit.
-7. **Customer tracking poll (MEDIUM).** Each waiting customer polls `/api/shop/track` every 4 s
+8. **Customer tracking poll (MEDIUM).** Each waiting customer polls `/api/shop/track` every 4 s
    (`getOrder` 3 queries + `getDeliveryForOrder` + more), unauthenticated. 100 customers waiting = about
    100+ queries/s. Fix: back off (4 s, 8 s, 15 s), pause when the tab is hidden, or rely on Realtime,
    and cache per order id for 2 s.
-8. **Polling never pauses (LOW).** KDS (4 s), dispatch (5 s), open-orders (30 s), tracking (4 s) and the
+9. **Polling never pauses (LOW).** KDS (4 s), dispatch (5 s), open-orders (30 s), tracking (4 s) and the
    card-reader sync all poll regardless of tab visibility, and dispatch/KDS keep full-rate polling on
    hidden screens. Add `document.visibilityState` gating.
-9. **Storefront order path (LOW-MEDIUM).** `POST /api/shop/orders` resolves the location (2-3 queries),
+10. **Storefront order path (LOW-MEDIUM).** `POST /api/shop/orders` resolves the location (2-3 queries),
    subscription, entitlements, settings, menu (7), `ensureCustomer`, then `createOrder`: about 30
-   round trips per web order. Same fixes as 3 and 4.
-10. **Rate limits are per process (INFO).** `defaultLimiter` is in-memory, so on Vercel each instance has its own
+   round trips per web order. Same fixes as the menu and order-create items.
+11. **Rate limits are per process (INFO).** `defaultLimiter` is in-memory, so on Vercel each instance has its own
     window and the limits do not hold across instances. Per-IP buckets (`orders` 60/min, `payments` 30/min,
     `cardSync` 600/min) are well above one location's 3x peak (6 orders/min) so they will not block
     normal service, but a shop's tills share one NAT IP, so a split-bill rush of 30+ tenders/min would
@@ -123,4 +128,4 @@ and needs a Postgres to validate.
 
 1. Point the harness at a **disposable** Supabase project (local `supabase start` needs Docker, which this
    run did not touch) and rerun; the ranking above should be confirmed by per-endpoint p95 there.
-2. Do fixes 1 to 3 first; they remove most round trips from polling and order creation.
+2. Do the first four fixes first; they remove most round trips from polling and order creation.

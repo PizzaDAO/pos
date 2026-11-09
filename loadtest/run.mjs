@@ -46,6 +46,7 @@ const opts = {
   deliveryShare: 0.15,
   cardShare: 0.5,
   preseed: 0,
+  allowDb: "", // supabase host you explicitly allow the server to be using
   pid: "", // optional: pid of `next start` for cpu/rss sampling
   out: join(HERE, "results"),
   label: "run",
@@ -373,6 +374,17 @@ async function main() {
     process.exit(1);
   }
   menu = m.json.menu;
+  const PROD_REF = "dnazcilebqietfbrodtd";
+  if (m.json.driver !== "mock") {
+    const host = opts.allowDb.toLowerCase();
+    if (!host || host.includes(PROD_REF)) {
+      console.error(
+        `Refusing: server driver is "${m.json.driver}" (a real database). Pass --allow-db <supabase-host> naming a local/disposable DB (never the production project).`,
+      );
+      process.exit(2);
+    }
+    console.log(`real database allowed by flag: ${opts.allowDb}`);
+  }
   console.log(`target ${opts.base}  driver=${m.json.driver}  virtual locations=${opts.locations}`);
   if (m.json.driver === "mock")
     console.log("NOTE: mock driver (in-memory). It says little about Postgres/PostgREST latency; see REPORT.md.");
