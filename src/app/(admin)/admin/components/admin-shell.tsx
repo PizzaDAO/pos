@@ -57,8 +57,8 @@ const InventoryManager = dynamic(
   () => import("./inventory-manager").then((m) => m.InventoryManager),
   { loading: PanelFallback },
 );
-const ReportsView = dynamic(
-  () => import("./reports-view").then((m) => m.ReportsView),
+const OwnerReports = dynamic(
+  () => import("./owner-reports").then((m) => m.OwnerReports),
   { loading: PanelFallback },
 );
 const StaffShifts = dynamic(
@@ -277,7 +277,7 @@ export function AdminShell({
         )}
         {tab === "reports" &&
           (advancedReportsAllowed ? (
-            <ReportsView tenantId={tenantId} locations={locations} />
+            <OwnerReports tenantId={tenantId} locations={locations} />
           ) : (
             <FeatureLocked
               feature="Advanced reports"

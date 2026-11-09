@@ -111,6 +111,7 @@ import type {
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { buildSalesReport, isoDate } from "@/lib/reports";
+import { EMPTY_BUNDLE, type OwnerReportBundle } from "@/lib/owner-reports";
 import { fetchAllPages, safeKeyset } from "./paging";
 
 // ---------------------------------------------------------------------------
@@ -184,6 +185,7 @@ function mapLocation(r: Row): Location {
     name: r.name as string,
     slug: r.slug as string,
     timezone: r.timezone as string,
+    business_day_cutoff_minutes: (r.business_day_cutoff_minutes as number | null) ?? 0,
     address: (r.address as string | null) ?? null,
     address_line1: (r.address_line1 as string | null) ?? null,
     address_line2: (r.address_line2 as string | null) ?? null,
@@ -759,6 +761,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     table: string,
     column: string,
     ids: string[],
+    tieBreak = "id",
   ): Promise<Row[]> {
     const out: Row[] = [];
     for (let i = 0; i < ids.length; i += 100) {
@@ -771,7 +774,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
               .select("*")
               .in(column, chunk)
               .order(column)
-              .order("id")
+              .order(tieBreak)
               .range(from, to),
           ) as Row[],
         )),
@@ -3482,6 +3485,99 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       }
     },
 
+    async getMenuSnapshot(tenantId) {
+      // Every read is paged (PostgREST caps responses at max_rows ~ 1000) and
+      // every `in` list is chunked.
+      const tenantRows = (
+        table: string,
+        cols: string,
+        order: string,
+      ) =>
+        fetchAllPages<Row>(async (from, to) => {
+          let q = sb.from(table).select(cols).eq("tenant_id", tenantId);
+          // Stable total order: every column of the (composite) key.
+          for (const o of order.split(",")) q = q.order(o.trim());
+          return unwrap(await q.range(from, to)) as unknown as Row[];
+        });
+      const [cats, items, groups, recipes, allergens] = await Promise.all([
+        tenantRows("menu_categories", "id,name,sort_order", "id"),
+        tenantRows(
+          "menu_items",
+          "id,category_id,name,description,is_half_and_half_capable,station",
+          "id",
+        ),
+        tenantRows(
+          "modifier_groups",
+          "id,name,min_select,max_select,supports_half",
+          "id",
+        ),
+        tenantRows("item_inventory_links", "id,source_id", "id"),
+        tenantRows("menu_allergen_rows", "publication_id,target_id,target_type", "publication_id,target_type,target_id"),
+      ]);
+      const itemIds = items.map((r) => r.id as string);
+      const groupIds = groups.map((r) => r.id as string);
+      const [sizes, mods, links] = await Promise.all([
+        selectIn("item_sizes", "item_id", itemIds),
+        selectIn("modifiers", "group_id", groupIds),
+        selectIn("item_modifier_groups", "item_id", itemIds, "group_id"),
+      ]);
+      return {
+        categories: cats.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          sort_order: r.sort_order as number,
+        })),
+        items: items.map((r) => ({
+          id: r.id as string,
+          category_id: r.category_id as string,
+          name: r.name as string,
+          description: (r.description as string | null) ?? null,
+          is_half_and_half_capable: r.is_half_and_half_capable as boolean,
+          station: r.station as MenuItem["station"],
+        })),
+        sizes: sizes.map((r) => ({
+          id: r.id as string,
+          item_id: r.item_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        modifierGroups: groups.map((r) => ({
+          id: r.id as string,
+          name: r.name as string,
+          min_select: r.min_select as number,
+          max_select: r.max_select as number,
+          supports_half: r.supports_half as boolean,
+        })),
+        modifiers: mods.map((r) => ({
+          id: r.id as string,
+          group_id: r.group_id as string,
+          name: r.name as string,
+          price_cents: r.price_cents as number,
+          sort_order: r.sort_order as number,
+        })),
+        links: links.map((r) => ({
+          item_id: r.item_id as string,
+          group_id: r.group_id as string,
+          sort_order: r.sort_order as number,
+        })),
+        inventoryLinkSourceIds: recipes.map((r) => r.source_id as string),
+        allergenTargetIds: allergens.map((r) => r.target_id as string),
+      };
+    },
+
+    // ONE transaction inside public.import_menu() (migration
+    // 20261113000100): a PostgREST client can't span statements, so the whole
+    // replace/insert runs server-side and rolls back as a unit.
+    async applyMenuImport(tenantId, changes) {
+      unwrap(
+        await sb.rpc("import_menu", {
+          p_tenant_id: tenantId,
+          p_changes: changes,
+        }),
+      );
+    },
+
     async listCategories(tenantId) {
       return (
         unwrap(
@@ -4045,6 +4141,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         },
         locationName: (id: string) => locNameById.get(id) ?? id,
       });
+    },
+
+    async getOwnerReportBundle(tenantId, locationId, from, to, topN) {
+      // One SQL call: every aggregate is computed in Postgres, per location
+      // timezone and business-day cutoff (see report_sales_bundle).
+      const data = unwrap(
+        await sb.rpc("report_sales_bundle", {
+          p_tenant_id: tenantId,
+          p_location_id: locationId,
+          p_from: from,
+          p_to: to,
+          p_top_n: topN ?? 50,
+        }),
+      ) as Partial<OwnerReportBundle> | null;
+      return { ...EMPTY_BUNDLE, ...(data ?? {}) };
     },
 
     async getBusinessDayClose(tenantId, locationId, businessDate) {

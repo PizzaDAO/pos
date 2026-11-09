@@ -6,6 +6,7 @@
  * same interface WITHOUT touching any UI/call site. Selection happens in
  * `index.ts` via `getPosDriver()`.
  */
+import type { OwnerReportBundle } from "@/lib/owner-reports";
 import type {
   Printer,
   PrintJob,
@@ -98,6 +99,9 @@ import type {
   TenantHealth,
   TenantOnboarding,
 } from "./saas-types";
+
+import type { MenuSnapshot } from "@/lib/menu-import/types";
+import type { ImportChanges } from "@/lib/menu-import/apply";
 
 /** Menu entity kinds addressable by the back-office menu editor. */
 export type MenuEntityKind =
@@ -1298,6 +1302,24 @@ export interface PosDriver {
     id: string,
   ): Promise<string | null>;
 
+  /**
+   * Raw (override-free) names + ids of the tenant's whole menu, for the menu
+   * importer's add-mode matching.
+   */
+  getMenuSnapshot(tenantId: string): Promise<MenuSnapshot>;
+
+  /**
+   * Menu import apply. ATOMIC: the whole change set (in-place updates of
+   * matched rows, inserts, and deletes of rows absent from a replace file, plus
+   * the recipe / allergen / override rows of deleted targets) runs in ONE
+   * transaction; any failure rolls everything back. Matched rows keep their ids
+   * so carts, queued orders and recipes keep working; historical orders are
+   * untouched (order lines snapshot name/size/price; item ids have no FK).
+   * Every id and row must belong to `tenantId`, and inserts must not collide
+   * with names already present (a concurrent change): either throws.
+   */
+  applyMenuImport(tenantId: string, changes: ImportChanges): Promise<void>;
+
   listCategories(tenantId: string): Promise<MenuCategory[]>;
   upsertCategory(input: CategoryInput): Promise<MenuCategory>;
   deleteCategory(id: string): Promise<void>;
@@ -1384,6 +1406,19 @@ export interface PosDriver {
   ): Promise<SalesReport>;
 
   /** Existing close for a (location, business day), or null. */
+  /**
+   * Owner reports for inclusive BUSINESS dates `from..to` (see
+   * `src/lib/owner-reports.ts` for the definitions). Supabase runs
+   * `report_sales_bundle` in SQL; the mock aggregates in memory. Tenant-scoped.
+   */
+  getOwnerReportBundle(
+    tenantId: string,
+    locationId: string | null,
+    from: string,
+    to: string,
+    topN?: number,
+  ): Promise<OwnerReportBundle>;
+
   getBusinessDayClose(
     tenantId: string,
     locationId: string,
