@@ -98,6 +98,8 @@ export interface AdjustmentRecord {
   approved_by: string | null;
   /** Free-form extras (percent_bps, error text, ...). */
   meta: Record<string, unknown> | null;
+  /** While one execution of the request runs (claimOrderAdjustment). */
+  claimed_until?: string | null;
   created_at: string;
   updated_at: string;
 }

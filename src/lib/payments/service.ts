@@ -33,9 +33,10 @@ import { deriveTenderId } from "./ids";
 import {
   baseRefundedCents,
   coveringBaseCents,
-  grossSettledBase,
   isFullyRefunded,
+  liveTenders,
   refundableParts,
+  refundedTenderCovers,
   refundedTendersCover,
   settledBaseCents,
 } from "./refund-state";
@@ -141,14 +142,25 @@ export function orderDueCents(order: Order): number {
  * failed and canceled tenders never cover. See refund-state.ts.
  */
 function coveredTenders(payments: Payment[], dueCents: number): Payment[] {
-  const withRefunded = refundedTendersCover(payments, dueCents);
+  const legacy = refundedTendersCover(payments, dueCents);
   return payments.filter(
     (p) =>
       p.status === "pending" ||
       p.status === "authorized" ||
       p.status === "captured" ||
-      (withRefunded && p.status === "refunded"),
+      (p.status === "refunded" && refundedTenderCovers(p, legacy)),
   );
+}
+
+/**
+ * Was the order paid in full (settled money covering the amount due, refunded
+ * tenders only as far as they still cover)? Refunds of an order that never was
+ * are refused at the till (void it instead).
+ */
+export async function orderPaidInFull(order: Order): Promise<boolean> {
+  const payments = await listOrderCurrencyPayments(order);
+  const due = orderDueCents(order);
+  return settledCents(payments, due) >= due;
 }
 
 function coveredCents(payments: Payment[], dueCents: number): number {
@@ -160,11 +172,6 @@ function settledCents(payments: Payment[], dueCents: number): number {
   return settledBaseCents(payments, dueCents);
 }
 
-/** Base money ever settled on the order (live + refunded tenders), in its currency. */
-export function grossSettledCents(payments: Payment[], currency: string): number {
-  const cur = currency.toUpperCase();
-  return grossSettledBase(payments.filter((p) => p.currency.toUpperCase() === cur));
-}
 
 /**
  * Tenders for an order that are in the ORDER's currency. A tender recorded in
@@ -984,6 +991,9 @@ function isCardRail(rail: Payment["rail"]): boolean {
  */
 export function isDefiniteRefundFailure(err: unknown): boolean {
   if (err instanceof RefundRefusedError) return true;
+  // An idempotency error means this key was already used (with other params):
+  // the original refund may well exist. Never "definite": leave it pending.
+  if (err instanceof StripeError && isIdempotencyError(err)) return false;
   return (
     err instanceof StripeError &&
     err.status >= 400 &&
@@ -991,6 +1001,42 @@ export function isDefiniteRefundFailure(err: unknown): boolean {
     err.status !== 409 &&
     err.status !== 429
   );
+}
+
+function isIdempotencyError(err: StripeError): boolean {
+  const e = ((err.raw ?? {}) as { error?: { type?: unknown; code?: unknown } }).error;
+  return err.code === "idempotency_error" || e?.type === "idempotency_error" || e?.code === "idempotency_error";
+}
+
+/**
+ * The provider call of one refund entry, built ONLY from what the entry stored
+ * (amount, tip part, reason) and stable ids, so the first call, every retry and
+ * the replay repair send identical parameters under the same idempotency key.
+ */
+function providerRefundRequest(
+  payment: Payment,
+  entry: { amount_cents: number; tip_cents?: number | null; reason: string | null },
+  refundId: string,
+) {
+  const tip = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
+  return {
+    context: {
+      tenantId: payment.tenant_id,
+      locationId: payment.location_id,
+      connectAccountId: payment.connect_account_id,
+      // One key per refund id: a retry is the SAME refund at the provider.
+      idempotencyKey: `refund_${payment.id}_${refundId}`,
+    },
+    chargeId: payment.charge_id ?? payment.id,
+    amount: { amount: entry.amount_cents, currency: payment.currency },
+    reason: entry.reason ?? undefined,
+    metadata: {
+      order_id: payment.order_id,
+      payment_id: payment.id,
+      refund_id: refundId,
+      ...(tip ? { tip_cents: String(tip) } : {}),
+    },
+  };
 }
 
 /** A card refund is reserved and its provider outcome is not known yet (retry to finish). */
@@ -1068,8 +1114,6 @@ export async function refundPayment(input: {
    * and only what is left over comes off the tip.
    */
   tipCents?: number;
-  /** Provider correlation (Stripe refund metadata). */
-  metadata?: Record<string, string>;
 }): Promise<RefundOutcome | null> {
   const driver = getPosDriver();
   const payment = await driver.getPayment(input.paymentId);
@@ -1093,31 +1137,15 @@ export async function refundPayment(input: {
       ? `auto_${payment.refunded_cents}_${refundAmount}`
       : `auto-${globalThis.crypto.randomUUID()}`);
 
-  const callRail = (amountCents: number, tipCents: number) =>
-    rail.refund({
-      context: {
-        tenantId: payment.tenant_id,
-        locationId: payment.location_id,
-        connectAccountId: payment.connect_account_id,
-        // One key per refund id: a retry is the SAME refund at the provider.
-        idempotencyKey: `refund_${payment.id}_${refundId}`,
-      },
-      chargeId: payment.charge_id ?? payment.id,
-      amount: { amount: amountCents, currency: payment.currency },
-      reason: input.reason,
-      metadata: {
-        ...(input.metadata ?? {}),
-        order_id: payment.order_id,
-        payment_id: payment.id,
-        ...(tipCents ? { tip_cents: String(tipCents) } : {}),
-      },
-    });
+  type StoredEntry = { amount_cents: number; tip_cents?: number | null; reason: string | null };
+  const callRail = (entry: StoredEntry) => rail.refund(providerRefundRequest(payment, entry, refundId));
 
   /** Card / stored value: ask the provider for a reserved refund, then confirm or release it. */
-  const settle = async (amountCents: number, tipCents: number): Promise<string | null> => {
+  const settle = async (entry: StoredEntry): Promise<string | null> => {
+    const amountCents = entry.amount_cents;
     let result;
     try {
-      result = await callRail(amountCents, tipCents);
+      result = await callRail(entry);
     } catch (err) {
       if (isDefiniteRefundFailure(err)) {
         await driver.releasePaymentRefund(payment.id, amountCents, refundId, { tombstone: card });
@@ -1162,7 +1190,7 @@ export async function refundPayment(input: {
     const entry = (payment.refunds ?? []).find((r) => r.request_id === refundId);
     if (providerFirst && entry?.state === "pending") {
       const tip = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
-      const ref = await settle(entry.amount_cents, tip);
+      const ref = await settle(entry);
       return finish(entry.amount_cents, tip, ref);
     }
     const repaired = await repairReplayedCardRefund(payment, refundId, rail);
@@ -1193,11 +1221,20 @@ export async function refundPayment(input: {
   const giftcards = await import("@/lib/giftcards/service");
   const saleMode = await giftcards.storedValueSaleRefundMode(payment, refundAmount);
 
+  // Whether the order was paid in full when this refund is made: only then does
+  // the refunded tender keep covering its balance (refund-state.ts).
+  const order = await driver.getOrder(payment.order_id);
+  const covering = order ? await orderPaidInFull(order) : null;
   const recorded: RefundReservation = await driver.reservePaymentRefund(
     payment.id,
     refundAmount,
     refundId,
-    { reason: input.reason ?? null, tipCents: tipPart ?? null, pending: providerFirst },
+    {
+      reason: input.reason ?? null,
+      tipCents: tipPart ?? null,
+      pending: providerFirst,
+      covering,
+    },
   );
   if (!recorded.ok) {
     if (recorded.reason === "duplicate") {
@@ -1207,8 +1244,12 @@ export async function refundPayment(input: {
     if (recorded.reason === "not_found") return null;
     throw new RefundExceedsError();
   }
-  const entry = (recorded.payment.refunds ?? []).find((r) => r.id === recorded.refundEntryId);
-  const tipNow = typeof entry?.tip_cents === "number" ? entry.tip_cents : 0;
+  const entry = (recorded.payment.refunds ?? []).find((r) => r.id === recorded.refundEntryId) ?? {
+    amount_cents: refundAmount,
+    tip_cents: tipPart ?? 0,
+    reason: input.reason ?? null,
+  };
+  const tipNow = typeof entry.tip_cents === "number" ? entry.tip_cents : 0;
 
   if (saleMode === "excess") {
     // Re-checked after the atomic reservation (it sees every concurrent one).
@@ -1222,10 +1263,10 @@ export async function refundPayment(input: {
 
   let processorRef: string | null = null;
   if (providerFirst) {
-    processorRef = await settle(refundAmount, tipNow);
+    processorRef = await settle(entry);
   } else {
     try {
-      const r = await callRail(refundAmount, tipNow);
+      const r = await callRail(entry);
       processorRef = r?.refundId ?? null;
     } catch (err) {
       await driver.releasePaymentRefund(payment.id, refundAmount, refundId);
@@ -1246,6 +1287,9 @@ export async function maybeMarkOrderRefunded(orderId: string): Promise<void> {
   const driver = getPosDriver();
   const all = await driver.listPaymentsForOrder(orderId);
   if (!isFullyRefunded(null, all)) return;
+  // Money given back on an order that was never paid in full does not close it
+  // out as `refunded`: it is still open (or voided by the void flow).
+  if (liveTenders(all).some((p) => (p.refunds ?? []).some((r) => r.covering === false))) return;
   await driver.transitionOrderStatus(
     orderId,
     [
@@ -1280,16 +1324,9 @@ async function repairReplayedCardRefund(
   const driver = getPosDriver();
   if (!driver.setRefundProcessorRef) return payment;
   try {
-    const railRefund = await rail.refund({
-      context: {
-        tenantId: payment.tenant_id,
-        locationId: payment.location_id,
-        connectAccountId: payment.connect_account_id,
-        idempotencyKey: `refund_${payment.id}_${refundId}`,
-      },
-      chargeId: payment.charge_id ?? payment.id,
-      amount: { amount: entry.amount_cents, currency: payment.currency },
-    });
+    // The same parameters as the original call (from the stored entry): a
+    // different body under the same key is a Stripe idempotency error.
+    const railRefund = await rail.refund(providerRefundRequest(payment, entry, refundId));
     if (railRefund?.refundId) {
       await driver.setRefundProcessorRef(payment.id, refundId, railRefund.refundId);
     }

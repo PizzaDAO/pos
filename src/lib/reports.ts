@@ -8,9 +8,9 @@
  */
 import type { Order, OrderChannel, Payment } from "@/lib/db";
 import { isUnpaidOnlineStatus } from "@/lib/db/menu-types";
-import { liveTenders, tipRefundedCents } from "@/lib/payments/refund-state";
+import { liveTenders } from "@/lib/payments/refund-state";
 import { providerLabel } from "@/lib/marketplace/types";
-import { businessDay, isValidTimezone } from "@/lib/owner-reports";
+import { businessDay, isValidTimezone, refundEvents } from "@/lib/owner-reports";
 import { captureError } from "@/lib/observability";
 import type {
   DateRange,
@@ -277,16 +277,9 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
       voidCents += order.totals.total_cents;
       continue;
     }
-    // Refunds: what the tenders actually gave back (partial refunds included).
-    // Refunded orders still represent rung sales; they stay in the tallies
-    // below so the period gross matches the register.
-    const live = liveTenders(tendersByOrder.get(order.id) ?? []);
-    const refunded = live.reduce((n, p) => n + p.refunded_cents, 0);
-    if (refunded > 0 || order.status === "refunded") {
-      refundCount += 1;
-      refundCents += refunded;
-      tipRefundCents += live.reduce((n, p) => n + tipRefundedCents(p), 0);
-    }
+    // Refunds are tallied below by the day they HAPPENED. Refunded orders
+    // still represent rung sales; they stay in the tallies below so the period
+    // gross matches the register.
     for (const a of order.adjustments ?? []) {
       if (a.type !== "comp") continue;
       compCount += 1;
@@ -335,6 +328,35 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
         pushBucket(byCategory, "uncategorized", "Uncategorized", lineGross, line.quantity);
       }
     }
+  }
+
+  // Refunds (partial included), dated by WHEN THEY HAPPENED, like the owner
+  // reports (src/lib/owner-reports.ts refundEvents): a refund on Tuesday of
+  // Monday's order is in Tuesday's report; an unrecorded older remainder keeps
+  // the order's day; pending card refunds are not refunds yet. The tip part is
+  // the one each refund recorded (else tip last).
+  for (const order of orders) {
+    if (order.status === "voided") continue;
+    const counted = liveTenders(tendersByOrder.get(order.id) ?? []).filter(
+      (p) => p.status === "captured" || p.status === "refunded",
+    );
+    if (!counted.some((p) => p.refunded_cents > 0)) continue;
+    const gross = orderGrossCents(order);
+    const discount = order.totals.discount_cents;
+    const tax = order.totals.tax_cents;
+    const fees = Math.max(0, order.totals.total_cents - order.totals.tip_cents - tax - (gross - discount));
+    const tip =
+      order.totals.tip_cents > 0 ? order.totals.tip_cents : counted.reduce((n, p) => n + p.tip_cents, 0);
+    const clock = input.locationClock?.(order.location_id);
+    let any = false;
+    for (const ev of refundEvents(counted, { sales: gross - discount, tax, fees }, tip)) {
+      const day = ev.at ? locationBusinessDate(ev.at, clock) : dayOf(order);
+      if ((range.from && day < range.from) || (range.to && day > range.to)) continue;
+      any = true;
+      refundCents += ev.total;
+      tipRefundCents += ev.tip;
+    }
+    if (any) refundCount += 1;
   }
 
   // Payment mix — over tenders for the in-range orders only.

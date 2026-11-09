@@ -50,6 +50,13 @@ export interface PaymentRefund {
   state?: "pending" | "succeeded";
   /** The tender status before this refund (restored if it is released). */
   status_before?: string | null;
+  /**
+   * The order was paid in full when this refund was made. Only then does a
+   * refunded tender keep covering the order's balance (a refund after the sale
+   * never re-opens it); a refund on an unpaid order gave the money back.
+   * Absent on older entries (refund-state.ts falls back to the money held).
+   */
+  covering?: boolean | null;
 }
 
 /**

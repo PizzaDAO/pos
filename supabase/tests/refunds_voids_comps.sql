@@ -18,6 +18,7 @@ declare
   lnew uuid := gen_random_uuid();
   p1 uuid := gen_random_uuid();
   pc uuid := gen_random_uuid();
+  pcov uuid := gen_random_uuid();
   out jsonb;
   pay public.payments;
   n int;
@@ -151,6 +152,22 @@ begin
     'kind', 'refund', 'amount_cents', 1000, 'lines', '[]'::jsonb,
     'reason_code', 'quality', 'actor_user_id', 'u1'));
   if out ->> 'outcome' <> 'duplicate' then raise exception 'retry not duplicate: %', out; end if;
+  -- one execution at a time per request
+  if not public.claim_order_adjustment(o1, 'req-item-0001', now() + interval '2 minutes') then
+    raise exception 'first claim refused';
+  end if;
+  if public.claim_order_adjustment(o1, 'req-item-0001', now() + interval '2 minutes') then
+    raise exception 'second claim granted while held';
+  end if;
+  -- the covering flag rides on the refund entry
+  insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, tip_cents, currency, simulated)
+  values (pcov, o1, t, loc, 'cash', 'captured', 500, 0, 'USD', true);
+  out := public.reserve_payment_refund(pcov, 1, 'r-cover', null, null, 0, false, true);
+  if (select e ->> 'covering' from jsonb_array_elements(out -> 'payment' -> 'refunds') e
+       where e ->> 'request_id' = 'r-cover') is distinct from 'true' then
+    raise exception 'covering not recorded: %', out;
+  end if;
+
   -- a failed refund gives its units back; it can be reopened while they are free
   out := public.finish_order_adjustment(o1, 'req-item-0001', 'failed', '[]'::jsonb, '{"error":"x"}'::jsonb);
   if out ->> 'status' <> 'failed' then raise exception 'finish did not update: %', out; end if;

@@ -395,6 +395,16 @@ export interface PosDriver {
    */
   reopenOrderRefund(orderId: string, id: string): Promise<BeginRefundResult>;
 
+  /**
+   * Claim a request for one execution until `untilIso` (a doubled request must
+   * not run its refunds twice in parallel). False while another unexpired claim
+   * holds it. `finishOrderAdjustment` releases the claim.
+   */
+  claimOrderAdjustment(orderId: string, id: string, untilIso: string): Promise<boolean>;
+
+  /** Refund records still `pending` since before `beforeIso` (oldest first), any tenant. */
+  listStalePendingRefunds(beforeIso: string, limit: number): Promise<AdjustmentRecord[]>;
+
   /** Record what a refund actually moved (status, allocations, meta). */
   finishOrderAdjustment(
     orderId: string,
@@ -730,6 +740,8 @@ export interface PosDriver {
       tipCents?: number | null;
       /** Card refunds: reserve as `pending` before the provider is called. */
       pending?: boolean;
+      /** The order was paid in full when the refund was made (refunds[].covering). */
+      covering?: boolean | null;
     },
   ): Promise<RefundReservation>;
 

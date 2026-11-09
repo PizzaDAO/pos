@@ -518,21 +518,6 @@ begin
 end
 $$;
 
-revoke all on function public.report_sales_bundle(uuid, uuid, date, date, integer) from public;
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'anon') then
-    revoke all on function public.report_sales_bundle(uuid, uuid, date, date, integer) from anon;
-  end if;
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    revoke all on function public.report_sales_bundle(uuid, uuid, date, date, integer) from authenticated;
-  end if;
-  if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant execute on function public.report_sales_bundle(uuid, uuid, date, date, integer) to service_role;
-  end if;
-end
-$$;
-
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'service_role') then

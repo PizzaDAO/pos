@@ -50,6 +50,7 @@ import { LiveTenderConflictError } from "@/lib/db/payment-types";
 import { deriveStatus, fetchConnectStatus } from "@/lib/payments/connect";
 import { captureError } from "@/lib/observability";
 import { recordAudit } from "@/lib/security/audit";
+import { refreshRefundRecord } from "@/lib/adjustments/service";
 import { TerminalFlowError, syncCardTender } from "@/lib/payments/terminal/flow";
 
 export const runtime = "nodejs";
@@ -324,23 +325,25 @@ async function handleRefundUpdate(account: string | undefined, refund: RefundObj
         null)
       : null;
   // The order was closed out (refunded, or voided by a full refund) on the
-  // strength of this refund: the money is held again, so put it back where it
-  // was before the refund (as recorded on the ledger row; else completed) and
-  // say so -- never leave a voided order silently holding money.
+  // strength of this refund: the money is held again, so put it back. A recent
+  // refund (< 1 h) goes back to the status it had (from the ledger row); an older
+  // one to `completed`, so an old ticket never reappears on the kitchen screen.
+  // Either way staff are alerted below: never silently holding money.
   const restoredFrom = order?.status;
   if (order && (order.status === "refunded" || order.status === "voided")) {
+    const recent = !!record && Date.now() - Date.parse(record.created_at) < 60 * 60_000;
     const before =
-      typeof record?.meta?.order_status_before === "string"
+      recent && typeof record?.meta?.order_status_before === "string"
         ? (record.meta.order_status_before as typeof order.status)
         : "completed";
     const target = before === "refunded" || before === "voided" ? "completed" : before;
     await driver.transitionOrderStatus(order.id, [order.status], target);
   }
   if (record) {
-    await driver.finishOrderAdjustment(tender.order_id, record.id, {
-      status: "partial",
-      allocations: record.allocations,
-      meta: { refund_failed: refund.id, refund_failure: refund.failure_reason ?? refund.status },
+    // Allocations and status re-derived from what the tenders now show.
+    await refreshRefundRecord(tender.order_id, record.id, {
+      refund_failed: refund.id,
+      refund_failure: refund.failure_reason ?? refund.status,
     });
   }
   if (restoredFrom === "voided") {

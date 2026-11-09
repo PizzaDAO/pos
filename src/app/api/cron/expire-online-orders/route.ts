@@ -5,8 +5,9 @@
  * `Authorization: Bearer $CRON_SECRET`. Every `awaiting_payment` online order
  * past its expiry window is closed on its payment provider and moved to
  * `abandoned` (or finalized if its payment landed). It also voids `/v1` held
- * orders (`draft`, hold `awaiting_payment`) whose hold expired, and prunes stored
- * quotes. See `src/lib/shop/lifecycle.ts`.
+ * orders (`draft`, hold `awaiting_payment`) whose hold expired, prunes stored
+ * quotes, and sweeps refund requests stuck pending (sweepPendingRefunds). See
+ * `src/lib/shop/lifecycle.ts`.
  *
  * Auth: `CRON_SECRET` is REQUIRED. The one exception is the in-memory mock driver
  * (zero-env dev/CI), where there is no data worth protecting and the route is
@@ -20,6 +21,7 @@ import { usingMockDriver } from "@/lib/payments/env";
 import { reconcileTerminalTenders } from "@/lib/payments/terminal/flow";
 import { captureError } from "@/lib/observability";
 import { sweepDriverDispatches } from "@/lib/delivery/service";
+import { sweepPendingRefunds } from "@/lib/adjustments/service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -87,8 +89,14 @@ export async function GET(request: Request) {
     captureError(err, { scope: "driver-dispatch-sweep-cron" });
     return null;
   });
+  // Refund requests stuck pending > 15 min: alerted; their card / stored-value
+  // refunds still pending at the provider are finished with the same key.
+  const refunds = await sweepPendingRefunds().catch((err) => {
+    captureError(err, { scope: "refund-sweep-cron" });
+    return null;
+  });
   return NextResponse.json(
-    { ...summary, held, quotesPruned, printJobsPruned, terminal, driverDispatch },
+    { ...summary, held, quotesPruned, printJobsPruned, terminal, driverDispatch, refunds },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

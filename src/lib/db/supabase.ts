@@ -250,6 +250,7 @@ function mapAdjustmentRecord(r: Row): AdjustmentRecord {
     actor_user_id: r.actor_user_id as string,
     approved_by: (r.approved_by as string | null) ?? null,
     meta: (r.meta as Record<string, unknown> | null) ?? null,
+    claimed_until: (r.claimed_until as string | null) ?? null,
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -1824,6 +1825,33 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { outcome: "not_found" };
     },
 
+    async claimOrderAdjustment(orderId, id, untilIso) {
+      return (
+        unwrap(
+          await sb.rpc("claim_order_adjustment", {
+            p_order_id: orderId,
+            p_id: id,
+            p_until: untilIso,
+          }),
+        ) === true
+      );
+    },
+
+    async listStalePendingRefunds(beforeIso, limit) {
+      return (
+        unwrap(
+          await sb
+            .from("order_adjustments")
+            .select("*")
+            .eq("status", "pending")
+            .eq("kind", "refund")
+            .lt("updated_at", beforeIso)
+            .order("updated_at")
+            .limit(Math.min(Math.max(limit, 1), 200)),
+        ) as Row[]
+      ).map(mapAdjustmentRecord);
+    },
+
     async finishOrderAdjustment(orderId, id, patch) {
       const out = unwrap(
         await sb.rpc("finish_order_adjustment", {
@@ -1983,7 +2011,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             // Only sent when set, so shop and terminal inserts keep working on a
             // database that predates the column.
             ...(input.core_ext ? { core_ext: input.core_ext } : {}),
-            // Same: only with comps/discounts (migration 20261113000300).
+            // Same: only with comps/discounts (migration 20261113001000).
             ...(input.adjustments?.length ? { adjustments: input.adjustments } : {}),
             created_at: now,
             updated_at: now,
@@ -2605,9 +2633,10 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           p_processor_ref: meta?.processorRef ?? null,
           p_reason: meta?.reason ?? null,
           // Only sent when set (an explicit tip split needs migration
-          // 20261113000300; without it the legacy tip-first rule applies).
+          // 20261113001000; without it the legacy tip-first rule applies).
           ...(typeof meta?.tipCents === "number" ? { p_tip_amount: meta.tipCents } : {}),
           ...(meta?.pending ? { p_pending: true } : {}),
+          ...(typeof meta?.covering === "boolean" ? { p_covering: meta.covering } : {}),
         }),
       ) as { outcome: string; payment?: Row; refund_entry_id?: string };
       const payment = out.payment ? mapPayment(out.payment) : null;

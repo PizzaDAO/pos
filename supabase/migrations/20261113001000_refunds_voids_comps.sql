@@ -1,6 +1,8 @@
 -- ============================================================================
--- Migration: refunds_voids_comps (20261113001000: after 000800 staff admin gate
--- and 000900-000940 stored value; nothing here depends on their order)
+-- Migration: refunds_voids_comps
+--
+-- Numbered after 20261113000800 (staff admin gate) and 000900-000940 (stored
+-- value); it depends on neither.
 --
 -- Partial refunds (by amount or by item, across tenders), voids, comps and
 -- discounts at the till, with reasons, approvals and an audit ledger.
@@ -8,35 +10,38 @@
 --   1. audit_action: order_line_void, order_void, order_comp, order_discount,
 --      adjustment_policy_change (own transaction: a new enum value cannot be
 --      used in the transaction that adds it; nothing here uses them).
---   2. payments.tip_refunded_cents: the GRATUITY part of refunded_cents. Tip
---      refunds are tracked separately from food refunds (who absorbs them is not
---      decided; it is only recorded). Backfilled with the legacy rule: refunds
---      Backfilled tip LAST (greatest(refunded - amount, 0) capped at the tip),
---      matching the owner reports in production. A writer that bypasses the
---      reservation functions gets the old tip-first rule from a BEFORE UPDATE
---      trigger (what core_trg_payments' tip events always assumed).
---   3. reserve_payment_refund gains p_tip_amount (the tip part of the refund;
---      NULL = legacy tip-first). Base and tip are capped separately, under the
---      row lock. Every refunds[] entry records its `tip_cents`.
---      release_payment_refund gives the entry's tip part back.
---   4. orders.adjustments (comps + discounts applied, Σ = discount_cents) and
+--   2. payments.tip_refunded_cents: the GRATUITY part of refunded_cents (tip
+--      refunds are tracked separately from food refunds; who absorbs them is
+--      not decided, only recorded). Backfilled TIP LAST (greatest(refunded -
+--      amount, 0) capped at the tip), the rule the owner reports in production
+--      already use; a writer that bypasses the reservation functions gets the
+--      same rule from a BEFORE UPDATE trigger.
+--      payments.refund_reserved_cents: room held by PENDING refunds (card /
+--      stored value, reserved before the provider is called); not refunded
+--      until confirmed.
+--   3. reserve_payment_refund(.., p_tip_amount, p_pending, p_covering): the
+--      tip part (NULL = tip last), a pending reservation, and whether the order
+--      was paid in full when the refund was made (refunds[].covering).
+--      confirm_payment_refund turns a pending reservation into a refund;
+--      release_payment_refund (refund id required) undoes one, optionally
+--      keeping the id as a tombstone.
+--   4. orders.adjustments (comps + discounts applied, sum = discount_cents) and
 --      store_settings.adjustment_policy (per-location approval thresholds).
 --   5. order_adjustments: the ledger (one row per refund / void / comp /
---      discount: who, approved by whom, why, what money moved).
---      begin_order_refund   reserves item-refund quantities under the ORDER row
---                           lock (two tills can never refund the same unit);
---      finish_order_adjustment records what a refund moved;
---      apply_order_edit     voids lines (whole or split), comps, discounts or the
---                           whole order as a compare-and-set on orders.version,
---                           re-checking the money under the lock.
+--      discount: who, approved by whom, why, what money moved), RLS forced.
+--      begin_order_refund / reopen_order_refund reserve item-refund units
+--      under the ORDER row lock; claim_order_adjustment lets one request run at
+--      a time; finish_order_adjustment records what a refund moved;
+--      apply_order_edit voids lines (whole or split), comps, discounts or the
+--      whole order as a compare-and-set on orders.version, re-checking the
+--      money under the lock.
 --   6. tip events (core_trg_payments, core_tip_backfill_for_order) follow the
---      recorded tip part instead of "tip first", matching src/lib/core/tips.ts.
+--      recorded tip part (else tip last) and skip pending reservations,
+--      matching src/lib/core/tips.ts.
 --
--- DEPLOY ORDER: migration first, then code. (The code sends p_tip_amount and
--- calls the new functions; on an un-migrated database refunds still work with
--- the legacy split, but voids / comps / item refunds fail.)
--- Live-safe: additive columns with defaults, new table, replaced functions;
--- lock_timeout bounds every lock.
+-- DEPLOY ORDER: migration first, then code (the code calls the new functions
+-- and arguments). Live-safe: additive columns with defaults, a new table,
+-- replaced functions; lock_timeout bounds every lock.
 -- ============================================================================
 
 begin;
@@ -121,6 +126,7 @@ $$;
 drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text);
 drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text, integer);
 drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean);
+drop function if exists public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean, boolean);
 drop function if exists public.release_payment_refund(uuid, integer, text);
 drop function if exists public.release_payment_refund(uuid, integer, text, boolean);
 
@@ -136,7 +142,10 @@ create or replace function public.reserve_payment_refund(
   p_processor_ref text default null,
   p_reason text default null,
   p_tip_amount integer default null,
-  p_pending boolean default false
+  -- Card / stored value: reserved BEFORE the provider is called, confirmed after.
+  p_pending boolean default false,
+  -- The order was paid in full when this refund was made (see refund-state.ts).
+  p_covering boolean default null
 ) returns jsonb
 language plpgsql
 as $$
@@ -188,7 +197,8 @@ begin
            'reason', p_reason,
            'request_id', p_refund_id,
            'state', case when v_pend then 'pending' else 'succeeded' end,
-           'status_before', r.status::text
+           'status_before', r.status::text,
+           'covering', p_covering
          )),
          status = case
            when not v_pend and p.refunded_cents + p_amount >= p.amount_cents + p.tip_cents
@@ -342,7 +352,7 @@ begin
 end;
 $$;
 
-revoke all on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean)
+revoke all on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean, boolean)
   from public, anon, authenticated;
 revoke all on function public.payment_pending_refund_tip(jsonb) from public, anon, authenticated;
 revoke all on function public.confirm_payment_refund(uuid, text, text)
@@ -374,10 +384,14 @@ create table if not exists public.order_adjustments (
   actor_user_id text not null,
   approved_by text,
   meta jsonb,
+  -- One execution at a time per request (claim_order_adjustment).
+  claimed_until timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   primary key (order_id, id)
 );
+create index if not exists order_adjustments_pending_idx
+  on public.order_adjustments (updated_at) where status = 'pending';
 create index if not exists order_adjustments_location_idx
   on public.order_adjustments (tenant_id, location_id, created_at desc);
 
@@ -488,6 +502,25 @@ begin
 end;
 $$;
 
+-- One execution of a request at a time (a doubled request must not run its
+-- refunds twice in parallel): claim until p_until; refused while another
+-- unexpired claim holds it.
+create or replace function public.claim_order_adjustment(
+  p_order_id uuid,
+  p_id text,
+  p_until timestamptz
+) returns boolean
+language plpgsql
+as $$
+begin
+  update public.order_adjustments
+     set claimed_until = p_until
+   where order_id = p_order_id and id = p_id
+     and (claimed_until is null or claimed_until < now());
+  return found;
+end;
+$$;
+
 -- Resume a FAILED item refund under its own id: take its units again under the
 -- order row lock (exceeds when another refund took them meanwhile).
 create or replace function public.reopen_order_refund(p_order_id uuid, p_id text)
@@ -556,6 +589,7 @@ begin
                             then p_allocations else a.allocations end,
          meta = case when jsonb_typeof(p_meta) = 'object'
                      then coalesce(a.meta, '{}'::jsonb) || p_meta else a.meta end,
+         claimed_until = null,
          updated_at = now()
    where a.order_id = p_order_id and a.id = p_id
   returning * into r;
@@ -715,15 +749,17 @@ revoke all on function public.finish_order_adjustment(uuid, text, text, jsonb, j
   from public, anon, authenticated;
 revoke all on function public.apply_order_edit(jsonb) from public, anon, authenticated;
 revoke all on function public.reopen_order_refund(uuid, text) from public, anon, authenticated;
+revoke all on function public.claim_order_adjustment(uuid, text, timestamptz) from public, anon, authenticated;
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant execute on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean)
+    grant execute on function public.reserve_payment_refund(uuid, integer, text, text, text, integer, boolean, boolean)
       to service_role;
     grant execute on function public.payment_pending_refund_tip(jsonb) to service_role;
     grant execute on function public.confirm_payment_refund(uuid, text, text) to service_role;
     grant execute on function public.release_payment_refund(uuid, integer, text, boolean) to service_role;
     grant execute on function public.reopen_order_refund(uuid, text) to service_role;
+    grant execute on function public.claim_order_adjustment(uuid, text, timestamptz) to service_role;
     grant execute on function public.order_adjustment_insert(jsonb, text) to service_role;
     grant execute on function public.begin_order_refund(jsonb) to service_role;
     grant execute on function public.finish_order_adjustment(uuid, text, text, jsonb, jsonb)

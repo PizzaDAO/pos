@@ -1166,6 +1166,24 @@ export const mockDriver: PosDriver = {
     return { outcome: "ok", record: structuredClone(next) };
   },
 
+  // Mirrors claim_order_adjustment(): synchronous, atomic in the mock.
+  async claimOrderAdjustment(orderId: string, id: string, untilIso: string): Promise<boolean> {
+    const idx = adjustmentRecords.findIndex((r) => r.order_id === orderId && r.id === id);
+    if (idx < 0) return false;
+    const cur = adjustmentRecords[idx]!;
+    if (cur.claimed_until && cur.claimed_until > nowIso()) return false;
+    adjustmentRecords[idx] = { ...cur, claimed_until: untilIso };
+    return true;
+  },
+
+  async listStalePendingRefunds(beforeIso: string, limit: number): Promise<AdjustmentRecord[]> {
+    return adjustmentRecords
+      .filter((r) => r.kind === "refund" && r.status === "pending" && r.updated_at < beforeIso)
+      .sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+      .slice(0, limit)
+      .map((r) => structuredClone(r));
+  },
+
   async finishOrderAdjustment(orderId, id, patch): Promise<AdjustmentRecord | null> {
     const idx = adjustmentRecords.findIndex((r) => r.order_id === orderId && r.id === id);
     if (idx < 0) return null;
@@ -1173,6 +1191,7 @@ export const mockDriver: PosDriver = {
       ...adjustmentRecords[idx]!,
       status: patch.status,
       allocations: structuredClone(patch.allocations),
+      claimed_until: null,
       ...(patch.meta !== undefined
         ? { meta: { ...(adjustmentRecords[idx]!.meta ?? {}), ...(patch.meta ?? {}) } }
         : {}),
@@ -1975,6 +1994,7 @@ export const mockDriver: PosDriver = {
       reason?: string | null;
       tipCents?: number | null;
       pending?: boolean;
+      covering?: boolean | null;
     },
   ): Promise<RefundReservation> {
     // One synchronous block (no awaits): atomic in the single-threaded mock,
@@ -2018,6 +2038,7 @@ export const mockDriver: PosDriver = {
       tip_cents: tipPart,
       state: pending ? ("pending" as const) : ("succeeded" as const),
       status_before: p.status,
+      covering: meta?.covering ?? null,
     };
     const refunded = pending ? p.refunded_cents : p.refunded_cents + amountCents;
     const updated: Payment = {

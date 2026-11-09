@@ -99,43 +99,53 @@ export function grossSettledBase(payments: readonly Payment[]): number {
 }
 
 /**
- * Do REFUNDED tenders still count toward the amount due? Only when the order was
- * paid in full (live + refunded settled money reached the amount due): a refund
- * after the sale never re-opens the balance (no second charge). On an order that
- * was never paid in full a refunded tender is money given back, not money owed:
- * it does not count (split $100: A $30 refunded, B $30 live => $70 due).
+ * Does a REFUNDED tender still count toward the amount due? Yes when it was
+ * refunded after the order had been paid in full (a refund after the sale
+ * never re-opens the balance, so it can never invite a second charge): its
+ * refunds say so (`refunds[].covering`, decided when the refund was made). A
+ * tender refunded while the order was still unpaid was money given back: it
+ * does not count (split $100: A $30 refunded, B $30 + C $40 => $30 still due).
+ * Older refunds without the flag fall back to `legacyCovers`.
  */
+export function refundedTenderCovers(p: Pick<Payment, "refunds">, legacyCovers: boolean): boolean {
+  const entries = p.refunds ?? [];
+  if (entries.some((e) => e.covering === true)) return true;
+  if (entries.some((e) => e.covering === false)) return false;
+  return legacyCovers;
+}
+
+/** Legacy fallback for refunds made before `covering` was recorded: the money held. */
 export function refundedTendersCover(payments: readonly Payment[], dueCents: number): boolean {
   return grossSettledBase(payments) >= dueCents;
 }
 
 /**
  * Base money covering the amount due: pending (crypto confirming), authorized,
- * captured, and refunded tenders when `refundedTendersCover`. Shared by the
- * balance, the receipt and the paid check, so they always agree.
+ * captured, and refunded tenders that still cover (`refundedTenderCovers`).
+ * Shared by the balance, the receipt and the paid check, so they always agree.
  */
 export function coveringBaseCents(payments: readonly Payment[], dueCents: number): number {
-  const withRefunded = refundedTendersCover(payments, dueCents);
+  const legacy = refundedTendersCover(payments, dueCents);
   return payments
     .filter(
       (p) =>
         p.status === "pending" ||
         p.status === "authorized" ||
         p.status === "captured" ||
-        (withRefunded && p.status === "refunded"),
+        (p.status === "refunded" && refundedTenderCovers(p, legacy)),
     )
     .reduce((n, p) => n + p.amount_cents, 0);
 }
 
 /** Settled base money (pending excluded) under the same rule: the "paid" check. */
 export function settledBaseCents(payments: readonly Payment[], dueCents: number): number {
-  const withRefunded = refundedTendersCover(payments, dueCents);
+  const legacy = refundedTendersCover(payments, dueCents);
   return payments
     .filter(
       (p) =>
         p.status === "authorized" ||
         p.status === "captured" ||
-        (withRefunded && p.status === "refunded"),
+        (p.status === "refunded" && refundedTenderCovers(p, legacy)),
     )
     .reduce((n, p) => n + p.amount_cents, 0);
 }

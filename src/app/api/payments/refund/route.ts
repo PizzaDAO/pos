@@ -14,7 +14,7 @@ import {
   RefundExceedsError,
   refundPayment,
 } from "@/lib/payments/service";
-import { getOrderBalance } from "@/lib/payments/service";
+import { getOrderBalance, orderPaidInFull } from "@/lib/payments/service";
 import { getPosDriver } from "@/lib/db";
 import { requireTenantRole } from "@/lib/auth/api";
 import { effectiveTerminalRole } from "@/lib/auth/active-staff";
@@ -111,6 +111,19 @@ export async function POST(request: Request) {
     return NextResponse.json(
       { error: "Only an owner or manager can refund." },
       { status: 403 },
+    );
+  }
+
+  // A refund belongs to an order that was paid in full; money taken on an order
+  // that never was is given back by voiding it (the till's void flow).
+  const refundOrder = await driver.getOrder(existingPayment.order_id);
+  if (!refundOrder || !(await orderPaidInFull(refundOrder))) {
+    return NextResponse.json(
+      {
+        error: "This order isn't paid in full: void it (which gives back what was taken) instead of refunding.",
+        code: "order_unpaid",
+      },
+      { status: 409 },
     );
   }
 

@@ -44,10 +44,6 @@ export async function prepareAction(
       res: NextResponse.json({ error: "requestId is required (8-64 chars, A-Z a-z 0-9 _ -)." }, { status: 422 }),
     };
   }
-  const reason = validateReason(reasonKind, body.reasonCode, body.reasonText);
-  if (!reason.ok) {
-    return { ok: false, res: NextResponse.json({ error: reason.error, code: "reason_required" }, { status: 422 }) };
-  }
   let order: Order | null = null;
   try {
     order = await getPosDriver().getOrder(orderId);
@@ -55,6 +51,18 @@ export async function prepareAction(
     order = null;
   }
   if (!order) return { ok: false, res: NextResponse.json({ error: "Order not found." }, { status: 404 }) };
+  // Resuming / canceling a request that already exists: its STORED reason
+  // stands (it may come from another kind of action, e.g. a void that became a
+  // refund); nothing in this body may change it.
+  const existing = (await getPosDriver().listOrderAdjustments(order.id)).find(
+    (r) => r.id === body.requestId,
+  );
+  const reason = existing
+    ? { ok: true as const, code: existing.reason_code, text: existing.reason_text }
+    : validateReason(reasonKind, body.reasonCode, body.reasonText);
+  if (!reason.ok) {
+    return { ok: false, res: NextResponse.json({ error: reason.error, code: "reason_required" }, { status: 422 }) };
+  }
   const who = await resolveTillActor(request, order.tenant_id);
   if (!who.ok) return who;
   const approval = parseApproval(body.approval);
