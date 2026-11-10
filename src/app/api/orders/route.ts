@@ -201,11 +201,16 @@ export async function POST(request: Request) {
         typeof body.notes === "string" && body.notes.trim()
           ? body.notes.trim()
           : null,
-      // The server numbers every order (the location's atomic counter); a
-      // client-sent order_number (older tills) is accepted but ignored.
+      // The server numbers orders from the location's atomic counter. An older
+      // till still sends its own number: it is kept when free at the location,
+      // otherwise the order gets a server number and the till's becomes its
+      // provisional label (create_order_with_lines).
+      ...(typeof body.order_number === "string" && body.order_number.trim()
+        ? { order_number: body.order_number.trim() }
+        : {}),
       status: "placed",
       staff_id: staffId,
-      // Order type + customer name from the till (nothing else of core_ext).
+      // Order type, customer name, provisional label (nothing else of core_ext).
       ...(sanitizeTillCoreExt(body.core_ext)
         ? { core_ext: sanitizeTillCoreExt(body.core_ext) }
         : {}),

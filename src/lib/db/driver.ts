@@ -133,8 +133,8 @@ export interface OrderListOptions {
 /** Filters for {@link PosDriver.listKitchenOrders}. */
 export interface KitchenOrderListOptions {
   statuses: readonly OrderStatus[];
-  /** ISO: active orders created at/after this instant. */
-  createdSince: string;
+  /** ISO: active orders UPDATED at/after this instant (a release or bump refreshes it). */
+  activeSince: string;
   /** ISO: plus any order updated at/after this instant. */
   updatedSince: string;
   limit?: number;
@@ -460,7 +460,7 @@ export interface PosDriver {
 
   /**
    * The kitchen board's working set, filtered in SQL: orders in one of
-   * `statuses` created at/after `createdSince`, plus ANY order updated at/after
+   * `statuses` updated at/after `activeSince`, plus ANY order updated at/after
    * `updatedSince` (recent voids for the STOP banner). De-duplicated, newest
    * first, at most `limit` (default and max 500) of each kind.
    */

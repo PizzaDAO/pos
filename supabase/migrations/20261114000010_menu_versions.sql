@@ -15,6 +15,9 @@
 --   whose triggers must not fail on the vanishing tenant (an orphan version row
 --   is harmless).
 --
+-- DEPLOY ORDER: code first, then this migration (without the table the driver
+-- simply does not cache menus).
+--
 -- Additive and live-safe. Server-only table (RLS on + forced, no client
 -- grants). Re-runnable.
 -- ============================================================================

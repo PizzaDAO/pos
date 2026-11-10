@@ -38,6 +38,12 @@ export interface RealtimeSubscribeOptions<T = unknown> {
    * payload is unchanged (the last entry repeats) and restart on any change.
    */
   backoffMs?: readonly number[];
+  /**
+   * Keep updating while the tab is hidden: the poller polls at this slower
+   * interval (instead of pausing) and a push transport keeps refetching on
+   * changes. For screens that must alert while minimised (the KDS chime).
+   */
+  hiddenIntervalMs?: number;
   /** What counts as "changed" for the back-off (default: the whole payload). */
   changeKey?: (data: T) => string;
 }

@@ -140,15 +140,16 @@ function order(opts: {
 }
 
 describe("order numbers", () => {
-  it("the server numbers till orders; a client-sent number is ignored", async () => {
-    const a = await order({ discount: 0, orderNumber: "1200-555" });
-    const b = await order({ discount: 0, orderNumber: "1200-555" });
-    expect(a.status).toBe(201);
-    const na = ((await a.json()) as { order: { order_number: string } }).order.order_number;
-    const nb = ((await b.json()) as { order: { order_number: string } }).order.order_number;
-    expect(na).toMatch(/^A-\d{4,}$/);
-    expect(nb).toMatch(/^A-\d{4,}$/);
-    expect(na).not.toBe(nb);
+  it("the server numbers till orders; an older till's taken number becomes the provisional label", async () => {
+    type Res = { order: { order_number: string; core_ext?: { provisional_label?: string } | null } };
+    const fresh = ((await (await order({ discount: 0 })).json()) as Res).order;
+    expect(fresh.order_number).toMatch(/^A-\d{4,}$/);
+    const label = `0${Date.now() % 1000}-555`;
+    const a = ((await (await order({ discount: 0, orderNumber: label })).json()) as Res).order;
+    const b = ((await (await order({ discount: 0, orderNumber: label })).json()) as Res).order;
+    expect(a.order_number).toBe(label); // free at the location: honoured
+    expect(b.order_number).toMatch(/^A-\d{4,}$/);
+    expect(b.core_ext?.provisional_label).toBe(label);
   });
 });
 

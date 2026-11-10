@@ -139,7 +139,7 @@ export function createSupabaseRealtimeProvider(): RealtimeProvider {
       let stale = false;
       const scheduleFetch = () => {
         if (!active) return;
-        if (isPageHidden()) {
+        if (isPageHidden() && !options?.hiddenIntervalMs) {
           stale = true;
           return;
         }

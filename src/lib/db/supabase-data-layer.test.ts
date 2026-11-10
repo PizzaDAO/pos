@@ -315,21 +315,51 @@ describe.skipIf(!PGLITE)("data-layer fixes through the Supabase driver on PGlite
       expect(created[0]!.items[0]!.modifiers[0]!.modifier_name).toBe("Basil");
     });
 
-    it("keeps a client number, suffixes a taken one, and is idempotent on the id", async () => {
+    it("keeps a free client number; a taken one becomes the provisional label", async () => {
       const a = await driver.createOrder(orderInput({ order_number: "1201-555", channel: "in_store" }));
       const b = await driver.createOrder(orderInput({ order_number: "1201-555", channel: "in_store" }));
-      const c = await driver.createOrder(orderInput({ order_number: "1201-555", channel: "in_store" }));
-      expect([a.order_number, b.order_number, c.order_number]).toEqual(["1201-555", "1201-555-2", "1201-555-3"]);
+      expect(a.order_number).toBe("1201-555");
+      expect(b.order_number).toMatch(/^A-\d{4,}$/);
+      expect(b.core_ext?.provisional_label).toBe("1201-555");
+      // A label the till already set is kept.
+      const c = await driver.createOrder(
+        orderInput({ order_number: "1201-555", core_ext: { provisional_label: "1201-556" } }),
+      );
+      expect(c.order_number).toMatch(/^A-/);
+      expect(c.core_ext?.provisional_label).toBe("1201-556");
       // Another location may reuse the number.
       const other = await driver.createOrder(orderInput({ location_id: LOC2, order_number: "1201-555" }));
       expect(other.order_number).toBe("1201-555");
+    });
 
-      const input = orderInput();
+    it("is idempotent on the id, within the tenant only", async () => {
+      const input = orderInput({ core_ext: { provisional_label: "0930-111" } });
       const first = await driver.createOrder(input);
+      expect(first.core_ext?.provisional_label).toBe("0930-111");
       const retry = await driver.createOrder({ ...input, order_number: "ignored" });
       expect(retry.id).toBe(first.id);
       expect(retry.order_number).toBe(first.order_number);
       expect(await count("select count(*) n from public.order_items where order_id = $1", [input.id])).toBe(1);
+
+      const t2 = crypto.randomUUID();
+      const l2 = crypto.randomUUID();
+      await db.query("insert into public.tenants (id, name, slug) values ($1, 'Y', $2)", [t2, `y-${t2.slice(0, 8)}`]);
+      await db.query("insert into public.locations (id, tenant_id, name, slug) values ($1, $2, 'L', 'l')", [l2, t2]);
+      await expect(
+        driver.createOrder({ ...input, tenant_id: t2, location_id: l2 }),
+      ).rejects.toThrow(/already in use/);
+    });
+
+    it("widens past 9999 instead of truncating (A-9999, A-10000, A-10001)", async () => {
+      const loc = crypto.randomUUID();
+      await db.query("insert into public.locations (id, tenant_id, name, slug) values ($1, $2, 'W', $3)", [loc, T, `w-${loc.slice(0, 8)}`]);
+      await db.query(
+        "insert into public.order_number_counters (location_id, tenant_id, last_value) values ($1, $2, 9998)",
+        [loc, T],
+      );
+      const nums: string[] = [];
+      for (let i = 0; i < 3; i++) nums.push((await driver.createOrder(orderInput({ location_id: loc }))).order_number);
+      expect(nums).toEqual(["A-9999", "A-10000", "A-10001"]);
     });
 
     it("writes nothing when a line fails (one transaction)", async () => {
@@ -376,7 +406,8 @@ describe.skipIf(!PGLITE)("data-layer fixes through the Supabase driver on PGlite
       expect(def).toMatch(/WHERE \(created_at >=/);
       // New orders still never reuse a number, old duplicates included.
       const o = await driver.createOrder(orderInput({ order_number: "DUP-1" }));
-      expect(o.order_number).toBe("DUP-1-2");
+      expect(o.order_number).toMatch(/^A-/);
+      expect(o.core_ext?.provisional_label).toBe("DUP-1");
     });
   });
 
@@ -405,13 +436,19 @@ describe.skipIf(!PGLITE)("data-layer fixes through the Supabase driver on PGlite
          values (gen_random_uuid(), $1, $2, 'placed', 'in_store', '{}'::jsonb, 'OLD-1', now() - interval '30 days', now() - interval '30 days')`,
         [T, loc],
       );
+      // A catering order booked 20 days ahead, released to the kitchen an hour ago.
+      await db.query(
+        `insert into public.orders (id, tenant_id, location_id, status, channel, totals, order_number, created_at, updated_at)
+         values (gen_random_uuid(), $1, $2, 'in_kitchen', 'in_store', '{}'::jsonb, 'CAT-1', now() - interval '20 days', now() - interval '1 hour')`,
+        [T, loc],
+      );
       const now = Date.now();
       const got = await driver.listKitchenOrders(T, loc, {
         statuses: KDS_ACTIVE_STATUSES,
-        createdSince: new Date(now - 7 * 86_400_000).toISOString(),
+        activeSince: new Date(now - 7 * 86_400_000).toISOString(),
         updatedSince: new Date(now - 15 * 60_000).toISOString(),
       });
-      expect(got.map((o) => o.order_number).sort()).toEqual([active.order_number, "V-1"].sort());
+      expect(got.map((o) => o.order_number).sort()).toEqual([active.order_number, "CAT-1", "V-1"].sort());
       expect(got.find((o) => o.id === active.id)!.items).toHaveLength(1);
     }, 60_000);
   });

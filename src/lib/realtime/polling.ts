@@ -65,7 +65,9 @@ export function createPollingProvider(): RealtimeProvider {
 
       // Fire immediately, then on the interval (or back-off schedule), only
       // while the page is visible.
-      const handle = startPolling(tick, options?.backoffMs ?? intervalMs);
+      const handle = startPolling(tick, options?.backoffMs ?? intervalMs, {
+        hiddenMs: options?.hiddenIntervalMs,
+      });
 
       return () => {
         active = false;

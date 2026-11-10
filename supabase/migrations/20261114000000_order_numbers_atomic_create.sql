@@ -25,12 +25,17 @@
 --      row, its lines and their modifiers in ONE transaction (PostgREST cannot
 --      span statements), replacing insert + insert + insert + compensating
 --      delete. Idempotent on the order id (an existing order is returned
---      unchanged, created = false). A client-supplied number (the till's
---      offline `HHMM-NNN`) is kept; if it is already taken at the location it
---      gets a `-2`, `-3`, ... suffix instead of colliding. Returns the stored
---      order, lines and modifiers so the driver needs no read-back.
+--      unchanged, created = false; an id owned by another tenant is refused).
+--      Every order is numbered `A-####` (wider past 9999) from the counter,
+--      except a client-supplied number (an older till's `HHMM-NNN`) that is
+--      still free at the location; a taken one is kept as
+--      core_ext.provisional_label and the order is numbered. Returns the
+--      stored order, lines and modifiers so the driver needs no read-back.
 --   4. Index orders (tenant_id, location_id, updated_at) for the kitchen poll's
 --      "changed in the last 15 minutes" read.
+--
+-- DEPLOY ORDER: code first, then this migration (the driver falls back to its
+-- old insert path while create_order_with_lines does not exist).
 --
 -- Additive and live-safe: one new table, new functions, new indexes. The
 -- index builds take a SHARE lock on orders (writes wait while they build;
@@ -174,6 +179,8 @@ declare
   v_location uuid := (p_order ->> 'location_id')::uuid;
   v_requested text := nullif(btrim(coalesce(p_order ->> 'order_number', '')), '');
   v_number text;
+  v_seq bigint;
+  v_ext jsonb := nullif(p_order -> 'core_ext', 'null'::jsonb);
   v_row public.orders;
   v_try integer := 0;
   v_items integer;
@@ -185,9 +192,13 @@ begin
       using errcode = '22023';
   end if;
 
-  -- Idempotent on the client order id.
+  -- Idempotent on the client order id (only within the same tenant).
   select * into v_row from public.orders where id = v_id;
   if found then
+    if v_row.tenant_id <> v_tenant then
+      raise exception 'create_order_with_lines: order id already in use'
+        using errcode = '23505';
+    end if;
     return public.order_graph_json(v_row, false);
   end if;
 
@@ -202,17 +213,25 @@ begin
     if v_try > 50 then
       raise exception 'create_order_with_lines: no free order number' using errcode = '23505';
     end if;
-    if v_requested is null then
-      v_number := 'A-' || lpad(public.next_order_number(v_tenant, v_location)::text, 4, '0');
-    elsif v_try = 1 then
+    if v_requested is not null and v_try = 1 then
       v_number := v_requested;
     else
-      v_number := left(v_requested, 28) || '-' || v_try;
+      -- lpad TRUNCATES to the width: pad to at least 4, never cut (A-10000).
+      v_seq := public.next_order_number(v_tenant, v_location);
+      v_number := 'A-' || lpad(v_seq::text, greatest(4, length(v_seq::text)), '0');
     end if;
     -- The whole table (a partial unique index does not cover legacy rows).
-    continue when exists (
-      select 1 from public.orders
-       where location_id = v_location and order_number = v_number);
+    if exists (select 1 from public.orders
+                where location_id = v_location and order_number = v_number) then
+      -- A client number that is taken: number the order, and keep the
+      -- client's as its provisional label (what the cashier showed).
+      if v_requested is not null and v_try = 1
+         and coalesce(v_ext ->> 'provisional_label', '') = '' then
+        v_ext := coalesce(v_ext, '{}'::jsonb)
+                 || jsonb_build_object('provisional_label', v_requested);
+      end if;
+      continue;
+    end if;
     begin
       insert into public.orders (
         id, tenant_id, location_id, status, channel, currency, discount_cents,
@@ -232,7 +251,7 @@ begin
         nullif(p_order -> 'fulfillment', 'null'::jsonb),
         nullif(p_order -> 'source', 'null'::jsonb),
         nullif(p_order -> 'hold', 'null'::jsonb),
-        nullif(p_order -> 'core_ext', 'null'::jsonb),
+        v_ext,
         nullif(p_order -> 'adjustments', 'null'::jsonb),
         coalesce((p_order ->> 'created_at')::timestamptz, now()),
         coalesce((p_order ->> 'updated_at')::timestamptz, now()))
@@ -242,7 +261,11 @@ begin
     exception when unique_violation then
       -- A concurrent order took this number between the check and the insert
       -- (the unique index): try the next one.
-      null;
+      if v_requested is not null and v_try = 1
+         and coalesce(v_ext ->> 'provisional_label', '') = '' then
+        v_ext := coalesce(v_ext, '{}'::jsonb)
+                 || jsonb_build_object('provisional_label', v_requested);
+      end if;
     end;
   end loop;
 

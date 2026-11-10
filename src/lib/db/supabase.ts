@@ -2237,7 +2237,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       const [active, recent] = await Promise.all([
         base()
           .in("status", [...opts.statuses])
-          .gte("created_at", opts.createdSince)
+          .gte("updated_at", opts.activeSince)
           .order("created_at", { ascending: false })
           .order("id", { ascending: false })
           .range(0, limit - 1),

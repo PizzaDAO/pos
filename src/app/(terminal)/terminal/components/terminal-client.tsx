@@ -111,13 +111,23 @@ export function TerminalClient({
     initialTenantId,
     initialLocationId,
   );
-  const sync = useOfflineSync();
+  const toast = useToast();
+  // A queued order synced in the background: announce the number the server
+  // gave it (the cashier only saw its provisional label).
+  const sync = useOfflineSync((numbered) => {
+    for (const n of numbered) {
+      toast({
+        title: `Order ${n.orderNumber} synced`,
+        description: n.provisional ? `Was ${n.provisional} while offline.` : undefined,
+        variant: "success",
+      });
+    }
+  });
   const { activeStaff, signOut: signOutStaff, verifyPin } = useActiveStaff();
   const [showStaffSwitch, setShowStaffSwitch] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [showOpenOrders, setShowOpenOrders] = useState(false);
   const [showGiftCards, setShowGiftCards] = useState(false);
-  const toast = useToast();
   const queuedStaff: QueuedStaff | null = activeStaff
     ? {
         id: activeStaff.id,
@@ -353,7 +363,11 @@ export function TerminalClient({
         // tie to the person at the till.
         staff_id: activeStaff?.id ?? null,
         // Order type + call-out name: the server keeps only these two fields.
-        core_ext: buildTillCoreExt(orderType, customerName),
+        // + the provisional label shown until the server numbers the order.
+        core_ext: {
+          ...(buildTillCoreExt(orderType, customerName) ?? {}),
+          provisional_label: provisional,
+        },
       };
 
       // Record who was at the till (and their staff session) with the queued

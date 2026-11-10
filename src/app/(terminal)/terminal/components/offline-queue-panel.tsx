@@ -87,7 +87,7 @@ export function OfflineQueuePanel({
                 <li key={e.id} className="rounded-md border p-3">
                   <div className="mb-1 flex items-center justify-between text-sm">
                     <span className="font-medium">
-                      Order {p.order_number ?? e.id.slice(0, 8)}
+                      Order {p.order_number ?? p.core_ext?.provisional_label ?? e.id.slice(0, 8)}
                     </span>
                     <span>{formatMoney(p.totals.total_cents, p.currency)}</span>
                   </div>

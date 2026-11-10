@@ -43,18 +43,38 @@ export function buildTillCoreExt(
   };
 }
 
+/** A till's provisional label: short, printable, or null. */
+export function cleanProvisionalLabel(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  return /^[A-Za-z0-9 #:._-]{1,32}$/.test(s) ? s : null;
+}
+
 /**
- * Server side: keep ONLY the order type and customer name from whatever core_ext
- * a till client sent (everything else in core_ext is for the /v1 API).
+ * Server side: keep ONLY the order type, customer name and provisional label
+ * from whatever core_ext a till client sent (everything else in core_ext is for
+ * the /v1 API).
  */
 export function sanitizeTillCoreExt(raw: unknown): OrderCoreExt | null {
   if (!raw || typeof raw !== "object") return null;
-  const r = raw as { callout_name?: unknown; metadata?: unknown };
+  const r = raw as { callout_name?: unknown; metadata?: unknown; provisional_label?: unknown };
   const meta = r.metadata && typeof r.metadata === "object" ? (r.metadata as Record<string, unknown>) : {};
-  return buildTillCoreExt(
+  const ext = buildTillCoreExt(
     isTillOrderType(meta.order_type) ? meta.order_type : null,
     cleanCustomerName(r.callout_name),
   );
+  const label = cleanProvisionalLabel(r.provisional_label);
+  if (!label) return ext;
+  return { ...(ext ?? {}), provisional_label: label };
+}
+
+/**
+ * The order number as staff see it: the server's number, plus the provisional
+ * label the till showed when they differ ("A-0412 (was 1405-123)").
+ */
+export function orderNumberLabel(order: Pick<Order, "order_number" | "core_ext">): string {
+  const was = order.core_ext?.provisional_label;
+  return was && was !== order.order_number ? `${order.order_number} (was ${was})` : order.order_number;
 }
 
 export function orderTypeOf(order: Pick<Order, "core_ext">): TillOrderType | null {

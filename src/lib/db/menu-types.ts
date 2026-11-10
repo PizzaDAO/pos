@@ -542,6 +542,12 @@ export interface OrderCoreExt {
    * treat it as a liability). Once it settles the amount is credited to the card.
    */
   stored_value?: StoredValueOrderExt;
+  /**
+   * The provisional label the till showed before the server numbered the order
+   * (an offline-queued order, or an older till's own number that was already
+   * taken). Display only: shown next to the real number ("A-0412 (was 1405-123)").
+   */
+  provisional_label?: string | null;
 }
 
 /** See `OrderCoreExt.stored_value`. */

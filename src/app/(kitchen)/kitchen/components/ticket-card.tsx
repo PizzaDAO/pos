@@ -115,6 +115,12 @@ function TicketCardImpl({
         <div className="flex items-center justify-between">
           <span className="text-2xl font-bold tracking-tight">
             {order.order_number}
+            {order.core_ext?.provisional_label &&
+            order.core_ext.provisional_label !== order.order_number ? (
+              <span className="ml-1 text-sm font-medium opacity-80">
+                (was {order.core_ext.provisional_label})
+              </span>
+            ) : null}
           </span>
           <span className="font-mono text-lg font-bold tabular-nums">
             {formatElapsed(elapsed)}

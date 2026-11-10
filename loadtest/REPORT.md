@@ -137,7 +137,8 @@ and needs a Postgres to validate.
 ## Fixed in data-layer-fixes (2026-11-09)
 
 Migrations: `20261114000000_order_numbers_atomic_create.sql`, `20261114000010_menu_versions.sql`
-(both additive; the driver falls back to its old order path until the first is applied).
+(both additive). Deploy order: code first, then the migrations (the driver falls back to its old
+order path, and does not cache menus, until they are applied).
 
 1. **Menu truncation (rank 1, 4).** `assembleMenu` reads sizes and group links by the tenant's
    item ids and modifiers by its group ids (chunked `.in`, parallel chunks), and pages every
@@ -151,16 +152,20 @@ Migrations: `20261114000000_order_numbers_atomic_create.sql`, `20261114000010_me
 2. **Order numbers (rank 5, correctness).** `create_order_with_lines` (one RPC, one transaction)
    inserts order + lines + modifiers, so a failure leaves nothing behind (no compensating delete,
    no outbox event for a rolled-back order). The server numbers EVERY order, till orders included
-   (the till's client `HHMM-RRR` is no longer sent; offline orders show a provisional local label
-   until they sync), from `order_number_counters`: one atomic `UPDATE ... RETURNING` per location,
+   (the till's client `HHMM-RRR` is no longer sent as the number; it travels as
+   `core_ext.provisional_label`, shown on the KDS ticket and receipt as "A-0412 (was 1405-123)", and
+   the till toasts the real number after a background sync), from `order_number_counters`: one atomic `UPDATE ... RETURNING` per location,
    seeded on first use after the location's existing numbers. Format stays `A-####`. It is a
    per-location sequence, NOT reset daily: with a unique `(location_id, order_number)` index and no
    date in the number, a daily reset would collide with yesterday's `A-0001`. Unique index
    `orders_location_order_number_key`: if the live table already has duplicate pairs, the
    migration builds it PARTIAL (`created_at >=` migration time, reported by a NOTICE) plus a plain
    index, and the RPC still checks the whole table. A client-supplied number (other callers) that
-   is taken gets a `-2`, `-3` suffix. Idempotent on the order id.
-3. **KDS poll (rank 2).** New `listKitchenOrders`: active KDS statuses created in the last 7 days
+   from an older till is kept when free at the location; a taken one becomes the provisional label
+   and the order gets a server number. Padding widens past 9999 (`A-10000`). Idempotent on the
+   order id, within the same tenant only.
+3. **KDS poll (rank 2).** New `listKitchenOrders`: active KDS statuses UPDATED in the last 7 days
+   (release and bumps refresh it, so a catering order booked weeks ahead stays on after release)
    plus anything updated in the 15-minute void window, two indexed queries in parallel (new index
    on `orders (tenant_id, location_id, updated_at)`), instead of the last 1,000 orders. Order
    items/modifiers chunks now run in parallel (4 at a time). About 4 round trips per poll after
@@ -172,9 +177,11 @@ Migrations: `20261114000000_order_numbers_atomic_create.sql`, `20261114000010_me
 5. **Bump and storefront (ranks 6, 10).** Bump CASes on the status the guard already read
    (`casOrderStatus`), dropping a read; a lost race now answers `changed: false`. Storefront reads
    subscription, settings and menu in parallel; order create is one RPC with no read-back.
-6. **Polling (ranks 8, 9).** KDS, dispatch, open orders, tracking and the pay-sync poll pause
-   while the tab is hidden and refetch once on return; Realtime refetches are deferred while
-   hidden. Tracking backs off 4, 4, 8, 8, then 15 s while the order is unchanged.
+6. **Polling (ranks 8, 9).** Dispatch, open orders, tracking and the pay-sync poll pause while the
+   tab is hidden and refetch once on return. The KDS never stops: it drops to a 15 s poll while
+   hidden (the new-order chime must fire on a minimised kitchen screen) and its Realtime channel
+   keeps refetching. Tracking backs off from its base interval (4, 4, 8, 8, then 15 s by default)
+   while the order is unchanged.
 
 Mock-driver rerun (same harness, branch vs `origin/main` back to back; the laptop was shared with
 other builds, load average ~400): no errors and no breaking point on either up to 1000x; 3x till
@@ -182,3 +189,11 @@ create p95 6.5 ms (main 4.3 ms), KDS poll p95 5.9 ms (6.2 ms); at 1000x till cre
 (3.1 ms), KDS poll p95 7.8 ms (6.4 ms). Differences are within the noise of that machine. An
 earlier branch run during a load-average spike broke at 1000x (1% errors, 7 s p95) and was
 discarded. The mock still says nothing about Postgres; the round-trip savings above are the point.
+
+Also fixed: `inRange` (src/lib/reports.ts) string-compared a full ISO `range.from` against a
+business date ("2026-11-09" sorts before "2026-11-09T00:03Z"), which dropped that day; timestamp
+bounds are now converted on the location's clock. Every in-app caller passes yyyy-mm-dd already
+(EOD, owner reports validate it); `/api/admin/reports` passes raw query params, so it was reachable.
+
+Still open, same family as rank 1: `getSalesReport` in the Supabase driver selects every order of
+the tenant with no paging and reads each order graph one by one; it truncates at 1000 orders.

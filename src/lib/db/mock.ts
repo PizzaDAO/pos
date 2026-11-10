@@ -1355,6 +1355,19 @@ export const mockDriver: PosDriver = {
     if (existing) return existing;
 
     const now = nowIso();
+    // Same numbering as create_order_with_lines: a client number is kept only
+    // while free at the location; a taken one becomes the provisional label.
+    let coreExt = input.core_ext ?? null;
+    let orderNumber = input.order_number?.trim() || null;
+    if (
+      orderNumber &&
+      [...orders.values()].some(
+        (o) => o.location_id === input.location_id && o.order_number === orderNumber,
+      )
+    ) {
+      if (!coreExt?.provisional_label) coreExt = { ...(coreExt ?? {}), provisional_label: orderNumber };
+      orderNumber = null;
+    }
     const order: Order = {
       id: input.id,
       tenant_id: input.tenant_id,
@@ -1366,13 +1379,13 @@ export const mockDriver: PosDriver = {
       discount_cents: input.discount_cents,
       totals: input.totals,
       notes: input.notes,
-      order_number: input.order_number ?? nextOrderNumber(),
+      order_number: orderNumber ?? nextOrderNumber(),
       customer_id: input.customer_id ?? null,
       staff_id: input.staff_id ?? null,
       fulfillment: input.fulfillment,
       source: input.source,
       hold: input.hold ?? null,
-      core_ext: input.core_ext ?? null,
+      core_ext: coreExt,
       adjustments: input.adjustments?.length ? structuredClone(input.adjustments) : null,
       version: 1,
       created_at: now,
@@ -1422,7 +1435,7 @@ export const mockDriver: PosDriver = {
       .filter((o) => o.tenant_id === tenantId && o.location_id === locationId)
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
     const active = mine
-      .filter((o) => statuses.has(o.status) && o.created_at >= opts.createdSince)
+      .filter((o) => statuses.has(o.status) && o.updated_at >= opts.activeSince)
       .slice(0, limit);
     const recent = mine.filter((o) => o.updated_at >= opts.updatedSince).slice(0, limit);
     const seen = new Set(active.map((o) => o.id));

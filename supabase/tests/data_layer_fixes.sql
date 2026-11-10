@@ -7,8 +7,9 @@
 --   * next_order_number continues after the location's existing numbers and
 --     increments by one per call
 --   * (location_id, order_number) is unique
---   * create_order_with_lines writes order + lines atomically, suffixes a taken
---     client number, and is idempotent on the id
+--   * create_order_with_lines writes order + lines atomically, numbers an order
+--     whose client number is taken (keeping it as provisional_label), is
+--     idempotent on the id, and pads A-#### without truncating past 9999
 --   * every menu table write bumps the tenant's menu_versions row
 -- ============================================================================
 begin;
@@ -70,7 +71,8 @@ begin
       'item_name', 'Pie', 'sort_order', 0)),
     jsonb_build_array(jsonb_build_object('order_item_id', line, 'group_id', gen_random_uuid(),
       'group_name', 'G', 'modifier_id', gen_random_uuid(), 'modifier_name', 'M')));
-  if res ->> 'created' <> 'true' or res -> 'order' ->> 'order_number' <> 'A-0500-2'
+  if res ->> 'created' <> 'true' or res -> 'order' ->> 'order_number' !~ '^A-[0-9]{4,}$'
+     or res -> 'order' -> 'core_ext' ->> 'provisional_label' <> 'A-0500'
      or jsonb_array_length(res -> 'items') <> 1 or jsonb_array_length(res -> 'modifiers') <> 1 then
     raise exception 'create_order_with_lines: unexpected result %', res;
   end if;
@@ -90,6 +92,17 @@ begin
     raise exception 'a modifier for another order''s line was accepted';
   exception when invalid_parameter_value then null;
   end;
+
+  -- lpad must not truncate: 9999 -> 10000 -> 10001
+  update public.order_number_counters set last_value = 9998 where location_id = l_id;
+  foreach p in array array['A-9999', 'A-10000', 'A-10001'] loop
+    res := public.create_order_with_lines(
+      jsonb_build_object('id', gen_random_uuid(), 'tenant_id', t_id, 'location_id', l_id,
+        'channel', 'in_store', 'totals', '{}'::jsonb), '[]', '[]');
+    if res -> 'order' ->> 'order_number' <> p then
+      raise exception 'expected %, got %', p, res -> 'order' ->> 'order_number';
+    end if;
+  end loop;
 
   -- menu version bumps on every menu table
   select coalesce((select version from public.menu_versions where tenant_id = t_id), 0) into v1;

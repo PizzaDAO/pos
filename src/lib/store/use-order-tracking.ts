@@ -52,10 +52,13 @@ async function fetchTrack(orderId: string): Promise<TrackResponse> {
 }
 
 /**
- * Customer tracking poll: 4 s, 4 s, 8 s, 8 s, then every 15 s while nothing
- * changes (any change goes back to 4 s); paused while the tab is hidden.
+ * Customer tracking back-off, as multiples of the base interval: with the
+ * default 4 s that is 4, 4, 8, 8, then every 15 s while nothing changes (any
+ * change goes back to the base); paused while the tab is hidden.
  */
-export const TRACKING_BACKOFF_MS = [4000, 4000, 8000, 8000, 15000] as const;
+export function trackingBackoff(intervalMs: number): number[] {
+  return [1, 1, 2, 2, 3.75].map((k) => Math.round(intervalMs * k));
+}
 
 export function useOrderTracking(orderId: string, intervalMs = 4000) {
   const [data, setData] = useState<TrackResponse | null>(null);
@@ -74,7 +77,7 @@ export function useOrderTracking(orderId: string, intervalMs = 4000) {
       },
       {
         intervalMs,
-        backoffMs: TRACKING_BACKOFF_MS,
+        backoffMs: trackingBackoff(intervalMs),
         // serverTime changes on every response; the order + delivery do not.
         changeKey: (d) => JSON.stringify([d.order, d.delivery]),
       },

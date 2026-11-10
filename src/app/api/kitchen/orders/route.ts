@@ -46,9 +46,11 @@ import {
 export const runtime = "nodejs";
 
 /**
- * How far back an order still in an active status stays on the board. Orders
- * stuck longer (never bumped) drop off; scheduled orders placed further ahead
- * than this would too.
+ * An order in an active status stays on the board while it was touched
+ * (placed, released from a hold, bumped, edited) in the last week. Filtered on
+ * updated_at, not created_at, so a catering order booked weeks ahead stays on
+ * the board after its release. Only an active order nobody touched for a week
+ * drops off.
  */
 const KDS_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -74,13 +76,13 @@ export async function GET(request: Request) {
 
   const driver = getPosDriver();
   const now = new Date();
-  // Filtered in SQL: active tickets from the last week, plus anything changed
+  // Filtered in SQL: active tickets touched in the last week, plus anything changed
   // inside the void-notice window (a voided order or line). Not the location's
   // whole order history.
   const [orders, settings] = await Promise.all([
     driver.listKitchenOrders(tenantId, locationId, {
       statuses: KDS_ACTIVE_STATUSES,
-      createdSince: new Date(now.getTime() - KDS_ACTIVE_WINDOW_MS).toISOString(),
+      activeSince: new Date(now.getTime() - KDS_ACTIVE_WINDOW_MS).toISOString(),
       updatedSince: new Date(now.getTime() - VOID_NOTICE_MS).toISOString(),
     }),
     driver.getStoreSettings(tenantId, locationId),

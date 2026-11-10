@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildSalesReport } from "@/lib/reports";
+import { buildSalesReport, inRange, locationBusinessDate, normaliseRangeBound } from "@/lib/reports";
 import type { Order, OrderItem, Payment } from "@/lib/db";
 
 const RANGE = { from: "2026-06-01", to: "2026-06-30" };
@@ -292,5 +292,24 @@ describe("buildSalesReport — aggregation correctness", () => {
       locationName,
     });
     expect(r.order_count).toBe(1);
+  });
+});
+
+describe("inRange with timestamp bounds", () => {
+  const order = { created_at: "2026-11-09T23:30:00.000Z", location_id: "l" } as Order;
+  it("a full ISO bound is compared as a business date, not as a string", () => {
+    // "2026-11-09" < "2026-11-09T00:03:00Z" as strings: that excluded the whole day.
+    expect(inRange(order, { from: "2026-11-09T00:03:00.000Z", to: null })).toBe(true);
+    expect(inRange(order, { from: null, to: "2026-11-09T00:00:00.000Z" })).toBe(true);
+    expect(inRange(order, { from: "2026-11-10T01:00:00.000Z", to: null })).toBe(false);
+    expect(inRange(order, { from: "2026-11-09", to: "2026-11-09" })).toBe(true);
+  });
+  it("converts timestamp bounds on the location's clock", () => {
+    const ny = { timezone: "America/New_York", business_day_cutoff_minutes: 0 };
+    const dayOf = (o: Order) => locationBusinessDate(o.created_at, ny);
+    const bound = (iso: string) => locationBusinessDate(iso, ny);
+    // 23:30Z on Nov 9 = 18:30 in New York on Nov 9.
+    expect(inRange(order, { from: "2026-11-10T03:00:00.000Z", to: null }, dayOf, bound)).toBe(true);
+    expect(normaliseRangeBound("2026-11-10T03:00:00.000Z", bound)).toBe("2026-11-09");
   });
 });

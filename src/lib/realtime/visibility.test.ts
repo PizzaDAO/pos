@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startPolling } from "./visibility";
 import { createPollingProvider } from "./polling";
+import { trackingBackoff } from "@/lib/store/use-order-tracking";
 
 type Listener = () => void;
 function fakeDocument() {
@@ -59,6 +60,23 @@ describe("startPolling", () => {
     expect(doc.listeners.size).toBe(0);
   });
 
+  it("keeps a slow poll while hidden when asked (the KDS)", async () => {
+    const tick = vi.fn();
+    const poll = startPolling(tick, 1000, { hiddenMs: 15_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    doc.set("hidden");
+    await vi.advanceTimersByTimeAsync(1000); // the pending visible tick still runs
+    expect(tick).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(tick).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(tick).toHaveBeenCalledTimes(3); // 15 s while hidden
+    doc.set("visible");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tick).toHaveBeenCalledTimes(4); // immediately on return
+    poll.stop();
+  });
+
   it("follows a back-off schedule (last delay repeats) and reset() restarts it", async () => {
     const at: number[] = [];
     const poll = startPolling(() => void at.push(Date.now()), [100, 200, 400]);
@@ -110,5 +128,12 @@ describe("polling provider", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(fetcher).toHaveBeenCalledTimes(1);
     stop();
+  });
+});
+
+describe("tracking back-off", () => {
+  it("scales from the base interval", () => {
+    expect(trackingBackoff(4000)).toEqual([4000, 4000, 8000, 8000, 15000]);
+    expect(trackingBackoff(2000)).toEqual([2000, 2000, 4000, 4000, 7500]);
   });
 });
