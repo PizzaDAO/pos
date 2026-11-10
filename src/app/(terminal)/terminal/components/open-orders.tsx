@@ -17,6 +17,7 @@ import { formatMoney } from "@/lib/pricing";
 import { statusLabel } from "@/lib/kds/status";
 import { MarketplaceBadge } from "@/components/marketplace-badge";
 import { providerLabel } from "@/lib/marketplace/types";
+import { startPolling } from "@/lib/realtime/visibility";
 
 export interface OpenOrder {
   id: string;
@@ -58,9 +59,9 @@ export function useOpenOrders(
   }, [tenantId, locationId]);
 
   useEffect(() => {
-    void refresh();
-    const t = setInterval(() => void refresh(), pollMs);
-    return () => clearInterval(t);
+    // Paused while the tab is hidden; refreshes as soon as it is visible.
+    const poll = startPolling(refresh, pollMs);
+    return () => poll.stop();
   }, [refresh, pollMs]);
 
   return { open, refresh };

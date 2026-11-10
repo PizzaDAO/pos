@@ -151,18 +151,56 @@ export function locationBusinessDate(
 
 const reportedBadZones = new Set<string>();
 
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * A range bound as a business date. Bounds are meant to be "yyyy-mm-dd", but a
+ * full ISO timestamp must not be string-compared against a date ("2026-11-09"
+ * sorts BEFORE "2026-11-09T00:03Z", which dropped that whole day): it is
+ * converted with the same clock as the order (`toDay`).
+ */
+export function normaliseRangeBound(
+  bound: string | null,
+  toDay: (iso: string) => string = isoDate,
+): string | null {
+  if (!bound) return null;
+  if (isBusinessDate(bound)) return bound;
+  // Anything else unparseable is no bound (never a RangeError downstream).
+  if (!ISO_TS_RE.test(bound)) return null;
+  const ms = Date.parse(bound);
+  return Number.isNaN(ms) ? null : toDay(new Date(ms).toISOString());
+}
+
+const ISO_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/** A real calendar date "yyyy-mm-dd" (2026-02-31 is not). */
+export function isBusinessDate(v: string): boolean {
+  if (!YMD_RE.test(v)) return false;
+  const ms = Date.parse(`${v}T00:00:00Z`);
+  return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === v;
+}
+
+/** A report range bound a route accepts: "yyyy-mm-dd" or a full ISO timestamp. */
+export function isRangeBound(v: string): boolean {
+  return isBusinessDate(v) || (ISO_TS_RE.test(v) && !Number.isNaN(Date.parse(v)));
+}
+
 /**
  * Whether an order's business date falls within an inclusive date range.
- * `dayOf` gives the order's business date (default: UTC calendar date).
+ * `dayOf` gives the order's business date (default: UTC calendar date);
+ * `boundDay` turns a timestamp bound into a business date on the same clock.
  */
 export function inRange(
   order: Order,
   range: DateRange,
   dayOf: (order: Order) => string = (o) => isoDate(o.created_at),
+  boundDay: (iso: string, order: Order) => string = (iso) => isoDate(iso),
 ): boolean {
   const day = dayOf(order);
-  if (range.from && day < range.from) return false;
-  if (range.to && day > range.to) return false;
+  const from = normaliseRangeBound(range.from, (iso) => boundDay(iso, order));
+  const to = normaliseRangeBound(range.to, (iso) => boundDay(iso, order));
+  if (from && day < from) return false;
+  if (to && day > to) return false;
   return true;
 }
 
@@ -228,7 +266,10 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
   const { payments } = input;
   const dayOf = (o: Order) =>
     locationBusinessDate(o.created_at, input.locationClock?.(o.location_id));
-  const inRange = (o: Order, r: DateRange) => inRangeBy(o, r, dayOf);
+  const inRange = (o: Order, r: DateRange) =>
+    inRangeBy(o, r, dayOf, (iso, ord) =>
+      locationBusinessDate(iso, input.locationClock?.(ord.location_id)),
+    );
   const range = input.range;
   // Unpaid online checkouts (awaiting_payment / abandoned) are not sales.
   const allOrders = input.orders.filter((o) => !isUnpaidOnlineStatus(o.status));
@@ -351,7 +392,10 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     let any = false;
     for (const ev of refundEvents(counted, { sales: gross - discount, tax, fees }, tip)) {
       const day = ev.at ? locationBusinessDate(ev.at, clock) : dayOf(order);
-      if ((range.from && day < range.from) || (range.to && day > range.to)) continue;
+      const toDay = (iso: string) => locationBusinessDate(iso, clock);
+      const from = normaliseRangeBound(range.from, toDay);
+      const to = normaliseRangeBound(range.to, toDay);
+      if ((from && day < from) || (to && day > to)) continue;
       any = true;
       refundCents += ev.total;
       tipRefundCents += ev.tip;

@@ -39,9 +39,11 @@
  */
 import { getBrowserSupabase } from "@/lib/auth/supabase-browser";
 import { createPollingProvider } from "./polling";
+import { isPageHidden } from "./visibility";
 import type {
   RealtimeListener,
   RealtimeProvider,
+  RealtimeSubscribeOptions,
   Unsubscribe,
 } from "./provider";
 
@@ -86,7 +88,7 @@ export function createSupabaseRealtimeProvider(): RealtimeProvider {
       topic: string,
       fetcher: () => Promise<T>,
       listener: RealtimeListener<T>,
-      options?: { intervalMs?: number },
+      options?: RealtimeSubscribeOptions<T>,
     ): Unsubscribe {
       const client = getBrowserSupabase();
       const filter = parseOrdersFilter(topic);
@@ -132,14 +134,30 @@ export function createSupabaseRealtimeProvider(): RealtimeProvider {
         }
       };
 
+      // While the tab is hidden, changes only mark the board stale; it refetches
+      // once when the tab is visible again (not on every write).
+      let stale = false;
       const scheduleFetch = () => {
         if (!active) return;
+        if (isPageHidden() && !options?.hiddenIntervalMs) {
+          stale = true;
+          return;
+        }
         if (debounceHandle) clearTimeout(debounceHandle);
         debounceHandle = setTimeout(() => {
           debounceHandle = null;
           void runFetch();
         }, REFETCH_DEBOUNCE_MS);
       };
+
+      const onVisibility = () => {
+        if (!active || isPageHidden() || !stale) return;
+        stale = false;
+        scheduleFetch();
+      };
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", onVisibility);
+      }
 
       // 1. Initial load via the same fetcher the poller uses (no debounce — fill
       //    the UI immediately).
@@ -175,6 +193,9 @@ export function createSupabaseRealtimeProvider(): RealtimeProvider {
       return () => {
         if (!active) return;
         active = false;
+        if (typeof document !== "undefined") {
+          document.removeEventListener("visibilitychange", onVisibility);
+        }
         if (debounceHandle) {
           clearTimeout(debounceHandle);
           debounceHandle = null;

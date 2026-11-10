@@ -22,9 +22,14 @@
  * No env vars are read — everything runs against the in-memory mock driver.
  */
 import { after, NextResponse } from "next/server";
-import { getPosDriver } from "@/lib/db";
+import { getPosDriver, KDS_ACTIVE_STATUSES } from "@/lib/db";
 import { isPendingAcceptance, notifyMarketplaceReady } from "@/lib/marketplace/service";
-import { buildTickets, buildVoidNotices, DEFAULT_KDS_THRESHOLDS } from "@/lib/kds/board";
+import {
+  buildTickets,
+  buildVoidNotices,
+  DEFAULT_KDS_THRESHOLDS,
+  VOID_NOTICE_MS,
+} from "@/lib/kds/board";
 import {
   isHandoffStatus,
   kitchenHandsOffDelivery,
@@ -39,6 +44,15 @@ import {
 
 // In-memory mock state lives in the Node runtime; force it (not edge).
 export const runtime = "nodejs";
+
+/**
+ * An order in an active status stays on the board while it was touched
+ * (placed, released from a hold, bumped, edited) in the last week. Filtered on
+ * updated_at, not created_at, so a catering order booked weeks ahead stays on
+ * the board after its release. Only an active order nobody touched for a week
+ * drops off.
+ */
+const KDS_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** The delivery record's provider for an order (null when none / unreadable). */
 async function deliveryProviderOf(orderId: string): Promise<string | null> {
@@ -61,12 +75,19 @@ export async function GET(request: Request) {
   const locationId = auth.locationId as string;
 
   const driver = getPosDriver();
+  const now = new Date();
+  // Filtered in SQL: active tickets touched in the last week, plus anything changed
+  // inside the void-notice window (a voided order or line). Not the location's
+  // whole order history.
   const [orders, settings] = await Promise.all([
-    driver.listOrders(tenantId, locationId),
+    driver.listKitchenOrders(tenantId, locationId, {
+      statuses: KDS_ACTIVE_STATUSES,
+      activeSince: new Date(now.getTime() - KDS_ACTIVE_WINDOW_MS).toISOString(),
+      updatedSince: new Date(now.getTime() - VOID_NOTICE_MS).toISOString(),
+    }),
     driver.getStoreSettings(tenantId, locationId),
   ]);
 
-  const now = new Date();
   const thresholds = settings.kds_thresholds ?? DEFAULT_KDS_THRESHOLDS;
   const built = buildTickets(orders, now, thresholds);
   // Delivery tickets carry their delivery record's provider: it decides whether
@@ -148,7 +169,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ order: current, changed: false });
   }
 
-  const updated = await driver.updateOrderStatus(id, next);
+  // Compare-and-set on the status the guard just read (no second read): a
+  // concurrent bump that already moved the order makes this a no-op that
+  // returns the order as it now is.
+  const res = await driver.casOrderStatus(id, [current.status], next);
+  if (!res.ok && res.reason === "not_found") {
+    return NextResponse.json({ error: "Order not found." }, { status: 404 });
+  }
+  if (!res.ok) return NextResponse.json({ order: res.order, changed: false });
+  const updated = res.order;
   // Marketplace order bumped to ready: tell the provider (best effort, inert
   // unless the provider is configured).
   // Never awaited by the bump: runs after the response (or detached, outside a

@@ -600,9 +600,11 @@ describe("routes", () => {
 describe("reports and health ignore unpaid online orders", () => {
   it("excludes awaiting_payment and abandoned from the sales report and tenant health", async () => {
     const driver = getPosDriver();
+    // Plain business dates (yyyy-mm-dd), two days either side, so the range
+    // covers today in any location time zone.
     const range = {
-      from: new Date(Date.now() - 86_400_000).toISOString(),
-      to: new Date(Date.now() + 86_400_000).toISOString(),
+      from: new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10),
+      to: new Date(Date.now() + 2 * 86_400_000).toISOString().slice(0, 10),
     };
     const before = await driver.getSalesReport(TENANT, LOCATION, range);
     const healthBefore = (await driver.listTenantHealth()).find(

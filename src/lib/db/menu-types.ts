@@ -542,6 +542,12 @@ export interface OrderCoreExt {
    * treat it as a liability). Once it settles the amount is credited to the card.
    */
   stored_value?: StoredValueOrderExt;
+  /**
+   * The provisional label the till showed before the server numbered the order
+   * (an offline-queued order, or an older till's own number that was already
+   * taken). Display only: shown next to the real number ("A-0412 (was 1405-123)").
+   */
+  provisional_label?: string | null;
 }
 
 /** See `OrderCoreExt.stored_value`. */
@@ -636,4 +642,16 @@ export interface CreateOrderInput {
   core_ext?: OrderCoreExt | null;
   /** Comps + discounts applied at creation (Σ = discount_cents). */
   adjustments?: OrderAdjustment[] | null;
+}
+
+/**
+ * createOrder with an order id that already belongs to ANOTHER tenant (ids are
+ * client UUIDs, so this is a collision or a probe, never a retry). Maps to
+ * HTTP 409.
+ */
+export class OrderIdTakenError extends Error {
+  constructor() {
+    super("Order id already in use.");
+    this.name = "OrderIdTakenError";
+  }
 }

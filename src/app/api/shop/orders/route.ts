@@ -199,7 +199,13 @@ export async function POST(request: Request) {
   // The tenant's subscription tier gates customer online ordering (Phase 6). A
   // Starter-plan tenant's storefront cannot accept online orders; the server is
   // authoritative here even though the storefront also reflects it.
-  const subscription = await driver.getSubscription(tenantId);
+  // Independent reads in parallel (were three sequential round trips); the
+  // gates below still run in the same order.
+  const [subscription, settings, menu] = await Promise.all([
+    driver.getSubscription(tenantId),
+    driver.getStoreSettings(tenantId, locationId),
+    driver.getMenu(tenantId, locationId),
+  ]);
   const onlineGate = canUseOnlineOrdering(resolveEntitlements(subscription));
   if (!onlineGate.allowed) {
     return NextResponse.json(
@@ -208,7 +214,6 @@ export async function POST(request: Request) {
     );
   }
 
-  const settings = await driver.getStoreSettings(tenantId, locationId);
   const fulfillment = settings.fulfillment;
   if (!fulfillment) {
     return NextResponse.json(
@@ -221,7 +226,6 @@ export async function POST(request: Request) {
   // (86'd items excluded, per-location overrides applied).
   let activeItems: OrderItem[];
   try {
-    const menu = await driver.getMenu(tenantId, locationId);
     activeItems = repriceItems(menu, body.items);
   } catch (err) {
     if (err instanceof RepriceError) {

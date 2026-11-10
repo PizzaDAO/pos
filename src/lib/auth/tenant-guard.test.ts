@@ -221,6 +221,15 @@ describe("tenant-scoped API routes enforce the guard", () => {
     ).toBe(403);
   });
 
+  it("GET /api/admin/reports: a malformed range is a 400, not a 500", async () => {
+    const { GET } = await import("@/app/api/admin/reports/route");
+    session.user = demoOwner();
+    const q = (qs: string) => GET(new Request(url(`/api/admin/reports?tenantId=${DEMO_TENANT_ID}&${qs}`)));
+    expect((await q("from=garbage")).status).toBe(400);
+    expect((await q("to=2026-02-31")).status).toBe(400);
+    expect((await q("from=2026-11-01&to=2026-11-09T23:59:59.000Z")).status).toBe(200);
+  });
+
   it("GET /api/kitchen/orders: 401 anon, 403 cross-tenant", async () => {
     const { GET } = await import("@/app/api/kitchen/orders/route");
     const req = () =>

@@ -38,11 +38,14 @@ export interface FlushResult {
   failed: number;
   /** Refused this run → now waiting on staff. */
   needsAttention: number;
+  /** Orders synced this run with the number the server gave them. */
+  numbered: { provisional: string | null; orderNumber: string }[];
 }
 
 /** Outcome of pushing ONE queued order to the server. */
 export type SyncOutcome =
-  | { status: "synced" }
+  /** `orderNumber`: the number the server stored (it suffixes a taken one). */
+  | { status: "synced"; orderNumber?: string }
   /** Interactive only: non-retryable 4xx shown to the cashier; not placed. */
   | { status: "rejected"; httpStatus: number; error: string; code?: string }
   /** Background: non-retryable 4xx; kept and surfaced for staff to resolve. */
@@ -65,15 +68,45 @@ function isPermanentRejection(status: number): boolean {
   return status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
+/**
+ * The toast for a queued order a background flush just synced. When an older
+ * till's own number was kept (provisional === orderNumber) there is nothing to
+ * explain: just "Order 1405-123 synced".
+ */
+export function syncedOrderMessage(n: FlushResult["numbered"][number]): {
+  title: string;
+  description?: string;
+} {
+  const title = `Order ${n.orderNumber} synced`;
+  return n.provisional && n.provisional !== n.orderNumber
+    ? { title, description: `Was ${n.provisional} while offline.` }
+    : { title };
+}
+
 /** Order ids being placed interactively right now (background flush skips). */
 const inFlight = new Set<string>();
 
-/** The request body for an entry: its payload + the queued-time staff session. */
-export function flushBody(entry: QueuedOrder): Record<string, unknown> {
+/**
+ * The request body for an entry: its payload + the queued-time staff session.
+ * `interactive` (the cashier is placing it right now, online): the provisional
+ * label is dropped, since nobody saw it; the server's number is the only one.
+ * A queued (offline / background) replay keeps it, so the KDS and receipt show
+ * what the cashier was shown ("A-0412 (was 1405-123)").
+ */
+export function flushBody(
+  entry: QueuedOrder,
+  opts: { interactive?: boolean } = {},
+): Record<string, unknown> {
   const sessionId = entry.queuedBy?.sessionId;
+  let payload: CreateOrderInput = entry.payload;
+  if (opts.interactive && payload.core_ext?.provisional_label) {
+    const { provisional_label: _drop, ...rest } = payload.core_ext;
+    void _drop;
+    payload = { ...payload, core_ext: Object.keys(rest).length ? rest : null };
+  }
   return sessionId
-    ? { ...entry.payload, queued_staff_session_id: sessionId }
-    : { ...entry.payload };
+    ? { ...payload, queued_staff_session_id: sessionId }
+    : { ...payload };
 }
 
 /** Push one queued entry; classifies the server's answer. */
@@ -86,11 +119,15 @@ export async function syncEntry(
     const res = await fetch("/api/orders", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(flushBody(entry)),
+      body: JSON.stringify(flushBody(entry, { interactive: opts.interactive })),
     });
     if (res.ok) {
       await markSynced(entry.id);
-      return { status: "synced" };
+      const data = (await res.json().catch(() => null)) as {
+        order?: { order_number?: unknown };
+      } | null;
+      const n = data?.order?.order_number;
+      return typeof n === "string" ? { status: "synced", orderNumber: n } : { status: "synced" };
     }
     let message = `HTTP ${res.status}`;
     let code: string | undefined;
@@ -165,7 +202,7 @@ let flushing = false;
  * overlapping runs); skips orders the cashier is placing interactively.
  */
 export async function flushQueue(): Promise<FlushResult> {
-  const empty = { attempted: 0, synced: 0, failed: 0, needsAttention: 0 };
+  const empty: FlushResult = { attempted: 0, synced: 0, failed: 0, needsAttention: 0, numbered: [] };
   if (typeof window === "undefined") return empty;
   if (flushing) return empty;
   flushing = true;
@@ -173,6 +210,7 @@ export async function flushQueue(): Promise<FlushResult> {
   let synced = 0;
   let failed = 0;
   let attention = 0;
+  const numbered: FlushResult["numbered"] = [];
   try {
     const pending = await getPendingOrders();
     for (const snap of pending) {
@@ -183,8 +221,16 @@ export async function flushQueue(): Promise<FlushResult> {
       const entry = await getQueuedOrder(snap.id);
       if (!entry || !isFlushable(entry) || inFlight.has(entry.id)) continue;
       const outcome = await syncEntry(entry);
-      if (outcome.status === "synced") synced += 1;
-      else {
+      if (outcome.status === "synced") {
+        synced += 1;
+        if (outcome.orderNumber) {
+          numbered.push({
+            provisional:
+              entry.payload.core_ext?.provisional_label ?? entry.payload.order_number ?? null,
+            orderNumber: outcome.orderNumber,
+          });
+        }
+      } else {
         failed += 1;
         if (outcome.status === "needs_attention") attention += 1;
       }
@@ -194,6 +240,7 @@ export async function flushQueue(): Promise<FlushResult> {
       synced,
       failed,
       needsAttention: attention,
+      numbered,
     };
   } finally {
     flushing = false;

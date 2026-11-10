@@ -29,6 +29,25 @@ export type RealtimeListener<T> = (snapshot: RealtimeSnapshot<T>) => void;
 /** Tear down a subscription. Safe to call more than once. */
 export type Unsubscribe = () => void;
 
+/** Polling cadence (ignored by a push transport except as its fallback). */
+export interface RealtimeSubscribeOptions<T = unknown> {
+  /** Fixed poll interval (default 4 s). */
+  intervalMs?: number;
+  /**
+   * Back-off schedule instead of a fixed interval: the delays grow while the
+   * payload is unchanged (the last entry repeats) and restart on any change.
+   */
+  backoffMs?: readonly number[];
+  /**
+   * Keep updating while the tab is hidden: the poller polls at this slower
+   * interval (instead of pausing) and a push transport keeps refetching on
+   * changes. For screens that must alert while minimised (the KDS chime).
+   */
+  hiddenIntervalMs?: number;
+  /** What counts as "changed" for the back-off (default: the whole payload). */
+  changeKey?: (data: T) => string;
+}
+
 /**
  * A channel keyed by an opaque `topic` (e.g. `kds:<tenant>:<location>`). The
  * provider decides how to source data for that topic (poll an API now, listen
@@ -48,6 +67,6 @@ export interface RealtimeProvider {
     topic: string,
     fetcher: () => Promise<T>,
     listener: RealtimeListener<T>,
-    options?: { intervalMs?: number },
+    options?: RealtimeSubscribeOptions<T>,
   ): Unsubscribe;
 }

@@ -14,6 +14,7 @@ import type { DeliveryRecord } from "@/lib/db";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/pricing";
 import { driverAttention } from "@/lib/delivery/attention";
+import { startPolling } from "@/lib/realtime/visibility";
 
 interface DriverOption {
   id: string;
@@ -99,9 +100,9 @@ export function DeliveryDispatch({
   }, [tenantId, locationId]);
 
   useEffect(() => {
-    void load();
-    const h = setInterval(() => void load(), 5000);
-    return () => clearInterval(h);
+    // Every 5 s while the tab is visible (paused when hidden).
+    const poll = startPolling(load, 5000);
+    return () => poll.stop();
   }, [load]);
 
   async function assign(deliveryId: string) {

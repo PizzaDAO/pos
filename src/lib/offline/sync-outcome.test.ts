@@ -28,7 +28,7 @@ import {
   requeueWithoutDiscount,
   type QueuedStaff,
 } from "./queue";
-import { flushQueue, placeOrderNow, syncEntry } from "./sync";
+import { flushQueue, placeOrderNow, syncEntry, syncedOrderMessage } from "./sync";
 
 function payload(id: string, discount = 500): CreateOrderInput {
   return {
@@ -288,5 +288,40 @@ describe("resolved entries are never flipped back to needs_attention", () => {
     await syncEntry(entry("res-rej"));
     expect((await getQueuedOrder("res-rej"))?.status).toBe("rejected");
     expect(await getAttentionOrders()).toEqual([]);
+  });
+});
+
+describe("provisional label: only on queued replays", () => {
+  const withLabel = (id: string): CreateOrderInput => ({
+    ...payload(id, 0),
+    core_ext: { callout_name: "Al", provisional_label: "1405-123" },
+  });
+  const sentBody = (fn: ReturnType<typeof respond>) =>
+    JSON.parse(String(fn.mock.calls.at(-1)![1]!.body)) as CreateOrderInput;
+
+  it("an interactive (online) placement does not send the label", async () => {
+    const fn = respond(201, { order: { order_number: "A-0412" } });
+    const out = await placeOrderNow(withLabel("int-1"), null, true);
+    expect(out).toEqual({ status: "synced", orderNumber: "A-0412" });
+    expect(sentBody(fn).core_ext).toEqual({ callout_name: "Al" });
+  });
+
+  it("a background replay of a queued order keeps it, and reports the real number", async () => {
+    respond(503);
+    await placeOrderNow(withLabel("bg-lbl"), null, true); // failed: stays queued
+    const fn = respond(201, { order: { order_number: "A-0413" } });
+    const res = await flushQueue();
+    expect(sentBody(fn).core_ext?.provisional_label).toBe("1405-123");
+    expect(res.numbered).toEqual([{ provisional: "1405-123", orderNumber: "A-0413" }]);
+  });
+
+  it("the synced toast explains only a changed number", () => {
+    expect(syncedOrderMessage({ provisional: "1405-123", orderNumber: "A-0413" })).toEqual({
+      title: "Order A-0413 synced",
+      description: "Was 1405-123 while offline.",
+    });
+    expect(syncedOrderMessage({ provisional: "1405-123", orderNumber: "1405-123" })).toEqual({
+      title: "Order 1405-123 synced",
+    });
   });
 });

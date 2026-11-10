@@ -20,6 +20,7 @@ import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { giftCardsEnabled } from "@/lib/giftcards/limits";
 import { getStoredValueStore } from "@/lib/giftcards/store";
 import { captureError } from "@/lib/observability";
+import { isRangeBound, normaliseRangeBound } from "@/lib/reports";
 
 export const runtime = "nodejs";
 
@@ -34,6 +35,12 @@ export async function GET(request: Request) {
   const { tenantId, locationId } = auth;
   const from = searchParams.get("from");
   const to = searchParams.get("to");
+  if ((from && !isRangeBound(from)) || (to && !isRangeBound(to))) {
+    return NextResponse.json(
+      { error: "from / to must be yyyy-mm-dd or an ISO timestamp." },
+      { status: 400 },
+    );
+  }
 
   const report = await getPosDriver().getSalesReport(tenantId, locationId, {
     from: from || null,
@@ -43,9 +50,12 @@ export async function GET(request: Request) {
   if (report.stored_value && giftCardsEnabled()) {
     try {
       const store = await getStoredValueStore();
-      const fromIso = from ? `${from}T00:00:00.000Z` : "1970-01-01T00:00:00.000Z";
-      const toIso = to
-        ? new Date(Date.parse(`${to}T00:00:00.000Z`) + 86_400_000).toISOString()
+      // As dates: an ISO bound is reduced to its (UTC) date first.
+      const fromDay = normaliseRangeBound(from);
+      const toDay = normaliseRangeBound(to);
+      const fromIso = fromDay ? `${fromDay}T00:00:00.000Z` : "1970-01-01T00:00:00.000Z";
+      const toIso = toDay
+        ? new Date(Date.parse(`${toDay}T00:00:00.000Z`) + 86_400_000).toISOString()
         : "9999-12-31T00:00:00.000Z";
       const sum = await store.summary(tenantId, locationId, fromIso, toIso);
       report.stored_value.store_credit_issued_count = sum.store_credit_issued_count;

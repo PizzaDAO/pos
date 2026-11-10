@@ -52,3 +52,27 @@ export function safeKeyset(after: { created_at: string; id: string }): {
   }
   return { created_at: new Date(after.created_at).toISOString(), id: after.id };
 }
+
+/**
+ * Run `fn` over `items` in chunks of `size`, at most `concurrency` chunks at a
+ * time. Results come back in chunk order.
+ */
+export async function mapChunks<T, R>(
+  items: T[],
+  size: number,
+  fn: (chunk: T[]) => Promise<R>,
+  concurrency = 4,
+): Promise<R[]> {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  const out = new Array<R>(chunks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < chunks.length) {
+      const i = next++;
+      out[i] = await fn(chunks[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, worker));
+  return out;
+}

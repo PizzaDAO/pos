@@ -27,6 +27,19 @@ import { NextResponse } from "next/server";
 import { getPosDriver, type MembershipRole, type Order } from "@/lib/db";
 import { getCurrentUser, type SessionUser } from "./session";
 import { SURFACE_ROLES, type GatedSurface } from "./roles";
+import { requestMemo } from "./request-memo";
+
+/**
+ * Whether `locationId` belongs to `tenantId`. The tenant's location list is
+ * read once per request (src/lib/auth/request-memo.ts), however many guards
+ * the route runs.
+ */
+async function locationInTenant(tenantId: string, locationId: string): Promise<boolean> {
+  const locations = await requestMemo(`locations:${tenantId}`, () =>
+    getPosDriver().listLocations(tenantId),
+  );
+  return locations.some((l) => l.id === locationId);
+}
 
 /** A tenant surface name or an explicit list of permitted membership roles. */
 export type TenantAccess = Exclude<GatedSurface, "platform"> | MembershipRole[];
@@ -111,11 +124,8 @@ async function grantFor(
   if (!locationId && opts?.requireLocation) {
     return deny(400, "locationId is required.");
   }
-  if (locationId) {
-    const locations = await getPosDriver().listLocations(decision.tenantId);
-    if (!locations.some((l) => l.id === locationId)) {
-      return deny(403, "Location is not part of this tenant.");
-    }
+  if (locationId && !(await locationInTenant(decision.tenantId, locationId))) {
+    return deny(403, "Location is not part of this tenant.");
   }
   return {
     ok: true,
@@ -136,8 +146,7 @@ export async function requireLocationInTenant(
   tenantId: string,
   locationId: string,
 ): Promise<GuardFailure | null> {
-  const locations = await getPosDriver().listLocations(tenantId);
-  return locations.some((l) => l.id === locationId)
+  return (await locationInTenant(tenantId, locationId))
     ? null
     : deny(403, "Location is not part of this tenant.");
 }

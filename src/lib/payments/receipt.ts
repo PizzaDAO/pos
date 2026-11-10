@@ -8,7 +8,7 @@
  */
 import type { Order, OrderItem, Payment } from "@/lib/db";
 import { tenderRailLabel } from "./registry";
-import { orderTypeLabel } from "@/lib/till/order-meta";
+import { orderNumberLabel, orderTypeLabel } from "@/lib/till/order-meta";
 import {
   coveringBaseCents,
   isFullyRefunded,
@@ -215,7 +215,7 @@ export function buildReceipt(order: Order, payments: Payment[]): Receipt {
     })),
     refunds,
     fullyRefunded,
-    orderNumber: order.order_number,
+    orderNumber: orderNumberLabel(order),
     orderType: orderTypeLabel(order),
     customerName: order.core_ext?.callout_name ?? null,
     currency: order.currency,

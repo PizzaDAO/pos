@@ -12,14 +12,19 @@
  *  - The listener fires once immediately on subscribe (no wait for first tick).
  *  - In-flight ticks are de-duped: if a fetch is still running when the next
  *    interval fires, that tick is skipped (avoids pile-up on a slow network).
+ *  - Paused while the tab is hidden (src/lib/realtime/visibility.ts); ticks
+ *    again as soon as it is visible. `backoffMs` stretches the interval while
+ *    the payload is unchanged (customer tracking).
  *  - Errors are swallowed per-tick (a transient fetch failure shouldn't kill the
  *    subscription); the previous snapshot simply persists until the next success.
  */
 import type {
   RealtimeListener,
   RealtimeProvider,
+  RealtimeSubscribeOptions,
   Unsubscribe,
 } from "./provider";
+import { startPolling } from "./visibility";
 
 const DEFAULT_INTERVAL_MS = 4000;
 
@@ -31,11 +36,12 @@ export function createPollingProvider(): RealtimeProvider {
       _topic: string,
       fetcher: () => Promise<T>,
       listener: RealtimeListener<T>,
-      options?: { intervalMs?: number },
+      options?: RealtimeSubscribeOptions<T>,
     ): Unsubscribe {
       const intervalMs = options?.intervalMs ?? DEFAULT_INTERVAL_MS;
       let active = true;
       let inFlight = false;
+      let last: string | null = null;
 
       const tick = async () => {
         if (!active || inFlight) return;
@@ -43,6 +49,12 @@ export function createPollingProvider(): RealtimeProvider {
         try {
           const data = await fetcher();
           if (!active) return;
+          if (options?.backoffMs) {
+            // Back off while nothing changes; any change resets the schedule.
+            const key = options.changeKey ? options.changeKey(data) : JSON.stringify(data);
+            if (key !== last) handle.reset();
+            last = key;
+          }
           listener({ data, source: "poll", at: new Date().toISOString() });
         } catch {
           // Transient failure — keep the last good snapshot, retry next tick.
@@ -51,13 +63,15 @@ export function createPollingProvider(): RealtimeProvider {
         }
       };
 
-      // Fire immediately, then on the interval.
-      void tick();
-      const handle = setInterval(() => void tick(), intervalMs);
+      // Fire immediately, then on the interval (or back-off schedule), only
+      // while the page is visible.
+      const handle = startPolling(tick, options?.backoffMs ?? intervalMs, {
+        hiddenMs: options?.hiddenIntervalMs,
+      });
 
       return () => {
         active = false;
-        clearInterval(handle);
+        handle.stop();
       };
     },
   };

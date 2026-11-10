@@ -33,6 +33,7 @@ import {
   getServerSupabase,
   isSupabaseAuthConfigured,
 } from "./supabase-server";
+import { requestMemo } from "./request-memo";
 
 /** The resolved current user + their tenant access, derived from the session. */
 export interface SessionUser {
@@ -118,30 +119,9 @@ export async function getCurrentUser(opts?: {
 
   if (isSupabaseAuthConfigured()) {
     // ---- REAL MODE: identity comes from the Supabase auth cookie. ----
-    const supabase = await getServerSupabase();
-    if (!supabase) return null;
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return null;
-
-    const email = user.email ?? "";
-    // auth.uid() == public.users.id (identity bridge). Resolve access by id.
-    const [memberships, isPlatformAdmin, sessionRes] = await Promise.all([
-      driver.listMembershipsForUser(user.id),
-      driver.isPlatformAdmin(user.id),
-      // The token was just verified by getUser(); read its sign-in time.
-      supabase.auth.getSession().catch(() => null),
-    ]);
-    const token = sessionRes?.data?.session?.access_token ?? null;
-    return {
-      id: user.id,
-      email,
-      memberships,
-      isPlatformAdmin,
-      real: true,
-      authAt: authTimeFromAccessToken(token),
-    };
+    // Once per request: every guard a route runs shares one getUser() +
+    // memberships + platform-admin read (src/lib/auth/request-memo.ts).
+    return requestMemo("session-user", () => resolveRealUser());
   }
 
   // ---- SIMULATED MODE: derive a deterministic session from the seed. ----
@@ -163,6 +143,35 @@ export async function getCurrentUser(opts?: {
     memberships,
     isPlatformAdmin,
     real: false,
+  };
+}
+
+/** REAL MODE: the Supabase auth cookie's user + their access (uncached). */
+async function resolveRealUser(): Promise<SessionUser | null> {
+  const driver = getPosDriver();
+  const supabase = await getServerSupabase();
+  if (!supabase) return null;
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  const email = user.email ?? "";
+  // auth.uid() == public.users.id (identity bridge). Resolve access by id.
+  const [memberships, isPlatformAdmin, sessionRes] = await Promise.all([
+    driver.listMembershipsForUser(user.id),
+    driver.isPlatformAdmin(user.id),
+    // The token was just verified by getUser(); read its sign-in time.
+    supabase.auth.getSession().catch(() => null),
+  ]);
+  const token = sessionRes?.data?.session?.access_token ?? null;
+  return {
+    id: user.id,
+    email,
+    memberships,
+    isPlatformAdmin,
+    real: true,
+    authAt: authTimeFromAccessToken(token),
   };
 }
 

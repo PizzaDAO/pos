@@ -44,6 +44,9 @@ export interface UseKitchenBoardResult {
   refresh: () => Promise<void>;
 }
 
+/** KDS poll interval while the tab is hidden (it never stops). */
+export const KDS_HIDDEN_INTERVAL_MS = 15_000;
+
 export function useKitchenBoard(
   tenantId: string = DEMO_TENANT_ID,
   locationId: string = DEMO_LOCATION_DOWNTOWN_ID,
@@ -68,7 +71,9 @@ export function useKitchenBoard(
         setLastUpdated(snapshot.at);
         setLoading(false);
       },
-      { intervalMs },
+      // The board must keep updating (and chiming) on a minimised or
+      // background kitchen screen: slow 15 s poll while hidden, realtime stays live.
+      { intervalMs, hiddenIntervalMs: KDS_HIDDEN_INTERVAL_MS },
     );
     return unsubscribe;
   }, [tenantId, locationId, intervalMs]);

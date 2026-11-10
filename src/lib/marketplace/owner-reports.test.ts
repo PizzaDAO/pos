@@ -16,6 +16,7 @@ import {
   signSimulatedWebhook,
 } from "./adapters/simulator";
 import { SIMULATOR_DEV_SECRET } from "./env";
+import { locationBusinessDate } from "@/lib/reports";
 import { ingestMarketplaceWebhook, respondToMarketplaceOrder } from "./service";
 
 beforeEach(() => resetMockOrders());
@@ -45,7 +46,9 @@ describe("owner reports", () => {
     expect(reportChannel(order)).toBe("marketplace");
 
     const location = (await d.listLocations(T)).find((l) => l.id === L)!;
-    const day = order.created_at.slice(0, 10);
+    // The location's business date (its time zone + cutoff), not the UTC date:
+    // they differ in the evening, US time.
+    const day = locationBusinessDate(order.created_at, location);
     const bundle = buildOwnerBundle({
       tenantId: T,
       locationId: L,

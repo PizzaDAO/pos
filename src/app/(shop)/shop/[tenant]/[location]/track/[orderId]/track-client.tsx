@@ -20,6 +20,7 @@ import { formatMoney } from "@/lib/pricing";
 import { useOrderTracking } from "@/lib/store/use-order-tracking";
 import { useShop } from "@/lib/store/use-shop";
 import { storefrontPath, type StorefrontRef } from "@/lib/shop/storefront";
+import { startPolling } from "@/lib/realtime/visibility";
 
 /** Pickup vs delivery timelines (delivery adds out_for_delivery). */
 function steps(isDelivery: boolean): { status: OrderStatus; label: string }[] {
@@ -85,9 +86,9 @@ export function TrackClient({
       void fetch(`/api/shop/orders/${orderId}/pay/sync`, {
         method: "POST",
       }).catch(() => undefined);
-    sync();
-    const timer = setInterval(sync, 4000);
-    return () => clearInterval(timer);
+    // Paused while the tab is hidden.
+    const poll = startPolling(sync, 4000);
+    return () => poll.stop();
   }, [awaiting, orderId]);
 
   async function cancelCheckout() {

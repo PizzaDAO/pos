@@ -13,7 +13,7 @@
  */
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CreateOrderInput } from "@/lib/db";
 import {
   discardOrder,
@@ -25,7 +25,7 @@ import {
   type QueuedOrder,
   type QueuedStaff,
 } from "./queue";
-import { flushQueue, placeOrderNow, type SyncOutcome } from "./sync";
+import { flushQueue, placeOrderNow, type FlushResult, type SyncOutcome } from "./sync";
 
 export interface OfflineSyncState {
   online: boolean;
@@ -58,7 +58,16 @@ export interface OfflineSyncState {
 
 const POLL_MS = 5_000;
 
-export function useOfflineSync(): OfflineSyncState {
+/**
+ * `onBackgroundSynced`: called with the orders a BACKGROUND flush just synced
+ * and the numbers the server gave them (so the till can announce the real
+ * number of an order it queued offline).
+ */
+export function useOfflineSync(
+  onBackgroundSynced?: (numbered: FlushResult["numbered"]) => void,
+): OfflineSyncState {
+  const onSyncedRef = useRef(onBackgroundSynced);
+  onSyncedRef.current = onBackgroundSynced;
   const [online, setOnline] = useState(true);
   const [pendingCount, setPendingCount] = useState(0);
   const [attention, setAttention] = useState<QueuedOrder[]>([]);
@@ -77,7 +86,8 @@ export function useOfflineSync(): OfflineSyncState {
   }, []);
 
   const flushNow = useCallback(async () => {
-    await flushQueue();
+    const res = await flushQueue();
+    if (res.numbered.length) onSyncedRef.current?.(res.numbered);
     await refresh();
   }, [refresh]);
 
