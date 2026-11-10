@@ -67,11 +67,11 @@ function LineRow({ line }: { line: OrderItem }) {
         <ModifierList mods={grouped.whole} />
 
         {half && (
-          <div className="mt-1 grid grid-cols-2 gap-1 rounded border border-foreground/30 p-1">
-            <div className="border-r border-foreground/30 pr-1">
+          <div className="mt-1 grid grid-cols-1 gap-1 rounded border border-foreground/30 p-1">
+            <div className="border-b border-foreground/30 pb-1">
               <ModifierList label="Left" mods={grouped.left} />
             </div>
-            <div className="pl-1">
+            <div>
               <ModifierList label="Right" mods={grouped.right} />
             </div>
           </div>

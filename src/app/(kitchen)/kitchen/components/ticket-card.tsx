@@ -18,9 +18,10 @@ import { memo, useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { KdsThresholds } from "@/lib/db";
-import { ageLevelFor } from "@/lib/kds/board";
+import { ageLevelFor, hasKitchenWork } from "@/lib/kds/board";
 import { handoffLabel, isHandoffStatus, statusLabel } from "@/lib/kds/status";
 import { channelLabel, formatElapsed } from "@/lib/kds/format";
+import { orderTypeLabel } from "@/lib/till/order-meta";
 import type { AgeLevel, KitchenTicket, StationFilter } from "@/lib/kds/types";
 import { MarketplaceBadge } from "@/components/marketplace-badge";
 import { TicketItems } from "./ticket-items";
@@ -40,8 +41,12 @@ const AGE_STYLES: Record<AgeLevel, { card: string; header: string }> = {
   },
 };
 
+/** Dark mode: a calm green Bump, not a solid-white slab (glare on a dark wall). */
+const BUMP_DARK =
+  "dark:border dark:border-emerald-600 dark:bg-emerald-900 dark:text-emerald-50 dark:hover:bg-emerald-800";
+
 const READY_STYLE = {
-  card: "border-muted-foreground/40 opacity-80",
+  card: "border-muted-foreground/40",
   header: "bg-muted text-foreground",
 };
 
@@ -68,6 +73,7 @@ function TicketCardImpl({
   stationFilter,
   onBump,
   onRecall,
+  onNoPrepHandoff,
   busy,
 }: {
   ticket: KitchenTicket;
@@ -75,9 +81,18 @@ function TicketCardImpl({
   stationFilter: StationFilter;
   onBump: (orderId: string) => void;
   onRecall: (orderId: string) => void;
+  /** Hand off a drink-only ticket (no station has anything to make). */
+  onNoPrepHandoff: (orderId: string) => void;
   busy: boolean;
 }) {
   const { order } = ticket;
+  // Nothing for any station (e.g. just a soda): shown compact, hand off in one tap.
+  const noPrep =
+    !hasKitchenWork(order) &&
+    !isHandoffStatus(order.status) &&
+    order.status !== "recall";
+  const typeLabel = orderTypeLabel(order);
+  const customer = order.core_ext?.callout_name ?? null;
   const elapsed = useLiveElapsed(order.created_at);
   const ageLevel = ageLevelFor(elapsed, thresholds);
   const isBumped = isHandoffStatus(order.status);
@@ -89,7 +104,8 @@ function TicketCardImpl({
 
   return (
     <article
-      aria-label={`Order ${order.order_number}, ${statusLabel(order.status)}, ${channelLabel(order.channel)}`}
+      data-ticket=""
+      aria-label={`Order ${order.order_number}, ${statusLabel(order.status)}, ${typeLabel ?? channelLabel(order.channel)}${customer ? `, ${customer}` : ""}`}
       className={cn(
         "flex flex-col overflow-hidden rounded-lg border-2 bg-card shadow-sm",
         styles.card,
@@ -111,7 +127,10 @@ function TicketCardImpl({
               displayId={order.fulfillment.marketplace.display_id}
             />
           ) : (
-            <span>{channelLabel(order.channel)}</span>
+            <span>
+              {typeLabel ?? channelLabel(order.channel)}
+              {customer && <span className="ml-1 font-bold">· {customer}</span>}
+            </span>
           )}
           <span
             className={cn(
@@ -138,7 +157,25 @@ function TicketCardImpl({
       )}
 
       <div className="flex-1 px-3 py-2">
-        <TicketItems items={order.items} stationFilter={stationFilter} />
+        {noPrep && (
+          <p className="mb-1 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            No prep needed
+          </p>
+        )}
+        {noPrep ? (
+          <ul className="text-lg font-medium">
+            {order.items
+              .filter((i) => !i.voided)
+              .map((i) => (
+                <li key={i.id}>
+                  {i.quantity}× {i.item_name}
+                  {i.size_name ? ` · ${i.size_name}` : ""}
+                </li>
+              ))}
+          </ul>
+        ) : (
+          <TicketItems items={order.items} stationFilter={stationFilter} />
+        )}
         {order.notes && (
           <p className="mt-2 rounded bg-amber-50 px-2 py-1 text-sm font-medium text-amber-800">
             Order note: {order.notes}
@@ -147,10 +184,21 @@ function TicketCardImpl({
       </div>
 
       <footer className="flex gap-2 border-t p-2">
+        {noPrep && (
+          <Button
+            size="lg"
+            className={cn("h-14 flex-1 text-lg", BUMP_DARK)}
+            disabled={busy}
+            aria-label={`No prep: hand off order ${order.order_number}`}
+            onClick={() => onNoPrepHandoff(order.id)}
+          >
+            No prep: hand off
+          </Button>
+        )}
         {handoff && (
           <Button
             size="lg"
-            className="h-14 flex-1 text-lg"
+            className={cn("h-14 flex-1 text-lg", BUMP_DARK)}
             disabled={busy}
             aria-label={`${handoff}: hand off order ${order.order_number}`}
             onClick={() => onBump(order.id)}
@@ -158,7 +206,7 @@ function TicketCardImpl({
             {handoff}
           </Button>
         )}
-        {isBumped ? (
+        {noPrep ? null : isBumped ? (
           <Button
             variant="outline"
             size="lg"
@@ -172,7 +220,7 @@ function TicketCardImpl({
         ) : (
           <Button
             size="lg"
-            className="h-14 flex-1 text-lg"
+            className={cn("h-14 flex-1 text-lg", BUMP_DARK)}
             disabled={busy}
             aria-label={`Bump order ${order.order_number}`}
             onClick={() => onBump(order.id)}

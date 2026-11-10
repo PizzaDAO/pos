@@ -14,7 +14,7 @@ function escapeRe(s: string): string {
  * `rightTopping` on the Right half (a true half-and-half), and confirms.
  *
  * The builder is a role="dialog" with size buttons, single-select crust/sauce
- * (defaulted), and per-topping L/Whole/R segmented controls (aria-pressed).
+ * (defaulted), and per-topping tiles (Whole) with L / R toggles (aria-pressed).
  */
 export async function buildHalfAndHalf(
   page: Page,
@@ -49,25 +49,21 @@ export async function buildHalfAndHalf(
   await expect(dialog).toBeHidden();
 }
 
-/** Click the L/Whole/R placement button within a named topping row. */
+/**
+ * Place a topping: the topping tile (`data-topping`) is the Whole tap, with
+ * separate L / R half toggles (aria-pressed on whichever applied).
+ */
 async function placeTopping(
   page: Page,
   dialog: ReturnType<Page["getByRole"]>,
   topping: string,
   placement: "L" | "Whole" | "R",
 ): Promise<void> {
-  // Each topping is a bordered row: the topping name + a 3-button segmented
-  // control (L / Whole / R). Find the SMALLEST div that holds both the topping
-  // text and the placement button (the row), then click that button. Using the
-  // button's own aria-pressed to confirm the placement actually applied.
-  const row = dialog
-    .locator("div.rounded-lg.border")
-    .filter({ hasText: topping })
-    .filter({
-      has: page.getByRole("button", { name: placement, exact: true }),
-    })
-    .first();
-  const button = row.getByRole("button", { name: placement, exact: true });
+  const tile = dialog.locator(`[data-topping="${topping}"]`);
+  const button =
+    placement === "Whole"
+      ? tile.locator("button").first()
+      : tile.getByRole("button", { name: placement, exact: true });
   await button.click();
   await expect(button).toHaveAttribute("aria-pressed", "true");
 }

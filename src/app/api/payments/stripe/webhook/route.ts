@@ -340,11 +340,15 @@ async function handleRefundUpdate(account: string | undefined, refund: RefundObj
     await driver.transitionOrderStatus(order.id, [order.status], target);
   }
   if (record) {
-    // Allocations and status re-derived from what the tenders now show.
-    await refreshRefundRecord(tender.order_id, record.id, {
-      refund_failed: refund.id,
-      refund_failure: refund.failure_reason ?? refund.status,
-    });
+    // Allocations and status re-derived from what the tenders now show. The
+    // webhook never owns the request's execution claim: a till or the sweeper
+    // may be running it right now, so its claim is left alone.
+    await refreshRefundRecord(
+      tender.order_id,
+      record.id,
+      { refund_failed: refund.id, refund_failure: refund.failure_reason ?? refund.status },
+      { keepClaim: true },
+    );
   }
   if (restoredFrom === "voided") {
     captureError(new Error("refund failed on a VOIDED order: money is held again"), {

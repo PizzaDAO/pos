@@ -43,7 +43,24 @@ export function remainingCents(
   return Math.max(0, dueCents(order) - coveredCents(order, payments));
 }
 
-/** Settled (captured/authorized) base cents cover the amount due. */
+/**
+ * The base money a settled tender still HOLDS: its amount less what was
+ * refunded or is held by a pending refund (the tip absorbs a refund first, as
+ * the tip / base caps do). SQL: sv_order_settled_cents.
+ */
+export function heldBaseCents(
+  p: Pick<Payment, "amount_cents" | "tip_cents" | "refunded_cents" | "refund_reserved_cents">,
+): number {
+  const left = p.amount_cents + p.tip_cents - p.refunded_cents - (p.refund_reserved_cents ?? 0);
+  return Math.max(0, Math.min(p.amount_cents, left));
+}
+
+/**
+ * Settled (captured/authorized) base cents, NET of refunds, cover the amount
+ * due. A partially refunded sale tender counts only what it still holds, so a
+ * part-refunded, not-yet-settled sale never activates the card for the full
+ * amount. (What the order still OWES, `remainingCents`, is not netted.)
+ */
 export function isSettled(
   order: Pick<Order, "currency" | "totals">,
   payments: readonly Payment[],
@@ -53,6 +70,6 @@ export function isSettled(
       (p) =>
         sameCurrency(order, p) && (p.status === "captured" || p.status === "authorized"),
     )
-    .reduce((n, p) => n + p.amount_cents, 0);
+    .reduce((n, p) => n + heldBaseCents(p), 0);
   return settled >= dueCents(order);
 }

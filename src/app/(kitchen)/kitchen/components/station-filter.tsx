@@ -38,7 +38,7 @@ export function StationFilterBar({
             type="button"
             onClick={() => onChange(s.value)}
             className={cn(
-              "rounded-full border px-3 py-1.5 text-sm font-medium transition-colors",
+              "min-h-11 rounded-full border px-4 py-2 text-sm font-medium transition-colors touch-manipulation",
               active
                 ? "border-foreground bg-foreground text-background"
                 : "border-input bg-background hover:bg-accent",

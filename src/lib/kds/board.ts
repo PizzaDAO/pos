@@ -39,6 +39,18 @@ export function orderStations(order: Order): Station[] {
   return [...seen];
 }
 
+/**
+ * Whether an order has any line for a station, or fired food voided since. An
+ * order without (a drink-only one) stays on the board as a compact "No prep"
+ * ticket so it can still be handed off (ready/completed events, callbacks).
+ */
+export function hasKitchenWork(order: Order): boolean {
+  if (order.items.length === 0) return true; // nothing to judge by: leave it on the board
+  return order.items.some((i) =>
+    i.voided ? !!i.fired_at && lineStation(i) !== "none" : lineStation(i) !== "none",
+  );
+}
+
 /** Whether a line belongs to the given station filter. */
 export function lineMatchesStation(
   item: OrderItem,

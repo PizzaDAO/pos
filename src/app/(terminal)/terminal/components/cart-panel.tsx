@@ -11,6 +11,12 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { cn } from "@/lib/utils";
 import { computeOrderTotals, formatMoney } from "@/lib/pricing";
 import { useCartStore } from "@/lib/store/cart";
+import {
+  MAX_CUSTOMER_NAME,
+  ORDER_TYPE_LABELS,
+  TILL_UI_ORDER_TYPES,
+  type TillOrderType,
+} from "@/lib/till/order-meta";
 
 function placementLabel(placement: OrderItemModifier["placement"]): string {
   if (placement === "left") return " (L)";
@@ -32,6 +38,11 @@ export interface CartPanelProps {
   placing: boolean;
   /** Whether the active staff member may apply an order discount. */
   canDiscount?: boolean;
+  /** Order type + customer name taken at the till (shown on the KDS and receipt). */
+  orderType: TillOrderType | null;
+  onOrderType: (t: TillOrderType | null) => void;
+  customerName: string;
+  onCustomerName: (name: string) => void;
 }
 
 export function CartPanel({
@@ -40,6 +51,10 @@ export function CartPanel({
   onPlaceOrder,
   placing,
   canDiscount = false,
+  orderType,
+  onOrderType,
+  customerName,
+  onCustomerName,
 }: CartPanelProps) {
   const items = useCartStore((s) => s.items);
   const discountCents = useCartStore((s) => s.discountCents);
@@ -170,8 +185,40 @@ export function CartPanel({
         </ul>
       </div>
 
+      {/* Order type + name for call-out */}
+      <div className="space-y-2 border-t px-4 pt-3">
+        <div role="group" aria-label="Order type" className="grid grid-cols-2 gap-2">
+          {TILL_UI_ORDER_TYPES.map((t) => (
+            <button
+              key={t}
+              type="button"
+              aria-pressed={orderType === t}
+              onClick={() => onOrderType(orderType === t ? null : t)}
+              className={cn(
+                "min-h-11 rounded-lg border px-2 text-sm font-medium touch-manipulation",
+                orderType === t
+                  ? "border-primary bg-primary/10 ring-2 ring-primary"
+                  : "hover:bg-secondary",
+              )}
+            >
+              {ORDER_TYPE_LABELS[t]}
+            </button>
+          ))}
+        </div>
+        <input
+          type="text"
+          aria-label="Customer name"
+          autoComplete="off"
+          maxLength={MAX_CUSTOMER_NAME}
+          value={customerName}
+          onChange={(e) => onCustomerName(e.target.value)}
+          placeholder="Name for call-out (optional)"
+          className="min-h-11 w-full rounded-lg border bg-background px-3 text-base sm:text-sm"
+        />
+      </div>
+
       {/* Discount + totals */}
-      <div className="space-y-3 border-t p-4">
+      <div className="space-y-3 p-4 pt-3">
         {canDiscount && (
           <div className="flex items-center justify-between gap-2">
             <label htmlFor="discount" className="text-sm text-muted-foreground">
