@@ -41,6 +41,7 @@ import { isItemSoldOut, soldOutSets } from "@/lib/menu-availability";
 import { useActiveStaff } from "@/lib/store/use-active-staff";
 import { useOfflineSync } from "@/lib/offline/use-offline-sync";
 import type { QueuedStaff } from "@/lib/offline/queue";
+import { syncedOrderMessage } from "@/lib/offline/sync";
 import { OfflineQueuePanel } from "./offline-queue-panel";
 import { MenuBrowse } from "./menu-browse";
 import { StaffSwitch } from "./staff-switch";
@@ -116,11 +117,7 @@ export function TerminalClient({
   // gave it (the cashier only saw its provisional label).
   const sync = useOfflineSync((numbered) => {
     for (const n of numbered) {
-      toast({
-        title: `Order ${n.orderNumber} synced`,
-        description: n.provisional ? `Was ${n.provisional} while offline.` : undefined,
-        variant: "success",
-      });
+      toast({ ...syncedOrderMessage(n), variant: "success" });
     }
   });
   const { activeStaff, signOut: signOutStaff, verifyPin } = useActiveStaff();

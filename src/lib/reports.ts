@@ -163,9 +163,26 @@ export function normaliseRangeBound(
   bound: string | null,
   toDay: (iso: string) => string = isoDate,
 ): string | null {
-  if (!bound || YMD_RE.test(bound)) return bound;
+  if (!bound) return null;
+  if (isBusinessDate(bound)) return bound;
+  // Anything else unparseable is no bound (never a RangeError downstream).
+  if (!ISO_TS_RE.test(bound)) return null;
   const ms = Date.parse(bound);
-  return Number.isNaN(ms) ? bound : toDay(new Date(ms).toISOString());
+  return Number.isNaN(ms) ? null : toDay(new Date(ms).toISOString());
+}
+
+const ISO_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/** A real calendar date "yyyy-mm-dd" (2026-02-31 is not). */
+export function isBusinessDate(v: string): boolean {
+  if (!YMD_RE.test(v)) return false;
+  const ms = Date.parse(`${v}T00:00:00Z`);
+  return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === v;
+}
+
+/** A report range bound a route accepts: "yyyy-mm-dd" or a full ISO timestamp. */
+export function isRangeBound(v: string): boolean {
+  return isBusinessDate(v) || (ISO_TS_RE.test(v) && !Number.isNaN(Date.parse(v)));
 }
 
 /**

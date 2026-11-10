@@ -66,7 +66,7 @@ import {
   LiveTenderConflictError,
   PaymentSessionConflictError,
 } from "./payment-types";
-import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
+import { isLiveOrderStatus, isUnpaidOnlineStatus, OrderIdTakenError } from "./menu-types";
 import type { CreateOrderInput } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
@@ -1080,7 +1080,10 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     const existingRow = unwrap(
       await sb.from("orders").select("*").eq("id", input.id).maybeSingle(),
     ) as Row | null;
-    if (existingRow) return { order: await readOrderRow(existingRow), created: false };
+    if (existingRow) {
+      if (existingRow.tenant_id !== input.tenant_id) throw new OrderIdTakenError();
+      return { order: await readOrderRow(existingRow), created: false };
+    }
 
     const orderNumber =
       input.order_number ??
@@ -2180,6 +2183,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       let created: boolean;
       if (rpc.error && isMissingFunction(rpc.error)) {
         ({ order, created } = await createOrderLegacy(input));
+      } else if (rpc.error && /order id already in use/.test(rpc.error.message)) {
+        throw new OrderIdTakenError();
       } else {
         const res = unwrap(rpc) as {
           created: boolean;

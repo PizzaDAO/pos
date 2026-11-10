@@ -67,7 +67,7 @@ import {
   tenderHoldsOpenSlot,
 } from "./payment-types";
 import { applyCustomerIdentity } from "./customer-identity";
-import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
+import { isLiveOrderStatus, isUnpaidOnlineStatus, OrderIdTakenError } from "./menu-types";
 import type {
   Customer,
   CustomerIdentityWrite,
@@ -1352,7 +1352,11 @@ export const mockDriver: PosDriver = {
 
   async createOrder(input: CreateOrderInput): Promise<Order> {
     const existing = orders.get(input.id);
-    if (existing) return existing;
+    if (existing) {
+      // Same as create_order_with_lines: an id is never shared across tenants.
+      if (existing.tenant_id !== input.tenant_id) throw new OrderIdTakenError();
+      return existing;
+    }
 
     const now = nowIso();
     // Same numbering as create_order_with_lines: a client number is kept only

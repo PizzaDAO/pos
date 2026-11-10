@@ -22,7 +22,7 @@ import { getPosDriver, type Location, type SalesReport } from "@/lib/db";
 import { requireAdminAccess } from "@/lib/auth/admin-gate";
 import { eodDrawerSummary, reportCashCents } from "@/lib/eod-drawer";
 import { isMoneyCents } from "@/lib/security";
-import { locationBusinessDate } from "@/lib/reports";
+import { isBusinessDate, locationBusinessDate } from "@/lib/reports";
 
 export const runtime = "nodejs";
 
@@ -90,7 +90,11 @@ export async function GET(request: Request) {
   const tenantId = auth.tenantId;
   const locationId = auth.locationId as string;
   const driver = getPosDriver();
-  const date = searchParams.get("date") ?? (await todayAt(tenantId, locationId));
+  const dateParam = searchParams.get("date");
+  if (dateParam !== null && !isBusinessDate(dateParam)) {
+    return NextResponse.json({ error: "date must be yyyy-mm-dd." }, { status: 400 });
+  }
+  const date = dateParam ?? (await todayAt(tenantId, locationId));
   const close = await driver.getBusinessDayClose(tenantId, locationId, date);
   if (close) return NextResponse.json({ close, closed: true });
 
@@ -132,6 +136,9 @@ export async function POST(request: Request) {
       { error: "countedCents must be non-negative integer cents." },
       { status: 422 },
     );
+  }
+  if (body.date !== undefined && (typeof body.date !== "string" || !isBusinessDate(body.date))) {
+    return NextResponse.json({ error: "date must be yyyy-mm-dd." }, { status: 400 });
   }
   const driver = getPosDriver();
   const date = body.date ?? (await todayAt(body.tenantId, body.locationId));

@@ -15,7 +15,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PosDriver } from "@/lib/db/driver";
 import type { CreateOrderInput } from "@/lib/db";
-import { KDS_ACTIVE_STATUSES } from "@/lib/db/menu-types";
+import { KDS_ACTIVE_STATUSES, OrderIdTakenError } from "@/lib/db/menu-types";
 
 const PGLITE = process.env.PGLITE ? resolve(process.env.PGLITE) : null;
 const ROOT = resolve(__dirname, "../../..");
@@ -348,7 +348,7 @@ describe.skipIf(!PGLITE)("data-layer fixes through the Supabase driver on PGlite
       await db.query("insert into public.locations (id, tenant_id, name, slug) values ($1, $2, 'L', 'l')", [l2, t2]);
       await expect(
         driver.createOrder({ ...input, tenant_id: t2, location_id: l2 }),
-      ).rejects.toThrow(/already in use/);
+      ).rejects.toBeInstanceOf(OrderIdTakenError);
     });
 
     it("widens past 9999 instead of truncating (A-9999, A-10000, A-10001)", async () => {

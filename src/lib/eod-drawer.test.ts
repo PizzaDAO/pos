@@ -111,6 +111,24 @@ describe("/api/admin/eod", () => {
   beforeEach(() => resetMockOrders());
   const DAY = "2031-01-15";
 
+  it("rejects a malformed date with 400 (not a 500)", async () => {
+    for (const bad of ["garbage", "2026-02-31", "2026-11-09T00:00:00Z"]) {
+      const g = await GET(
+        new Request(
+          `http://x/api/admin/eod?tenantId=${DEMO_TENANT_ID}&locationId=${DEMO_LOCATION_DOWNTOWN_ID}&date=${encodeURIComponent(bad)}`,
+        ),
+      );
+      expect(g.status).toBe(400);
+      const p = await POST(
+        new Request("http://x/api/admin/eod", {
+          method: "POST",
+          body: JSON.stringify({ tenantId: DEMO_TENANT_ID, locationId: DEMO_LOCATION_DOWNTOWN_ID, date: bad }),
+        }),
+      );
+      expect(p.status).toBe(400);
+    }
+  });
+
   it("GET previews the drawer; POST freezes the counted cash and over/short", async () => {
     const pre = await GET(
       new Request(

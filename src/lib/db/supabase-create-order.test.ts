@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from "vitest";
 /** Minimal chainable fake of the supabase-js query builder, recording ops. */
 const ops: { table: string; op: string }[] = [];
 let deleteError: { message: string } | null = null;
+let existingOrder: Record<string, unknown> | null = null;
 let rpcResult: unknown = null;
 const rpcCalls: { name: string; args: unknown }[] = [];
 const captured: unknown[] = [];
@@ -39,6 +40,9 @@ function fakeClient() {
       c.then = (res: (v: unknown) => unknown, rej: (e: unknown) => unknown) => {
         ops.push({ table, op });
         let result: unknown = { data: null, error: null, count: 0 };
+        if (table === "orders" && op === "select" && existingOrder) {
+          result = { data: existingOrder, error: null };
+        }
         if (table === "orders" && op === "insert") {
           result = { data: { id: "ord-1" }, error: null };
         }
@@ -60,6 +64,7 @@ vi.mock("@supabase/supabase-js", () => ({
 }));
 
 import { createSupabaseDriver } from "@/lib/db/supabase";
+import { OrderIdTakenError } from "@/lib/db/menu-types";
 
 describe("supabase createOrder is not left half-written (pre-migration fallback)", () => {
   it("deletes the order row when writing its lines fails", async () => {
@@ -138,6 +143,15 @@ const order = {
   },
   notes: null,
 };
+
+describe("pre-migration fallback refuses another tenant's order id", () => {
+  it("throws OrderIdTakenError instead of returning the other tenant's order", async () => {
+    existingOrder = { id: "ord-2", tenant_id: "other-tenant", location_id: "lx" };
+    const driver = createSupabaseDriver({ url: "http://x", key: "k" });
+    await expect(driver.createOrder(order)).rejects.toBeInstanceOf(OrderIdTakenError);
+    existingOrder = null;
+  });
+});
 
 describe("rollback failure is reported", () => {
   it("captures + logs when the compensating delete itself fails", async () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildSalesReport, inRange, locationBusinessDate, normaliseRangeBound } from "@/lib/reports";
+import { buildSalesReport, inRange, isRangeBound, locationBusinessDate, normaliseRangeBound } from "@/lib/reports";
 import type { Order, OrderItem, Payment } from "@/lib/db";
 
 const RANGE = { from: "2026-06-01", to: "2026-06-30" };
@@ -311,5 +311,21 @@ describe("inRange with timestamp bounds", () => {
     // 23:30Z on Nov 9 = 18:30 in New York on Nov 9.
     expect(inRange(order, { from: "2026-11-10T03:00:00.000Z", to: null }, dayOf, bound)).toBe(true);
     expect(normaliseRangeBound("2026-11-10T03:00:00.000Z", bound)).toBe("2026-11-09");
+  });
+});
+
+describe("range bound validation", () => {
+  it("accepts dates and ISO timestamps, nothing else", () => {
+    expect(isRangeBound("2026-11-09")).toBe(true);
+    expect(isRangeBound("2026-11-09T05:00:00.000Z")).toBe(true);
+    expect(isRangeBound("2026-11-09T05:00:00-05:00")).toBe(true);
+    for (const bad of ["garbage", "2026-02-31", "11/09/2026", "2026-11-09T99:00:00Z", ""]) {
+      expect(isRangeBound(bad), bad).toBe(false);
+    }
+  });
+  it("an unparseable bound is no bound, never a RangeError", () => {
+    expect(normaliseRangeBound("garbage")).toBeNull();
+    expect(normaliseRangeBound("2026-02-31")).toBeNull();
+    expect(normaliseRangeBound("2026-11-09T99:00:00Z")).toBeNull();
   });
 });

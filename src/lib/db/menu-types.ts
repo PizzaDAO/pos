@@ -643,3 +643,15 @@ export interface CreateOrderInput {
   /** Comps + discounts applied at creation (Σ = discount_cents). */
   adjustments?: OrderAdjustment[] | null;
 }
+
+/**
+ * createOrder with an order id that already belongs to ANOTHER tenant (ids are
+ * client UUIDs, so this is a collision or a probe, never a retry). Maps to
+ * HTTP 409.
+ */
+export class OrderIdTakenError extends Error {
+  constructor() {
+    super("Order id already in use.");
+    this.name = "OrderIdTakenError";
+  }
+}

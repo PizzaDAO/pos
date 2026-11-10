@@ -18,7 +18,7 @@
  */
 import { scheduleAutoPrint } from "@/lib/printing/queue";
 import { NextResponse } from "next/server";
-import { getPosDriver, type CreateOrderInput } from "@/lib/db";
+import { getPosDriver, OrderIdTakenError, type CreateOrderInput } from "@/lib/db";
 import { requireTenantMember, requireTenantRole } from "@/lib/auth/api";
 import {
   requireLocationInTenant,
@@ -250,6 +250,11 @@ export async function POST(request: Request) {
     });
     return NextResponse.json({ order }, { status: 201, headers });
   } catch (err) {
+    // A concurrent create of the same id by another tenant (the check above
+    // raced): a conflict, not a server error.
+    if (err instanceof OrderIdTakenError) {
+      return NextResponse.json({ error: err.message }, { status: 409, headers });
+    }
     captureError(err, {
       requestId,
       scope: "orders",
