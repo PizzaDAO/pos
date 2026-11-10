@@ -67,6 +67,7 @@ import {
   PaymentSessionConflictError,
 } from "./payment-types";
 import { isLiveOrderStatus, isUnpaidOnlineStatus } from "./menu-types";
+import type { CreateOrderInput } from "./menu-types";
 import type { Customer, DeliveryRecord } from "./customer-types";
 import type {
   BusinessDayClose,
@@ -113,7 +114,7 @@ import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
 import { buildSalesReport, locationBusinessDate } from "@/lib/reports";
 import { EMPTY_BUNDLE, type OwnerReportBundle } from "@/lib/owner-reports";
-import { fetchAllPages, safeKeyset } from "./paging";
+import { fetchAllPages, mapChunks, safeKeyset } from "./paging";
 
 // ---------------------------------------------------------------------------
 // Config + client construction (lazy; never at module load).
@@ -146,6 +147,15 @@ function genUuid(): string {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** PostgREST / Postgres "no such function" (a migration not applied yet). */
+function isMissingFunction(err: { code?: string; message?: string }): boolean {
+  return (
+    err.code === "PGRST202" ||
+    err.code === "42883" ||
+    /could not find the function/i.test(err.message ?? "")
+  );
 }
 
 /** Slugify a name into a URL-safe base slug (uniqueness handled by caller). */
@@ -667,43 +677,129 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     return res.data as T;
   }
 
+  /**
+   * Every row of a tenant-scoped table, paged over a stable total order (each
+   * column of `order`, comma separated). PostgREST caps a response at max_rows
+   * (~1000), so an unpaged select silently truncates.
+   */
+  const tenantRows = (
+    table: string,
+    cols: string,
+    order: string,
+    tenantId: string,
+    extra?: { column: string; value: string },
+  ) =>
+    fetchAllPages<Row>(async (from, to) => {
+      let q = sb.from(table).select(cols).eq("tenant_id", tenantId);
+      if (extra) q = q.eq(extra.column, extra.value);
+      for (const o of order.split(",")) q = q.order(o.trim());
+      return unwrap(await q.range(from, to)) as unknown as Row[];
+    });
+
+  /**
+   * Assembled menus, per instance: (tenant, location, includeUnavailable) ->
+   * menu at a `menu_versions` version. Every getMenu reads the version first
+   * (one indexed row) and reuses the menu only when it is unchanged and young;
+   * any write to a menu table bumps it (statement triggers, migration
+   * 20261114000010). No version table (migration not applied) = no caching.
+   */
+  const MENU_CACHE_TTL_MS = 60_000;
+  const MENU_CACHE_MAX = 500;
+  const menuCache = new Map<string, { version: number; at: number; menu: Menu }>();
+
+  async function menuVersion(tenantId: string): Promise<number | null> {
+    try {
+      const res = await sb
+        .from("menu_versions")
+        .select("version")
+        .eq("tenant_id", tenantId)
+        .maybeSingle();
+      if (res.error) return null;
+      return Number((res.data as Row | null)?.version ?? 0);
+    } catch {
+      return null;
+    }
+  }
+
+  async function getMenuCached(
+    tenantId: string,
+    locationId: string,
+    includeUnavailable = false,
+  ): Promise<Menu> {
+    const key = `${tenantId}:${locationId}:${includeUnavailable ? 1 : 0}`;
+    // Read the version BEFORE the menu: a write that lands in between makes
+    // the next call see a newer version and rebuild.
+    const version = await menuVersion(tenantId);
+    const hit = menuCache.get(key);
+    if (
+      version !== null &&
+      hit &&
+      hit.version === version &&
+      Date.now() - hit.at < MENU_CACHE_TTL_MS
+    ) {
+      return structuredClone(hit.menu);
+    }
+    const menu = await assembleMenu(tenantId, locationId, includeUnavailable);
+    if (version !== null) {
+      menuCache.delete(key);
+      if (menuCache.size >= MENU_CACHE_MAX) {
+        const oldest = menuCache.keys().next().value;
+        if (oldest !== undefined) menuCache.delete(oldest);
+      }
+      menuCache.set(key, { version, at: Date.now(), menu: structuredClone(menu) });
+    }
+    return menu;
+  }
+
   // -- Menu assembly (mirrors mock.assembleMenu, folding overrides + 86) ------
+  // Every read is scoped to the tenant (sizes / links by its item ids,
+  // modifiers by its group ids) and paged, so the result never depends on how
+  // many rows OTHER tenants have.
   async function assembleMenu(
     tenantId: string,
     locationId: string,
     includeUnavailable = false,
   ): Promise<Menu> {
-    const [cats, items, sizes, groups, mods, links, overrides] =
-      await Promise.all([
-        sb
-          .from("menu_categories")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .order("sort_order"),
-        sb.from("menu_items").select("*").eq("tenant_id", tenantId),
-        sb.from("item_sizes").select("*"),
-        sb.from("modifier_groups").select("*").eq("tenant_id", tenantId),
-        sb.from("modifiers").select("*"),
-        sb.from("item_modifier_groups").select("*"),
-        sb
-          .from("location_menu_overrides")
-          .select("*")
-          .eq("tenant_id", tenantId)
-          .eq("location_id", locationId),
-      ]);
+    const [categoryRows, itemRows, groupRows, overrideRaw] = await Promise.all([
+      tenantRows("menu_categories", "*", "sort_order,id", tenantId),
+      tenantRows("menu_items", "*", "id", tenantId),
+      tenantRows("modifier_groups", "*", "id", tenantId),
+      tenantRows("location_menu_overrides", "*", "id", tenantId, {
+        column: "location_id",
+        value: locationId,
+      }),
+    ]);
+    const itemIds = itemRows.map((r) => r.id as string);
+    const groupIds = groupRows.map((r) => r.id as string);
+    const [sizeRows, linkRows, modRows] = await Promise.all([
+      selectIn("item_sizes", "item_id", itemIds),
+      selectIn("item_modifier_groups", "item_id", itemIds, "group_id"),
+      selectIn("modifiers", "group_id", groupIds),
+    ]);
+    const overrideRows = overrideRaw.map(mapOverride);
 
-    const categoryRows = unwrap(cats) as Row[];
-    const itemRows = unwrap(items) as Row[];
-    const sizeRows = unwrap(sizes) as Row[];
-    const groupRows = unwrap(groups) as Row[];
-    const modRows = unwrap(mods) as Row[];
-    const linkRows = unwrap(links) as Row[];
-    const overrideRows = (unwrap(overrides) as Row[]).map(mapOverride);
-
+    const overrides = new Map<string, LocationMenuOverride>();
+    for (const o of overrideRows) overrides.set(`${o.target_type}:${o.target_id}`, o);
     const ov = (type: OverrideTargetType, targetId: string) =>
-      overrideRows.find(
-        (o) => o.target_type === type && o.target_id === targetId,
-      );
+      overrides.get(`${type}:${targetId}`);
+
+    const bySortOrder = (a: Row, b: Row) =>
+      (a.sort_order as number) - (b.sort_order as number);
+    const groupBy = (rows: Row[], col: string) => {
+      const out = new Map<string, Row[]>();
+      for (const r of rows) {
+        const k = r[col] as string;
+        const list = out.get(k);
+        if (list) list.push(r);
+        else out.set(k, [r]);
+      }
+      for (const list of out.values()) list.sort(bySortOrder);
+      return out;
+    };
+    const sizesByItem = groupBy(sizeRows, "item_id");
+    const linksByItem = groupBy(linkRows, "item_id");
+    const modsByGroup = groupBy(modRows, "group_id");
+    const groupsById = new Map(groupRows.map((g) => [g.id as string, g]));
 
     const buildItemDetail = (itemRow: Row): MenuItemDetail => {
       const item: MenuItem = {
@@ -715,30 +811,21 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         is_half_and_half_capable: itemRow.is_half_and_half_capable as boolean,
         station: itemRow.station as MenuItem["station"],
       };
-      const itemSizes: ItemSize[] = sizeRows
-        .filter((s) => s.item_id === item.id)
-        .sort((a, b) => (a.sort_order as number) - (b.sort_order as number))
-        .map((s) => {
-          const o = ov("size", s.id as string);
-          return {
-            id: s.id as string,
-            item_id: s.item_id as string,
-            name: s.name as string,
-            price_cents:
-              o?.price_cents != null
-                ? o.price_cents
-                : (s.price_cents as number),
-            sort_order: s.sort_order as number,
-          };
-        });
+      const itemSizes: ItemSize[] = (sizesByItem.get(item.id) ?? []).map((s) => {
+        const o = ov("size", s.id as string);
+        return {
+          id: s.id as string,
+          item_id: s.item_id as string,
+          name: s.name as string,
+          price_cents:
+            o?.price_cents != null ? o.price_cents : (s.price_cents as number),
+          sort_order: s.sort_order as number,
+        };
+      });
 
-      const groupLinks = linkRows
-        .filter((l) => l.item_id === item.id)
-        .sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
-
-      const modifierGroups: MenuModifierGroup[] = groupLinks
+      const modifierGroups: MenuModifierGroup[] = (linksByItem.get(item.id) ?? [])
         .map((link) => {
-          const g = groupRows.find((x) => x.id === link.group_id);
+          const g = groupsById.get(link.group_id as string);
           if (!g) return null;
           const group: ModifierGroup = {
             id: g.id as string,
@@ -748,14 +835,12 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
             max_select: g.max_select as number,
             supports_half: g.supports_half as boolean,
           };
-          const groupMods: Modifier[] = modRows
-            .filter((m) => m.group_id === group.id)
+          const groupMods: Modifier[] = (modsByGroup.get(group.id) ?? [])
             .filter(
               (m) =>
                 includeUnavailable ||
                 ov("modifier", m.id as string)?.available !== false,
             )
-            .sort((a, b) => (a.sort_order as number) - (b.sort_order as number))
             .map((m) => {
               const o = ov("modifier", m.id as string);
               return {
@@ -776,9 +861,15 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return { ...item, sizes: itemSizes, modifierGroups };
     };
 
+    const itemsByCategory = new Map<string, Row[]>();
+    for (const i of itemRows) {
+      const k = i.category_id as string;
+      const list = itemsByCategory.get(k);
+      if (list) list.push(i);
+      else itemsByCategory.set(k, [i]);
+    }
     const categories: MenuCategoryWithItems[] = categoryRows.map((c) => {
-      const catItems = itemRows
-        .filter((i) => i.category_id === c.id)
+      const catItems = (itemsByCategory.get(c.id as string) ?? [])
         .filter(
           (i) =>
             includeUnavailable ||
@@ -805,6 +896,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
   /**
    * Chunked `in` query that PAGES each chunk with `.range()` over a stable total
    * order (parent column, then id), so nothing past PostgREST's row cap is lost.
+   * Chunks run a few at a time in parallel (results keep chunk order).
    * Callers re-sort in memory when they need a business order (sort_order, ...).
    */
   async function selectIn(
@@ -813,24 +905,20 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     ids: string[],
     tieBreak = "id",
   ): Promise<Row[]> {
-    const out: Row[] = [];
-    for (let i = 0; i < ids.length; i += 100) {
-      const chunk = ids.slice(i, i + 100);
-      out.push(
-        ...(await fetchAllPages<Row>(async (from, to) =>
-          unwrap(
-            await sb
-              .from(table)
-              .select("*")
-              .in(column, chunk)
-              .order(column)
-              .order(tieBreak)
-              .range(from, to),
-          ) as Row[],
-        )),
-      );
-    }
-    return out;
+    const chunks = await mapChunks(ids, 100, (chunk) =>
+      fetchAllPages<Row>(async (from, to) =>
+        unwrap(
+          await sb
+            .from(table)
+            .select("*")
+            .in(column, chunk)
+            .order(column)
+            .order(tieBreak)
+            .range(from, to),
+        ) as Row[],
+      ),
+    );
+    return chunks.flat();
   }
 
   /** Batch order-graph read: 2 queries per 100 orders, not 2 per order. */
@@ -841,13 +929,18 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       "order_id",
       orderRows.map((r) => r.id as string),
     );
-    itemRows.sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
     const modRows = await selectIn(
       "order_item_modifiers",
       "order_item_id",
       itemRows.map((r) => r.id as string),
     );
-    modRows.sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
+    return assembleOrders(orderRows, itemRows, modRows);
+  }
+
+  /** Fold order rows + their item and modifier rows into `Order`s. */
+  function assembleOrders(orderRows: Row[], itemRows: Row[], modRows: Row[]): Order[] {
+    itemRows = [...itemRows].sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
+    modRows = [...modRows].sort((a, b) => (a.sort_order as number) - (b.sort_order as number));
     const modsByItem = new Map<string, Row[]>();
     for (const m of modRows) {
       const k = m.order_item_id as string;
@@ -892,12 +985,8 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     });
   }
 
-  /** Write an order's line items + modifiers (delete-then-insert children). */
-  async function writeOrderItems(
-    orderId: string,
-    items: OrderItem[],
-  ): Promise<void> {
-    // Children cascade on order delete, but on a fresh insert there are none.
+  /** The order_items + order_item_modifiers rows for an order's lines. */
+  function orderLineRows(orderId: string, items: OrderItem[]) {
     const itemRows = items.map((line, idx) => ({
       id: line.id,
       order_id: orderId,
@@ -914,9 +1003,6 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       line_total_cents: line.line_total_cents,
       sort_order: idx,
     }));
-    if (itemRows.length > 0) {
-      unwrap(await sb.from("order_items").insert(itemRows).select());
-    }
     const modRows = items.flatMap((line) =>
       line.modifiers.map((m, idx) => ({
         id: genUuid(),
@@ -930,9 +1016,97 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
         sort_order: idx,
       })),
     );
+    return { itemRows, modRows };
+  }
+
+  /** Write an order's line items + modifiers (fresh insert: there are none yet). */
+  async function writeOrderItems(
+    orderId: string,
+    items: OrderItem[],
+  ): Promise<void> {
+    const { itemRows, modRows } = orderLineRows(orderId, items);
+    if (itemRows.length > 0) {
+      unwrap(await sb.from("order_items").insert(itemRows).select());
+    }
     if (modRows.length > 0) {
       unwrap(await sb.from("order_item_modifiers").insert(modRows).select());
     }
+  }
+
+  /** The order header row createOrder inserts. */
+  function orderInsertRow(input: CreateOrderInput, orderNumber: string | null) {
+    const now = nowIso();
+    return {
+      id: input.id,
+      tenant_id: input.tenant_id,
+      location_id: input.location_id,
+      status: input.status ?? "placed",
+      channel: input.channel,
+      currency: input.currency,
+      discount_cents: input.discount_cents,
+      totals: input.totals,
+      notes: input.notes,
+      order_number: orderNumber,
+      customer_id: input.customer_id ?? null,
+      staff_id: input.staff_id ?? null,
+      fulfillment: input.fulfillment ?? null,
+      source: input.source ?? null,
+      hold: input.hold ?? null,
+      // Only sent when set, so shop and terminal inserts keep working on a
+      // database that predates the column.
+      ...(input.core_ext ? { core_ext: input.core_ext } : {}),
+      // Same: only with comps/discounts (migration 20261113001000).
+      ...(input.adjustments?.length ? { adjustments: input.adjustments } : {}),
+      created_at: now,
+      updated_at: now,
+    };
+  }
+
+  /**
+   * Pre-20261114000000 path (no create_order_with_lines RPC yet): insert the
+   * order, then its lines, compensating with a delete if the lines fail.
+   */
+  async function createOrderLegacy(input: CreateOrderInput): Promise<{ order: Order; created: boolean }> {
+    const existingRow = unwrap(
+      await sb.from("orders").select("*").eq("id", input.id).maybeSingle(),
+    ) as Row | null;
+    if (existingRow) return { order: await readOrderRow(existingRow), created: false };
+
+    const orderNumber =
+      input.order_number ??
+      (await nextOrderNumberLegacy(input.tenant_id, input.location_id));
+    const orderRow = unwrap(
+      await sb
+        .from("orders")
+        .insert(orderInsertRow(input, orderNumber))
+        .select()
+        .single(),
+    ) as Row;
+    // PostgREST has no multi-statement transaction, so the order + its lines
+    // are not atomic here. Compensate: if writing the lines fails, delete the
+    // order row (its children cascade) so a failed insert can never leave an
+    // item-less `placed` order on the KDS, then surface the error.
+    try {
+      await writeOrderItems(input.id, input.items);
+    } catch (err) {
+      const { error: delErr } = await sb
+        .from("orders")
+        .delete()
+        .eq("id", input.id);
+      if (delErr) {
+        // The rollback itself failed: an item-less order may remain. Log it
+        // loudly (and to the error sink) so it can be cleaned up.
+        captureError(new Error(`createOrder rollback failed: ${delErr.message}`), {
+          scope: "createOrder",
+          orderId: input.id,
+        });
+        console.error(
+          `[createOrder] rollback delete failed for order ${input.id}: ${delErr.message}`,
+        );
+      }
+      throw err;
+    }
+    return { order: await readOrderRow(orderRow), created: true };
   }
 
   // -- Inventory movement (read level, apply delta, write ledger) -------------
@@ -1123,11 +1297,11 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     };
   }
 
-  async function nextOrderNumber(
+  /** Pre-migration numbering: A-#### from the location's order count (racy). */
+  async function nextOrderNumberLegacy(
     tenantId: string,
     locationId: string,
   ): Promise<string> {
-    // Sequential A-#### per location, derived from the current order count.
     const { count } = await sb
       .from("orders")
       .select("id", { count: "exact", head: true })
@@ -1723,7 +1897,7 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
     },
 
     async getMenu(tenantId, locationId, opts) {
-      return assembleMenu(tenantId, locationId, opts?.includeUnavailable);
+      return getMenuCached(tenantId, locationId, opts?.includeUnavailable);
     },
 
     async getStoreSettings(tenantId, locationId) {
@@ -1979,74 +2153,32 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     // -- Orders ------------------------------------------------------------
     async createOrder(input) {
-      const existingRow = unwrap(
-        await sb.from("orders").select("*").eq("id", input.id).maybeSingle(),
-      ) as Row | null;
-      if (existingRow) return readOrderRow(existingRow);
-
-      const now = nowIso();
-      const orderNumber =
-        input.order_number ??
-        (await nextOrderNumber(input.tenant_id, input.location_id));
-      const status = input.status ?? "placed";
-      const orderRow = unwrap(
-        await sb
-          .from("orders")
-          .insert({
-            id: input.id,
-            tenant_id: input.tenant_id,
-            location_id: input.location_id,
-            status,
-            channel: input.channel,
-            currency: input.currency,
-            discount_cents: input.discount_cents,
-            totals: input.totals,
-            notes: input.notes,
-            order_number: orderNumber,
-            customer_id: input.customer_id ?? null,
-            staff_id: input.staff_id ?? null,
-            fulfillment: input.fulfillment ?? null,
-            source: input.source ?? null,
-            hold: input.hold ?? null,
-            // Only sent when set, so shop and terminal inserts keep working on a
-            // database that predates the column.
-            ...(input.core_ext ? { core_ext: input.core_ext } : {}),
-            // Same: only with comps/discounts (migration 20261113001000).
-            ...(input.adjustments?.length ? { adjustments: input.adjustments } : {}),
-            created_at: now,
-            updated_at: now,
-          })
-          .select()
-          .single(),
-      ) as Row;
-      // PostgREST has no multi-statement transaction, so the order + its lines
-      // are not atomic by themselves. Compensate: if writing the lines fails,
-      // delete the order row (its children cascade) so a failed insert can never
-      // leave an item-less `placed` order on the KDS, then surface the error.
-      // (Chosen over an RPC to avoid a new SQL function + migration that cannot
-      // be exercised without a live database; the client's retry is idempotent
-      // on the order id, so a clean rollback makes the retry safe.)
-      try {
-        await writeOrderItems(input.id, input.items);
-      } catch (err) {
-        const { error: delErr } = await sb
-          .from("orders")
-          .delete()
-          .eq("id", input.id);
-        if (delErr) {
-          // The rollback itself failed: an item-less order may remain. Log it
-          // loudly (and to the error sink) so it can be cleaned up.
-          captureError(new Error(`createOrder rollback failed: ${delErr.message}`), {
-            scope: "createOrder",
-            orderId: input.id,
-          });
-          console.error(
-            `[createOrder] rollback delete failed for order ${input.id}: ${delErr.message}`,
-          );
-        }
-        throw err;
+      // ONE transaction (migration 20261114000000): order + lines + modifiers,
+      // the number from the location's atomic counter (or the client's
+      // offline number, suffixed if already taken), idempotent on the id. It
+      // returns the stored graph, so nothing is read back.
+      const { itemRows, modRows } = orderLineRows(input.id, input.items);
+      const rpc = await sb.rpc("create_order_with_lines", {
+        p_order: orderInsertRow(input, input.order_number ?? null),
+        p_items: itemRows,
+        p_modifiers: modRows,
+      });
+      let order: Order;
+      let created: boolean;
+      if (rpc.error && isMissingFunction(rpc.error)) {
+        ({ order, created } = await createOrderLegacy(input));
+      } else {
+        const res = unwrap(rpc) as {
+          created: boolean;
+          order: Row;
+          items: Row[];
+          modifiers: Row[];
+        };
+        order = assembleOrders([res.order], res.items ?? [], res.modifiers ?? [])[0] as Order;
+        created = res.created;
       }
-      const order = await readOrderRow(orderRow);
+      // An existing order (idempotent retry) is returned unchanged.
+      if (!created) return order;
       // An online order awaiting payment (or abandoned) consumes nothing: it is
       // depleted by `depleteInventoryForOrder` once payment finalizes. Held
       // (draft) orders deplete when released (updateOrderStatus).
@@ -2086,6 +2218,38 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
           .order("id", { ascending: false })
           .range(offset, offset + limit - 1),
       ) as Row[];
+      return readOrderRows(rows);
+    },
+
+    async listKitchenOrders(tenantId, locationId, opts) {
+      const limit = Math.min(Math.max(opts.limit ?? 500, 1), 500);
+      const base = () =>
+        sb
+          .from("orders")
+          .select("*")
+          .eq("tenant_id", tenantId)
+          .eq("location_id", locationId);
+      // Two indexed reads in parallel (status / updated_at), not the last
+      // 1000 orders of history.
+      const [active, recent] = await Promise.all([
+        base()
+          .in("status", [...opts.statuses])
+          .gte("created_at", opts.createdSince)
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: false })
+          .range(0, limit - 1),
+        base()
+          .gte("updated_at", opts.updatedSince)
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: false })
+          .range(0, limit - 1),
+      ]);
+      const rows = unwrap(active) as Row[];
+      const seen = new Set(rows.map((r) => r.id as string));
+      for (const r of unwrap(recent) as Row[]) {
+        if (!seen.has(r.id as string)) rows.push(r);
+      }
+      rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
       return readOrderRows(rows);
     },
 

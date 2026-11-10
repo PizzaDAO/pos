@@ -47,8 +47,12 @@ function newUuid(): string {
   return `ord-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-/** Short, human-friendly client order number (no server round-trip needed). */
-function clientOrderNumber(): string {
+/**
+ * Provisional LOCAL label for an order until the server numbers it. Never sent:
+ * the server assigns every order number from the location's atomic counter
+ * (offline-queued orders get theirs when they sync).
+ */
+function provisionalOrderLabel(): string {
   const t = new Date();
   const hhmm = `${String(t.getHours()).padStart(2, "0")}${String(
     t.getMinutes(),
@@ -276,7 +280,7 @@ export function TerminalClient({
         tipCents: 0,
       });
 
-      const orderNumber = clientOrderNumber();
+      const provisional = provisionalOrderLabel();
       const orderId = newUuid();
       const payload: CreateOrderInput = {
         id: orderId,
@@ -288,7 +292,6 @@ export function TerminalClient({
         discount_cents: totals.discount_cents,
         totals,
         notes: notes.trim() ? notes.trim() : null,
-        order_number: orderNumber,
         status: "placed",
         // Attribute to the PIN-switched active staff (if any) so orders/shifts
         // tie to the person at the till.
@@ -315,18 +318,21 @@ export function TerminalClient({
       clear();
       if (outcome.status === "synced") {
         // Order reached the server → go straight to taking payment.
-        toast({ title: `Order ${orderNumber} placed`, variant: "success" });
+        toast({
+          title: outcome.orderNumber ? `Order ${outcome.orderNumber} placed` : "Order placed",
+          variant: "success",
+        });
         setPayOrderId(orderId);
       } else {
         // Offline: payment needs connectivity (beyond reader store-and-forward),
         // so confirm the queued order; the cashier pays once back online.
         toast({
-          title: `Order ${orderNumber} saved offline`,
+          title: `Order ${provisional} (provisional) saved offline`,
           description: "It will sync automatically when back online.",
           variant: "info",
         });
         setPlaced({
-          orderNumber,
+          orderNumber: `${provisional} (provisional)`,
           totalCents: totals.total_cents,
           currency: settings.currency,
           synced: false,

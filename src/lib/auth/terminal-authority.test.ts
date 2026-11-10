@@ -101,6 +101,7 @@ function order(opts: {
   cookie?: string;
   queuedSession?: string;
   staffId?: string;
+  orderNumber?: string;
 }) {
   seq += 1;
   return ordersPOST(
@@ -128,6 +129,7 @@ function order(opts: {
           },
         ],
         discount_cents: opts.discount,
+        ...(opts.orderNumber ? { order_number: opts.orderNumber } : {}),
         ...(opts.staffId ? { staff_id: opts.staffId } : {}),
         ...(opts.queuedSession
           ? { queued_staff_session_id: opts.queuedSession }
@@ -136,6 +138,19 @@ function order(opts: {
     }),
   );
 }
+
+describe("order numbers", () => {
+  it("the server numbers till orders; a client-sent number is ignored", async () => {
+    const a = await order({ discount: 0, orderNumber: "1200-555" });
+    const b = await order({ discount: 0, orderNumber: "1200-555" });
+    expect(a.status).toBe(201);
+    const na = ((await a.json()) as { order: { order_number: string } }).order.order_number;
+    const nb = ((await b.json()) as { order: { order_number: string } }).order.order_number;
+    expect(na).toMatch(/^A-\d{4,}$/);
+    expect(nb).toMatch(/^A-\d{4,}$/);
+    expect(na).not.toBe(nb);
+  });
+});
 
 describe("discounts: PIN tenant", () => {
   it("the demo tenant uses PINs", async () => {

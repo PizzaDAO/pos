@@ -130,6 +130,16 @@ export interface OrderListOptions {
   to?: string;
 }
 
+/** Filters for {@link PosDriver.listKitchenOrders}. */
+export interface KitchenOrderListOptions {
+  statuses: readonly OrderStatus[];
+  /** ISO: active orders created at/after this instant. */
+  createdSince: string;
+  /** ISO: plus any order updated at/after this instant. */
+  updatedSince: string;
+  limit?: number;
+}
+
 export interface OrderPageOptions {
   /** Exclusive keyset cursor. */
   after?: { created_at: string; id: string };
@@ -441,6 +451,18 @@ export interface PosDriver {
     tenantId: string,
     locationId: string,
     opts?: OrderListOptions,
+  ): Promise<Order[]>;
+
+  /**
+   * The kitchen board's working set, filtered in SQL: orders in one of
+   * `statuses` created at/after `createdSince`, plus ANY order updated at/after
+   * `updatedSince` (recent voids for the STOP banner). De-duplicated, newest
+   * first, at most `limit` (default and max 500) of each kind.
+   */
+  listKitchenOrders(
+    tenantId: string,
+    locationId: string,
+    opts: KitchenOrderListOptions,
   ): Promise<Order[]>;
 
   /**

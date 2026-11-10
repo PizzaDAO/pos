@@ -200,7 +200,8 @@ export async function POST(request: Request) {
         typeof body.notes === "string" && body.notes.trim()
           ? body.notes.trim()
           : null,
-      order_number: body.order_number,
+      // The server numbers every order (the location's atomic counter); a
+      // client-sent order_number (older tills) is accepted but ignored.
       status: "placed",
       staff_id: staffId,
       // The till's order-level discount, as a recorded adjustment (core

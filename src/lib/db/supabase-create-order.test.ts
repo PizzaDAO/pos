@@ -14,6 +14,14 @@ function fakeClient() {
   return {
     rpc(name: string, args: unknown) {
       rpcCalls.push({ name, args });
+      // A database without migration 20261114000000: createOrder falls back to
+      // its insert + compensating-delete path, exercised below.
+      if (name === "create_order_with_lines") {
+        return Promise.resolve({
+          data: null,
+          error: { code: "PGRST202", message: "Could not find the function" },
+        });
+      }
       return Promise.resolve({ data: rpcResult, error: null });
     },
     from(table: string) {
@@ -53,7 +61,7 @@ vi.mock("@supabase/supabase-js", () => ({
 
 import { createSupabaseDriver } from "@/lib/db/supabase";
 
-describe("supabase createOrder is not left half-written", () => {
+describe("supabase createOrder is not left half-written (pre-migration fallback)", () => {
   it("deletes the order row when writing its lines fails", async () => {
     const driver = createSupabaseDriver({ url: "http://x", key: "k" });
     await expect(

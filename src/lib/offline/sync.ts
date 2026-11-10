@@ -42,7 +42,8 @@ export interface FlushResult {
 
 /** Outcome of pushing ONE queued order to the server. */
 export type SyncOutcome =
-  | { status: "synced" }
+  /** `orderNumber`: the number the server stored (it suffixes a taken one). */
+  | { status: "synced"; orderNumber?: string }
   /** Interactive only: non-retryable 4xx shown to the cashier; not placed. */
   | { status: "rejected"; httpStatus: number; error: string; code?: string }
   /** Background: non-retryable 4xx; kept and surfaced for staff to resolve. */
@@ -90,7 +91,11 @@ export async function syncEntry(
     });
     if (res.ok) {
       await markSynced(entry.id);
-      return { status: "synced" };
+      const data = (await res.json().catch(() => null)) as {
+        order?: { order_number?: unknown };
+      } | null;
+      const n = data?.order?.order_number;
+      return typeof n === "string" ? { status: "synced", orderNumber: n } : { status: "synced" };
     }
     let message = `HTTP ${res.status}`;
     let code: string | undefined;

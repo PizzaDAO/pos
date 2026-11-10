@@ -52,6 +52,10 @@ tickets from every order in memory. Server RSS went 447 MB to 686 MB at 1000x.
 
 ## What will hurt on Postgres: ranked fixes
 
+> Status 2026-11-09: items 1-6, 8, 9 and 10 are fixed on branch `data-layer-fixes` (see
+> "Fixed in data-layer-fixes" at the end). Still open: 7 (dispatch filter/limit), 11, and the
+> inventory-link caching part of 5.
+
 Round-trip counts assume the real Supabase auth mode (`getCurrentUser`: 1 GoTrue call + memberships +
 platform-admin) and one location with ~1,000 orders (about 8 hours at 120/hour).
 
@@ -129,3 +133,52 @@ and needs a Postgres to validate.
 1. Point the harness at a **disposable** Supabase project (local `supabase start` needs Docker, which this
    run did not touch) and rerun; the ranking above should be confirmed by per-endpoint p95 there.
 2. Do the first four fixes first; they remove most round trips from polling and order creation.
+
+## Fixed in data-layer-fixes (2026-11-09)
+
+Migrations: `20261114000000_order_numbers_atomic_create.sql`, `20261114000010_menu_versions.sql`
+(both additive; the driver falls back to its old order path until the first is applied).
+
+1. **Menu truncation (rank 1, 4).** `assembleMenu` reads sizes and group links by the tenant's
+   item ids and modifiers by its group ids (chunked `.in`, parallel chunks), and pages every
+   read with `fetchAllPages`; lookups use maps instead of per-item `.filter`. Menus are cached
+   per instance by (tenant, location) for up to 60 s and invalidated by `menu_versions`, a
+   per-tenant counter bumped by statement-level triggers on all seven menu tables, so every
+   write path (driver, `import_menu`, 86/overrides, SQL by hand) invalidates. A cache hit is one
+   indexed read instead of 7+ paged ones. Tested on PGlite with a fake PostgREST capped at 1000
+   rows: other tenants pushing every menu table past the cap, a tenant with 1,100 items and a
+   1,500-modifier group, and cache invalidation on price, 86 and modifier delete.
+2. **Order numbers (rank 5, correctness).** `create_order_with_lines` (one RPC, one transaction)
+   inserts order + lines + modifiers, so a failure leaves nothing behind (no compensating delete,
+   no outbox event for a rolled-back order). The server numbers EVERY order, till orders included
+   (the till's client `HHMM-RRR` is no longer sent; offline orders show a provisional local label
+   until they sync), from `order_number_counters`: one atomic `UPDATE ... RETURNING` per location,
+   seeded on first use after the location's existing numbers. Format stays `A-####`. It is a
+   per-location sequence, NOT reset daily: with a unique `(location_id, order_number)` index and no
+   date in the number, a daily reset would collide with yesterday's `A-0001`. Unique index
+   `orders_location_order_number_key`: if the live table already has duplicate pairs, the
+   migration builds it PARTIAL (`created_at >=` migration time, reported by a NOTICE) plus a plain
+   index, and the RPC still checks the whole table. A client-supplied number (other callers) that
+   is taken gets a `-2`, `-3` suffix. Idempotent on the order id.
+3. **KDS poll (rank 2).** New `listKitchenOrders`: active KDS statuses created in the last 7 days
+   plus anything updated in the 15-minute void window, two indexed queries in parallel (new index
+   on `orders (tenant_id, location_id, updated_at)`), instead of the last 1,000 orders. Order
+   items/modifiers chunks now run in parallel (4 at a time). About 4 round trips per poll after
+   auth instead of ~36 sequential.
+4. **Auth overhead (rank 3).** In real-auth mode the session user (GoTrue `getUser` + memberships
+   + platform-admin) and each tenant's location list are memoized per request (keyed on the
+   request's cookie store), so a route running several guards pays once. Nothing is shared across
+   requests and no check was removed. (JWT `getClaims` and cross-request caching were not done.)
+5. **Bump and storefront (ranks 6, 10).** Bump CASes on the status the guard already read
+   (`casOrderStatus`), dropping a read; a lost race now answers `changed: false`. Storefront reads
+   subscription, settings and menu in parallel; order create is one RPC with no read-back.
+6. **Polling (ranks 8, 9).** KDS, dispatch, open orders, tracking and the pay-sync poll pause
+   while the tab is hidden and refetch once on return; Realtime refetches are deferred while
+   hidden. Tracking backs off 4, 4, 8, 8, then 15 s while the order is unchanged.
+
+Mock-driver rerun (same harness, branch vs `origin/main` back to back; the laptop was shared with
+other builds, load average ~400): no errors and no breaking point on either up to 1000x; 3x till
+create p95 6.5 ms (main 4.3 ms), KDS poll p95 5.9 ms (6.2 ms); at 1000x till create p95 4.9 ms
+(3.1 ms), KDS poll p95 7.8 ms (6.4 ms). Differences are within the noise of that machine. An
+earlier branch run during a load-average spike broke at 1000x (1% errors, 7 s p95) and was
+discarded. The mock still says nothing about Postgres; the round-trip savings above are the point.

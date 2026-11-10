@@ -51,6 +51,12 @@ async function fetchTrack(orderId: string): Promise<TrackResponse> {
   return (await res.json()) as TrackResponse;
 }
 
+/**
+ * Customer tracking poll: 4 s, 4 s, 8 s, 8 s, then every 15 s while nothing
+ * changes (any change goes back to 4 s); paused while the tab is hidden.
+ */
+export const TRACKING_BACKOFF_MS = [4000, 4000, 8000, 8000, 15000] as const;
+
 export function useOrderTracking(orderId: string, intervalMs = 4000) {
   const [data, setData] = useState<TrackResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -66,7 +72,12 @@ export function useOrderTracking(orderId: string, intervalMs = 4000) {
         setLastUpdated(snapshot.at);
         setLoading(false);
       },
-      { intervalMs },
+      {
+        intervalMs,
+        backoffMs: TRACKING_BACKOFF_MS,
+        // serverTime changes on every response; the order + delivery do not.
+        changeKey: (d) => JSON.stringify([d.order, d.delivery]),
+      },
     );
     return unsubscribe;
   }, [orderId, intervalMs]);

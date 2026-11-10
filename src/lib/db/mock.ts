@@ -1412,6 +1412,23 @@ export const mockDriver: PosDriver = {
       .slice(opts?.offset ?? 0, (opts?.offset ?? 0) + limit);
   },
 
+  async listKitchenOrders(tenantId, locationId, opts): Promise<Order[]> {
+    ensureKitchenSeed();
+    const limit = Math.min(Math.max(opts.limit ?? 500, 1), 500);
+    const statuses = new Set<string>(opts.statuses);
+    const mine = [...orders.values()]
+      .filter((o) => o.tenant_id === tenantId && o.location_id === locationId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const active = mine
+      .filter((o) => statuses.has(o.status) && o.created_at >= opts.createdSince)
+      .slice(0, limit);
+    const recent = mine.filter((o) => o.updated_at >= opts.updatedSince).slice(0, limit);
+    const seen = new Set(active.map((o) => o.id));
+    return [...active, ...recent.filter((o) => !seen.has(o.id))].sort((a, b) =>
+      b.created_at.localeCompare(a.created_at),
+    );
+  },
+
   async listOrdersPage(tenantId, locationId, opts): Promise<Order[]> {
     ensureKitchenSeed();
     const after = opts.after;
