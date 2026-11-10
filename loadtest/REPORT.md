@@ -195,5 +195,9 @@ business date ("2026-11-09" sorts before "2026-11-09T00:03Z"), which dropped tha
 bounds are now converted on the location's clock. Every in-app caller passes yyyy-mm-dd already
 (EOD, owner reports validate it); `/api/admin/reports` passes raw query params, so it was reachable.
 
-Still open, same family as rank 1: `getSalesReport` in the Supabase driver selects every order of
-the tenant with no paging and reads each order graph one by one; it truncates at 1000 orders.
+`getSalesReport` (Supabase driver), same family as rank 1: it selected every order of the tenant
+unpaged (cut at 1000) and read each order graph one by one. It now reads the requested business
+dates widened by 2 days in SQL (time zones and cutoffs), paged, plus older orders with a tender
+refunded since the range start (refunds count on the day they happened), batch-loads lines and
+tenders with chunked `.in()`, and pages the label reads. PGlite test: 1,230 in-range orders under
+the 1000-row fake (main returned 999).

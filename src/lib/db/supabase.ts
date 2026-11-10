@@ -112,7 +112,11 @@ import type {
 } from "./saas-types";
 import { ONBOARDING_STEPS } from "./saas-types";
 import { buildStarterMenu } from "@/lib/saas/menu-template";
-import { buildSalesReport, locationBusinessDate } from "@/lib/reports";
+import {
+  buildSalesReport,
+  locationBusinessDate,
+  normaliseRangeBound,
+} from "@/lib/reports";
 import { EMPTY_BUNDLE, type OwnerReportBundle } from "@/lib/owner-reports";
 import { fetchAllPages, mapChunks, safeKeyset } from "./paging";
 
@@ -148,6 +152,12 @@ function genUuid(): string {
 function nowIso(): string {
   return new Date().toISOString();
 }
+
+/**
+ * Widening of a report's created_at window on each side of the requested
+ * business dates: covers UTC-14..+14 and a business-day cutoff of up to a day.
+ */
+const REPORT_TZ_MARGIN_MS = 2 * 86_400_000;
 
 /** PostgREST / Postgres "no such function" (a migration not applied yet). */
 function isMissingFunction(err: { code?: string; message?: string }): boolean {
@@ -4542,39 +4552,70 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
 
     // -- Reports + end-of-day ----------------------------------------------
     async getSalesReport(tenantId, locationId, range: DateRange) {
-      let oq = sb.from("orders").select("*").eq("tenant_id", tenantId);
-      if (locationId !== null) oq = oq.eq("location_id", locationId);
-      const orderRows = unwrap(await oq) as Row[];
-      const scoped = await Promise.all(orderRows.map((r) => readOrderRow(r)));
-      const orderIds = scoped.map((o) => o.id);
-      const scopedPayments =
-        orderIds.length === 0
-          ? []
-          : (
-              unwrap(
-                await sb.from("payments").select("*").in("order_id", orderIds),
-              ) as Row[]
-            ).map(mapPayment);
+      // Filtered + paged in SQL (was: every order of the tenant in one
+      // unpaged select, silently cut at PostgREST's 1000 rows, then one graph
+      // read per order). The window is the requested business dates widened
+      // by REPORT_TZ_MARGIN_MS on each side, so any location time zone and
+      // day cutoff is covered; buildSalesReport then applies the exact
+      // per-location business date.
+      const DAY = 86_400_000;
+      const fromDay = normaliseRangeBound(range.from);
+      const toDay = normaliseRangeBound(range.to);
+      const createdFrom = fromDay
+        ? new Date(Date.parse(`${fromDay}T00:00:00Z`) - REPORT_TZ_MARGIN_MS).toISOString()
+        : null;
+      const createdBefore = toDay
+        ? new Date(Date.parse(`${toDay}T00:00:00Z`) + DAY + REPORT_TZ_MARGIN_MS).toISOString()
+        : null;
+      const scopedOrders = (cols: string) => {
+        let q = sb.from("orders").select(cols).eq("tenant_id", tenantId);
+        if (locationId !== null) q = q.eq("location_id", locationId);
+        return q;
+      };
+      const [windowRows, refundedRows] = await Promise.all([
+        fetchAllPages<Row>(async (from, to) => {
+          let q = scopedOrders("*");
+          if (createdFrom) q = q.gte("created_at", createdFrom);
+          if (createdBefore) q = q.lt("created_at", createdBefore);
+          return unwrap(await q.order("created_at").order("id").range(from, to)) as unknown as Row[];
+        }),
+        // Refunds are reported on the day they HAPPENED, so an older order
+        // refunded inside the range counts too: a refund bumps the tender's
+        // updated_at, which therefore is at/after the refund.
+        fetchAllPages<Row>(async (from, to) => {
+          let q = sb
+            .from("payments")
+            .select("order_id,id")
+            .eq("tenant_id", tenantId)
+            .gt("refunded_cents", 0);
+          if (locationId !== null) q = q.eq("location_id", locationId);
+          if (createdFrom) q = q.gte("updated_at", createdFrom);
+          return unwrap(await q.order("id").range(from, to)) as unknown as Row[];
+        }),
+      ]);
+      const seen = new Set(windowRows.map((r) => r.id as string));
+      const extraIds = [
+        ...new Set(refundedRows.map((r) => r.order_id as string).filter((id) => !seen.has(id))),
+      ];
+      const extraRows = (await selectIn("orders", "id", extraIds)).filter(
+        (r) =>
+          r.tenant_id === tenantId && (locationId === null || r.location_id === locationId),
+      );
+      const scoped = await readOrderRows([...windowRows, ...extraRows]);
+      const scopedPayments = (
+        await selectIn(
+          "payments",
+          "order_id",
+          scoped.map((o) => o.id),
+        )
+      ).map(mapPayment);
 
-      // Resolve category + location labels (tenant-scoped reads).
-      const itemRows = unwrap(
-        await sb
-          .from("menu_items")
-          .select("id,category_id")
-          .eq("tenant_id", tenantId),
-      ) as Row[];
-      const catRows = unwrap(
-        await sb
-          .from("menu_categories")
-          .select("id,name")
-          .eq("tenant_id", tenantId),
-      ) as Row[];
-      const locRows = unwrap(
-        await sb
-          .from("locations")
-          .select("*")
-          .eq("tenant_id", tenantId),
-      ) as Row[];
+      // Resolve category + location labels (tenant-scoped, paged reads).
+      const [itemRows, catRows, locRows] = await Promise.all([
+        tenantRows("menu_items", "id,category_id", "id", tenantId),
+        tenantRows("menu_categories", "id,name", "id", tenantId),
+        tenantRows("locations", "*", "id", tenantId),
+      ]);
       const catNameById = new Map(
         catRows.map((c) => [c.id as string, c.name as string]),
       );

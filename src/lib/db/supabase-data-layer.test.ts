@@ -48,7 +48,7 @@ function fakeClient() {
       }
     },
     from(table: string) {
-      type F = { col: string; op: "eq" | "in" | "is" | "gte" | "lte" | "gt"; val: unknown };
+      type F = { col: string; op: "eq" | "in" | "is" | "gte" | "lte" | "gt" | "lt"; val: unknown };
       const filters: F[] = [];
       let single = false;
       let orderBy = "";
@@ -61,6 +61,7 @@ function fakeClient() {
       q.gte = (col: string, val: unknown) => (filters.push({ col, op: "gte", val }), q);
       q.lte = (col: string, val: unknown) => (filters.push({ col, op: "lte", val }), q);
       q.gt = (col: string, val: unknown) => (filters.push({ col, op: "gt", val }), q);
+      q.lt = (col: string, val: unknown) => (filters.push({ col, op: "lt", val }), q);
       q.order = (col: string, o?: { ascending?: boolean }) => (
         (orderBy = `${orderBy ? orderBy + ", " : " order by "}${col}${o?.ascending === false ? " desc" : ""}`), q
       );
@@ -78,7 +79,7 @@ function fakeClient() {
               if (f.op === "is") return `${f.col} is null`;
               params.push(f.val);
               if (f.op === "in") return `${f.col}::text = any($${params.length})`;
-              const o = { eq: "=", gte: ">=", lte: "<=", gt: ">" }[f.op];
+              const o = { eq: "=", gte: ">=", lte: "<=", gt: ">", lt: "<" }[f.op];
               return `${f.col} ${o} $${params.length}`;
             })
             .join(" and ");
@@ -451,6 +452,67 @@ describe.skipIf(!PGLITE)("data-layer fixes through the Supabase driver on PGlite
       expect(got.map((o) => o.order_number).sort()).toEqual([active.order_number, "CAT-1", "V-1"].sort());
       expect(got.find((o) => o.id === active.id)!.items).toHaveLength(1);
     }, 60_000);
+  });
+
+  describe("sales report", () => {
+    it("reads only the range, past the 1000-row cap, plus older orders refunded in it", async () => {
+      const loc = crypto.randomUUID();
+      await db.query(
+        "insert into public.locations (id, tenant_id, name, slug, timezone) values ($1, $2, 'R', $3, 'America/New_York')",
+        [loc, T, `r-${loc.slice(0, 8)}`],
+      );
+      const insertDay = (n: number, at: string, prefix: string) =>
+        db.query(
+          `with o as (
+             insert into public.orders (id, tenant_id, location_id, status, channel, totals, order_number, created_at, updated_at)
+             select gen_random_uuid(), $1, $2, 'completed', 'in_store',
+                    '{"subtotal_cents":1000,"discount_cents":0,"taxable_cents":1000,"tax_cents":0,"tip_cents":0,"total_cents":1000}'::jsonb,
+                    $4 || g, $3::timestamptz, $3::timestamptz
+               from generate_series(1, $5::int) g
+             returning id)
+           insert into public.order_items (id, order_id, item_id, item_name, quantity, unit_price_cents, line_total_cents)
+           select gen_random_uuid(), o.id, gen_random_uuid(), 'Pie', 1, 1000, 1000 from o`,
+          [T, loc, at, prefix, n],
+        );
+      // 1200 orders on Mar 10 (New York), 50 on Mar 1, and 30 at 02:00Z on
+      // Mar 11, which is still Mar 10 in New York.
+      await insertDay(1200, "2026-03-10T15:00:00Z", "IN-");
+      await insertDay(50, "2026-03-01T15:00:00Z", "OUT-");
+      await insertDay(30, "2026-03-11T02:00:00Z", "LATE-");
+      // A February order refunded on Mar 10.
+      const old = crypto.randomUUID();
+      await db.query(
+        `insert into public.orders (id, tenant_id, location_id, status, channel, totals, order_number, created_at)
+         values ($1, $2, $3, 'completed', 'in_store', '{"subtotal_cents":800,"discount_cents":0,"tax_cents":0,"tip_cents":0,"total_cents":800}', 'FEB-1', '2026-02-01T15:00:00Z')`,
+        [old, T, loc],
+      );
+      await db.query(
+        `insert into public.order_items (id, order_id, item_id, item_name, quantity, unit_price_cents, line_total_cents)
+         values (gen_random_uuid(), $1, gen_random_uuid(), 'Pie', 1, 800, 800)`,
+        [old],
+      );
+      await db.query(
+        `insert into public.payments (id, order_id, tenant_id, location_id, rail, status, amount_cents, refunded_cents, refunds, updated_at)
+         values (gen_random_uuid(), $1, $2, $3, 'cash', 'refunded', 800, 800,
+                 '[{"id":"r1","amount_cents":800,"at":"2026-03-10T16:00:00Z"}]', '2026-03-10T16:00:00Z')`,
+        [old, T, loc],
+      );
+
+      reads.length = 0;
+      const report = await driver.getSalesReport(T, loc, { from: "2026-03-10", to: "2026-03-10" });
+      expect(report.order_count).toBe(1230);
+      expect(report.gross_cents).toBe(1230 * 1000);
+      expect(report.refund_cents).toBe(800);
+      // Batched, not one graph read per order.
+      expect(reads.filter((t) => t === "order_items").length).toBeLessThan(30);
+
+      // An ISO bound is treated as its business date, not string-compared.
+      const iso = await driver.getSalesReport(T, loc, {
+        from: "2026-03-10T05:00:00.000Z",
+        to: "2026-03-10T05:00:00.000Z",
+      });
+      expect(iso.order_count).toBe(1230);
+    }, 120_000);
   });
 
   describe("new tables are server-only", () => {

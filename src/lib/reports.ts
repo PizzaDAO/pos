@@ -375,7 +375,10 @@ export function buildSalesReport(input: BuildReportInput): SalesReport {
     let any = false;
     for (const ev of refundEvents(counted, { sales: gross - discount, tax, fees }, tip)) {
       const day = ev.at ? locationBusinessDate(ev.at, clock) : dayOf(order);
-      if ((range.from && day < range.from) || (range.to && day > range.to)) continue;
+      const toDay = (iso: string) => locationBusinessDate(iso, clock);
+      const from = normaliseRangeBound(range.from, toDay);
+      const to = normaliseRangeBound(range.to, toDay);
+      if ((from && day < from) || (to && day > to)) continue;
       any = true;
       refundCents += ev.total;
       tipRefundCents += ev.tip;
