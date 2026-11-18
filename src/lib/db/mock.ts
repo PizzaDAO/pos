@@ -1779,6 +1779,28 @@ export const mockDriver: PosDriver = {
       .slice(0, limit);
   },
 
+  async listDueScheduledOrders(dueBy, opts): Promise<Order[]> {
+    ensureKitchenSeed();
+    const mode = opts?.checkoutMode;
+    return [...orders.values()]
+      .filter((o) => {
+        const f = o.fulfillment;
+        return (
+          o.status === "paid" &&
+          !!f?.kitchen_fire_at &&
+          f.kitchen_fire_at <= dueBy &&
+          f.kitchen_released_at === undefined &&
+          (!mode || f.checkout_mode === undefined || f.checkout_mode === mode)
+        );
+      })
+      .sort((a, b) =>
+        (a.fulfillment!.kitchen_fire_at ?? "").localeCompare(
+          b.fulfillment!.kitchen_fire_at ?? "",
+        ),
+      )
+      .slice(0, opts?.limit ?? 100);
+  },
+
   // Single synchronous block (no awaits): an atomic claim in the mock.
   async claimLatePayment(
     orderId: string,

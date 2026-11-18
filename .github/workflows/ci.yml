@@ -56,7 +56,9 @@ jobs:
 
   e2e:
     name: Playwright E2E (mock-driver, public + simulated) — optional, non-blocking
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04, where `playwright install --with-deps
+    # chromium` is not supported yet. Pin the image Playwright supports.
+    runs-on: ubuntu-24.04
     # This job builds the app and runs the Playwright suite against a locally
     # started production server. It is OPTIONAL and MUST NOT block a PR: it needs
     # a running app (and, for the real-auth flows, live Supabase + bootstrapped

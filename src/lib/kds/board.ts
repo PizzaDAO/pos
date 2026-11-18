@@ -10,6 +10,7 @@ import type { KdsThresholds, Order, OrderItem, Station } from "@/lib/db";
 import { KDS_ACTIVE_STATUSES } from "@/lib/db";
 import type { AgeLevel, KitchenTicket, StationFilter, VoidNotice } from "./types";
 import { lineStation } from "./types";
+import { isHeldForFire, kitchenFireAt, wasHeldAt } from "./fire";
 
 /** Default coloring cadence when a location omits `kds_thresholds`. */
 export const DEFAULT_KDS_THRESHOLDS: KdsThresholds = {
@@ -66,6 +67,9 @@ export function lineMatchesStation(
  * @param orders   all orders for the location (any status).
  * @param now      reference time (server clock) that anchors elapsed time.
  * @param thresholds age-coloring thresholds for this location.
+ *
+ * A paid scheduled online order is left off until its fire time and then ages
+ * from it (src/lib/kds/fire.ts); everything else ages from `created_at`.
  */
 export function buildTickets(
   orders: Order[],
@@ -80,14 +84,19 @@ export function buildTickets(
     .filter((o) => active.has(o.status) && !o.core_ext?.stored_value)
     // A marketplace order the cashier has not accepted yet is not for the kitchen.
     .filter((o) => o.fulfillment?.marketplace?.acceptance !== "pending")
+    // A scheduled online order waits for its fire time (computed on read).
+    .filter((o) => !isHeldForFire(o, now))
     .map((order) => {
-      const placedMs = new Date(order.created_at).getTime();
+      const fireAt = kitchenFireAt(order);
+      const ageFrom = fireAt ?? order.created_at;
       const elapsedSeconds = Math.max(
         0,
-        Math.floor((nowMs - placedMs) / 1000),
+        Math.floor((nowMs - new Date(ageFrom).getTime()) / 1000),
       );
       return {
         order,
+        ageFrom,
+        ...(fireAt ? { scheduledFor: order.fulfillment!.promised_at } : {}),
         elapsedSeconds,
         ageLevel: ageLevelFor(elapsedSeconds, thresholds),
         stations: orderStations(order),
@@ -131,6 +140,8 @@ export function buildVoidNotices(
     // ends `refunded` and is not the kitchen's business).
     if (order.status === "voided") {
       if (new Date(order.updated_at).getTime() < since) continue;
+      // A scheduled order voided before its fire time never reached the kitchen.
+      if (wasHeldAt(order, new Date(order.updated_at))) continue;
       const fired = order.items.filter((i) => !!i.fired_at && !i.voided);
       if (fired.length === 0) continue;
       out.push({
@@ -147,7 +158,8 @@ export function buildVoidNotices(
         i.voided &&
         !!i.fired_at &&
         !!i.voided_at &&
-        new Date(i.voided_at).getTime() >= since,
+        new Date(i.voided_at).getTime() >= since &&
+        !wasHeldAt(order, new Date(i.voided_at)),
     );
     if (lines.length === 0) continue;
     out.push({

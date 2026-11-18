@@ -37,6 +37,7 @@ import { resolveStorefrontLocation } from "@/lib/shop/resolve-location";
 import {
   asapAvailability,
   checkScheduledTime,
+  usableTimeZone,
 } from "@/lib/shop/scheduling";
 import { quoteDelivery } from "@/lib/delivery/service";
 import { deploymentCheckoutMode } from "@/lib/payments/env";
@@ -46,6 +47,8 @@ import {
   anyOnlinePaymentAllowed,
 } from "@/lib/shop/training-online";
 import { DeliveryUnavailableError } from "@/lib/delivery";
+import { captureError } from "@/lib/observability";
+import { scheduledFireAt } from "@/lib/kds/fire";
 import {
   canUseOnlineOrdering,
   resolveEntitlements,
@@ -266,10 +269,20 @@ export async function POST(request: Request) {
   }
 
   // ---- Time gate (hours + prep / scheduling window) -------------------------
+  // Hours are local to the LOCATION's zone, never the server's (UTC on Vercel).
+  // No usable zone: the gate refuses (fail-safe) and staff are alerted.
   const now = new Date();
+  const timeZone = location.timezone;
+  if (!usableTimeZone(timeZone)) {
+    captureError(new Error("location has no usable timezone"), {
+      scope: "shop.orders.timezone",
+      locationId,
+      timezone: timeZone ?? null,
+    });
+  }
   let promisedAt: string;
   if (body.scheduledFor === "asap") {
-    const avail = asapAvailability(fulfillment, now);
+    const avail = asapAvailability(fulfillment, now, timeZone);
     if (!avail.available || !avail.promisedAt) {
       return NextResponse.json(
         { error: avail.reason ?? "ASAP ordering is unavailable." },
@@ -282,6 +295,7 @@ export async function POST(request: Request) {
       fulfillment,
       now,
       new Date(body.scheduledFor),
+      timeZone,
     );
     if (!check.ok || !check.promisedAt) {
       return NextResponse.json(
@@ -376,6 +390,11 @@ export async function POST(request: Request) {
     type: body.fulfillmentType,
     scheduled_for: body.scheduledFor,
     promised_at: promisedAt,
+    // A scheduled order is held off the KDS and the printer until its fire time
+    // (promised - prep); see src/lib/kds/fire.ts.
+    ...(body.scheduledFor !== "asap"
+      ? { kitchen_fire_at: scheduledFireAt(promisedAt, fulfillment.prep_minutes) }
+      : {}),
     // Which deployment kind owns this order's sweeping (prod vs staging).
     checkout_mode: deploymentCheckoutMode(),
     // Per-order contact (what the customer typed now), independent of the

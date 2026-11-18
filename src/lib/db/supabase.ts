@@ -2618,6 +2618,27 @@ export function createSupabaseDriver(config: SupabaseDriverConfig): PosDriver {
       return Promise.all(rows.map((r) => readOrderRow(r)));
     },
 
+    async listDueScheduledOrders(dueBy, opts) {
+      let q = sb
+        .from("orders")
+        .select("*")
+        .eq("status", "paid")
+        .not("fulfillment->>kitchen_fire_at", "is", null)
+        .lte("fulfillment->>kitchen_fire_at", dueBy)
+        .is("fulfillment->>kitchen_released_at", null);
+      if (opts?.checkoutMode) {
+        q = q.or(
+          `fulfillment->>checkout_mode.eq.${opts.checkoutMode},fulfillment->>checkout_mode.is.null`,
+        );
+      }
+      const rows = unwrap(
+        await q
+          .order("fulfillment->>kitchen_fire_at", { ascending: true })
+          .limit(opts?.limit ?? 100),
+      ) as Row[];
+      return Promise.all(rows.map((r) => readOrderRow(r)));
+    },
+
     // Atomic (one UPDATE inside the RPC): no read-modify-write window.
     async mergeOrderFulfillment(id, patch) {
       const rows = unwrap(

@@ -10,13 +10,23 @@
  *    prep + lead minutes in the future, and (c) inside an open window for its
  *    weekday.
  *
- * Times in settings are local "HH:MM" in the location's timezone. To keep the
- * mock deterministic with no tz database, we treat the provided `now` (and
- * scheduled Date) in the SAME wall-clock frame the hours are expressed in; a
- * real impl would convert using the location timezone. This is sufficient for
- * gating in the pilot.
+ * Time zones: settings hold local "HH:MM" in the LOCATION's IANA zone
+ * (`locations.timezone`). Every function takes that zone and reads the weekday
+ * and minute of an instant in it (Intl, so DST is handled by the tz database),
+ * never the runtime's clock: the server (UTC on Vercel), the customer's browser
+ * and a till in another zone all get the same answer. Windows that close after
+ * midnight (11:00-02:00) belong to the day they open on.
+ *
+ * Fail-safe: a missing or unknown zone means we cannot tell local time, so the
+ * store reads as CLOSED (no ASAP, no slots, every scheduled time refused, with
+ * `TIMEZONE_UNSET_REASON`). Taking orders at the wrong hours is worse than
+ * pausing online ordering until the location's zone is fixed.
  */
 import type { DayHours, FulfillmentSettings } from "@/lib/db";
+
+/** Shown when the location has no usable IANA time zone (see the header). */
+export const TIMEZONE_UNSET_REASON =
+  "Online ordering is paused: this store's time zone is not set.";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -25,8 +35,62 @@ function parseHm(hm: string): number {
   return (h ?? 0) * 60 + (m ?? 0);
 }
 
-function minutesIntoDay(d: Date): number {
-  return d.getHours() * 60 + d.getMinutes();
+const WEEKDAYS: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+const clockFormatters = new Map<string, Intl.DateTimeFormat | null>();
+
+function clockFormatter(timeZone: string): Intl.DateTimeFormat | null {
+  let f = clockFormatters.get(timeZone);
+  if (f === undefined) {
+    try {
+      f = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      });
+    } catch {
+      f = null; // unknown zone
+    }
+    clockFormatters.set(timeZone, f);
+  }
+  return f;
+}
+
+/** The zone if this runtime knows it, else null (missing / blank / unknown). */
+export function usableTimeZone(
+  timeZone: string | null | undefined,
+): string | null {
+  const tz = timeZone?.trim();
+  if (!tz) return null;
+  return clockFormatter(tz) ? tz : null;
+}
+
+/**
+ * Weekday (0 = Sunday) and minutes past local midnight of `at` in `timeZone`.
+ * Null when the zone is unusable.
+ */
+export function localWeekdayMinutes(
+  at: Date,
+  timeZone: string | null | undefined,
+): { weekday: number; minutes: number } | null {
+  const tz = usableTimeZone(timeZone);
+  if (!tz || Number.isNaN(at.getTime())) return null;
+  const parts: Record<string, string> = {};
+  for (const p of clockFormatter(tz)!.formatToParts(at)) parts[p.type] = p.value;
+  const weekday = WEEKDAYS[parts.weekday ?? ""];
+  if (weekday === undefined) return null;
+  const minutes = (Number(parts.hour) % 24) * 60 + Number(parts.minute);
+  return { weekday, minutes };
 }
 
 function dayHoursFor(
@@ -37,12 +101,19 @@ function dayHoursFor(
 }
 
 /**
- * Is the store open at `at`? Handles windows that wrap past midnight (open >
- * close means it closes the next morning).
+ * Is the store open at `at`, read in the location's `timeZone`? Handles windows
+ * that wrap past midnight (open > close means it closes the next morning).
+ * False when the zone is unusable (fail-safe, see the header).
  */
-export function isOpenAt(hours: DayHours[], at: Date): boolean {
-  const today = dayHoursFor(hours, at.getDay());
-  const mins = minutesIntoDay(at);
+export function isOpenAt(
+  hours: DayHours[],
+  at: Date,
+  timeZone: string | null | undefined,
+): boolean {
+  const local = localWeekdayMinutes(at, timeZone);
+  if (!local) return false;
+  const today = dayHoursFor(hours, local.weekday);
+  const mins = local.minutes;
   if (today && !today.closed) {
     const open = parseHm(today.open);
     const close = parseHm(today.close);
@@ -54,7 +125,7 @@ export function isOpenAt(hours: DayHours[], at: Date): boolean {
     }
   }
   // Spillover from YESTERDAY's wrapping window into the early morning.
-  const yesterday = dayHoursFor(hours, (at.getDay() + 6) % 7);
+  const yesterday = dayHoursFor(hours, (local.weekday + 6) % 7);
   if (yesterday && !yesterday.closed) {
     const open = parseHm(yesterday.open);
     const close = parseHm(yesterday.close);
@@ -81,12 +152,16 @@ export interface AsapAvailability {
 export function asapAvailability(
   settings: FulfillmentSettings,
   now: Date,
+  timeZone: string | null | undefined,
 ): AsapAvailability {
-  if (!isOpenAt(settings.hours, now)) {
+  if (!usableTimeZone(timeZone)) {
+    return { available: false, reason: TIMEZONE_UNSET_REASON };
+  }
+  if (!isOpenAt(settings.hours, now, timeZone)) {
     return { available: false, reason: "The store is currently closed." };
   }
   const ready = asapPromisedAt(settings, now);
-  if (!isOpenAt(settings.hours, ready)) {
+  if (!isOpenAt(settings.hours, ready, timeZone)) {
     return {
       available: false,
       reason: "Too close to closing for an ASAP order.",
@@ -109,9 +184,13 @@ export function checkScheduledTime(
   settings: FulfillmentSettings,
   now: Date,
   scheduledFor: Date,
+  timeZone: string | null | undefined,
 ): ScheduleCheck {
   if (Number.isNaN(scheduledFor.getTime())) {
     return { ok: false, reason: "Invalid time." };
+  }
+  if (!usableTimeZone(timeZone)) {
+    return { ok: false, reason: TIMEZONE_UNSET_REASON };
   }
   const leadMs =
     (settings.prep_minutes + settings.scheduling_lead_minutes) * 60_000;
@@ -130,7 +209,7 @@ export function checkScheduledTime(
       reason: `Schedule within ${settings.scheduling_horizon_days} days.`,
     };
   }
-  if (!isOpenAt(settings.hours, scheduledFor)) {
+  if (!isOpenAt(settings.hours, scheduledFor, timeZone)) {
     return { ok: false, reason: "The store is closed at that time." };
   }
   return { ok: true, promisedAt: scheduledFor.toISOString() };
@@ -139,15 +218,26 @@ export function checkScheduledTime(
 /**
  * Generate selectable scheduled slots (every `stepMinutes`) within the horizon
  * that pass `checkScheduledTime`. Used to populate the checkout time picker.
- * Capped at `max` slots so the dropdown stays manageable.
+ * Capped at `max` slots so the dropdown stays manageable. Labels are in the
+ * STORE's zone (with its abbreviation), whatever zone the customer is in.
  */
 export function generateSlots(
   settings: FulfillmentSettings,
   now: Date,
+  timeZone: string | null | undefined,
   stepMinutes = 15,
   max = 64,
 ): { iso: string; label: string }[] {
   const slots: { iso: string; label: string }[] = [];
+  const tz = usableTimeZone(timeZone);
+  if (!tz) return slots;
+  const label = new Intl.DateTimeFormat(undefined, {
+    timeZone: tz,
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
   const stepMs = stepMinutes * 60_000;
   const leadMs =
     (settings.prep_minutes + settings.scheduling_lead_minutes) * 60_000;
@@ -156,15 +246,8 @@ export function generateSlots(
   const end = now.getTime() + settings.scheduling_horizon_days * DAY_MS;
   while (t <= end && slots.length < max) {
     const d = new Date(t);
-    if (isOpenAt(settings.hours, d)) {
-      slots.push({
-        iso: d.toISOString(),
-        label: d.toLocaleString(undefined, {
-          weekday: "short",
-          hour: "numeric",
-          minute: "2-digit",
-        }),
-      });
+    if (isOpenAt(settings.hours, d, tz)) {
+      slots.push({ iso: d.toISOString(), label: label.format(d) });
     }
     t += stepMs;
   }

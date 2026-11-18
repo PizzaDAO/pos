@@ -209,6 +209,7 @@ export function KitchenBoard({
       key={ticket.order.id}
       ticket={ticket}
       thresholds={thresholds}
+      timeZone={board?.timezone ?? null}
       stationFilter={station}
       onNoPrepHandoff={(id) => void withBusy(id, () => handoffNoPrep(ticket, bump))}
       busy={busyId === ticket.order.id}

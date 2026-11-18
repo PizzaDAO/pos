@@ -11,6 +11,32 @@ export function formatElapsed(totalSeconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/**
+ * "For Fri 1:00 PM": a scheduled order's promised time in the STORE's zone (the
+ * screen's own zone when the store's is missing or unknown).
+ */
+export function formatScheduledFor(
+  iso: string,
+  timeZone?: string | null,
+): string {
+  const d = new Date(iso);
+  const opts: Intl.DateTimeFormatOptions = {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  };
+  let text: string;
+  try {
+    text = d.toLocaleString("en-US", {
+      ...opts,
+      timeZone: timeZone || undefined,
+    });
+  } catch {
+    text = d.toLocaleString("en-US", opts);
+  }
+  return `For ${text.replace(",", "")}`;
+}
+
 /** Short, kitchen-friendly channel label. */
 export function channelLabel(channel: OrderChannel): string {
   switch (channel) {

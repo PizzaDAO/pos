@@ -371,6 +371,18 @@ export interface OrderFulfillment {
   scheduled_for: "asap" | string;
   /** Promised-ready ISO timestamp (now + prep, or the scheduled time). */
   promised_at: string;
+  /**
+   * Scheduled online orders only: when the kitchen should start it (ISO,
+   * `promised_at - prep_minutes`, fixed at checkout). Until then the paid order
+   * stays off the KDS and is not auto-printed (src/lib/kds/fire.ts).
+   */
+  kitchen_fire_at?: string;
+  /**
+   * Set by the fire sweep (cron) once a held scheduled order was released: its
+   * ticket queued for auto-print. The board itself does not need it (it compares
+   * `kitchen_fire_at` with the clock on every read).
+   */
+  kitchen_released_at?: string;
   /** Delivery address (delivery only). */
   address?: DeliveryAddress;
   /** Resolved delivery zone / quote id (delivery only). Also the quote id. */
