@@ -48,9 +48,10 @@ function order(over: Record<string, unknown> = {}) {
 
 describe("POST /api/shop/orders", () => {
   beforeEach(() => {
-    // Wednesday noon: inside the seeded 11:00-22:00 hours.
+    // Wednesday noon in New York (EDT, UTC-4): inside the seeded 11:00-22:00
+    // hours, which are read in the location's zone (not the process zone).
     vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date(2026, 5, 3, 12, 0, 0));
+    vi.setSystemTime(new Date("2026-06-03T16:00:00.000Z"));
   });
   afterEach(() => {
     vi.useRealTimers();

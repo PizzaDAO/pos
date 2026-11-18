@@ -285,3 +285,22 @@ for (const processTz of ["UTC", "Pacific/Auckland", "America/Los_Angeles"]) {
     });
   });
 }
+
+// The E2E seed (POS_MOCK_ALWAYS_OPEN) uses 00:00-24:00 for "always open".
+describe("00:00-24:00 is open around the clock", () => {
+  const hours = dailyHours("00:00", "24:00");
+  it("is open at every quarter hour of a day, and ASAP works just before midnight", () => {
+    for (let q = 0; q < 96; q += 1) {
+      const at = new Date(Date.parse("2026-11-18T05:00:00Z") + q * 15 * 60_000);
+      expect(isOpenAtIn(hours, at, NY)).toBe(true);
+    }
+    // 23:55 EST = 04:55Z next day; ready 00:15.
+    expect(
+      asapAvailability(
+        settings({ hours }),
+        new Date("2026-11-19T04:55:00Z"),
+        NY,
+      ).available,
+    ).toBe(true);
+  });
+});

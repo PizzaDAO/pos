@@ -62,6 +62,12 @@ export default defineConfig({
     : {
         command: "npm run start -- --port 3100",
         url: BASE_URL,
+        // Seeded mock stores open 24/7, so ASAP checkout (and the order reaching
+        // the KDS) does not depend on the time of the run (see seed-data.ts).
+        env: { ...process.env, POS_MOCK_ALWAYS_OPEN: "1" } as Record<
+          string,
+          string
+        >,
         reuseExistingServer: !process.env.CI,
         timeout: 120_000,
         stdout: "pipe",

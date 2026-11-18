@@ -404,9 +404,20 @@ export const itemModifierGroups: ItemModifierGroup[] = [
  * Mock weekly hours (Phase 4 online-ordering gate). Open Mon–Thu + Sun
  * 11:00–22:00, Fri–Sat 11:00–23:00. Deterministic so the storefront's
  * ASAP/scheduled gating behaves the same in every preview instance.
+ *
+ * `POS_MOCK_ALWAYS_OPEN=1` (set by playwright.config.ts for the E2E server)
+ * opens the seeded stores around the clock, so browser flows that place an ASAP
+ * order and follow it to the kitchen pass at any wall-clock time. Hours are read
+ * in the location's zone, so without it a CI run at 08:00 ET finds them closed.
  */
 function weeklyHours(): DayHours[] {
   const out: DayHours[] = [];
+  if (typeof process !== "undefined" && process.env?.POS_MOCK_ALWAYS_OPEN === "1") {
+    for (let weekday = 0; weekday < 7; weekday += 1) {
+      out.push({ weekday, open: "00:00", close: "24:00", closed: false });
+    }
+    return out;
+  }
   for (let weekday = 0; weekday < 7; weekday += 1) {
     const lateNight = weekday === 5 || weekday === 6; // Fri/Sat
     out.push({
