@@ -3,6 +3,7 @@
   "framework": "nextjs",
   "crons": [
     { "path": "/api/cron/expire-online-orders", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/fire-scheduled-orders", "schedule": "* * * * *" },
     { "path": "/api/core/outbox", "schedule": "* * * * *" }
   ]
 }

@@ -79,17 +79,22 @@ export async function GET(request: Request) {
   // Filtered in SQL: active tickets touched in the last week, plus anything changed
   // inside the void-notice window (a voided order or line). Not the location's
   // whole order history.
-  const [orders, settings] = await Promise.all([
+  const [orders, settings, locations] = await Promise.all([
     driver.listKitchenOrders(tenantId, locationId, {
       statuses: KDS_ACTIVE_STATUSES,
       activeSince: new Date(now.getTime() - KDS_ACTIVE_WINDOW_MS).toISOString(),
       updatedSince: new Date(now.getTime() - VOID_NOTICE_MS).toISOString(),
     }),
     driver.getStoreSettings(tenantId, locationId),
+    driver.listLocations(tenantId),
   ]);
 
   const thresholds = settings.kds_thresholds ?? DEFAULT_KDS_THRESHOLDS;
-  const built = buildTickets(orders, now, thresholds);
+  // Scheduled online orders stay off until their fire time (computed here, on
+  // every read: no timers), see src/lib/kds/fire.ts.
+  const built = buildTickets(orders, now, thresholds, {
+    prepMinutes: settings.fulfillment?.prep_minutes,
+  });
   // Delivery tickets carry their delivery record's provider: it decides whether
   // the kitchen offers a hand-off (in-house only).
   const tickets = await Promise.all(
@@ -106,6 +111,7 @@ export async function GET(request: Request) {
     driver: driver.name,
     serverTime: now.toISOString(),
     thresholds,
+    timezone: locations.find((l) => l.id === locationId)?.timezone ?? null,
   };
   // No caching — the board must reflect the latest status on every poll.
   return NextResponse.json(body, {

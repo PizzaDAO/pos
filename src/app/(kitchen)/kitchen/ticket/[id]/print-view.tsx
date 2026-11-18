@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Order } from "@/lib/db";
-import { channelLabel } from "@/lib/kds/format";
+import { channelLabel, formatScheduledFor } from "@/lib/kds/format";
 import { TicketItems } from "../../components/ticket-items";
 
 export function PrintView({
@@ -106,6 +106,12 @@ export function PrintView({
           <p className="text-xs">
             {placed.toLocaleDateString()} {placed.toLocaleTimeString()}
           </p>
+          {order.fulfillment?.scheduled_for &&
+            order.fulfillment.scheduled_for !== "asap" && (
+              <p className="text-sm font-bold uppercase">
+                {formatScheduledFor(order.fulfillment.scheduled_for)}
+              </p>
+            )}
         </header>
 
         <div className="py-2">

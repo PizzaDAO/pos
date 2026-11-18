@@ -16,7 +16,14 @@ export type StationFilter = Station | "all";
 
 export interface KitchenTicket {
   order: Order;
-  /** Seconds since the order was placed (server-computed for stable coloring). */
+  /**
+   * ISO instant the ticket ages from: the fire time of a scheduled online order,
+   * else `created_at`. Optional for older snapshots (treat as `created_at`).
+   */
+  ageFrom?: string;
+  /** Scheduled online orders: the promised-ready time the customer picked (ISO). */
+  scheduledFor?: string;
+  /** Seconds since `ageFrom` (server-computed for stable coloring). */
   elapsedSeconds: number;
   /** Age bucket derived from `elapsedSeconds` vs. the location thresholds. */
   ageLevel: AgeLevel;
@@ -53,6 +60,8 @@ export interface KitchenBoardResponse {
   serverTime: string;
   /** Location age-coloring thresholds, so clients can re-color as time ticks. */
   thresholds: KdsThresholds;
+  /** Location IANA zone, for showing scheduled times in store time. */
+  timezone?: string | null;
 }
 
 /** Filter a line's effective station, falling back to "expo" when unknown. */

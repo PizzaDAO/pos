@@ -1,0 +1,75 @@
+/**
+ * Fire time of scheduled online orders (audit 2026-11-18 pos P1-1).
+ *
+ * A scheduled online order (pickup or delivery for a later time) is paid at
+ * checkout, possibly days ahead. It must not reach the kitchen then. It is held
+ * until its FIRE TIME, `promised_at - prep_minutes`, stored at checkout as
+ * `fulfillment.kitchen_fire_at`:
+ *
+ *  - KDS: computed on every read (`isHeldForFire` in `buildTickets`), so the
+ *    ticket appears on the first poll / refetch after the fire time, with its age
+ *    counted from the fire time, not from checkout. Nothing in memory, no timers.
+ *  - Printer: `runPostPaymentSteps` auto-prints only an order that is already due.
+ *    A held order is printed by the fire sweep (`releaseDueScheduledOrders`,
+ *    Vercel cron every minute), which also stamps `kitchen_released_at`. That
+ *    write bumps the row, so a KDS on Supabase Realtime refetches at release.
+ *    The print's `fire:<orderId>` dedupe key keeps a re-run from printing twice.
+ *
+ * Only `paid` online orders are held: once anyone moves the order on (bump,
+ * void, refund), the status decides as usual. /v1 holds (`order.hold`, catering)
+ * are a separate mechanism and untouched.
+ */
+import type { Order } from "@/lib/db";
+
+/** `promised_at - prep` as ISO. */
+export function scheduledFireAt(
+  promisedAtIso: string,
+  prepMinutes: number,
+): string {
+  const prep = Number.isFinite(prepMinutes) ? Math.max(0, prepMinutes) : 0;
+  return new Date(
+    new Date(promisedAtIso).getTime() - prep * 60_000,
+  ).toISOString();
+}
+
+function isScheduledOnline(
+  order: Pick<Order, "channel" | "fulfillment">,
+): boolean {
+  const f = order.fulfillment;
+  return (
+    (order.channel === "online_pickup" ||
+      order.channel === "online_delivery") &&
+    !!f &&
+    f.scheduled_for !== "asap"
+  );
+}
+
+/**
+ * The order's kitchen fire time (ISO), or null when it fires on payment (ASAP,
+ * in-store, /v1). An order created before `kitchen_fire_at` existed falls back
+ * to `promised_at - prepMinutes` when the caller knows the location's prep.
+ */
+export function kitchenFireAt(
+  order: Pick<Order, "channel" | "fulfillment">,
+  prepMinutes?: number,
+): string | null {
+  if (!isScheduledOnline(order)) return null;
+  const f = order.fulfillment!;
+  if (f.kitchen_fire_at && !Number.isNaN(Date.parse(f.kitchen_fire_at))) {
+    return f.kitchen_fire_at;
+  }
+  if (prepMinutes === undefined || Number.isNaN(Date.parse(f.promised_at)))
+    return null;
+  return scheduledFireAt(f.promised_at, prepMinutes);
+}
+
+/** True while a paid scheduled order is waiting for its fire time. */
+export function isHeldForFire(
+  order: Pick<Order, "channel" | "fulfillment" | "status" | "hold">,
+  now: Date,
+  prepMinutes?: number,
+): boolean {
+  if (order.status !== "paid" || order.hold) return false;
+  const fireAt = kitchenFireAt(order, prepMinutes);
+  return fireAt !== null && Date.parse(fireAt) > now.getTime();
+}

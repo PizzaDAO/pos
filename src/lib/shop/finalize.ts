@@ -36,6 +36,7 @@ import type { DeliveryProviderKey } from "@/lib/delivery";
 import { dispatchDelivery, quoteDelivery } from "@/lib/delivery/service";
 import { captureError } from "@/lib/observability";
 import { asapPromisedAt } from "./scheduling";
+import { isHeldForFire } from "@/lib/kds/fire";
 
 /** A quote with no stated expiry is trusted for this long after checkout. */
 const QUOTE_FALLBACK_TTL_MS = 15 * 60_000;
@@ -123,8 +124,10 @@ export async function runPostPaymentSteps(paid: Order): Promise<boolean> {
 
   // The order is live: auto-print its ticket if the location opted in. Here (not
   // in finalizeOnlinePayment) so the crash-recovery sweep covers it too; the
-  // fire:<orderId> dedupe key keeps repeats from printing twice.
-  scheduleAutoPrint(paid);
+  // fire:<orderId> dedupe key keeps repeats from printing twice. A scheduled
+  // order not yet at its fire time is printed by the fire sweep instead
+  // (releaseDueScheduledOrders, cron), so Friday's pickup is not printed today.
+  if (!isHeldForFire(paid, new Date())) scheduleAutoPrint(paid);
 
   // (3) Inventory. A failure must not un-pay the order; surface it.
   try {

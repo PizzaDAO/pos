@@ -20,7 +20,11 @@ import { Button } from "@/components/ui/button";
 import type { KdsThresholds } from "@/lib/db";
 import { ageLevelFor, hasKitchenWork } from "@/lib/kds/board";
 import { handoffLabel, isHandoffStatus, statusLabel } from "@/lib/kds/status";
-import { channelLabel, formatElapsed } from "@/lib/kds/format";
+import {
+  channelLabel,
+  formatElapsed,
+  formatScheduledFor,
+} from "@/lib/kds/format";
 import { orderTypeLabel } from "@/lib/till/order-meta";
 import type { AgeLevel, KitchenTicket, StationFilter } from "@/lib/kds/types";
 import { MarketplaceBadge } from "@/components/marketplace-badge";
@@ -50,7 +54,10 @@ const READY_STYLE = {
   header: "bg-muted text-foreground",
 };
 
-/** Elapsed seconds right now, anchored on created_at (independent of polls). */
+/**
+ * Elapsed seconds right now, anchored on the ticket's age origin (`ageFrom`: a
+ * scheduled order's fire time, else created_at), independent of polls.
+ */
 function useLiveElapsed(createdAtIso: string): number {
   const compute = () =>
     Math.max(
@@ -70,6 +77,7 @@ function useLiveElapsed(createdAtIso: string): number {
 function TicketCardImpl({
   ticket,
   thresholds,
+  timeZone,
   stationFilter,
   onBump,
   onRecall,
@@ -78,6 +86,8 @@ function TicketCardImpl({
 }: {
   ticket: KitchenTicket;
   thresholds: KdsThresholds;
+  /** Location zone, for the scheduled time. */
+  timeZone?: string | null;
   stationFilter: StationFilter;
   onBump: (orderId: string) => void;
   onRecall: (orderId: string) => void;
@@ -93,7 +103,10 @@ function TicketCardImpl({
     order.status !== "recall";
   const typeLabel = orderTypeLabel(order);
   const customer = order.core_ext?.callout_name ?? null;
-  const elapsed = useLiveElapsed(order.created_at);
+  const elapsed = useLiveElapsed(ticket.ageFrom ?? order.created_at);
+  const scheduledLabel = ticket.scheduledFor
+    ? formatScheduledFor(ticket.scheduledFor, timeZone)
+    : null;
   const ageLevel = ageLevelFor(elapsed, thresholds);
   const isBumped = isHandoffStatus(order.status);
   // Ready/done tickets are waiting for hand-off, not aging in the kitchen, so
@@ -105,7 +118,7 @@ function TicketCardImpl({
   return (
     <article
       data-ticket=""
-      aria-label={`Order ${order.order_number}, ${statusLabel(order.status)}, ${typeLabel ?? channelLabel(order.channel)}${customer ? `, ${customer}` : ""}`}
+      aria-label={`Order ${order.order_number}, ${statusLabel(order.status)}, ${typeLabel ?? channelLabel(order.channel)}${customer ? `, ${customer}` : ""}${scheduledLabel ? `, ${scheduledLabel}` : ""}`}
       className={cn(
         "flex flex-col overflow-hidden rounded-lg border-2 bg-card shadow-sm",
         styles.card,
@@ -152,6 +165,12 @@ function TicketCardImpl({
           </span>
         </div>
       </header>
+
+      {scheduledLabel && (
+        <div className="bg-sky-700 px-3 py-1 text-sm font-bold text-white">
+          {scheduledLabel}
+        </div>
+      )}
 
       {order.fulfillment?.marketplace?.cancel_requested && (
         <div

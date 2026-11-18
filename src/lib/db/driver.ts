@@ -670,6 +670,18 @@ export interface PosDriver {
   ): Promise<Order[]>;
 
   /**
+   * Paid scheduled online orders whose kitchen fire time
+   * (`fulfillment.kitchen_fire_at`) is at/before `dueBy` and that the fire sweep
+   * has not released yet (`fulfillment.kitchen_released_at` unset), earliest
+   * fire first. `checkoutMode` keeps this deployment's orders (plus legacy
+   * unmarked ones), like the other sweeps. Input to `releaseDueScheduledOrders`.
+   */
+  listDueScheduledOrders(
+    dueBy: string,
+    opts?: { limit?: number; checkoutMode?: "live" | "test" | "sim" },
+  ): Promise<Order[]>;
+
+  /**
    * Atomically claim an unresolved (or refund-owed) late-payment marker for one
    * actor: sets `late_payment.claim` only if no live claim exists (a claim older
    * than `staleBeforeIso` is treated as abandoned). Returns the order, or null if

@@ -130,13 +130,18 @@ export function CheckoutFlow({
   const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim());
 
   const now = useMemo(() => new Date(), []);
+  // Store hours are in the LOCATION's zone, same as the server's check, whatever
+  // zone this browser is in. Slot labels are in store time too.
+  const storeTimeZone = location.timezone;
   const asap = fulfillmentSettings
-    ? asapAvailability(fulfillmentSettings, now)
+    ? asapAvailability(fulfillmentSettings, now, storeTimeZone)
     : { available: false, reason: "Unavailable" };
   const slots = useMemo(
     () =>
-      fulfillmentSettings ? generateSlots(fulfillmentSettings, now) : [],
-    [fulfillmentSettings, now],
+      fulfillmentSettings
+        ? generateSlots(fulfillmentSettings, now, storeTimeZone)
+        : [],
+    [fulfillmentSettings, now, storeTimeZone],
   );
 
   const deliveryFee = fulfillment === "delivery" ? quote?.feeCents ?? 0 : 0;

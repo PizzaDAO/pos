@@ -304,9 +304,14 @@ export async function POST(request: Request) {
       }
       // An ASAP order is only payable while the store can still make it.
       if (order.fulfillment?.scheduled_for === "asap") {
-        const settings = await driver.getStoreSettings(tenantId, locationId);
+        const [settings, locations] = await Promise.all([
+          driver.getStoreSettings(tenantId, locationId),
+          driver.listLocations(tenantId),
+        ]);
         if (settings.fulfillment) {
-          const avail = asapAvailability(settings.fulfillment, new Date());
+          // In the LOCATION's zone (no zone: refused, see scheduling.ts).
+          const timeZone = locations.find((l) => l.id === locationId)?.timezone;
+          const avail = asapAvailability(settings.fulfillment, new Date(), timeZone);
           if (!avail.available) {
             return NextResponse.json(
               { error: avail.reason ?? "ASAP ordering is unavailable." },
