@@ -15,7 +15,7 @@
  *    write bumps the row, so a KDS on Supabase Realtime refetches at release.
  *    The print's `fire:<orderId>` dedupe key keeps a re-run from printing twice.
  *
- * Only `paid` online orders are held: once anyone moves the order on (bump,
+ * Only `paid` online orders that carry `kitchen_fire_at` are held: once anyone moves the order on (bump,
  * void, refund), the status decides as usual. /v1 holds (`order.hold`, catering)
  * are a separate mechanism and untouched.
  */
@@ -45,31 +45,39 @@ function isScheduledOnline(
 }
 
 /**
- * The order's kitchen fire time (ISO), or null when it fires on payment (ASAP,
- * in-store, /v1). An order created before `kitchen_fire_at` existed falls back
- * to `promised_at - prepMinutes` when the caller knows the location's prep.
+ * The order's kitchen fire time (ISO), or null when it fires on payment. Only
+ * an order that CARRIES `kitchen_fire_at` (set by the storefront checkout for a
+ * scheduled order) is ever held: /v1 orders (catering releases, /v1
+ * awaiting_payment) and orders placed before this field existed never are, so
+ * nothing that was already printed can vanish from the board.
  */
 export function kitchenFireAt(
   order: Pick<Order, "channel" | "fulfillment">,
-  prepMinutes?: number,
 ): string | null {
   if (!isScheduledOnline(order)) return null;
-  const f = order.fulfillment!;
-  if (f.kitchen_fire_at && !Number.isNaN(Date.parse(f.kitchen_fire_at))) {
-    return f.kitchen_fire_at;
-  }
-  if (prepMinutes === undefined || Number.isNaN(Date.parse(f.promised_at)))
-    return null;
-  return scheduledFireAt(f.promised_at, prepMinutes);
+  const at = order.fulfillment!.kitchen_fire_at;
+  return at && !Number.isNaN(Date.parse(at)) ? at : null;
 }
 
 /** True while a paid scheduled order is waiting for its fire time. */
 export function isHeldForFire(
   order: Pick<Order, "channel" | "fulfillment" | "status" | "hold">,
   now: Date,
-  prepMinutes?: number,
 ): boolean {
   if (order.status !== "paid" || order.hold) return false;
-  const fireAt = kitchenFireAt(order, prepMinutes);
+  const fireAt = kitchenFireAt(order);
   return fireAt !== null && Date.parse(fireAt) > now.getTime();
+}
+
+/**
+ * Whether the kitchen had not been given this order yet at `at` (its fire time
+ * was still ahead). A void or refund then is not the kitchen's business: no VOID
+ * ticket, no STOP banner. Works on the order after it left `paid` too.
+ */
+export function wasHeldAt(
+  order: Pick<Order, "channel" | "fulfillment">,
+  at: Date,
+): boolean {
+  const fireAt = kitchenFireAt(order);
+  return fireAt !== null && Date.parse(fireAt) > at.getTime();
 }

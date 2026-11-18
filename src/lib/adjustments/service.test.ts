@@ -83,7 +83,12 @@ function item(id: string, unit: number, qty: number, over: Partial<OrderItem> = 
 
 async function seedOrder(
   items: OrderItem[],
-  opts: { status?: Order["status"]; tax?: number } = {},
+  opts: {
+    status?: Order["status"];
+    tax?: number;
+    channel?: Order["channel"];
+    fulfillment?: Order["fulfillment"];
+  } = {},
 ): Promise<Order> {
   seq += 1;
   const subtotal = items.reduce((n, i) => n + i.unit_price_cents * i.quantity, 0);
@@ -92,10 +97,11 @@ async function seedOrder(
     id: globalThis.crypto.randomUUID(),
     tenant_id: TENANT,
     location_id: LOCATION,
-    channel: "in_store",
+    channel: opts.channel ?? "in_store",
     currency: "USD",
     items,
     discount_cents: 0,
+    ...(opts.fulfillment ? { fulfillment: opts.fulfillment } : {}),
     totals: {
       subtotal_cents: subtotal,
       discount_cents: 0,
@@ -1196,6 +1202,62 @@ describe("VOID ticket for fired food", () => {
     expect(jobs).toHaveLength(1);
     expect(jobs[0]!.document.lines.map((l) => l.text).join("\n")).toMatch(/\*\*\* VOID \*\*\*/);
     expect(jobs[0]!.document.lines.map((l) => l.text).join("\n")).toMatch(/1x Pizza/);
+  });
+});
+
+// Audit 2026-11-18 pos P1-1 review: a scheduled online order still waiting for its
+// fire time never reached the kitchen, so voiding it prints no VOID ticket and
+// shows no STOP banner. Once it has fired, both still happen.
+describe("voiding a scheduled order before its fire time", () => {
+  async function scheduledPaid(fireInMs: number) {
+    const promised = new Date(Date.now() + fireInMs + 20 * 60_000).toISOString();
+    const order = await seedOrder([item("l-sch", 1000, 1)], {
+      status: "paid",
+      channel: "online_pickup",
+      fulfillment: {
+        type: "pickup",
+        scheduled_for: promised,
+        promised_at: promised,
+        kitchen_fire_at: new Date(Date.now() + fireInMs).toISOString(),
+      },
+    });
+    await seedTender(order);
+    return order;
+  }
+
+  async function voidJobs(orderId: string) {
+    await new Promise((r) => setTimeout(r, 20));
+    return (await getPosDriver().listPrintJobs(TENANT, LOCATION, 50)).filter(
+      (j) =>
+        j.order_id === orderId &&
+        j.document.lines.some((l) => /\*\*\* VOID \*\*\*/.test(l.text)),
+    );
+  }
+
+  it("held (fire time ahead): no VOID ticket, no STOP notice", async () => {
+    const { createPrinter } = await import("@/lib/printing/queue");
+    const { buildVoidNotices } = await import("@/lib/kds/board");
+    await createPrinter({ tenantId: TENANT, locationId: LOCATION, label: "Line", protocol: "star_cloudprnt" });
+    const order = await scheduledPaid(2 * 24 * 60 * 60_000);
+    expect(order.items[0]!.fired_at).toBeTruthy(); // fired at creation, but held
+    const res = await voidReq(order.id, { wholeOrder: true, reasonCode: "walkout" });
+    expect(res.status).toBe(200);
+    const voided = (await getPosDriver().getOrder(order.id))!;
+    expect(voided.status).toBe("voided");
+    expect(await voidJobs(order.id)).toHaveLength(0);
+    expect(buildVoidNotices([voided], new Date())).toEqual([]);
+  });
+
+  it("fired (fire time passed): VOID ticket and STOP notice as usual", async () => {
+    const { createPrinter } = await import("@/lib/printing/queue");
+    const { buildVoidNotices } = await import("@/lib/kds/board");
+    await createPrinter({ tenantId: TENANT, locationId: LOCATION, label: "Line", protocol: "star_cloudprnt" });
+    const order = await scheduledPaid(-5 * 60_000);
+    const res = await voidReq(order.id, { wholeOrder: true, reasonCode: "walkout" });
+    expect(res.status).toBe(200);
+    const voided = (await getPosDriver().getOrder(order.id))!;
+    expect(await voidJobs(order.id)).toHaveLength(1);
+    expect(buildVoidNotices([voided], new Date())).toHaveLength(1);
   });
 });
 

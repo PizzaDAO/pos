@@ -76,23 +76,13 @@ describe("buildTickets holds scheduled online orders until fire time", () => {
     expect(t!.scheduledFor).toBe(FRI_1PM);
   });
 
-  it("a legacy order without kitchen_fire_at uses promised - the location's prep", () => {
+  it("never holds an order without kitchen_fire_at (legacy or /v1)", () => {
     const o = baseOrder();
     delete o.fulfillment!.kitchen_fire_at;
-    const prep = 25;
-    expect(kitchenFireAt(o, prep)).toBe(
-      new Date(Date.parse(FRI_1PM) - 25 * MIN).toISOString(),
-    );
-    expect(
-      buildTickets([o], WED_10AM, DEFAULT_KDS_THRESHOLDS, {
-        prepMinutes: prep,
-      }),
-    ).toEqual([]);
-    const at = new Date(Date.parse(FRI_1PM) - 20 * MIN);
-    const [t] = buildTickets([o], at, DEFAULT_KDS_THRESHOLDS, {
-      prepMinutes: prep,
-    });
-    expect(t!.elapsedSeconds).toBe(300);
+    expect(kitchenFireAt(o)).toBeNull();
+    const [t] = buildTickets([o], WED_10AM, DEFAULT_KDS_THRESHOLDS);
+    expect(t?.order.id).toBe(o.id);
+    expect(t!.ageFrom).toBe(o.created_at);
   });
 
   it("does not touch ASAP, in-store, bumped or /v1-held orders", () => {
@@ -214,9 +204,9 @@ describe("checkout -> payment -> fire sweep (mock driver)", () => {
       driver
         .listOrders(placed.tenant_id, placed.location_id)
         .then((os) =>
-          buildTickets(os, at, DEFAULT_KDS_THRESHOLDS, {
-            prepMinutes: prep,
-          }).filter((t) => t.order.id === placed.id),
+          buildTickets(os, at, DEFAULT_KDS_THRESHOLDS).filter(
+            (t) => t.order.id === placed.id,
+          ),
         );
 
     // Wednesday: not on the board, not printed, not released by the sweep.

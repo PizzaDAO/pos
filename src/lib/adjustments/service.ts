@@ -55,6 +55,7 @@ import {
 } from "@/lib/payments/service";
 import { deriveDrawerEventId } from "@/lib/payments/ids";
 import { scheduleVoidTicket } from "@/lib/printing/queue";
+import { isHeldForFire } from "@/lib/kds/fire";
 import { isFullyRefunded, liveTenders } from "@/lib/payments/refund-state";
 import {
   AdjustmentInputError,
@@ -750,6 +751,9 @@ function kitchenVoidTicket(
   record: AdjustmentRecord,
   reason: { code: string; text: string | null },
 ): void {
+  // A scheduled online order still waiting for its fire time was never sent to
+  // the kitchen (nothing printed, not on the KDS): no VOID ticket.
+  if (isHeldForFire(before, new Date())) return;
   const items =
     kind === "void_order"
       ? before.items.filter((i) => !i.voided && !!i.fired_at)

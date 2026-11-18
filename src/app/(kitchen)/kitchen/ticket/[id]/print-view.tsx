@@ -13,13 +13,24 @@ import type { Order } from "@/lib/db";
 import { channelLabel, formatScheduledFor } from "@/lib/kds/format";
 import { TicketItems } from "../../components/ticket-items";
 
+function formatInZone(d: Date, timeZone: string | null): string {
+  try {
+    return d.toLocaleString(undefined, { timeZone: timeZone || undefined });
+  } catch {
+    return d.toLocaleString();
+  }
+}
+
 export function PrintView({
   order,
   networkPrinters = 0,
+  timeZone = null,
 }: {
   order: Order;
   /** Registered network printers at the order's location; 0 = browser printing. */
   networkPrinters?: number;
+  /** Location IANA zone; times print in store time (screen zone when unknown). */
+  timeZone?: string | null;
 }) {
   const [net, setNet] = useState<{ state: "idle" | "sending" | "sent" | "error"; message?: string }>(
     { state: "idle" },
@@ -104,12 +115,12 @@ export function PrintView({
           </p>
           <p className="text-xs">{channelLabel(order.channel)}</p>
           <p className="text-xs">
-            {placed.toLocaleDateString()} {placed.toLocaleTimeString()}
+            {formatInZone(placed, timeZone)}
           </p>
           {order.fulfillment?.scheduled_for &&
             order.fulfillment.scheduled_for !== "asap" && (
               <p className="text-sm font-bold uppercase">
-                {formatScheduledFor(order.fulfillment.scheduled_for)}
+                {formatScheduledFor(order.fulfillment.scheduled_for, timeZone)}
               </p>
             )}
         </header>

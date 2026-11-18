@@ -54,6 +54,31 @@ export const runtime = "nodejs";
  */
 const KDS_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * Location zone per location id, cached briefly: the board polls every few
+ * seconds and the zone almost never changes. Per server instance; a stale entry
+ * only affects how the scheduled time is labelled for up to the TTL.
+ */
+const ZONE_TTL_MS = 5 * 60_000;
+const zoneCache = new Map<string, { timezone: string | null; until: number }>();
+
+async function locationTimezone(
+  tenantId: string,
+  locationId: string,
+  nowMs: number,
+): Promise<string | null> {
+  const hit = zoneCache.get(locationId);
+  if (hit && hit.until > nowMs) return hit.timezone;
+  try {
+    const locs = await getPosDriver().listLocations(tenantId);
+    const timezone = locs.find((l) => l.id === locationId)?.timezone ?? null;
+    zoneCache.set(locationId, { timezone, until: nowMs + ZONE_TTL_MS });
+    return timezone;
+  } catch {
+    return hit?.timezone ?? null;
+  }
+}
+
 /** The delivery record's provider for an order (null when none / unreadable). */
 async function deliveryProviderOf(orderId: string): Promise<string | null> {
   try {
@@ -79,22 +104,20 @@ export async function GET(request: Request) {
   // Filtered in SQL: active tickets touched in the last week, plus anything changed
   // inside the void-notice window (a voided order or line). Not the location's
   // whole order history.
-  const [orders, settings, locations] = await Promise.all([
+  const [orders, settings, timezone] = await Promise.all([
     driver.listKitchenOrders(tenantId, locationId, {
       statuses: KDS_ACTIVE_STATUSES,
       activeSince: new Date(now.getTime() - KDS_ACTIVE_WINDOW_MS).toISOString(),
       updatedSince: new Date(now.getTime() - VOID_NOTICE_MS).toISOString(),
     }),
     driver.getStoreSettings(tenantId, locationId),
-    driver.listLocations(tenantId),
+    locationTimezone(tenantId, locationId, now.getTime()),
   ]);
 
   const thresholds = settings.kds_thresholds ?? DEFAULT_KDS_THRESHOLDS;
   // Scheduled online orders stay off until their fire time (computed here, on
   // every read: no timers), see src/lib/kds/fire.ts.
-  const built = buildTickets(orders, now, thresholds, {
-    prepMinutes: settings.fulfillment?.prep_minutes,
-  });
+  const built = buildTickets(orders, now, thresholds);
   // Delivery tickets carry their delivery record's provider: it decides whether
   // the kitchen offers a hand-off (in-house only).
   const tickets = await Promise.all(
@@ -111,7 +134,7 @@ export async function GET(request: Request) {
     driver: driver.name,
     serverTime: now.toISOString(),
     thresholds,
-    timezone: locations.find((l) => l.id === locationId)?.timezone ?? null,
+    timezone,
   };
   // No caching — the board must reflect the latest status on every poll.
   return NextResponse.json(body, {

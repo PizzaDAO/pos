@@ -49,8 +49,13 @@ export default async function TicketPrintPage({
   }
 
   // A network printer at this location takes the ticket; otherwise the browser.
-  const networkPrinters = (
-    await driver.listPrinters(order.tenant_id, order.location_id).catch(() => [])
-  ).length;
-  return <PrintView order={order} networkPrinters={networkPrinters} />;
+  const [printers, locations] = await Promise.all([
+    driver.listPrinters(order.tenant_id, order.location_id).catch(() => []),
+    driver.listLocations(order.tenant_id).catch(() => []),
+  ]);
+  // Times on the ticket are in the store's zone, not the screen's.
+  const timeZone = locations.find((l) => l.id === order.location_id)?.timezone ?? null;
+  return (
+    <PrintView order={order} networkPrinters={printers.length} timeZone={timeZone} />
+  );
 }
